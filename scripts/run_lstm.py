@@ -9,11 +9,21 @@ from torch.utils.data.distributed import DistributedSampler
 from itertools import permutations
 import argparse
 import yaml
+from datetime import timedelta
 import os
 import wandb
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+import signal
+import sys
 
+def signal_handler(sig, frame):
+    print("Signal received: Cleaning up and exiting...")
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
 
 # Helper functions
 def load_config(config_file):
@@ -79,14 +89,31 @@ def main():
     args = parse_args()
     config = load_config(args.config)
 
-    # Initialize WandB only on the main process
-    if is_main_process():
-        wandb.init(project="lstm_tcr_model", config=config)
+    # Set up environment variables (handled by torchrun)
+    local_rank = int(os.environ["LOCAL_RANK"])  # Automatically set by torchrun
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    
+    # Initialize distributed process group
+    dist.init_process_group(
+        backend="nccl", 
+        init_method="env://", 
+        timeout=timedelta(hours=1)
+    )
 
-    # Initialize distributed training
-    dist.init_process_group(backend="nccl", init_method="env://")
-    local_rank = int(os.environ["LOCAL_RANK"])
+    # Set the local GPU for the current process
     torch.cuda.set_device(local_rank)
+
+    # Log basic info for debugging
+    print(f"[Rank {rank}/{world_size}] Initialized on device {local_rank}")
+
+    # Disable tqdm for non-main processes
+    if not is_main_process():
+        tqdm.set_lock(None)
+
+    # Initialize WandB only on the main process
+    if rank == 0:
+        wandb.init(project="lstm_tcr_model", config=config)
 
     # Load dataset
     dataset = pd.read_parquet(config['dataset']['path'])
@@ -109,9 +136,9 @@ def main():
     val_dataset = AminoAcidDataset(val_data, seq_length)
     test_dataset = AminoAcidDataset(test_data, seq_length)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=DistributedSampler(train_dataset), num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=DistributedSampler(train_dataset), num_workers=1, persistent_workers=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=1, persistent_workers=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=1, persistent_workers=True)
 
     # Initialize model
     vocab_size = len(token_to_idx)
@@ -127,88 +154,114 @@ def main():
         torch.cuda.empty_cache()
         model.train()
         total_train_loss, total_train_accuracy = 0, 0
+        train_loader.sampler.set_epoch(epoch)
+        # Use tqdm only for the main process
+        if is_main_process():
+            pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{config['training']['num_epochs']} - Training", disable=not is_main_process())
+        else:
+            pbar = None
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(local_rank), targets.to(local_rank)
 
-        with tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{config['training']['num_epochs']} - Training", position=local_rank) as pbar:
-            for inputs, targets in train_loader:
-                inputs, targets = inputs.to(local_rank), targets.to(local_rank)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            accuracy = calculate_accuracy(outputs, targets)
 
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                accuracy = calculate_accuracy(outputs, targets)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                total_train_loss += loss.item()
-                total_train_accuracy += accuracy.item()
-
+            total_train_loss += loss.item()
+            total_train_accuracy += accuracy.item()
+            # Update tqdm bar only for the main process
+            if is_main_process():
                 pbar.set_postfix({"Loss": loss.item(), "Accuracy": accuracy.item()})
                 pbar.update(1)
+
+        # Close tqdm bar
+        if is_main_process():
+            pbar.close()
+
 
         avg_train_loss = total_train_loss / len(train_loader)
         avg_train_accuracy = total_train_accuracy / len(train_loader)
         # Log only from the main process
         if is_main_process():
             wandb.log({"epoch": epoch, "train_loss": avg_train_loss, "train_accuracy": avg_train_accuracy})
-        print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Train Accuracy: {avg_train_accuracy:.4f}")
+            print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Train Accuracy: {avg_train_accuracy:.4f}")
 
         # Validation loop
         model.eval()
         total_val_loss, total_val_accuracy = 0, 0
         with torch.no_grad():
-            with tqdm(total=len(val_loader), desc=f"Epoch {epoch+1}/{config['training']['num_epochs']} - Validation", position=local_rank) as pbar:
-                for inputs, targets in val_loader:
-                    inputs, targets = inputs.to(local_rank), targets.to(local_rank)
-
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    accuracy = calculate_accuracy(outputs, targets)
-
-                    total_val_loss += loss.item()
-                    total_val_accuracy += accuracy.item()
-                    pbar.set_postfix({"Loss": loss.item(), "Accuracy": accuracy.item()})
-                    pbar.update(1)
-
-        avg_val_loss = total_val_loss / len(val_loader)
-        avg_val_accuracy = total_val_accuracy / len(val_loader)
-        # Log only from the main process
-        if is_main_process():
-            wandb.log({"epoch": epoch, "val_loss": avg_val_loss, "val_accuracy": avg_val_accuracy})
-
-        print(f"Epoch {epoch+1}, Val Loss: {avg_val_loss:.4f}, Val Accuracy: {avg_val_accuracy:.4f}")
-
-    # Test loop
-    model.eval()
-    total_test_loss, total_test_accuracy = 0, 0
-    with torch.no_grad():
-        with tqdm(total=len(test_loader), desc="Testing", position=local_rank) as pbar:
-            for inputs, targets in test_loader:
+            # Use tqdm only for the main process
+            if is_main_process():
+                pbar = tqdm(total=len(val_loader), desc=f"Epoch {epoch+1}/{config['training']['num_epochs']} - Validation", disable=not is_main_process())
+            else:
+                pbar = None
+            for inputs, targets in val_loader:
                 inputs, targets = inputs.to(local_rank), targets.to(local_rank)
 
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 accuracy = calculate_accuracy(outputs, targets)
 
-                total_test_loss += loss.item()
-                total_test_accuracy += accuracy.item()
+                total_val_loss += loss.item()
+                total_val_accuracy += accuracy.item()
+                if is_main_process():
+                    pbar.set_postfix({"Loss": loss.item(), "Accuracy": accuracy.item()})
+                    pbar.update(1)
+
+        # Close tqdm bar
+        if pbar is not None:
+            pbar.close()
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        avg_val_accuracy = total_val_accuracy / len(val_loader)
+        # Log only from the main process
+        if is_main_process():
+            wandb.log({"epoch": epoch, "val_loss": avg_val_loss, "val_accuracy": avg_val_accuracy})
+            print(f"Epoch {epoch+1}, Val Loss: {avg_val_loss:.4f}, Val Accuracy: {avg_val_accuracy:.4f}")
+
+    # Test loop
+    model.eval()
+    total_test_loss, total_test_accuracy = 0, 0
+    with torch.no_grad():
+        # Use tqdm only for the main process
+        if is_main_process():
+            pbar = tqdm(total=len(test_loader), desc=f"Epoch {epoch+1}/{config['training']['num_epochs']} - Testing", disable=not is_main_process())
+        else:
+            pbar = None
+        for inputs, targets in test_loader:
+            inputs, targets = inputs.to(local_rank), targets.to(local_rank)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            accuracy = calculate_accuracy(outputs, targets)
+
+            total_test_loss += loss.item()
+            total_test_accuracy += accuracy.item()
+            # Update tqdm bar only for the main process
+            if is_main_process():
                 pbar.set_postfix({"Loss": loss.item(), "Accuracy": accuracy.item()})
                 pbar.update(1)
+
+        # Close tqdm bar
+        if pbar is not None:
+            pbar.close()
 
     avg_test_loss = total_test_loss / len(test_loader)
     avg_test_accuracy = total_test_accuracy / len(test_loader)
             # Log only from the main process
     if is_main_process():
         wandb.log( {"test_loss": avg_test_loss, "test_accuracy": avg_test_accuracy})
-
-    print(f"Test Loss: {avg_test_loss:.4f}, Test Accuracy: {avg_test_accuracy:.4f}")
+        print(f"Test Loss: {avg_test_loss:.4f}, Test Accuracy: {avg_test_accuracy:.4f}")
     # Finalize WandB on the main process
-    if is_main_process():
+    # Cleanup
+    if rank == 0:
         wandb.finish()
 
-    # Clean up distributed process group
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    dist.destroy_process_group()
         
 if __name__ == "__main__":
     main()
