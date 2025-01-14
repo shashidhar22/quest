@@ -1,0 +1,14 @@
+# Extensions
+*.out
+*.ipynb_checkpoints
+*.err
+*.csv
+
+# Folders
+config
+data
+keys
+logs
+misc
+wandb
+model_config
