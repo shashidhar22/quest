@@ -11,4 +11,6 @@ keys
 logs
 misc
 wandb
+temp
 model_config
+__pycache__
