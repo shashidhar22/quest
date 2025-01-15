@@ -4,6 +4,8 @@
 *.err
 *.csv
 
+# Files
+.env
 # Folders
 config
 data
