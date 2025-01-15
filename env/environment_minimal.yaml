@@ -1,0 +1,20 @@
+name: quest
+channels:
+  - conda-forge
+dependencies:
+  - python==3.12.6
+  - ca-certificates
+  - openssl
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.4
+  - pandas
+  - certifi
+  - r-base
+  - r-essentials
+  - gh
+  - pytables
+  - openpyxl
+  - dask
+  - r-optparse
