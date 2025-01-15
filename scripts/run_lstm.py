@@ -1,70 +1,96 @@
-import pandas as pd
-import torch
-import random
-import torch.nn as nn
-from tqdm import tqdm
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-from torch.utils.data.distributed import DistributedSampler
-from itertools import permutations
-import argparse
-import yaml
-from datetime import timedelta
 import os
-import wandb
+import sys
+import argparse
+import pickle
+from datetime import timedelta
+
+# PyTorch imports
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+
+# Other libraries
+import pandas as pd
+from tqdm import tqdm
+import wandb
+
+# Signal handling
 import signal
-import sys
 
-def signal_handler(sig, frame):
-    print("Signal received: Cleaning up and exiting...")
-    if dist.is_initialized():
-        dist.destroy_process_group()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-
-# Helper functions
-def load_config(config_file):
-    """Load configuration from a YAML file."""
-    with open(config_file, 'r') as file:
-        return yaml.safe_load(file)
-
-
-def calculate_accuracy(outputs, targets):
-    """Calculate accuracy."""
-    _, predicted = torch.max(outputs, dim=1)
-    correct = (predicted == targets).float()
-    return correct.sum() / len(correct)
-
-
-def parse_args():
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="Train an LSTM model on amino acid sequences.")
-    parser.add_argument('--config', type=str, required=True, help="Path to the configuration YAML file.")
-    return parser.parse_args()
-
+from torch.utils.data import Dataset
+import torch
 
 class AminoAcidDataset(Dataset):
+    """
+    A custom PyTorch Dataset class for generating input-target pairs from amino acid sequences.
+
+    Attributes:
+        sequences (list of lists of int): A list of encoded amino acid sequences.
+        seq_length (int): The desired length of each input subsequence.
+        step (int): The step size for sliding the window to generate subsequences.
+        pad_token (int): The token used for padding sequences (currently unused in this implementation).
+
+    Methods:
+        __len__(): Returns the total number of input-target pairs in the dataset.
+        __getitem__(idx): Returns the input-target pair at the specified index.
+    """
+
     def __init__(self, sequences, seq_length, step=1):
+        """
+        Initializes the AminoAcidDataset object.
+
+        Args:
+            sequences (list of lists of int): Encoded amino acid sequences.
+            seq_length (int): The desired length of input subsequences.
+            step (int, optional): The step size for sliding the window. Default is 1.
+        """
         self.sequences = sequences
         self.seq_length = seq_length
         self.step = step
 
     def __len__(self):
+        """
+        Calculates the total number of input-target pairs in the dataset.
+
+        Returns:
+            int: The total number of input-target pairs.
+        """
+        # Calculate the number of subsequences for each sequence and sum them
         return sum((len(seq) - self.seq_length) // self.step for seq in self.sequences)
 
     def __getitem__(self, idx):
+        """
+        Fetches the input-target pair at the specified index.
+
+        Args:
+            idx (int): The index of the desired input-target pair.
+
+        Returns:
+            x (torch.Tensor): Input subsequence of shape (seq_length,) as a long tensor.
+            y (torch.Tensor): Target token as a long tensor.
+        """
         for seq in self.sequences:
+            # Determine the number of valid subsequences in the current sequence
             num_subseqs = (len(seq) - self.seq_length) // self.step
+
+            # Check if the index falls within the current sequence
             if idx < num_subseqs:
+                # Calculate the start position for the subsequence
                 start = idx * self.step
+                # Input subsequence of length seq_length
                 x = seq[start:start + self.seq_length]
+                # Target is the token immediately following the subsequence
                 y = seq[start + self.seq_length]
                 return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+            
+            # Adjust index for the next sequence
             idx -= num_subseqs
 
+        # Raise an error if index is out of bounds (this shouldn't happen with a well-defined dataset)
+        raise IndexError("Index out of range for the dataset.")
 
 class LSTMGenerator(nn.Module):
     def __init__(self, vocab_size, embed_size, hidden_size, num_layers):
@@ -79,189 +105,244 @@ class LSTMGenerator(nn.Module):
         out = self.fc(out[:, -1, :])
         return out
 
+def signal_handler(sig, frame):
+    print("Signal received: Cleaning up and exiting...")
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Train an LSTM model on amino acid sequences.")
+    parser.add_argument('-d', '--dataset', type=str, required=True, help="Path to the training dataset ")
+    return parser.parse_args()
+
 def is_main_process():
     """Check if the current process is the main process (rank 0)."""
     return int(os.environ.get("LOCAL_RANK", 0)) == 0
 
+# Load preprocessed dataset from file
+def load_preprocessed_dataset(file_path):
+    with open(file_path, "rb") as f:
+        data = pickle.load(f)
+    return data
+
+
+def train_one_epoch(model, loader, criterion, optimizer, epoch, local_rank, world_size):
+    model.train()
+    total_loss, total_correct, total_samples = 0.0, 0, 0
+    loader.sampler.set_epoch(epoch)
+
+    pbar = tqdm(total=len(loader), desc=f"Epoch {epoch + 1} - Training", position=0) if is_main_process() else None
+
+    for inputs, targets in loader:
+        inputs, targets = inputs.to(local_rank), targets.to(local_rank)
+
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        _, predicted = torch.max(outputs, dim=1)
+
+        # Update metrics
+        total_loss += loss.item() * inputs.size(0)
+        total_correct += (predicted == targets).sum().item()
+        total_samples += inputs.size(0)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if is_main_process() and pbar is not None:
+            pbar.set_postfix({"Loss": loss.item(), "Batch Accuracy": (predicted == targets).float().mean().item()})
+            pbar.update(1)
+
+    if is_main_process() and pbar is not None:
+        pbar.close()
+
+    dist.barrier()
+    log_metrics(total_loss, total_correct, total_samples, "train", epoch, local_rank, world_size)
+
+
+def validate_one_epoch(model, loader, criterion, epoch, local_rank, world_size):
+    model.eval()
+    total_loss, total_correct, total_samples = 0.0, 0, 0
+
+    pbar = tqdm(total=len(loader), desc=f"Epoch {epoch + 1} - Validation", position=0) if is_main_process() else None
+
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(local_rank), targets.to(local_rank)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            _, predicted = torch.max(outputs, dim=1)
+
+            # Update metrics
+            total_loss += loss.item() * inputs.size(0)
+            total_correct += (predicted == targets).sum().item()
+            total_samples += inputs.size(0)
+
+            if is_main_process() and pbar is not None:
+                pbar.set_postfix({"Loss": loss.item(), "Batch Accuracy": (predicted == targets).float().mean().item()})
+                pbar.update(1)
+
+    if is_main_process() and pbar is not None:
+        pbar.close()
+
+    dist.barrier()
+    log_metrics(total_loss, total_correct, total_samples, "val", epoch, local_rank, world_size)
+
+def test_model(model, loader, criterion, local_rank, world_size):
+    model.eval()
+    total_loss, total_correct, total_samples = 0.0, 0, 0
+
+    pbar = tqdm(total=len(loader), desc="Testing", position=0) if is_main_process() else None
+
+    with torch.no_grad():
+        for inputs, targets in loader:
+            inputs, targets = inputs.to(local_rank), targets.to(local_rank)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            _, predicted = torch.max(outputs, dim=1)
+
+            # Update metrics
+            total_loss += loss.item() * inputs.size(0)
+            total_correct += (predicted == targets).sum().item()
+            total_samples += inputs.size(0)
+
+            if is_main_process() and pbar is not None:
+                pbar.set_postfix({"Loss": loss.item(), "Batch Accuracy": (predicted == targets).float().mean().item()})
+                pbar.update(1)
+
+    if is_main_process() and pbar is not None:
+        pbar.close()
+
+    dist.barrier()
+    log_metrics(total_loss, total_correct, total_samples, "test", None, local_rank, world_size)
+
+def log_metrics(total_loss, total_correct, total_samples, stage, epoch, local_rank, world_size):
+    total_loss_tensor = torch.tensor(total_loss, device=local_rank)
+    total_correct_tensor = torch.tensor(total_correct, device=local_rank)
+    total_samples_tensor = torch.tensor(total_samples, device=local_rank)
+
+    dist.reduce(total_loss_tensor, dst=0, op=dist.ReduceOp.SUM)
+    dist.reduce(total_correct_tensor, dst=0, op=dist.ReduceOp.SUM)
+    dist.reduce(total_samples_tensor, dst=0, op=dist.ReduceOp.SUM)
+
+    if is_main_process():
+        avg_loss = total_loss_tensor.item() / total_samples_tensor.item()
+        avg_accuracy = total_correct_tensor.item() / total_samples_tensor.item()
+        log_data = {f"{stage}_loss": avg_loss, f"{stage}_accuracy": avg_accuracy}
+        if epoch is not None:
+            log_data["epoch"] = epoch
+        wandb.log(log_data)
 
 def main():
-    # Parse arguments and load config
+    # --- Parse arguments and setup environment ---
     args = parse_args()
-    config = load_config(args.config)
-
-    # Set up environment variables (handled by torchrun)
-    local_rank = int(os.environ["LOCAL_RANK"])  # Automatically set by torchrun
+    local_rank = int(os.environ["LOCAL_RANK"])  # Set by torchrun
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    
-    # Initialize distributed process group
+    torch.cuda.set_device(local_rank)
     dist.init_process_group(
-        backend="nccl", 
-        init_method="env://", 
-        timeout=timedelta(hours=1)
+        backend="nccl",
+        init_method="env://",
+        timeout=timedelta(hours=1),
+        world_size=world_size,
+        rank=rank
     )
 
-    # Set the local GPU for the current process
-    torch.cuda.set_device(local_rank)
+    preprocessed_data = load_preprocessed_dataset(args.dataset)
 
-    # Log basic info for debugging
-    print(f"[Rank {rank}/{world_size}] Initialized on device {local_rank}")
+    # Set temp, and model path
+    temp_path = preprocessed_data["temp_path"]
+    model_path = preprocessed_data["output_path"]
 
-    # Disable tqdm for non-main processes
-    if not is_main_process():
-        tqdm.set_lock(None)
+    # --- Initialize WandB (only for the main process) ---
+    if is_main_process():
+        config = {'sequence length': preprocessed_data["seq_length"],
+              'batch size' : preprocessed_data["batch_size"], 
+              'embedding dimensions': preprocessed_data["embedding_dim"],
+              'hidden dimensions': preprocessed_data["hidden_dim"],
+              'number of layers': preprocessed_data["num_layers"],
+              'learning_rate': preprocessed_data["learning_rate"],
+              'number of epochs': preprocessed_data["num_epochs"],
+              'data source': preprocessed_data["source"],
+              'amount of raw data used': preprocessed_data["percentage"]}
 
-    # Initialize WandB only on the main process
-    if rank == 0:
-        wandb.init(project="lstm_tcr_model", config=config)
+        wandb.init(
+            project="lstm_tcr_model",
+            config=config,
+            name=f"{config['data source']} ; {config['amount of raw data used']}%"
+        )
 
-    # Load dataset
-    dataset = pd.read_parquet(config['dataset']['path'])
-    sequences = dataset['sequence'].unique().tolist()
+    # --- Load preprocessed dataset ---
+    train_dataset = preprocessed_data["train_data"]
+    val_dataset = preprocessed_data["val_data"]
+    test_dataset = preprocessed_data["test_data"]
+    token_to_idx = preprocessed_data["token_to_idx"]
+    idx_to_token = preprocessed_data["idx_to_token"]
 
-    # Preprocess and encode data
-    selected_sequences = random.sample(sequences, int(len(sequences) * config['dataset']['selection_percentage'] / 100))
-    token_to_idx = {token: idx for idx, token in enumerate(set("".join(selected_sequences)))}
-    encoded_sequences = [[token_to_idx[char] for char in seq] for seq in selected_sequences]
+    # --- Prepare DataLoaders ---
+    batch_size = preprocessed_data["batch_size"]
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True, seed=42)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=1, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True)
 
-    train_size = int(0.8 * len(encoded_sequences))
-    val_size = int(0.1 * len(encoded_sequences))
-    test_size = len(encoded_sequences) - train_size - val_size
-    train_data, val_data, test_data = random_split(encoded_sequences, [train_size, val_size, test_size])
-
-    seq_length = config['model']['seq_length']
-    batch_size = config['model']['batch_size']
-
-    train_dataset = AminoAcidDataset(train_data, seq_length)
-    val_dataset = AminoAcidDataset(val_data, seq_length)
-    test_dataset = AminoAcidDataset(test_data, seq_length)
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=DistributedSampler(train_dataset), num_workers=1, persistent_workers=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=1, persistent_workers=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=1, persistent_workers=True)
-
-    # Initialize model
+    # --- Initialize model and optimizer ---
     vocab_size = len(token_to_idx)
-    model = LSTMGenerator(vocab_size, config['model']['embed_size'], config['model']['hidden_size'], config['model']['num_layers'])
-    model = model.to(local_rank)
+    model = LSTMGenerator(
+        vocab_size=vocab_size,
+        embed_size=preprocessed_data["embedding_dim"],
+        hidden_size=preprocessed_data["hidden_dim"],
+        num_layers=preprocessed_data["num_layers"]
+    ).to(local_rank)
     model = DDP(model, device_ids=[local_rank])
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=config['training']['learning_rate'])
+    optimizer = optim.Adam(model.parameters(), lr=preprocessed_data["learning_rate"])
 
-    # Training loop
-    for epoch in range(config['training']['num_epochs']):
-        torch.cuda.empty_cache()
-        model.train()
-        total_train_loss, total_train_accuracy = 0, 0
-        train_loader.sampler.set_epoch(epoch)
-        # Use tqdm only for the main process
-        if is_main_process():
-            pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{config['training']['num_epochs']} - Training", disable=not is_main_process())
-        else:
-            pbar = None
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(local_rank), targets.to(local_rank)
+    # --- Training Loop ---
+    for epoch in range(preprocessed_data["num_epochs"]):
+        train_one_epoch(
+            model, train_loader, criterion, optimizer, epoch, local_rank, world_size
+        )
 
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            accuracy = calculate_accuracy(outputs, targets)
+        # --- Validation Loop ---
+        val_loss = validate_one_epoch(model, val_loader, criterion, epoch, local_rank, world_size)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        # Save checkpoint every 5 epochs
+        if is_main_process() :
+            checkpoint_path = f"{temp_path}/{preprocessed_data['source']}_{preprocessed_data['percentage']}_checkpoint_epoch_{epoch+1}_rank_{rank}.pth"
+            torch.save(
+                {
+                    "model_state_dict": model.module.state_dict(),
+                    "epoch": epoch,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": val_loss,
+                },
+                checkpoint_path
+            )
+            print(f"Epoch {epoch + 1}: Checkpoint saved to {checkpoint_path}")
 
-            total_train_loss += loss.item()
-            total_train_accuracy += accuracy.item()
-            # Update tqdm bar only for the main process
-            if is_main_process():
-                pbar.set_postfix({"Loss": loss.item(), "Accuracy": accuracy.item()})
-                pbar.update(1)
+    # --- Load the best model for testing ---
+    # if is_main_process():
+    #     checkpoint = torch.load(best_model_path)
+    #     model.module.load_state_dict(checkpoint["model_state_dict"])
+    #     print(f"Loaded best model from epoch {checkpoint['epoch']} for testing.")
 
-        # Close tqdm bar
-        if is_main_process():
-            pbar.close()
+    # --- Test Loop ---
+    test_model(model, test_loader, criterion, local_rank, world_size)
 
-
-        avg_train_loss = total_train_loss / len(train_loader)
-        avg_train_accuracy = total_train_accuracy / len(train_loader)
-        # Log only from the main process
-        if is_main_process():
-            wandb.log({"epoch": epoch, "train_loss": avg_train_loss, "train_accuracy": avg_train_accuracy})
-            print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}, Train Accuracy: {avg_train_accuracy:.4f}")
-
-        # Validation loop
-        model.eval()
-        total_val_loss, total_val_accuracy = 0, 0
-        with torch.no_grad():
-            # Use tqdm only for the main process
-            if is_main_process():
-                pbar = tqdm(total=len(val_loader), desc=f"Epoch {epoch+1}/{config['training']['num_epochs']} - Validation", disable=not is_main_process())
-            else:
-                pbar = None
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(local_rank), targets.to(local_rank)
-
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                accuracy = calculate_accuracy(outputs, targets)
-
-                total_val_loss += loss.item()
-                total_val_accuracy += accuracy.item()
-                if is_main_process():
-                    pbar.set_postfix({"Loss": loss.item(), "Accuracy": accuracy.item()})
-                    pbar.update(1)
-
-        # Close tqdm bar
-        if pbar is not None:
-            pbar.close()
-
-        avg_val_loss = total_val_loss / len(val_loader)
-        avg_val_accuracy = total_val_accuracy / len(val_loader)
-        # Log only from the main process
-        if is_main_process():
-            wandb.log({"epoch": epoch, "val_loss": avg_val_loss, "val_accuracy": avg_val_accuracy})
-            print(f"Epoch {epoch+1}, Val Loss: {avg_val_loss:.4f}, Val Accuracy: {avg_val_accuracy:.4f}")
-
-    # Test loop
-    model.eval()
-    total_test_loss, total_test_accuracy = 0, 0
-    with torch.no_grad():
-        # Use tqdm only for the main process
-        if is_main_process():
-            pbar = tqdm(total=len(test_loader), desc=f"Epoch {epoch+1}/{config['training']['num_epochs']} - Testing", disable=not is_main_process())
-        else:
-            pbar = None
-        for inputs, targets in test_loader:
-            inputs, targets = inputs.to(local_rank), targets.to(local_rank)
-
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            accuracy = calculate_accuracy(outputs, targets)
-
-            total_test_loss += loss.item()
-            total_test_accuracy += accuracy.item()
-            # Update tqdm bar only for the main process
-            if is_main_process():
-                pbar.set_postfix({"Loss": loss.item(), "Accuracy": accuracy.item()})
-                pbar.update(1)
-
-        # Close tqdm bar
-        if pbar is not None:
-            pbar.close()
-
-    avg_test_loss = total_test_loss / len(test_loader)
-    avg_test_accuracy = total_test_accuracy / len(test_loader)
-            # Log only from the main process
+    # --- Cleanup ---
     if is_main_process():
-        wandb.log( {"test_loss": avg_test_loss, "test_accuracy": avg_test_accuracy})
-        print(f"Test Loss: {avg_test_loss:.4f}, Test Accuracy: {avg_test_accuracy:.4f}")
-    # Finalize WandB on the main process
-    # Cleanup
-    if rank == 0:
         wandb.finish()
-
     dist.destroy_process_group()
+
+
         
 if __name__ == "__main__":
     main()
