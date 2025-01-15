@@ -14,3 +14,4 @@ wandb
 temp
 model_config
 __pycache__
+log
