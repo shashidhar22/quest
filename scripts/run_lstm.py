@@ -13,6 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
 # Other libraries
+import json
 import pandas as pd
 from tqdm import tqdm
 import wandb
@@ -239,6 +240,32 @@ def log_metrics(total_loss, total_correct, total_samples, stage, epoch, local_ra
             log_data["epoch"] = epoch
         wandb.log(log_data)
 
+def broadcast_config(config, local_rank):
+    if dist.get_rank() == 0:
+        # Serialize the wandb config on rank 0
+        config_str = json.dumps(dict(config))
+        config_len = torch.tensor(len(config_str), dtype=torch.int, device=f"cuda:{local_rank}")
+    else:
+        config_str = ""
+        config_len = torch.tensor(0, dtype=torch.int, device=f"cuda:{local_rank}")
+
+    # Broadcast the length of the config string
+    dist.broadcast(config_len, src=0)
+
+    # Create a buffer for the config string
+    buffer = torch.empty(config_len.item(), dtype=torch.uint8, device=f"cuda:{local_rank}")
+
+    if dist.get_rank() == 0:
+        # Copy the string bytes into the buffer on rank 0
+        buffer[:] = torch.tensor(list(config_str.encode()), dtype=torch.uint8, device=f"cuda:{local_rank}")
+
+    # Broadcast the buffer to all ranks
+    dist.broadcast(buffer, src=0)
+
+    # Decode the string on all ranks and convert it back to a dictionary
+    config_str = "".join(map(chr, buffer.cpu().tolist()))
+    return json.loads(config_str)
+
 def main():
     # --- Parse arguments and setup environment ---
     args = parse_args()
@@ -258,25 +285,28 @@ def main():
 
     # Set temp, and model path
     temp_path = preprocessed_data["temp_path"]
-    model_path = preprocessed_data["output_path"]
 
     # --- Initialize WandB (only for the main process) ---
     if is_main_process():
-        config = {'sequence length': preprocessed_data["seq_length"],
-              'batch size' : preprocessed_data["batch_size"], 
-              'embedding dimensions': preprocessed_data["embedding_dim"],
-              'hidden dimensions': preprocessed_data["hidden_dim"],
-              'number of layers': preprocessed_data["num_layers"],
+        config = {'seq_length': preprocessed_data["seq_length"],
+              'batch_size' : preprocessed_data["batch_size"], 
+              'embedding_dim': preprocessed_data["embedding_dim"],
+              'hidden_dim': preprocessed_data["hidden_dim"],
+              'num_layers': preprocessed_data["num_layers"],
               'learning_rate': preprocessed_data["learning_rate"],
-              'number of epochs': preprocessed_data["num_epochs"],
-              'data source': preprocessed_data["source"],
-              'amount of raw data used': preprocessed_data["percentage"]}
+              'num_epochs': preprocessed_data["num_epochs"],
+              'source': preprocessed_data["source"],
+              'percentage': preprocessed_data["percentage"]}
 
         wandb.init(
             project="lstm_tcr_model",
             config=config,
-            name=f"{config['data source']} ; {config['amount of raw data used']}%"
+            name=f"{config['source']} ; {config['percentage']}%"
         )
+
+    # Broadcast the config from rank 0 to all other ranks
+    config_dict = broadcast_config(wandb.config, local_rank)
+    config = argparse.Namespace(**config_dict)
 
     # --- Load preprocessed dataset ---
     train_dataset = preprocessed_data["train_data"]
@@ -286,7 +316,7 @@ def main():
     idx_to_token = preprocessed_data["idx_to_token"]
 
     # --- Prepare DataLoaders ---
-    batch_size = preprocessed_data["batch_size"]
+    batch_size = config.batch_size
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True, seed=42)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=1, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True)
@@ -296,17 +326,17 @@ def main():
     vocab_size = len(token_to_idx)
     model = LSTMGenerator(
         vocab_size=vocab_size,
-        embed_size=preprocessed_data["embedding_dim"],
-        hidden_size=preprocessed_data["hidden_dim"],
-        num_layers=preprocessed_data["num_layers"]
+        embed_size=config.embedding_dim,
+        hidden_size=config.hidden_dim,
+        num_layers=config.num_layers
     ).to(local_rank)
     model = DDP(model, device_ids=[local_rank])
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=preprocessed_data["learning_rate"])
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
 
     # --- Training Loop ---
-    for epoch in range(preprocessed_data["num_epochs"]):
+    for epoch in range(config.num_epochs):
         train_one_epoch(
             model, train_loader, criterion, optimizer, epoch, local_rank, world_size
         )
@@ -316,7 +346,7 @@ def main():
 
         # Save checkpoint every 5 epochs
         if is_main_process() :
-            checkpoint_path = f"{temp_path}/{preprocessed_data['source']}_{preprocessed_data['percentage']}_checkpoint_epoch_{epoch+1}_rank_{rank}.pth"
+            checkpoint_path = f"{temp_path}/{config.source}_{config.percentage}_checkpoint_epoch_{epoch+1}_rank_{rank}.pth"
             torch.save(
                 {
                     "model_state_dict": model.module.state_dict(),
