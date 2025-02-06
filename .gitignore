@@ -15,5 +15,6 @@ misc
 wandb
 temp
 model_config
+batch_scripts
 __pycache__
 log
