@@ -158,7 +158,7 @@ def transform_mhc_restriction(values, fasta_dict):
     return values.map(process_value)
 
 
-def format_combined_tcell(row):
+def format_combined_tcell(barcode, index, tra, trb):
     """
     Row-wise wrapper for formatting a combined T-cell for Dask compatibility.
 
@@ -168,10 +168,10 @@ def format_combined_tcell(row):
     Returns:
         dict: Formatted T-cell information as a dictionary.
     """
-    barcode = row['barcode']
-    index = row['index']
-    tra = (row['tra'], row['trav_gene'], row['trad_gene'], row['traj_gene']) if pd.notna(row['tra']) else None
-    trb = (row['trb'], row['trbv_gene'], row['trbd_gene'], row['trbj_gene']) if pd.notna(row['trb']) else None
+    #barcode = row['barcode']
+    #index = row['index']
+    #tra = (row['tra'], row['trav_gene'], row['trad_gene'], row['traj_gene']) if pd.notna(row['tra']) else None
+    #trb = (row['trb'], row['trbv_gene'], row['trbd_gene'], row['trbj_gene']) if pd.notna(row['trb']) else None
 
     tid = f"{barcode}_{index}"
     result_dict = {'tid': tid}
@@ -253,24 +253,29 @@ def standardize_sequence(df):
         dd.DataFrame: Standardized Dask DataFrame.
     """
     fixed_columns = [
-        'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
+        'source', 'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
         'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
     ]
 
     # Define metadata for all columns
-    meta = {col: 'object' for col in fixed_columns}
+    meta = OrderedDict({col: 'object' for col in fixed_columns})
 
     # Ensure all columns are present by adding missing columns with default value None
     def add_missing_columns(partition):
         for col in fixed_columns:
             if col not in partition.columns:
                 partition[col] = None
+        partition = partition[meta.keys()]
         return partition
+
+    def reorder_columns(df, columns):
+    # Reindex with the correct order
+        return df[columns]
 
     # Apply the function to each partition and enforce fixed columns
     df = df.map_partitions(add_missing_columns, meta=meta)
 
     # Reorder columns to match the fixed set
-    df = df[fixed_columns]
+    df = df.map_partitions(reorder_columns, columns=fixed_columns)
 
     return df
