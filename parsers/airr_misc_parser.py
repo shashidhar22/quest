@@ -5,6 +5,7 @@ import pandas as pd
 import dask.dataframe as dd
 
 from itertools import product
+from collections import OrderedDict
 
 from .utils import standardize_sequence
 
@@ -38,9 +39,9 @@ class MiscFileParser:
 
     def _load_misc_table(self):
         if self.separator in ["\t", "s", "t"]:
-            return dd.read_csv(self.misc_file, sep="\t", dtype="str").fillna("unknown")
+            return dd.read_csv(self.misc_file, sep="\t", dtype=str, na_filter=False).fillna("unknown")
         elif self.separator == ",":
-            return dd.read_csv(self.misc_file, dtype="str").fillna("unknown")
+            return dd.read_csv(self.misc_file, dtype=str, na_filter=False).fillna("unknown")
         else:
             return None
             
@@ -71,7 +72,7 @@ class MiscFileParser:
             tuple: Dask DataFrames for MRI table and sequence table.
         """
         # Metadata for the resulting Dask DataFrame
-        meta = {
+        meta = OrderedDict({
             'tid': 'object',
             'tra': 'object',
             'trad_gene': 'object',
@@ -82,7 +83,7 @@ class MiscFileParser:
             'trbj_gene': 'object',
             'trbv_gene': 'object',
             'sequence': 'object'
-        }
+        })
 
         # Function to process each partition
         def process_partition(df):
@@ -157,7 +158,7 @@ class MiscFileParser:
             tuple: Dask DataFrames for MRI table and sequence table.
         """
         # Define metadata for the resulting DataFrame
-        meta = {
+        meta = OrderedDict({
             'tid': 'object',
             'tra': 'object',
             'trad_gene': 'object',
@@ -168,7 +169,7 @@ class MiscFileParser:
             'trbj_gene': 'object',
             'trbv_gene': 'object',
             'sequence': 'object'
-        }
+        })
 
         # Function to process each row
         def process_partition(partition_df):
@@ -272,7 +273,7 @@ class MiscFileParser:
 
         # Create a combined sequence column lazily
         mri_table['sequence'] = mri_table[['tra', 'trb']].map_partitions(
-            lambda df: df.apply(lambda row: ' '.join(filter(None, row)) + ';', axis=1),
+            lambda df: df.apply(lambda row: ' '.join(row.dropna().astype(str)) + ';', axis=1),
             meta=('sequence', 'str')
         )
 
@@ -351,14 +352,14 @@ class MiscFileParser:
                         })
             return pd.DataFrame(formatted_contigs)
 
-        meta = {
+        meta = OrderedDict({
             'tid': 'object',
             'tra': 'object',
             'trb': 'object',
             'sequence': 'object',
             'repertoire_id': 'object',
             'condition': 'object'
-        }
+        })
 
         # Apply the processing function lazily
         mri_table = misc_table.map_partitions(process_partition, meta=meta)
@@ -424,7 +425,7 @@ class MiscFileParser:
             )
             return df
 
-        sequence_table = sequence_table.map_partitions(generate_sequence, meta={
+        sequence_table = sequence_table.map_partitions(generate_sequence, meta=OrderedDict({
             'source': 'object',
             'trav_gene': 'object',
             'trad_gene': 'object',
@@ -435,7 +436,7 @@ class MiscFileParser:
             'trbj_gene': 'object',
             'trb': 'object',
             'sequence': 'object'
-        })
+        }))
 
         # Standardize the sequence table lazily
         sequence_table = standardize_sequence(sequence_table)
@@ -462,10 +463,18 @@ class MiscFileParser:
                         'trav_gene': row['v'],
                         'traj_gene': row['j'],
                         'trad_gene': row['d'],
-                        'tra': row['cdr3aa']
+                        'tra': row['cdr3aa'],
+                        'trbv_gene': None,
+                        'trbj_gene': None,
+                        'trbd_gene': None,
+                        'trb': None
                     }
                 elif "TRBV" in row['v']:
                     return {
+                        'trav_gene': None,
+                        'traj_gene': None,
+                        'trad_gene': None,
+                        'tra': None,
                         'trbv_gene': row['v'],
                         'trbj_gene': row['j'],
                         'trbd_gene': row['d'],
@@ -478,7 +487,7 @@ class MiscFileParser:
             result = pd.DataFrame([process_row(row) for _, row in df.iterrows()])
             return result
 
-        meta = {
+        meta = OrderedDict({
             'trav_gene': 'object',
             'traj_gene': 'object',
             'trad_gene': 'object',
@@ -486,9 +495,8 @@ class MiscFileParser:
             'trbv_gene': 'object',
             'trbj_gene': 'object',
             'trbd_gene': 'object',
-            'trb': 'object',
-            'sequence': 'object'
-        }
+            'trb': 'object'
+        })
 
         # Process the misc_table partition-wise
         formatted_sequences = misc_table.map_partitions(process_partition, meta=meta)
@@ -506,9 +514,13 @@ class MiscFileParser:
             molecule_type=self.molecule_type
         )
 
+        sequence_table = mri_table[[
+            'source', 'trav_gene', 'trad_gene', 'traj_gene', 'tra',
+            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb'
+        ]]
         # Prepare the sequence table
-        sequence_table = mri_table.assign(
-            sequence=mri_table[['tra', 'trb']].map_partitions(
+        sequence_table = sequence_table.assign(
+            sequence=sequence_table[['tra', 'trb']].map_partitions(
                 lambda df: df.apply(
                     lambda row: ' '.join(filter(None, [row.get('tra'), row.get('trb')])) + ';',
                     axis=1
@@ -516,7 +528,18 @@ class MiscFileParser:
                 meta=('sequence', 'str')
             )
         )
-
+        seq_meta = OrderedDict({
+            'source': 'object',
+            'trav_gene': 'object',
+            'trad_gene': 'object',
+            'traj_gene': 'object',
+            'tra': 'object',
+            'trbv_gene': 'object',
+            'trbd_gene': 'object',
+            'trbj_gene': 'object',
+            'trb': 'object',
+            'sequence': 'object'
+            })
         # Ensure sequences for single-chain data
         sequence_table = sequence_table.map_partitions(
             lambda df: df.assign(
@@ -524,7 +547,7 @@ class MiscFileParser:
                     df['trb'] + ';' if 'trb' in df.columns and 'tra' not in df.columns else df['sequence']
                 )
             ),
-            meta=meta
+            meta=seq_meta
         )
 
         # Standardize the sequence table

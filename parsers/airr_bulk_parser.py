@@ -4,6 +4,9 @@ import csv
 import yaml
 import dask.dataframe as dd
 import pandas as pd
+
+from collections import OrderedDict
+
 from .utils import standardize_sequence
 
 
@@ -54,13 +57,13 @@ class BulkFileParser:
     def _load_bulk_table(self):
         if self.separator == "\t":
             try:
-                return dd.read_csv(self.bulk_file, sep="\t", dtype="str").fillna("unknown")            
+                return dd.read_csv(self.bulk_file, sep="\t", dtype=str, na_filter=False).fillna("unknown")            
             except ValueError:
                 return None
         elif self.separator == ",":
-            return dd.read_csv(self.bulk_file, dtype="str").fillna("unknown")
+            return dd.read_csv(self.bulk_file, dtype=str, na_filter=False).fillna("unknown")
         elif self.separator == "M":
-            return dd.read_csv(self.bulk_file, sep="\t", dtype="str", skiprows=1).fillna("unknown")
+            return dd.read_csv(self.bulk_file, sep="\t", dtype=str, na_filter=False, skiprows=1).fillna("unknown")
 
     def parse(self):
         if self.bulk_table is None:
@@ -171,7 +174,7 @@ class BulkFileParser:
         mri_table = self.bulk_table.drop(columns=columns_to_drop, errors='ignore')
 
         # Define the final metadata explicitly
-        meta = {
+        meta = OrderedDict({
             'trav_gene': 'object',
             'traj_gene': 'object',
             'trad_gene': 'object',
@@ -181,7 +184,7 @@ class BulkFileParser:
             'trbd_gene': 'object',
             'trb': 'object',
             'sequence': 'object'
-        }
+        })
 
         # Process each partition to detect chain type and transform columns
         def process_partition(partition):
@@ -261,11 +264,11 @@ class BulkFileParser:
         mri_table = self.bulk_table.drop(columns=columns_to_drop, errors='ignore')
 
         # Define meta for the resulting DataFrame
-        meta = {
+        meta = OrderedDict({
             'trav_gene': 'object', 'trad_gene': 'object', 'traj_gene': 'object', 'tra': 'object',
             'trbv_gene': 'object', 'trbd_gene': 'object', 'trbj_gene': 'object', 'trb': 'object',
             'sequence': 'object'
-        }
+        })
 
         # Process each partition to detect chain type and transform columns
         def process_partition(partition):
@@ -345,7 +348,7 @@ class BulkFileParser:
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = {
+        meta = OrderedDict({
             'tid': 'object',
             'tra': 'object',
             'trad_gene': 'object',
@@ -356,7 +359,7 @@ class BulkFileParser:
             'trbj_gene': 'object',
             'trbv_gene': 'object',
             'sequence': 'object'
-        }
+        })
 
         # Function to process each partition
         def process_partition(partition):
@@ -435,7 +438,7 @@ class BulkFileParser:
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = {col: 'object' for col in fixed_columns}
+        meta = OrderedDict({col: 'object' for col in fixed_columns})
 
         # Define the row-level processing function
         def process_row(row):
@@ -611,7 +614,7 @@ class BulkFileParser:
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = {col: 'object' for col in fixed_columns}
+        meta = OrderedDict({col: 'object' for col in fixed_columns})
 
         # Define a function to process each partition
         def process_partition(partition):
@@ -698,7 +701,7 @@ class BulkFileParser:
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = {col: 'object' for col in fixed_columns}
+        meta = OrderedDict({col: 'object' for col in fixed_columns})
 
         # Define a function to process each partition
         def process_partition(partition):
@@ -781,7 +784,7 @@ class BulkFileParser:
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = {col: 'object' for col in fixed_columns}
+        meta = OrderedDict({col: 'object' for col in fixed_columns})
 
         # Define a function to process rows
         def process_row(row):

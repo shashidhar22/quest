@@ -5,6 +5,7 @@ import dask.dataframe as dd
 
 from pathlib import Path
 from dask import delayed 
+from collections import OrderedDict
 
 from .utils import parse_imgt_four_digit, transform_mhc_restriction, get_mhc_sequence
 
@@ -13,11 +14,14 @@ class DatabaseParser:
         self.config_path = config_path
         self.config = self._load_config()
         self.hla_dictionary = parse_imgt_four_digit(self.config['databases']['imgt']['hla_fasta'])
+        self.output_path = self.config['outputs']['output_path']
 
     def _load_config(self):
         with open(self.config_path, 'r') as f:
             return yaml.safe_load(f)
-        
+    
+    
+
     def parse(self):
         """
         Parse the databases specified in the configuration file.
@@ -60,7 +64,7 @@ class DatabaseParser:
         )
 
         # Define column renaming mapping
-        relevant_columns = {
+        relevant_columns = OrderedDict({
             'cdr3.alpha': 'tra',
             'v.alpha': 'trav_gene',
             'j.alpha': 'traj_gene',
@@ -80,7 +84,7 @@ class DatabaseParser:
             'meta.epitope.id': 'epitope_reference_name',
             'meta.tissue': 'source_tissue',
             'meta.donor.MHC': 'mhc_profile',
-        }
+        })
 
         # Filter and rename columns lazily
         vdjdb_table = vdjdb_table.loc[
@@ -152,7 +156,7 @@ class DatabaseParser:
             raise FileNotFoundError(f"No TSV files found in {database_path}")
 
         # Define metadata for Dask
-        meta = {
+        meta = OrderedDict({
             'study_id': 'object',
             'repertoire_id': 'object',
             'trbv_gene': 'object',
@@ -160,7 +164,7 @@ class DatabaseParser:
             'trbj_gene': 'object',
             'trb': 'object',
             'sequence': 'object'
-        }
+        })
 
         # Load all files lazily using Dask
         tcrdb_tables = []

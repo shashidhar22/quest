@@ -3,7 +3,7 @@ import pandas as pd
 import dask.dataframe as dd
 
 from itertools import product
-
+from collections import OrderedDict
 from .utils import parse_junction_aa, standardize_sequence, format_combined_tcell
 
 class PairedFileParser:
@@ -26,8 +26,12 @@ class PairedFileParser:
             tuple: Dask DataFrames for MRI table and sequence table.
         """
         # Read the contig file into a Dask DataFrame
-        contig_table = dd.read_csv(self.paired_file, dtype="str").fillna("unknown")
-
+        contig_table = dd.read_csv(
+            self.paired_file,
+            dtype=str, na_filter=False,    # or "str"
+            include_path_column=True)
+        contig_table = contig_table.astype(str)
+        contig_table = contig_table.fillna("unknown")
         try:
             # Filter for productive, high-confidence contigs
             productive_contigs = contig_table[
@@ -39,7 +43,7 @@ class PairedFileParser:
             return None, None
 
         # Define metadata for the output DataFrame
-        meta = {
+        meta = OrderedDict({
             'tid': 'object',
             'tra': 'object',
             'trad_gene': 'object',
@@ -50,14 +54,14 @@ class PairedFileParser:
             'trbj_gene': 'object',
             'trbv_gene': 'object',
             'sequence': 'object'
-        }
+        })
 
         def process_partition(partition):
             """
             Process a single partition of the DataFrame to format TRA and TRB contigs.
             """
             formatted_contigs = []
-
+            
             for barcode, group in partition.groupby('barcode'):
                 tra_seqs = (
                     group[group['chain'] == 'TRA'][['cdr3', 'v_gene', 'd_gene', 'j_gene']]
@@ -73,24 +77,30 @@ class PairedFileParser:
                 # Combine TRA and TRB sequences
                 if tra_seqs and trb_seqs:
                     for index, (tra, trb) in enumerate(product(tra_seqs, trb_seqs), start=1):
-                        result_dict = format_combined_tcell(barcode, index, tra, trb, tra_only=False)
+                        result_dict = format_combined_tcell(barcode, index, tra, trb) #, tra_only=False)
                         formatted_contigs.append(result_dict)
                 elif tra_seqs:  # TRA only
                     for index, tra in enumerate(tra_seqs, start=1):
-                        result_dict = format_combined_tcell(barcode, index, tra, None, tra_only=True)
+                        result_dict = format_combined_tcell(barcode, index, tra, None) #, tra_only=True)
                         formatted_contigs.append(result_dict)
                 elif trb_seqs:  # TRB only
                     for index, trb in enumerate(trb_seqs, start=1):
-                        result_dict = format_combined_tcell(barcode, index, None, trb, tra_only=False)
+                        result_dict = format_combined_tcell(barcode, index, None, trb) #, tra_only=False)
                         formatted_contigs.append(result_dict)
+            #try:
+            formatted_table = pd.DataFrame(formatted_contigs)
+                #formatted_table  = formatted_table.drop(columns=['path'])
+            formatted_table = formatted_table[meta.keys()]
+            formatted_table = formatted_table.astype(str)
+            #except KeyError:
+            #    breakpoint()
+            return formatted_table
 
-            return pd.DataFrame(formatted_contigs)
 
-        # Apply processing to each partition
         formatted_contigs = productive_contigs.map_partitions(
             process_partition, meta=meta
         )
-
+        
         # Add metadata to the MRI table
         mri_table = formatted_contigs.copy()
         mri_table = mri_table.assign(
@@ -104,8 +114,9 @@ class PairedFileParser:
 
         # Create the sequence table by selecting relevant columns
         sequence_table = mri_table[[
-            'source', 'trav_gene', 'trad_gene', 'traj_gene', 'tra',
-            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb', 'sequence'
+            'source', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
+            'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
+
         ]]
         sequence_table = sequence_table.drop_duplicates()
         sequence_table = standardize_sequence(sequence_table)
@@ -115,7 +126,7 @@ class PairedFileParser:
     
     def _parse_clonotypes(self):
         # Load the clonotype file as a Dask DataFrame
-        clonotype_table = dd.read_csv(self.paired_file, sep=",", dtype="str").fillna("unknown")
+        clonotype_table = dd.read_csv(self.paired_file, sep=",", dtype=str, na_filter=False).fillna("unknown")
 
         # Metadata extracted from the file path
         repertoire_id = os.path.splitext(os.path.basename(self.paired_file))[0]
@@ -125,7 +136,7 @@ class PairedFileParser:
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = {
+        meta = OrderedDict({
             'tid': 'object',
             'tra': 'object',
             'trad_gene': 'object',
@@ -136,7 +147,7 @@ class PairedFileParser:
             'trbj_gene': 'object',
             'trbv_gene': 'object',
             'sequence': 'object'
-        }
+        })
 
         def process_partition(df):
             # Parse `cdr3s_aa` column to extract TRA and TRB sequences
@@ -196,7 +207,7 @@ class PairedFileParser:
             tuple: Dask DataFrames for MRI table and sequence table.
         """
         # Read the AIRR file as a Dask DataFrame
-        airr_table = dd.read_csv(self.paired_file, sep="\t", dtype="str").fillna("unknown")
+        airr_table = dd.read_csv(self.paired_file, sep="\t", dtype=str, na_filter=False).fillna("unknown")
 
         # Filter for productive cells
         airr_table = airr_table[
@@ -208,7 +219,7 @@ class PairedFileParser:
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = {col: 'object' for col in fixed_columns}
+        meta = OrderedDict({col: 'object' for col in fixed_columns})
 
         # Define the partition processing function
         def process_partition(df):
