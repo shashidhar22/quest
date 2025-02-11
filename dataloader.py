@@ -20,7 +20,7 @@ def load_config(config_path):
         with open(config_path, 'r') as f:
             return yaml.safe_load(f)
 
-def parse_airrseq(study_path, config_path):
+def parse_airrseq(study_path, config_path, output_path):
     """
     Parse AIRR-Seq datasets in the study path and write results to Parquet files in batches.
 
@@ -46,7 +46,6 @@ def parse_airrseq(study_path, config_path):
                 extension = file_path.suffix
                 file_type = file_path.parent.name
                 filename = file_path.name
-
                 # Skip irrelevant files
                 if (extension in {".sh", ".zip"} or
                     file_type in {"fasta", "consensus_fasta", "consensus", "raw_contigs", "contig_fasta", "unfiltered_contigs", "gd"} or
@@ -68,16 +67,21 @@ def parse_airrseq(study_path, config_path):
                     open('missing_data.txt', 'a').write(f'{file_path}\n')
                     continue
                 if mri_table is not None and sequence_table is not None:
-                    mri_tables.append(mri_table)
-                    sequence_tables.append(sequence_table)
+                    try:
+                        mri_table = mri_table.astype({col: "string" for col in mri_table.columns})
+                        mri_table.to_parquet(f"{output_path}/mri/{filename}.parquet", engine="pyarrow",  compute=True)
+                        sequence_table = sequence_table.astype({col: "string" for col in sequence_table.columns})
+                        sequence_table.to_parquet(f"{output_path}/sequence/{filename}.parquet", engine="pyarrow",  compute=True)
+                    except (ValueError, TypeError) as e:
+                        breakpoint()
                 else:
                     open('missing_data.txt', 'a').write(f'{file_path}\n')
-    mri_table = dd.concat(mri_tables, axis=0, interleave_partitions=True)
-    sequence_table = dd.concat(sequence_tables, axis=0, interleave_partitions=True)
+    #mri_table = dd.concat(mri_tables, axis=0, interleave_partitions=True)
+    #sequence_table = dd.concat(sequence_tables, axis=0, interleave_partitions=True)
     return mri_table, sequence_table
 
 
-def parse_database(config_path):
+def parse_database(config_path, output_path):
     """
     Parse the AIRR-Seq database.
 
@@ -89,6 +93,10 @@ def parse_database(config_path):
     """
     tqdm.write("Parsing AIRR-Seq database...")
     mri_table, sequence_table = DatabaseParser(config_path).parse()
+    with ProgressBar():
+        mri_table.to_parquet(f"{output_path}/mri/databases.parquet", engine="pyarrow",  compute=True)
+    with ProgressBar():
+        sequence_table.to_parquet(f"{output_path}/sequence/databases.parquet", engine="pyarrow",  compute=True)
     return mri_table, sequence_table
 
 def main(config_path):
@@ -100,33 +108,34 @@ def main(config_path):
     tqdm.write(f"Output path: {config["outputs"]["output_path"]}")
     tqdm.write(f"Temp path: {config["outputs"]["temp_path"]}")
     tqdm.write("Starting AIRR-Seq data parsing...")
-    mri_seq_table, sequence_seq_table = parse_airrseq(study_path, format_path)
+    dask.config.set(temporary_directory=config["outputs"]["temp_path"])
+    mri_seq_table, sequence_seq_table = parse_airrseq(study_path, format_path, config["outputs"]["output_path"])
 
     tqdm.write("Starting AIRR-Seq database parsing...")
-    mri_db_table, sequence_db_table = parse_database(config_path)
+    mri_db_table, sequence_db_table = parse_database(config_path, config["outputs"]["output_path"])
 
     # Optional: Repartition. Only if you want to reduce partitions or set a size.
-    mri_seq_table = mri_seq_table.repartition(partition_size="1024MB")
-    mri_db_table = mri_db_table.repartition(partition_size="1024MB")
+    #mri_seq_table = mri_seq_table.repartition(partition_size="1024MB")
+    #mri_db_table = mri_db_table.repartition(partition_size="1024MB")
 
     # Concat them as Dask DataFrames
-    mri_table = dd.concat([mri_seq_table, mri_db_table], interleave_partitions=True)
+    #mri_table = dd.concat([mri_seq_table, mri_db_table], interleave_partitions=True)
 
     # Same for sequence tables
-    sequence_seq_table = sequence_seq_table.repartition(partition_size="1024MB")
-    sequence_db_table = sequence_db_table.repartition(partition_size="1024MB")
+    #sequence_seq_table = sequence_seq_table.repartition(partition_size="1024MB")
+    #sequence_db_table = sequence_db_table.repartition(partition_size="1024MB")
 
-    sequence_table = dd.concat([sequence_seq_table, sequence_db_table], interleave_partitions=True)
+    #sequence_table = dd.concat([sequence_seq_table, sequence_db_table], interleave_partitions=True)
 
     # Write to Parquet using Dask (lazy -> triggered compute in parallel)
-    output_path = Path(config["outputs"]["output_path"])
-    output_path.mkdir(parents=True, exist_ok=True)
-    dask.config.set(temporary_directory=config["outputs"]["temp_path"])
-    tqdm.write(f"Saving MRI and Sequence table to {output_path}")
-    with ProgressBar():
-        mri_table.to_parquet(str(output_path / "mri_table.parquet"), engine="pyarrow",  compute=True)
-    with ProgressBar():
-        sequence_table.to_parquet(str(output_path / "sequence_table.parquet"), engine="pyarrow",  compute=True)
+    #output_path = Path(config["outputs"]["output_path"])
+    #output_path.mkdir(parents=True, exist_ok=True)
+    
+    #tqdm.write(f"Saving MRI and Sequence table to {output_path}")
+    #with ProgressBar():
+    #    mri_table.to_parquet(str(output_path / "mri_table.parquet"), engine="pyarrow",  compute=True)
+    #with ProgressBar():
+    #    sequence_table.to_parquet(str(output_path / "sequence_table.parquet"), engine="pyarrow",  compute=True)
 
     tqdm.write("Done!")
 
