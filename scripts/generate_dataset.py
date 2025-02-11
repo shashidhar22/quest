@@ -100,13 +100,6 @@ def parse_args():
     parser.add_argument('-t', '--temp_path', type=str, required=True, help="Path to the output folder.")
     parser.add_argument('-o', '--output', type=str, required=True, help="Path to the output folder.")
     parser.add_argument('-p', '--percentage', type=float, default=100, help="Percentage of sequences to select.")
-    parser.add_argument('-b', '--batch_size', type=int, default=128, help="Batch size for training.")
-    parser.add_argument('-s', '--seq_length', type=int, default=6, help="Length of input sequences.")
-    parser.add_argument('-m', '--embedding_dim', type=int, default=16, help="Dimension of the embedding layer.")
-    parser.add_argument('-n', '--hidden_dim', type=int, default=128, help="Dimension of the hidden layer.")
-    parser.add_argument('-l', '--num_layers', type=int, default=1, help="Number of LSTM layers.")
-    parser.add_argument('-r', '--learning_rate', type=float, default=0.001, help="Learning rate for training.")
-    parser.add_argument('-e', '--num_epochs', type=int, default=20, help="Number of epochs for training.")
     return parser.parse_args()
 
 
@@ -183,13 +176,6 @@ def main(seed=1234):
         "test_data": test_dataset,
         "token_to_idx": token_to_idx,
         "idx_to_token": idx_to_token,
-        "seq_length": args.seq_length,
-        "batch_size": args.batch_size,
-        "embedding_dim": args.embedding_dim,
-        "hidden_dim": args.hidden_dim,
-        "num_layers": args.num_layers,
-        "learning_rate": args.learning_rate,
-        "num_epochs": args.num_epochs,
         "percentage": args.percentage,
         "source": input_basename,
         "temp_path": args.temp_path,

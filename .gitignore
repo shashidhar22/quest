@@ -6,6 +6,8 @@
 
 # Files
 .env
+missed_files.txt
+missing_data.txt
 # Folders
 config
 data
@@ -15,5 +17,6 @@ misc
 wandb
 temp
 model_config
+batch_scripts
 __pycache__
 log
