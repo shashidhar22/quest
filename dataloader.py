@@ -14,6 +14,48 @@ from parsers.airr_misc_parser import MiscFileParser
 from parsers.airr_database_parser import DatabaseParser
 from parsers.airr_paired_parser import PairedFileParser
 
+import dask.dataframe as dd
+
+def write_parquet_append(ddfs, output_path, overwrite=True, engine="pyarrow"):
+    """
+    Write a list of Dask DataFrames to a single Parquet dataset incrementally,
+    avoiding a massive task graph by appending each DataFrame in a loop.
+    
+    Parameters
+    ----------
+    ddfs : list of dd.DataFrame
+        The list of Dask DataFrames (all must share the same schema).
+    output_path : str
+        The directory (or path) for the resulting Parquet dataset.
+    overwrite : bool, optional (default True)
+        If True, the first DataFrame overwrites any existing data at `output_path`.
+        Subsequent DataFrames are appended.
+    engine : str, optional (default "pyarrow")
+        The Parquet engine to use for writing.
+    """
+    first_write = True
+    for df in tqdm(ddfs, desc="Writing AIRR-Seq studies"):
+        # Optional: Repartition each DF if you want a certain # of partitions
+        # df = df.repartition(npartitions=10)
+        
+        # On the first iteration, possibly overwrite existing dataset
+        df = df.map_partitions(lambda pdf: pdf.astype("string[pyarrow]"))
+        if first_write and overwrite:
+            df.to_parquet(
+                output_path,
+                engine=engine,
+                write_index=False,
+                overwrite=True
+            )
+            first_write = False
+        else:
+            # On subsequent iterations, append to the existing dataset
+            df.to_parquet(
+                output_path,
+                engine=engine,
+                write_index=False,
+                append=True
+            )
 
 
 def load_config(config_path):
@@ -41,7 +83,6 @@ def parse_airrseq(study_path, config_path, output_path):
     for study_category in tqdm(study_categories, desc="Parsing AIRR-Seq studies"):
         if study_category.is_dir() and study_category.name not in ignore:
             tcr_files = list(study_category.rglob('*/tcr/*/*'))
-
             for file_path in tqdm(tcr_files, desc=f"Processing files in {study_category.name}", leave=False):
                 extension = file_path.suffix
                 file_type = file_path.parent.name
@@ -54,31 +95,36 @@ def parse_airrseq(study_path, config_path, output_path):
 
                 file_size = os.path.getsize(file_path)
                 if file_type == "contigs":
-                    mri_table, sequence_table = PairedFileParser(file_path).parse()
+                    mri_table, sequence_table = PairedFileParser(file_path, test=True).parse()
                 elif file_type == "clonotypes":
-                    mri_table, sequence_table = PairedFileParser(file_path).parse()
+                    mri_table, sequence_table = PairedFileParser(file_path, test=True).parse()
                 elif file_type == "airr":
-                    mri_table, sequence_table = PairedFileParser(file_path).parse()
+                    mri_table, sequence_table = PairedFileParser(file_path, test=True).parse()
                 elif file_type == "misc":
-                    mri_table, sequence_table = MiscFileParser(file_path, config_path).parse()
+                    mri_table, sequence_table = MiscFileParser(file_path, config_path, test=True).parse()
                 elif file_size > 0:
-                    mri_table, sequence_table = BulkFileParser(file_path, config_path).parse()
+                    mri_table, sequence_table = BulkFileParser(file_path, config_path, test=True).parse()
                 else:
                     open('missing_data.txt', 'a').write(f'{file_path}\n')
                     continue
                 if mri_table is not None and sequence_table is not None:
-                    try:
-                        mri_table = mri_table.astype({col: "string" for col in mri_table.columns})
-                        mri_table.to_parquet(f"{output_path}/mri/{filename}.parquet", engine="pyarrow",  compute=True)
-                        sequence_table = sequence_table.astype({col: "string" for col in sequence_table.columns})
-                        sequence_table.to_parquet(f"{output_path}/sequence/{filename}.parquet", engine="pyarrow",  compute=True)
-                    except (ValueError, TypeError) as e:
-                        breakpoint()
+                    mri_order = ['tid', 'tra', 'trad_gene', 'traj_gene', 
+                                 'trav_gene', 'trb', 'trbd_gene', 'trbj_gene', 
+                                 'trbv_gene', 'sequence', 'repertoire_id', 
+                                 'study_id', 'category', 'molecule_type', 
+                                 'host_organism', 'source']
+                    mri_table = mri_table[mri_order]
+                    mri_table = mri_table.astype("str")
+                    sequence_table = sequence_table.astype("str")
+                    mri_tables.append(mri_table)
+                    sequence_tables.append(sequence_table)
                 else:
                     open('missing_data.txt', 'a').write(f'{file_path}\n')
-    #mri_table = dd.concat(mri_tables, axis=0, interleave_partitions=True)
-    #sequence_table = dd.concat(sequence_tables, axis=0, interleave_partitions=True)
-    return mri_table, sequence_table
+    
+
+    write_parquet_append(mri_tables, f"{output_path}/mri/airr_seq_data.parquet", overwrite=True)
+    write_parquet_append(sequence_tables, f"{output_path}/sequence/airr_seq_data.parquet", overwrite=True)
+    return mri_tables, sequence_tables
 
 
 def parse_database(config_path, output_path):
@@ -92,7 +138,7 @@ def parse_database(config_path, output_path):
         tuple: Dask DataFrames for MRI table and sequence table.
     """
     tqdm.write("Parsing AIRR-Seq database...")
-    mri_table, sequence_table = DatabaseParser(config_path).parse()
+    mri_table, sequence_table = DatabaseParser(config_path, test=True).parse()
     with ProgressBar():
         mri_table.to_parquet(f"{output_path}/mri/databases.parquet", engine="pyarrow",  compute=True)
     with ProgressBar():
