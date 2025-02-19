@@ -7,13 +7,14 @@ import dask.dataframe as dd
 from itertools import product
 from collections import OrderedDict
 
-from .utils import standardize_sequence
+from .utils import standardize_sequence, standardize_mri
 
 
 class MiscFileParser:
-    def __init__(self, misc_file, format_config):
+    def __init__(self, misc_file, format_config, test=False):
         self.misc_file = misc_file
         self.format_config = format_config
+        self.test = test
         self.format_dict = self._load_format_config()
         self.separator = self._detect_delimiter()
         self.misc_table = self._load_misc_table()
@@ -25,6 +26,7 @@ class MiscFileParser:
         self.extension = os.path.splitext(self.misc_file)[1]
         self.source = 'misc_format'
         self.host_organism = 'human'
+        
 
     def _load_format_config(self):
         with open(self.format_config, 'r') as f:
@@ -39,12 +41,17 @@ class MiscFileParser:
 
     def _load_misc_table(self):
         if self.separator in ["\t", "s", "t"]:
-            return dd.read_csv(self.misc_file, sep="\t", dtype=str, na_filter=False).fillna("unknown")
+            misc_table = dd.read_csv(self.misc_file, sep="\t", dtype=str, na_filter=False)
         elif self.separator == ",":
-            return dd.read_csv(self.misc_file, dtype=str, na_filter=False).fillna("unknown")
+            misc_table = dd.read_csv(self.misc_file, dtype=str, na_filter=False)
         else:
             return None
-            
+        
+        if self.test:
+            misc_table = misc_table.sample(frac=0.1, random_state=21)
+        misc_table = misc_table.map_partitions(lambda pdf: pdf.astype("string[pyarrow]"))
+
+        return misc_table
 
     def parse(self):
         if self.misc_table is None:
@@ -73,16 +80,16 @@ class MiscFileParser:
         """
         # Metadata for the resulting Dask DataFrame
         meta = OrderedDict({
-            'tid': 'object',
-            'tra': 'object',
-            'trad_gene': 'object',
-            'traj_gene': 'object',
-            'trav_gene': 'object',
-            'trb': 'object',
-            'trbd_gene': 'object',
-            'trbj_gene': 'object',
-            'trbv_gene': 'object',
-            'sequence': 'object'
+            'tid': 'string[pyarrow]',
+            'tra': 'string[pyarrow]',
+            'trad_gene': 'string[pyarrow]',
+            'traj_gene': 'string[pyarrow]',
+            'trav_gene': 'string[pyarrow]',
+            'trb': 'string[pyarrow]',
+            'trbd_gene': 'string[pyarrow]',
+            'trbj_gene': 'string[pyarrow]',
+            'trbv_gene': 'string[pyarrow]',
+            'sequence': 'string[pyarrow]'
         })
 
         # Function to process each partition
@@ -146,7 +153,8 @@ class MiscFileParser:
 
         # Standardize the sequence table
         sequence_table = standardize_sequence(sequence_table)
-
+        mri_table = standardize_mri(mri_table)
+        
         return mri_table, sequence_table
 
 
@@ -159,16 +167,16 @@ class MiscFileParser:
         """
         # Define metadata for the resulting DataFrame
         meta = OrderedDict({
-            'tid': 'object',
-            'tra': 'object',
-            'trad_gene': 'object',
-            'traj_gene': 'object',
-            'trav_gene': 'object',
-            'trb': 'object',
-            'trbd_gene': 'object',
-            'trbj_gene': 'object',
-            'trbv_gene': 'object',
-            'sequence': 'object'
+            'tid': 'string[pyarrow]',
+            'tra': 'string[pyarrow]',
+            'trad_gene': 'string[pyarrow]',
+            'traj_gene': 'string[pyarrow]',
+            'trav_gene': 'string[pyarrow]',
+            'trb': 'string[pyarrow]',
+            'trbd_gene': 'string[pyarrow]',
+            'trbj_gene': 'string[pyarrow]',
+            'trbv_gene': 'string[pyarrow]',
+            'sequence': 'string[pyarrow]'
         })
 
         # Function to process each row
@@ -223,7 +231,8 @@ class MiscFileParser:
         # Create and deduplicate the sequence table
         sequence_table = mri_table[['source', 'tra', 'trb', 'sequence']].drop_duplicates()
         sequence_table = standardize_sequence(sequence_table)
-
+        mri_table = standardize_mri(mri_table)
+        
         return mri_table, sequence_table
 
 
@@ -273,8 +282,8 @@ class MiscFileParser:
 
         # Create a combined sequence column lazily
         mri_table['sequence'] = mri_table[['tra', 'trb']].map_partitions(
-            lambda df: df.apply(lambda row: ' '.join(row.dropna().astype(str)) + ';', axis=1),
-            meta=('sequence', 'str')
+            lambda df: df.apply(lambda row: ' '.join(row.dropna().astype('string[pyarrow]')) + ';', axis=1),
+            meta=('sequence', 'string[pyarrow]')
         )
 
         # Prepare the sequence table
@@ -284,7 +293,8 @@ class MiscFileParser:
         # Drop duplicates and standardize columns
         sequence_table = sequence_table.drop_duplicates()
         sequence_table = standardize_sequence(sequence_table)
-
+        mri_table = standardize_mri(mri_table)
+        
         return mri_table, sequence_table
 
     
@@ -315,8 +325,11 @@ class MiscFileParser:
                 chain_dict = {}
 
                 for tcr in cdr_data:
-                    chain, seq = tcr.split(':')
-                    chain_dict.setdefault(chain, []).append(seq)
+                    if tcr == 'NA':
+                        continue
+                    else:
+                        chain, seq = tcr.split(':')
+                        chain_dict.setdefault(chain, []).append(seq)
 
                 if 'TRA' in chain_dict and 'TRB' in chain_dict:
                     tra_seqs = chain_dict['TRA']
@@ -353,17 +366,16 @@ class MiscFileParser:
             return pd.DataFrame(formatted_contigs)
 
         meta = OrderedDict({
-            'tid': 'object',
-            'tra': 'object',
-            'trb': 'object',
-            'sequence': 'object',
-            'repertoire_id': 'object',
-            'condition': 'object'
+            'tid': 'string[pyarrow]',
+            'tra': 'string[pyarrow]',
+            'trb': 'string[pyarrow]',
+            'sequence': 'string[pyarrow]',
+            'repertoire_id': 'string[pyarrow]',
+            'condition': 'string[pyarrow]'
         })
 
         # Apply the processing function lazily
         mri_table = misc_table.map_partitions(process_partition, meta=meta)
-
         # Add metadata lazily
         mri_table = mri_table.assign(
             repertoire_id=os.path.splitext(os.path.basename(self.misc_file))[0],
@@ -375,7 +387,8 @@ class MiscFileParser:
         # Prepare the sequence table
         sequence_table = mri_table.drop(columns=['tid', 'repertoire_id', 'condition'])
         sequence_table = standardize_sequence(sequence_table)
-
+        mri_table = standardize_mri(mri_table)
+        
         return mri_table, sequence_table
 
 
@@ -421,26 +434,29 @@ class MiscFileParser:
         # Add a 'sequence' column by concatenating 'tra' and 'trb', skipping NA values
         def generate_sequence(df):
             df['sequence'] = df[['tra', 'trb']].apply(
-                lambda row: ' '.join(filter(None, row)) + ';', axis=1
+                lambda row: ' '.join(filter(lambda x: x != '', row)) + ';',
+                axis=1
             )
+
             return df
 
         sequence_table = sequence_table.map_partitions(generate_sequence, meta=OrderedDict({
-            'source': 'object',
-            'trav_gene': 'object',
-            'trad_gene': 'object',
-            'traj_gene': 'object',
-            'tra': 'object',
-            'trbv_gene': 'object',
-            'trbd_gene': 'object',
-            'trbj_gene': 'object',
-            'trb': 'object',
-            'sequence': 'object'
+            'source': 'string[pyarrow]',
+            'trav_gene': 'string[pyarrow]',
+            'trad_gene': 'string[pyarrow]',
+            'traj_gene': 'string[pyarrow]',
+            'tra': 'string[pyarrow]',
+            'trbv_gene': 'string[pyarrow]',
+            'trbd_gene': 'string[pyarrow]',
+            'trbj_gene': 'string[pyarrow]',
+            'trb': 'string[pyarrow]',
+            'sequence': 'string[pyarrow]'
         }))
 
         # Standardize the sequence table lazily
         sequence_table = standardize_sequence(sequence_table)
-
+        mri_table = standardize_mri(mri_table)
+        
         return mri_table, sequence_table
 
 
@@ -464,17 +480,17 @@ class MiscFileParser:
                         'traj_gene': row['j'],
                         'trad_gene': row['d'],
                         'tra': row['cdr3aa'],
-                        'trbv_gene': None,
-                        'trbj_gene': None,
-                        'trbd_gene': None,
-                        'trb': None
+                        'trbv_gene': '',
+                        'trbj_gene': '',
+                        'trbd_gene': '',
+                        'trb': ''
                     }
                 elif "TRBV" in row['v']:
                     return {
-                        'trav_gene': None,
-                        'traj_gene': None,
-                        'trad_gene': None,
-                        'tra': None,
+                        'trav_gene': '',
+                        'traj_gene': '',
+                        'trad_gene': '',
+                        'tra': '',
                         'trbv_gene': row['v'],
                         'trbj_gene': row['j'],
                         'trbd_gene': row['d'],
@@ -488,14 +504,14 @@ class MiscFileParser:
             return result
 
         meta = OrderedDict({
-            'trav_gene': 'object',
-            'traj_gene': 'object',
-            'trad_gene': 'object',
-            'tra': 'object',
-            'trbv_gene': 'object',
-            'trbj_gene': 'object',
-            'trbd_gene': 'object',
-            'trb': 'object'
+            'trav_gene': 'string[pyarrow]',
+            'traj_gene': 'string[pyarrow]',
+            'trad_gene': 'string[pyarrow]',
+            'tra': 'string[pyarrow]',
+            'trbv_gene': 'string[pyarrow]',
+            'trbj_gene': 'string[pyarrow]',
+            'trbd_gene': 'string[pyarrow]',
+            'trb': 'string[pyarrow]'
         })
 
         # Process the misc_table partition-wise
@@ -520,25 +536,27 @@ class MiscFileParser:
         ]]
         # Prepare the sequence table
         sequence_table = sequence_table.assign(
-            sequence=sequence_table[['tra', 'trb']].map_partitions(
+            sequence = sequence_table[['tra', 'trb']].map_partitions(
                 lambda df: df.apply(
-                    lambda row: ' '.join(filter(None, [row.get('tra'), row.get('trb')])) + ';',
+                    lambda row: ' '.join(
+                        filter(lambda x: x != '', [row.get('tra'), row.get('trb')])
+                    ) + ';',
                     axis=1
                 ),
-                meta=('sequence', 'str')
+                meta=('sequence', 'string[pyarrow]')
             )
         )
         seq_meta = OrderedDict({
-            'source': 'object',
-            'trav_gene': 'object',
-            'trad_gene': 'object',
-            'traj_gene': 'object',
-            'tra': 'object',
-            'trbv_gene': 'object',
-            'trbd_gene': 'object',
-            'trbj_gene': 'object',
-            'trb': 'object',
-            'sequence': 'object'
+            'source': 'string[pyarrow]',
+            'trav_gene': 'string[pyarrow]',
+            'trad_gene': 'string[pyarrow]',
+            'traj_gene': 'string[pyarrow]',
+            'tra': 'string[pyarrow]',
+            'trbv_gene': 'string[pyarrow]',
+            'trbd_gene': 'string[pyarrow]',
+            'trbj_gene': 'string[pyarrow]',
+            'trb': 'string[pyarrow]',
+            'sequence': 'string[pyarrow]'
             })
         # Ensure sequences for single-chain data
         sequence_table = sequence_table.map_partitions(
@@ -553,5 +571,6 @@ class MiscFileParser:
         # Standardize the sequence table
         sequence_table = sequence_table.drop_duplicates()
         sequence_table = standardize_sequence(sequence_table)
-
+        mri_table = standardize_mri(mri_table)
+        
         return mri_table, sequence_table

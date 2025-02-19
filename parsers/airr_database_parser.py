@@ -10,11 +10,13 @@ from collections import OrderedDict
 from .utils import parse_imgt_four_digit, transform_mhc_restriction, get_mhc_sequence
 
 class DatabaseParser:
-    def __init__(self, config_path):
+    def __init__(self, config_path, test=False):
         self.config_path = config_path
+        self.test = test
         self.config = self._load_config()
         self.hla_dictionary = parse_imgt_four_digit(self.config['databases']['imgt']['hla_fasta'])
         self.output_path = self.config['outputs']['output_path']
+        
 
     def _load_config(self):
         with open(self.config_path, 'r') as f:
@@ -62,7 +64,8 @@ class DatabaseParser:
             assume_missing=True,
             dtype={'d.beta': 'str', 'meta.epitope.id': 'str'}
         )
-
+        if self.test:
+            vdjdb_table = vdjdb_table.sample(frac=0.1, random_state=21)
         # Define column renaming mapping
         relevant_columns = OrderedDict({
             'cdr3.alpha': 'tra',
@@ -157,13 +160,13 @@ class DatabaseParser:
 
         # Define metadata for Dask
         meta = OrderedDict({
-            'study_id': 'object',
-            'repertoire_id': 'object',
-            'trbv_gene': 'object',
-            'trbd_gene': 'object',
-            'trbj_gene': 'object',
-            'trb': 'object',
-            'sequence': 'object'
+            'study_id': 'str',
+            'repertoire_id': 'str',
+            'trbv_gene': 'str',
+            'trbd_gene': 'str',
+            'trbj_gene': 'str',
+            'trb': 'str',
+            'sequence': 'str'
         })
 
         # Load all files lazily using Dask
@@ -173,7 +176,8 @@ class DatabaseParser:
 
             # Read the file lazily
             tcr_table = dd.read_csv(file_path, sep="\t", dtype="str", assume_missing=True)
-
+            if self.test:
+                tcr_table = tcr_table.sample(frac=0.1, random_state=21)
             # Rename columns for consistency
             tcr_table = tcr_table.rename(columns={
                 'RunId': 'repertoire_id',
@@ -187,7 +191,7 @@ class DatabaseParser:
             tcr_table = tcr_table.drop(columns=['cloneFraction'], errors='ignore')
 
             # Replace 'Unknown' with NaN
-            tcr_table = tcr_table.replace('Unknown', None)
+            tcr_table = tcr_table.replace('Unknown', '')
 
             # Assign metadata lazily
             tcr_table = tcr_table.assign(study_id=study_id)
@@ -224,7 +228,8 @@ class DatabaseParser:
         
         # Read the McPAS-TCR data using Dask
         mcpastcr_table = dd.read_csv(database_path, assume_missing=True, dtype="str")
-
+        if self.test:
+                mcpastcr_table = mcpastcr_table.sample(frac=0.1, random_state=21)
         # Rename columns for consistency
         rename_columns = {
             'TRAV': 'trav_gene',
@@ -274,7 +279,7 @@ class DatabaseParser:
         # Map MHC sequences based on restriction
         sequence_table['mhc_one'] = sequence_table['mhc_restriction'].map_partitions(
             lambda df: df.apply(lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)),
-            meta=('mhc_one', 'object')
+            meta=('mhc_one', 'str')
         )
 
         # Expand peptides lazily
@@ -288,7 +293,7 @@ class DatabaseParser:
         # Generate the 'sequence' column lazily
         sequence_table['sequence'] = sequence_table[['tra', 'trb', 'peptide', 'mhc_one']].map_partitions(
             lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'object')
+            meta=('sequence', 'str')
         )
 
         # Final selection and deduplication
@@ -328,7 +333,8 @@ class DatabaseParser:
             ],
             header=0
         )
-
+        if self.test:
+                tcell_table = tcell_table.sample(frac=0.1, random_state=21)
         # Drop rows where 'study_id' is missing and keep only positive assay outcomes
         tcell_table = tcell_table.dropna(subset=['study_id'])
         tcell_table = tcell_table[tcell_table['assay_outcome'] == "Positive"]
@@ -444,6 +450,9 @@ class DatabaseParser:
             dtype="str"
         ).dropna(subset=['study_id'])
 
+        if self.test:
+                mhc_ligand_table = mhc_ligand_table.sample(frac=0.1, random_state=21)
+
         # Filter for positive assay outcomes (if column exists)
         if 'assay_outcome' in mhc_ligand_table.columns:
             mhc_ligand_table = mhc_ligand_table[mhc_ligand_table['assay_outcome'] == "Positive"]
@@ -548,6 +557,9 @@ class DatabaseParser:
             dtype="str"
         )
 
+        if self.test:
+                receptor_table = receptor_table.sample(frac=0.1, random_state=21)
+
         # Process `study_id` for CEDAR datasets (extract numeric ID)
         if source.lower() == "cedar":
             receptor_table['study_id'] = receptor_table['study_id'].str.extract(r'(\d{7})')[0]
@@ -588,7 +600,7 @@ class DatabaseParser:
         # Generate the 'sequence' column lazily
         sequence_table['sequence'] = sequence_table[['tra', 'trb', 'peptide']].map_partitions(
             lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'object')
+            meta=('sequence', 'str')
         )
 
         # Select final columns for the sequence table
@@ -658,6 +670,9 @@ class DatabaseParser:
             ]
         )
 
+        if self.test:
+                database_table = database_table.sample(frac=0.1, random_state=21)
+
         # Filter productive rows lazily
         database_table = database_table[database_table['productive'] == 'T']
 
@@ -672,13 +687,13 @@ class DatabaseParser:
 
         # Process TRA and TRB chains lazily
         tra_table = database_table.map_partitions(process_chain, chain_type='TRA', 
-            rename_map=tra_map, meta={'trav_gene': 'object', 'trad_gene': 'object', 
-                                      'traj_gene': 'object', 'tra': 'object', 
+            rename_map=tra_map, meta={'trav_gene': 'str', 'trad_gene': 'str', 
+                                      'traj_gene': 'str', 'tra': 'str', 
                                       'cell_id': 'str', 'clone_id': 'str', 'data_processing_id': 'str'})
         
         trb_table = database_table.map_partitions(process_chain, chain_type='TRB',
-            rename_map=trb_map, meta={'trbv_gene': 'object', 'trbd_gene': 'object',
-                                      'trbj_gene': 'object', 'trb': 'object',
+            rename_map=trb_map, meta={'trbv_gene': 'str', 'trbd_gene': 'str',
+                                      'trbj_gene': 'str', 'trb': 'str',
                                       'cell_id': 'str', 'clone_id': 'str', 'data_processing_id': 'str'})
 
         # Merge TRA and TRB tables lazily
@@ -693,7 +708,7 @@ class DatabaseParser:
         # Generate 'sequence' column lazily
         sequence_table['sequence'] = sequence_table[['tra', 'trb']].map_partitions(
             lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'object')
+            meta=('sequence', 'str')
         )
 
         # Drop duplicates lazily
@@ -726,6 +741,8 @@ class DatabaseParser:
             ]
         )
 
+        if self.test:
+                tcr_table = tcr_table.sample(frac=0.1, random_state=21)
         # Filter for productive sequences lazily
         mri_table = tcr_table[tcr_table['productive'] == 'T'].drop(columns=['productive'])
 
@@ -765,8 +782,8 @@ class DatabaseParser:
         
 
         # Process TRA and TRB lazily using map_partitions
-        tra_table = mri_table.map_partitions(process_chain, locus='TRA', rename_map=rename_maps['TRA'], meta={'tra': 'object', 'trav_gene': 'object', 'trad_gene': 'object', 'traj_gene': 'object', 'repertoire_id': 'object', 'cell_id': 'object', 'clone_id': 'object'})
-        trb_table = mri_table.map_partitions(process_chain, locus='TRB', rename_map=rename_maps['TRB'], meta={'trb': 'object', 'trbv_gene': 'object', 'trbd_gene': 'object', 'trbj_gene': 'object', 'repertoire_id': 'object', 'cell_id': 'object', 'clone_id': 'object'})
+        tra_table = mri_table.map_partitions(process_chain, locus='TRA', rename_map=rename_maps['TRA'], meta={'tra': 'str', 'trav_gene': 'str', 'trad_gene': 'str', 'traj_gene': 'str', 'repertoire_id': 'str', 'cell_id': 'str', 'clone_id': 'str'})
+        trb_table = mri_table.map_partitions(process_chain, locus='TRB', rename_map=rename_maps['TRB'], meta={'trb': 'str', 'trbv_gene': 'str', 'trbd_gene': 'str', 'trbj_gene': 'str', 'repertoire_id': 'str', 'cell_id': 'str', 'clone_id': 'str'})
 
         # Merge TRA and TRB tables lazily
         sequence_table = dd.concat([tra_table, trb_table], interleave_partitions=True)
@@ -774,7 +791,7 @@ class DatabaseParser:
         # Generate 'sequence' column lazily
         sequence_table['sequence'] = sequence_table[['tra', 'trb']].map_partitions(
             lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'object')
+            meta=('sequence', 'str')
         )
 
         # Drop unnecessary columns
@@ -800,7 +817,7 @@ class DatabaseParser:
         # Define function to process a single JSON entry
         def process_repertoire(repertoire, database):
             """
-            Parses a single repertoire JSON object.
+            Parses a single repertoire JSON str.
             """
             try:
                 # Extract primary metadata fields
@@ -817,10 +834,10 @@ class DatabaseParser:
                         + (' ' + repertoire['subject']['diagnosis'][0]['disease_diagnosis']['label']
                         if repertoire['subject']['diagnosis'][0]['disease_diagnosis']['label'] else '')
                     ),
-                    'age': repertoire['subject'].get('age', None),
-                    'sex': repertoire['subject'].get('sex', None),
-                    'population_surveyed': repertoire['subject'].get('race', None),
-                    'source_tissue': repertoire['sample'][0]['tissue']['label'] if repertoire.get('sample') else None,
+                    'age': repertoire['subject'].get('age', ''),
+                    'sex': repertoire['subject'].get('sex', ''),
+                    'population_surveyed': repertoire['subject'].get('race', ''),
+                    'source_tissue': repertoire['sample'][0]['tissue']['label'] if repertoire.get('sample') else '',
                 }
 
                 # Extract MHC profile (if available)
@@ -831,7 +848,7 @@ class DatabaseParser:
                             if allele.get('allele_designation'):
                                 mhc_list.add(allele['allele_designation'])
 
-                repertoire_dict['mhc_profile'] = ','.join(sorted(mhc_list)) if mhc_list else None
+                repertoire_dict['mhc_profile'] = ','.join(sorted(mhc_list)) if mhc_list else ''
                 return repertoire_dict
             except Exception as e:
                 print(f"Error processing repertoire: {e}")
@@ -844,7 +861,7 @@ class DatabaseParser:
                 for item in ijson.items(meta_file, "Repertoire.item")
             ]
 
-        # Convert processed JSON objects to a Dask DataFrame lazily
+        # Convert processed JSON strs to a Dask DataFrame lazily
         metadata_table = dd.from_delayed([
             delayed(pd.DataFrame)([r]) for r in repertoires if r is not None
         ])
@@ -914,7 +931,7 @@ class DatabaseParser:
         sequence_tables = [seq_table[standardized_columns] for seq_table in sequence_tables]
 
         # Define metadata schema for lazy concatenation
-        meta = {col: 'object' for col in standardized_columns}
+        meta = {col: 'str' for col in standardized_columns}
 
         # Concatenate all sequence tables lazily
         sequence_table = dd.concat(sequence_tables, meta=meta).reset_index(drop=True)

@@ -7,13 +7,14 @@ import pandas as pd
 
 from collections import OrderedDict
 
-from .utils import standardize_sequence
+from .utils import standardize_sequence, standardize_mri
 
 
 class BulkFileParser:
-    def __init__(self, bulk_file, format_config):
+    def __init__(self, bulk_file, format_config, test=False):
         self.bulk_file = bulk_file
         self.format_config = format_config
+        self.test = test
         self.repertoire_id = os.path.splitext(os.path.basename(self.bulk_file))[0]
         self.study_id = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(self.bulk_file))))
         self.extension = os.path.splitext(self.bulk_file)[1]
@@ -24,7 +25,7 @@ class BulkFileParser:
         self.molecule_type = os.path.basename(os.path.dirname(os.path.dirname(self.bulk_file)))   
         self.study_id = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(self.bulk_file))))
         self.category = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(self.bulk_file)))))
-
+        
 
     def _load_format_config(self):
         with open(self.format_config, 'r') as f:
@@ -57,13 +58,19 @@ class BulkFileParser:
     def _load_bulk_table(self):
         if self.separator == "\t":
             try:
-                return dd.read_csv(self.bulk_file, sep="\t", dtype=str, na_filter=False).fillna("unknown")            
+                bulk_table =  dd.read_csv(self.bulk_file, sep="\t", dtype=str, na_filter=False)            
             except ValueError:
                 return None
         elif self.separator == ",":
-            return dd.read_csv(self.bulk_file, dtype=str, na_filter=False).fillna("unknown")
+             bulk_table =  dd.read_csv(self.bulk_file, dtype=str, na_filter=False)
         elif self.separator == "M":
-            return dd.read_csv(self.bulk_file, sep="\t", dtype=str, na_filter=False, skiprows=1).fillna("unknown")
+             bulk_table =  dd.read_csv(self.bulk_file, sep="\t", dtype=str, na_filter=False, skiprows=1)
+        if self.test:
+            bulk_table = bulk_table.sample(frac=0.1, random_state = 21)
+        bulk_table = bulk_table.map_partitions(lambda pdf: pdf.astype("string[pyarrow]"))
+
+        return bulk_table
+
 
     def parse(self):
         if self.bulk_table is None:
@@ -102,11 +109,11 @@ class BulkFileParser:
         def detect_chain_type(df):
             if not df.empty:
                 return df.iloc[0]['VGene']
-            return None
+            return ''
 
         # Ensure that `detect_chain_type` returns a single-column Dask Series
         # Detect chain type and drop missing values
-        chain_type_series = processed.map_partitions(detect_chain_type, meta=('VGene', 'str'))
+        chain_type_series = processed.map_partitions(detect_chain_type, meta=('VGene', 'string[pyarrow]'))
 
         # Compute the first non-null value from the series
         chain_type = chain_type_series.compute().iloc[0]
@@ -118,10 +125,11 @@ class BulkFileParser:
                 'VGene': 'trav_gene',
                 'JGene': 'traj_gene',
                 'aaCDR3': 'tra'
-            }).assign(trad_gene=None)
+            }).assign(trad_gene='')
 
             # Create sequence table
             sequence_table = mri_table[['trav_gene', 'trad_gene', 'traj_gene', 'tra']]
+            sequence_table['sequence'] = sequence_table['tra'] + ';'
 
         elif 'TRBV' in chain_type:
             # Rename columns for TRB chain and add trbd_gene as NaN
@@ -129,10 +137,11 @@ class BulkFileParser:
                 'VGene': 'trbv_gene',
                 'JGene': 'trbj_gene',
                 'aaCDR3': 'trb'
-            }).assign(trbd_gene=None)
+            }).assign(trbd_gene='')
 
             # Create sequence table
             sequence_table = mri_table[['trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']]
+            sequence_table['sequence'] = sequence_table['trb'] + ';'
 
         else:
             raise ValueError(f"Unrecognized chain type in VGene: {chain_type}")
@@ -150,7 +159,8 @@ class BulkFileParser:
 
         # Standardize sequence table columns
         sequence_table = standardize_sequence(sequence_table)
-
+        mri_table = standardize_mri(mri_table)
+        
         return mri_table, sequence_table
 
     
@@ -175,15 +185,15 @@ class BulkFileParser:
 
         # Define the final metadata explicitly
         meta = OrderedDict({
-            'trav_gene': 'object',
-            'traj_gene': 'object',
-            'trad_gene': 'object',
-            'tra': 'object',
-            'trbv_gene': 'object',
-            'trbj_gene': 'object',
-            'trbd_gene': 'object',
-            'trb': 'object',
-            'sequence': 'object'
+            'trav_gene': 'string[pyarrow]',
+            'traj_gene': 'string[pyarrow]',
+            'trad_gene': 'string[pyarrow]',
+            'tra': 'string[pyarrow]',
+            'trbv_gene': 'string[pyarrow]',
+            'trbj_gene': 'string[pyarrow]',
+            'trbd_gene': 'string[pyarrow]',
+            'trb': 'string[pyarrow]',
+            'sequence': 'string[pyarrow]'
         })
 
         # Process each partition to detect chain type and transform columns
@@ -203,10 +213,10 @@ class BulkFileParser:
                     'CDR3 amino acid sequence': 'tra'
                 })
                 partition['sequence'] = partition['tra'] + ';'
-                partition['trb'] = None
-                partition['trbv_gene'] = None
-                partition['trbj_gene'] = None
-                partition['trbd_gene'] = None
+                partition['trb'] = ''
+                partition['trbv_gene'] = ''
+                partition['trbj_gene'] = ''
+                partition['trbd_gene'] = ''
             elif "TRBV" in chain_type:
                 # Rename columns for TRB chain
                 partition = partition.rename(columns={
@@ -216,10 +226,10 @@ class BulkFileParser:
                     'CDR3 amino acid sequence': 'trb'
                 })
                 partition['sequence'] = partition['trb'] + ';'
-                partition['tra'] = None
-                partition['trav_gene'] = None
-                partition['traj_gene'] = None
-                partition['trad_gene'] = None
+                partition['tra'] = ''
+                partition['trav_gene'] = ''
+                partition['traj_gene'] = ''
+                partition['trad_gene'] = ''
             else:
                 raise ValueError(f"Unrecognized chain type in V alleles: {chain_type}")
 
@@ -231,7 +241,6 @@ class BulkFileParser:
 
         # Deduplicate the sequence table and standardize it
         sequence_table = mri_table.drop_duplicates(subset=['sequence'])
-        sequence_table = standardize_sequence(sequence_table)
 
         # Add metadata lazily
         mri_table = mri_table.assign(
@@ -243,6 +252,9 @@ class BulkFileParser:
             source='bulk_survey'
         )
         sequence_table['source'] = 'bulk_survey'
+
+        mri_table = standardize_mri(mri_table)
+        sequence_table = standardize_sequence(sequence_table)
 
         return mri_table, sequence_table
 
@@ -265,9 +277,9 @@ class BulkFileParser:
 
         # Define meta for the resulting DataFrame
         meta = OrderedDict({
-            'trav_gene': 'object', 'trad_gene': 'object', 'traj_gene': 'object', 'tra': 'object',
-            'trbv_gene': 'object', 'trbd_gene': 'object', 'trbj_gene': 'object', 'trb': 'object',
-            'sequence': 'object'
+            'trav_gene': 'string[pyarrow]', 'trad_gene': 'string[pyarrow]', 'traj_gene': 'string[pyarrow]', 'tra': 'string[pyarrow]',
+            'trbv_gene': 'string[pyarrow]', 'trbd_gene': 'string[pyarrow]', 'trbj_gene': 'string[pyarrow]', 'trb': 'string[pyarrow]',
+            'sequence': 'string[pyarrow]'
         })
 
         # Process each partition to detect chain type and transform columns
@@ -288,10 +300,10 @@ class BulkFileParser:
                     'CDR3 amino acid sequence': 'tra'
                 })
                 partition['sequence'] = partition['tra'] + ';'
-                partition['trb'] = None
-                partition['trbv_gene'] = None
-                partition['trbj_gene'] = None
-                partition['trbd_gene'] = None
+                partition['trb'] = ''
+                partition['trbv_gene'] = ''
+                partition['trbj_gene'] = ''
+                partition['trbd_gene'] = ''
             elif "TRBV" in chain_type:
                 # Rename columns for TRB chain
                 partition = partition.rename(columns={
@@ -301,10 +313,10 @@ class BulkFileParser:
                     'CDR3 amino acid sequence': 'trb'
                 })
                 partition['sequence'] = partition['trb'] + ';'
-                partition['tra'] = None
-                partition['trav_gene'] = None
-                partition['traj_gene'] = None
-                partition['trad_gene'] = None
+                partition['tra'] = ''
+                partition['trav_gene'] = ''
+                partition['traj_gene'] = ''
+                partition['trad_gene'] = ''
             else:
                 raise ValueError(f"Unrecognized chain type in V segments: {chain_type}")
 
@@ -316,7 +328,6 @@ class BulkFileParser:
 
         # Deduplicate the sequence table and standardize it
         sequence_table = mri_table.drop_duplicates(subset=['sequence'])
-        sequence_table = standardize_sequence(sequence_table)
 
         # Add metadata lazily
         mri_table = mri_table.assign(
@@ -328,6 +339,8 @@ class BulkFileParser:
             source='bulk_survey'
         )
         sequence_table = sequence_table.assign(source='bulk_survey')
+        mri_table = standardize_mri(mri_table)
+        sequence_table = standardize_sequence(sequence_table)
 
         return mri_table, sequence_table
 
@@ -349,16 +362,16 @@ class BulkFileParser:
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
         meta = OrderedDict({
-            'tid': 'object',
-            'tra': 'object',
-            'trad_gene': 'object',
-            'traj_gene': 'object',
-            'trav_gene': 'object',
-            'trb': 'object',
-            'trbd_gene': 'object',
-            'trbj_gene': 'object',
-            'trbv_gene': 'object',
-            'sequence': 'object'
+            'tid': 'string[pyarrow]',
+            'tra': 'string[pyarrow]',
+            'trad_gene': 'string[pyarrow]',
+            'traj_gene': 'string[pyarrow]',
+            'trav_gene': 'string[pyarrow]',
+            'trb': 'string[pyarrow]',
+            'trbd_gene': 'string[pyarrow]',
+            'trbj_gene': 'string[pyarrow]',
+            'trbv_gene': 'string[pyarrow]',
+            'sequence': 'string[pyarrow]'
         })
 
         # Function to process each partition
@@ -390,7 +403,7 @@ class BulkFileParser:
             # Ensure all fixed columns are present
             for col in fixed_columns:
                 if col not in result.columns:
-                    result[col] = None  # Add missing columns with default value
+                    result[col] = ''  # Add missing columns with default value
 
             # Return DataFrame with reordered columns
             return result[fixed_columns]
@@ -404,8 +417,8 @@ class BulkFileParser:
 
         # Add the 'sequence' column
         sequence_table['sequence'] = sequence_table[['tra', 'trb']].map_partitions(
-            lambda df: df.apply(lambda x: ' '.join(x.dropna()) + ';', axis=1),
-            meta=('sequence', 'str')
+            lambda df: df.apply(lambda x: ' '.join(y for y in [x['tra'], x['trb']] if y != '') + ';', axis=1),
+            meta=('sequence', 'string[pyarrow]')
         )
 
         # Add metadata lazily to MRI and sequence tables
@@ -418,7 +431,8 @@ class BulkFileParser:
             source='bulk_survey'
         )
         sequence_table = sequence_table.assign(source='bulk_survey')
-
+        mri_table = standardize_mri(mri_table)
+        sequence_table = standardize_sequence(sequence_table)
         return mri_table, sequence_table
 
     
@@ -438,7 +452,7 @@ class BulkFileParser:
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = OrderedDict({col: 'object' for col in fixed_columns})
+        meta = OrderedDict({col: 'string[pyarrow]' for col in fixed_columns})
 
         # Define the row-level processing function
         def process_row(row):
@@ -470,7 +484,7 @@ class BulkFileParser:
             result_df = pd.DataFrame(formatted_rows)
             for col in fixed_columns:
                 if col not in result_df.columns:
-                    result_df[col] = None  # Add missing columns
+                    result_df[col] = ''  # Add missing columns
             return result_df[fixed_columns]  # Reorder columns
 
         # Apply partition processing lazily
@@ -482,7 +496,7 @@ class BulkFileParser:
         # Add the 'sequence' column
         def generate_sequence(df):
             df['sequence'] = df[['tra', 'trb']].apply(
-                lambda x: ' '.join(x.dropna()) + ';', axis=1
+                lambda x: ' '.join(y for y in [x['tra'], x['trb']] if y != '') + ';', axis=1
             )
             return df
 
@@ -501,6 +515,7 @@ class BulkFileParser:
 
         # Standardize the sequence table
         sequence_table = standardize_sequence(sequence_table)
+        mri_table = standardize_mri(mri_table)
 
         return mri_table, sequence_table
 
@@ -516,14 +531,14 @@ class BulkFileParser:
         airr_table = self.bulk_table[self.bulk_table['fuction'] == "in-frame"]
         airr_table = airr_table[['aminoAcid(CDR3 in lowercase)', 'vGene', 'dGene', 'jGene']]
 
-        # Function to find the longest stretch of lowercase letters
+        # Function to find the longest string[pyarrow]etch of lowercase letters
         def longest_lowercase(s):
             lowercase_stretches = re.findall(r'[a-z]+', s)
             return max(lowercase_stretches, key=len, default='')
 
         # Apply the longest_lowercase function lazily
         airr_table['cdr3'] = airr_table['aminoAcid(CDR3 in lowercase)'].map_partitions(
-            lambda partition: partition.apply(longest_lowercase), meta=('cdr3', 'str')
+            lambda partition: partition.apply(longest_lowercase), meta=('cdr3', 'string[pyarrow]')
         )
 
         # Define the processing function for each partition
@@ -537,10 +552,10 @@ class BulkFileParser:
                         'traj_gene': row['jGene'],
                         'trad_gene': row['dGene'],
                         'tra': row['cdr3'],
-                        'trb': None,
-                        'trbv_gene': None,
-                        'trbj_gene': None,
-                        'trbd_gene': None
+                        'trb': '',
+                        'trbv_gene': '',
+                        'trbj_gene': '',
+                        'trbd_gene': ''
                     })
                 elif "TRBV" in row['vGene']:
                     formatted_rows.append({
@@ -548,21 +563,21 @@ class BulkFileParser:
                         'trbj_gene': row['jGene'],
                         'trbd_gene': row['dGene'],
                         'trb': row['cdr3'],
-                        'tra': None,
-                        'trav_gene': None,
-                        'traj_gene': None,
-                        'trad_gene': None
+                        'tra': '',
+                        'trav_gene': '',
+                        'traj_gene': '',
+                        'trad_gene': ''
                     })
 
             # Create a DataFrame and ensure consistent columns
             result = pd.DataFrame(formatted_rows)
             for col in self.fixed_columns:
                 if col not in result.columns:
-                    result[col] = None
+                    result[col] = ''
             return result[self.fixed_columns]
 
         # Apply partition-wise processing
-        meta = {col: 'object' for col in self.fixed_columns}
+        meta = {col: 'string[pyarrow]' for col in self.fixed_columns}
         mri_table = airr_table.map_partitions(process_partition, meta=meta)
 
         # Deduplicate the sequence table
@@ -571,7 +586,7 @@ class BulkFileParser:
         # Add a 'sequence' column lazily
         def generate_sequence(df):
             df['sequence'] = df[['tra', 'trb']].apply(
-                lambda x: ' '.join(x.dropna()) + ';', axis=1
+                lambda x: ' '.join(y for y in [x['tra'], x['trb']] if y != '') + ';', axis=1
             )
             return df
 
@@ -590,7 +605,7 @@ class BulkFileParser:
 
         # Standardize sequence table
         sequence_table = standardize_sequence(sequence_table)
-
+        mri_table = standardize_mri(mri_table)
         return mri_table, sequence_table
 
 
@@ -607,14 +622,14 @@ class BulkFileParser:
         airr_table = airr_table[['aminoAcid', 'vMaxResolved', 'dMaxResolved', 'jMaxResolved']]
 
         # Fill NaN values with a placeholder string
-        airr_table = airr_table.fillna("NAN")
+        airr_table = airr_table.fillna('')
 
         # Define fixed columns and metadata
         fixed_columns = [
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = OrderedDict({col: 'object' for col in fixed_columns})
+        meta = OrderedDict({col: 'string[pyarrow]' for col in fixed_columns})
 
         # Define a function to process each partition
         def process_partition(partition):
@@ -626,10 +641,10 @@ class BulkFileParser:
                         'traj_gene': row['jMaxResolved'],
                         'trad_gene': row['dMaxResolved'],
                         'tra': row['aminoAcid'],
-                        'trb': None,
-                        'trbv_gene': None,
-                        'trbj_gene': None,
-                        'trbd_gene': None,
+                        'trb': '',
+                        'trbv_gene': '',
+                        'trbj_gene': '',
+                        'trbd_gene': '',
                     })
                 elif "TCRBV" in row['vMaxResolved'] or "TCRBJ" in row['jMaxResolved'] or "TCRBD" in row['dMaxResolved']:
                     processed_rows.append({
@@ -637,17 +652,17 @@ class BulkFileParser:
                         'trbj_gene': row['jMaxResolved'],
                         'trbd_gene': row['dMaxResolved'],
                         'trb': row['aminoAcid'],
-                        'tra': None,
-                        'trav_gene': None,
-                        'traj_gene': None,
-                        'trad_gene': None,
+                        'tra': '',
+                        'trav_gene': '',
+                        'traj_gene': '',
+                        'trad_gene': '',
                     })
 
             result = pd.DataFrame(processed_rows)
             # Ensure all fixed columns are present
             for col in fixed_columns:
                 if col not in result.columns:
-                    result[col] = None
+                    result[col] = ''
             return result[fixed_columns]
 
         # Apply the processing function to each partition lazily
@@ -658,10 +673,18 @@ class BulkFileParser:
 
         # Generate the 'sequence' column
         def generate_sequence(partition):
+            if len(partition) == 0:
+                # Just return the empty partition as is
+                partition['sequence'] = []
+                return partition
+            
+            # Otherwise, do the apply
             partition['sequence'] = partition[['tra', 'trb']].apply(
-                lambda row: ' '.join(filter(None, [row['tra'], row['trb']])) + ';', axis=1
+                lambda row: ' '.join(x for x in [row['tra'], row['trb']] if x) + ';',
+                axis=1
             )
             return partition
+
 
         sequence_table = sequence_table.map_partitions(generate_sequence, meta=meta)
 
@@ -678,7 +701,7 @@ class BulkFileParser:
 
         # Standardize sequence table
         sequence_table = standardize_sequence(sequence_table)
-
+        mri_table = standardize_mri(mri_table)
         return mri_table, sequence_table
 
     
@@ -694,14 +717,14 @@ class BulkFileParser:
         airr_table = airr_table[['amino_acid', 'v_gene', 'd_gene', 'j_gene']]
 
         # Fill NaN values with a placeholder string
-        airr_table = airr_table.fillna("NAN")
+        airr_table = airr_table.fillna('')
 
         # Define fixed columns and metadata
         fixed_columns = [
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = OrderedDict({col: 'object' for col in fixed_columns})
+        meta = OrderedDict({col: 'string[pyarrow]' for col in fixed_columns})
 
         # Define a function to process each partition
         def process_partition(partition):
@@ -713,10 +736,10 @@ class BulkFileParser:
                         'traj_gene': row['j_gene'],
                         'trad_gene': row['d_gene'],
                         'tra': row['amino_acid'],
-                        'trb': None,
-                        'trbv_gene': None,
-                        'trbj_gene': None,
-                        'trbd_gene': None,
+                        'trb': '',
+                        'trbv_gene': '',
+                        'trbj_gene': '',
+                        'trbd_gene': '',
                     })
                 elif "TCRBV" in row['v_gene']:
                     processed_rows.append({
@@ -724,17 +747,17 @@ class BulkFileParser:
                         'trbj_gene': row['j_gene'],
                         'trbd_gene': row['d_gene'],
                         'trb': row['amino_acid'],
-                        'tra': None,
-                        'trav_gene': None,
-                        'traj_gene': None,
-                        'trad_gene': None,
+                        'tra': '',
+                        'trav_gene': '',
+                        'traj_gene': '',
+                        'trad_gene': '',
                     })
 
             result = pd.DataFrame(processed_rows)
             # Ensure all fixed columns are present
             for col in fixed_columns:
                 if col not in result.columns:
-                    result[col] = None
+                    result[col] = ''
             return result[fixed_columns]
 
         # Apply the transformation to each partition
@@ -745,11 +768,18 @@ class BulkFileParser:
 
         # Generate the 'sequence' column
         def generate_sequence(partition):
+            if len(partition) == 0:
+                # Just return the empty partition as is
+                partition['sequence'] = []
+                return partition
+            
+            # Otherwise, do the apply
             partition['sequence'] = partition[['tra', 'trb']].apply(
-                lambda row: ' '.join(filter(None, [row['tra'], row['trb']])) + ';', axis=1
+                lambda row: ' '.join(x for x in [row['tra'], row['trb']] if x) + ';',
+                axis=1
             )
             return partition
-
+        
         sequence_table = sequence_table.map_partitions(generate_sequence, meta=meta)
 
         # Add metadata lazily
@@ -765,7 +795,7 @@ class BulkFileParser:
 
         # Standardize the sequence table
         sequence_table = standardize_sequence(sequence_table)
-
+        mri_table = standardize_mri(mri_table)
         return mri_table, sequence_table
 
     
@@ -777,71 +807,67 @@ class BulkFileParser:
             tuple: Dask DataFrames for MRI and sequence tables.
         """
         # Select relevant columns
+        # Assume self.bulk_table is already a Dask DataFrame.
         airr_table = self.bulk_table[['cdr3_b_aa', 'v_b_gene', 'j_b_gene']]
 
-        # Define fixed columns and metadata
+        # Define fixed columns and metadata (using meta only for map_partitions)
         fixed_columns = [
             'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
             'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
         ]
-        meta = OrderedDict({col: 'object' for col in fixed_columns})
+        # Here meta is used only in map_partitions; you don't need it for from_delayed.
+        meta = {col: 'object' for col in fixed_columns}
 
         # Define a function to process rows
         def process_row(row):
             if "TRAV" in row['v_b_gene']:
                 return {
-                    'tid': None,
+                    'tid': '',
                     'trav_gene': row['v_b_gene'],
                     'traj_gene': row['j_b_gene'],
-                    'trad_gene': None,
+                    'trad_gene': '',
                     'tra': row['cdr3_b_aa'],
-                    'trbv_gene': None,
-                    'trbj_gene': None,
-                    'trbd_gene': None,
-                    'trb': None,
+                    'trbv_gene': '',
+                    'trbj_gene': '',
+                    'trbd_gene': '',
+                    'trb': '',
                     'sequence': f"{row['cdr3_b_aa']};",
                 }
             elif "TRBV" in row['v_b_gene']:
                 return {
-                    'tid': None,
-                    'trav_gene': None,
-                    'traj_gene': None,
-                    'trad_gene': None,
-                    'tra': None,
+                    'tid': '',
+                    'trav_gene': '',
+                    'traj_gene': '',
+                    'trad_gene': '',
+                    'tra': '',
                     'trbv_gene': row['v_b_gene'],
                     'trbj_gene': row['j_b_gene'],
-                    'trbd_gene': None,
+                    'trbd_gene': '',
                     'trb': row['cdr3_b_aa'],
                     'sequence': f"{row['cdr3_b_aa']};",
                 }
             return None
 
-        # Define a partition-level processing function
         def process_partition(partition):
-            # Iterate over rows and process
-            rows = [
-                process_row(row) for _, row in partition.iterrows()
-                if process_row(row) is not None
-            ]
-            # Convert to a list of dictionaries matching fixed_columns
+            # Process each row and keep only non-None results
+            rows = [process_row(row) for _, row in partition.iterrows() if process_row(row) is not None]
+            # If no rows processed, return an empty DataFrame with the fixed columns.
             if not rows:
-                return dd.utils.make_meta(meta)
-            return rows
+                return pd.DataFrame(columns=fixed_columns).astype({col: "object" for col in fixed_columns})
+            # Otherwise, return a DataFrame constructed from the list of dictionaries.
+            partition_table = pd.DataFrame(rows, columns=fixed_columns)
+            return partition_table.astype({col: "object" for col in fixed_columns})
 
-        # Apply the processing function to each partition
-        formatted_sequences = airr_table.map_partitions(
-            lambda partition: process_partition(partition), meta=meta
-        )
+        # Apply the processing function to each partition (this returns a Dask DataFrame natively)
+        formatted_sequences = airr_table.map_partitions(process_partition, meta=meta)
 
-        # Convert the list of dictionaries directly to a Dask DataFrame
-        mri_table = dd.from_delayed(
-            formatted_sequences.to_delayed(), meta=meta
-        )
+        # Now, instead of converting from delayed objects, use the resulting Dask DataFrame directly.
+        mri_table = formatted_sequences
 
         # Drop duplicates lazily
         sequence_table = mri_table.drop_duplicates(subset='sequence')
 
-        # Add metadata lazily
+        # Add metadata columns
         mri_table = mri_table.assign(
             repertoire_id=self.repertoire_id,
             study_id=self.study_id,
@@ -852,7 +878,8 @@ class BulkFileParser:
         )
         sequence_table = sequence_table.assign(source='bulk_survey')
 
-        # Ensure the sequence table has the fixed columns
+        # Optionally standardize columns with your functions
         sequence_table = standardize_sequence(sequence_table)
+        mri_table = standardize_mri(mri_table)
 
         return mri_table, sequence_table
