@@ -13,7 +13,7 @@ from parsers.airr_bulk_parser import BulkFileParser
 from parsers.airr_misc_parser import MiscFileParser
 from parsers.airr_database_parser import DatabaseParser
 from parsers.airr_paired_parser import PairedFileParser
-
+from parsers.utils import standardize_mri, standardize_sequence
 import dask.dataframe as dd
 
 def write_parquet_append(ddfs, output_path, overwrite=True, engine="pyarrow"):
@@ -50,12 +50,15 @@ def write_parquet_append(ddfs, output_path, overwrite=True, engine="pyarrow"):
             first_write = False
         else:
             # On subsequent iterations, append to the existing dataset
-            df.to_parquet(
-                output_path,
-                engine=engine,
-                write_index=False,
-                append=True
-            )
+            try:
+                df.to_parquet(
+                    output_path,
+                    engine=engine,
+                    write_index=False,
+                    append=True
+                )
+            except ValueError:
+                breakpoint()
 
 
 def load_config(config_path):
@@ -114,16 +117,20 @@ def parse_airrseq(study_path, config_path, output_path):
                                  'study_id', 'category', 'molecule_type', 
                                  'host_organism', 'source']
                     mri_table = mri_table[mri_order]
-                    mri_table = mri_table.astype("str")
-                    sequence_table = sequence_table.astype("str")
+                    mri_table = standardize_mri(mri_table)
+                    sequence_table = standardize_sequence(sequence_table)
+                    # try:
+                    #     mri_table.head(1)
+                    # except ValueError:
+                    #     breakpoint()
                     mri_tables.append(mri_table)
                     sequence_tables.append(sequence_table)
                 else:
                     open('missing_data.txt', 'a').write(f'{file_path}\n')
     
-
-    write_parquet_append(mri_tables, f"{output_path}/mri/airr_seq_data.parquet", overwrite=True)
     write_parquet_append(sequence_tables, f"{output_path}/sequence/airr_seq_data.parquet", overwrite=True)
+    write_parquet_append(mri_tables, f"{output_path}/mri/airr_seq_data.parquet", overwrite=True)
+    
     return mri_tables, sequence_tables
 
 
