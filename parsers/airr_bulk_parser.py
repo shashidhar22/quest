@@ -100,54 +100,76 @@ class BulkFileParser:
     
     def _parse_format_one(self):
         """
-        Parse format one using Dask DataFrame operations only.
+        Parse format one using Dask DataFrame operations only, without calling compute().
         """
         # Drop unnecessary columns
-        processed = self.bulk_table.drop(columns=['VJCombo', 'Copy', 'ntCDR3', 'NetInsertionLength'])
+        processed = self.bulk_table.drop(
+            columns=['VJCombo', 'Copy', 'ntCDR3', 'NetInsertionLength'], 
+            errors='ignore'
+        )
 
-        # Detect chain type from the first entry in 'VGene' using map_partitions
-        def detect_chain_type(df):
-            if not df.empty:
-                return df.iloc[0]['VGene']
-            return ''
+        # We define a function that renames columns based on chain type
+        # by inspecting the first row of each partition
+        def transform_partition(df):
+            if df.empty:
+                # If partition is empty, just return it
+                return df
 
-        # Ensure that `detect_chain_type` returns a single-column Dask Series
-        # Detect chain type and drop missing values
-        chain_type_series = processed.map_partitions(detect_chain_type, meta=('VGene', 'string[pyarrow]'))
+            # Detect chain type from the first row's VGene
+            chain_type = df.iloc[0]['VGene']
 
-        # Compute the first non-null value from the series
-        chain_type = chain_type_series.compute().iloc[0]
+            if 'TRAV' in chain_type:
+                # Rename columns for TRA chain
+                df = df.rename(
+                    columns={
+                        'VGene': 'trav_gene',
+                        'JGene': 'traj_gene',
+                        'aaCDR3': 'tra'
+                    }
+                )
+                # Insert empty trbd_gene, etc. if needed
+                df['trad_gene'] = ''
+                df['trb'] = ''
+                df['trbv_gene'] = ''
+                df['trbj_gene'] = ''
+                df['trbd_gene'] = ''
+                df['sequence'] = df['tra'] + ';'
+
+            elif 'TRBV' in chain_type:
+                # Rename columns for TRB chain
+                df = df.rename(
+                    columns={
+                        'VGene': 'trbv_gene',
+                        'JGene': 'trbj_gene',
+                        'aaCDR3': 'trb'
+                    }
+                )
+                df['tra'] = ''
+                df['trav_gene'] = ''
+                df['traj_gene'] = ''
+                df['trad_gene'] = ''
+                df['trbd_gene'] = ''
+                df['sequence'] = df['trb'] + ';'
+            else:
+                raise ValueError(f"Unrecognized chain type in VGene: {chain_type}")
+
+            return df
+
         
-        # Process based on chain type
-        if 'TRAV' in chain_type:
-            # Rename columns for TRA chain and add trad_gene as NaN
-            mri_table = processed.rename(columns={
-                'VGene': 'trav_gene',
-                'JGene': 'traj_gene',
-                'aaCDR3': 'tra'
-            }).assign(trad_gene='')
+        # This is the minimal set you'll produce in transform_partition.
+        meta_cols = [
+            'trav_gene', 'traj_gene', 'trad_gene', 'tra',
+            'trbv_gene', 'trbj_gene', 'trbd_gene', 'trb',
+            'sequence' 
+        ]
+        meta = pd.DataFrame(columns=meta_cols).astype('string[pyarrow]')
 
-            # Create sequence table
-            sequence_table = mri_table[['trav_gene', 'trad_gene', 'traj_gene', 'tra']]
-            sequence_table['sequence'] = sequence_table['tra'] + ';'
+        # Apply transform lazily on each partition
+        processed = processed.map_partitions(transform_partition, meta=meta)
 
-        elif 'TRBV' in chain_type:
-            # Rename columns for TRB chain and add trbd_gene as NaN
-            mri_table = processed.rename(columns={
-                'VGene': 'trbv_gene',
-                'JGene': 'trbj_gene',
-                'aaCDR3': 'trb'
-            }).assign(trbd_gene='')
-
-            # Create sequence table
-            sequence_table = mri_table[['trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']]
-            sequence_table['sequence'] = sequence_table['trb'] + ';'
-
-        else:
-            raise ValueError(f"Unrecognized chain type in VGene: {chain_type}")
-
-        # Add metadata using assign
-        mri_table = mri_table.assign(
+        # Now we have either a TRA- or TRB-renamed DataFrame in each partition.
+        # We can continue with the "mri_table" logic:
+        mri_table = processed.assign(
             repertoire_id=self.repertoire_id,
             study_id=self.study_id,
             category=self.category,
@@ -155,13 +177,18 @@ class BulkFileParser:
             host_organism='human',
             source='bulk_survey'
         )
-        sequence_table = sequence_table.assign(source='bulk_survey')
 
-        # Standardize sequence table columns
+        # Construct the sequence_table from columns
+        # If you want it exactly as in your original code, you can filter the columns you need:
+        sequence_table = mri_table[['trav_gene', 'trad_gene', 'traj_gene', 'tra',
+                                    'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb', 'sequence', 'source']]
+
+        # Standardize them
         sequence_table = standardize_sequence(sequence_table)
         mri_table = standardize_mri(mri_table)
-        
+
         return mri_table, sequence_table
+
 
     
     def _parse_format_two(self):
@@ -413,7 +440,6 @@ class BulkFileParser:
 
         # Deduplicate the sequence table and standardize it
         sequence_table = mri_table.drop_duplicates(subset=['sequence'])
-        sequence_table = standardize_sequence(sequence_table)
 
         # Add the 'sequence' column
         sequence_table['sequence'] = sequence_table[['tra', 'trb']].map_partitions(
