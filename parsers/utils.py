@@ -255,7 +255,8 @@ def standardize_sequence(df):
     """
     fixed_columns = [
         'source', 'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
-        'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
+        'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'peptide', 'mhc_one',
+        'mhc_two', 'sequence'
     ]
 
     # Define metadata for all columns
@@ -294,8 +295,9 @@ def standardize_mri(df):
         dd.DataFrame: Standardized Dask DataFrame.
     """
     fixed_columns = ['tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene', 'trb',
-        'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence', 'repertoire_id',
-        'study_id', 'category', 'molecule_type', 'host_organism', 'source']
+        'trbd_gene', 'trbj_gene', 'trbv_gene', 'peptide', 'mhc_one', 'mhc_two', 
+        'sequence', 'repertoire_id', 'study_id', 'category', 'molecule_type',
+        'host_organism', 'source']
 
     # Define metadata for all columns
     meta = OrderedDict({col: 'string[pyarrow]' for col in fixed_columns})
