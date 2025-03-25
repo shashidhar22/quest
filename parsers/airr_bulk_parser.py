@@ -134,6 +134,7 @@ class BulkFileParser:
                 df['trbj_gene'] = ''
                 df['trbd_gene'] = ''
                 df['sequence'] = df['tra'] + ';'
+                
 
             elif 'TRBV' in chain_type:
                 # Rename columns for TRB chain
@@ -152,7 +153,8 @@ class BulkFileParser:
                 df['sequence'] = df['trb'] + ';'
             else:
                 raise ValueError(f"Unrecognized chain type in VGene: {chain_type}")
-
+            df = df[['trav_gene', 'traj_gene', 'trad_gene', 'tra', 
+                        'trbv_gene', 'trbj_gene', 'trbd_gene', 'trb', 'sequence']]
             return df
 
         
@@ -162,7 +164,17 @@ class BulkFileParser:
             'trbv_gene', 'trbj_gene', 'trbd_gene', 'trb',
             'sequence' 
         ]
-        meta = pd.DataFrame(columns=meta_cols).astype('string[pyarrow]')
+        meta = OrderedDict({
+            'trav_gene': 'string[pyarrow]',
+            'traj_gene': 'string[pyarrow]',
+            'trad_gene': 'string[pyarrow]',
+            'tra': 'string[pyarrow]',
+            'trbv_gene': 'string[pyarrow]',
+            'trbj_gene': 'string[pyarrow]',
+            'trbd_gene': 'string[pyarrow]',
+            'trb': 'string[pyarrow]',
+            'sequence': 'string[pyarrow]'
+        })
 
         # Apply transform lazily on each partition
         processed = processed.map_partitions(transform_partition, meta=meta)
