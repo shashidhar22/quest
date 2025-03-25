@@ -9,68 +9,72 @@ import pyarrow.dataset as ds
 from tqdm import tqdm
 from itertools import permutations
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers
-from torch.utils.data import random_split
-from datasets import Dataset, DatasetDict
+from concurrent.futures import ProcessPoolExecutor
 
-# Import your updated class with RNN/transformer logic
+from datasets import DatasetDict, load_dataset
+from datasets import Features, Sequence, Value
+
+# Transformers for BERT-based tokenizer
+from transformers import AutoTokenizer  # NEW import
+
+# Custom dataset logic for amino acid sequences
 from quest.dataset import AminoAcidDataset
 
-# Constants from quest.constants
+# Constants
 from quest.constants import (
-    TRA_START, TRB_START, PEP_START, MHC1_START, MHC2_START,
+    SPECIAL_TOKENS, TRA_TOKENS, TRB_TOKENS, PEP_TOKENS, MHC1_TOKENS, 
+    MHC2_TOKENS,   PEP_START, MHC1_START, MHC2_START,
     END_TOKEN, PAD_TOKEN_STR, UNK_TOKEN_STR
 )
 
-# -----------------------------------------------------------------------------
-# 1) Argument Parsing
-# -----------------------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Load multiple Parquet files, generate permutations, sample, encode, and save as HF dataset."
+        description="Dataloader with incremental arrow writing using AminoAcidDataset."
     )
     parser.add_argument("-i", "--input", type=str, required=True, nargs='+',
-                        help="Directory containing multiple .parquet files.")
+                        help="Directory(ies) containing .parquet files.")
     parser.add_argument("-o", "--output", type=str, required=True,
-                        help="Output folder where HF dataset + dicts will be stored.")
+                        help="Output folder for final HF dataset.")
     parser.add_argument("-p", "--percentage", type=float, default=100,
-                        help="Percentage of sequences to select from the expanded set.")
+                        help="Percentage of expansions to keep per chunk (0-100).")
     parser.add_argument("-s", "--seq_length", type=int, default=21,
                         help="Max sequence length for model training.")
     parser.add_argument("--batch_size", type=int, default=500000,
-                        help="Rows per chunk to read from Parquet.")
+                        help="Rows per Parquet chunk.")
     parser.add_argument("--seed", type=int, default=1234,
                         help="Random seed.")
-
-    # Additional arguments
     parser.add_argument("--model_type", type=str, default="transformer",
                         choices=["transformer", "rnn"],
-                        help="Choose 'transformer' for entire-sequence causal LM, or 'rnn' for sliding-window samples.")
+                        help="Transformer or RNN mode in AminoAcidDataset.")
     parser.add_argument("--truncate_long_sequences", action="store_true",
-                        help="Truncate sequences longer than seq_length in transformer mode.")
+                        help="Truncate sequences longer than seq_length (transformer mode).")
     parser.add_argument("--train_ratio", type=float, default=0.8,
-                        help="Fraction of data for training.")
+                        help="Fraction of expansions in train split.")
     parser.add_argument("--val_ratio", type=float, default=0.1,
-                        help="Fraction of data for validation. Remainder is test.")
+                        help="Fraction of expansions in val split (test is remainder).")
     parser.add_argument("--build_tokenizer", action="store_true", default=False,
-                        help="Write a tokenizer")
+                        help="If true, train a new tokenizer from the expansions in the train set.")
     parser.add_argument("-v", "--vocab_size", type=int, default=200,
-                        help="Total number of iterations used in BPE, limits the vocab size to 200 token by default (needs to be optimized)")
+                        help="Vocabulary size for BPE tokenizer.")
+    parser.add_argument("--max_workers", type=int, default=None,
+                        help="Number of parallel processes (defaults to all cores).")
+    parser.add_argument(
+        "--tokenizer_type",
+        type=str,
+        default="bpe",
+        choices=["bpe", "bert"],
+        help="Choose whether to build/use BPE tokenizer or a pretrained BERT tokenizer."
+    )
     return parser.parse_args()
 
-
 def gather_parquet_files(paths):
-    """
-    Given a list of directory paths, gather all *.parquet files from each.
-    """
+    """Collect all *.parquet files from each directory in `paths`."""
     all_files = []
     for path in paths:
         found = glob.glob(os.path.join(path, '*.parquet'))
         all_files.extend(found)
     return all_files
 
-# -----------------------------------------------------------------------------
-# 2) Data Reading + Permutation Functions
-# -----------------------------------------------------------------------------
 def is_valid_sequence(seq):
     if not isinstance(seq, str) or not seq:
         return False
@@ -78,204 +82,385 @@ def is_valid_sequence(seq):
     return all(aa in valid_aas for aa in seq)
 
 def safe_get(row, key):
-    val = row.get(key, "")
-    if pd.isna(val):
+    val = getattr(row, key, "")
+    if pd.isna(val) or val == "NA":
         return ""
     return val
 
 def row_to_tagged_list(row):
+    """Convert relevant columns into a list of tagged sub-sequences."""
     mapping = [
-        ("tra", TRA_START),
-        ("trb", TRB_START),
-        ("peptide", PEP_START),
-        ("mhc_one", MHC1_START),
-        ("mhc_two", MHC2_START),
+        ("tra", TRA_TOKENS),
+        ("trb", TRB_TOKENS),
+        ("peptide",PEP_TOKENS),
+        ("mhc_one", MHC1_TOKENS),
+        ("mhc_two", MHC2_TOKENS),
     ]
     tagged = []
-    for col, start_tk in mapping:
+    for col, tokens in mapping:
+        start_tk, end_tk = tokens
         val = safe_get(row, col)
         if val and is_valid_sequence(val):
-            tagged.append(f"{start_tk} {val} {END_TOKEN}")
+            if 'O' in val or '[' in val or ']' in val:
+                breakpoint()
+            tagged.append(f"{start_tk} {val} {end_tk}")
     return tagged
 
 def generate_permutations_of_tagged(tagged):
+    """Generate permutations of the tagged sequences."""
     if not tagged:
         return []
     results = []
     n = len(tagged)
     for r in range(1, n + 1):
         for perm in permutations(tagged, r):
-            results.append(" ".join(perm))
+            sequence = " ".join(perm) + " [END]"
+            results.append(sequence)
     return results
 
-# -----------------------------------------------------------------------------
-# 3) Tokenizer
-# -----------------------------------------------------------------------------
+def process_chunk(df_chunk):
+    """
+    Expand a single chunk:
+      - row_to_tagged_list()
+      - generate_permutations_of_tagged()
+    Return a list of raw text expansions (strings).
+    """
+    if "tra" in df_chunk.columns:
+        df_chunk.loc[df_chunk["tra"].str.len() < 8, "tra"] = pd.NA
+    if "trb" in df_chunk.columns:
+        df_chunk.loc[df_chunk["trb"].str.len() < 8, "trb"] = pd.NA
+    if "peptide" in df_chunk.columns:
+        df_chunk.loc[df_chunk["peptide"].str.len() < 4, "peptide"] = pd.NA
+    local_expansions = []
+    for row in df_chunk.itertuples(index=False):
+        tagged = row_to_tagged_list(row)
+        if tagged:
+            perms = generate_permutations_of_tagged(tagged)
+            local_expansions.extend(perms)
+    return local_expansions
+
 def train_bpe_tokenizer(train_sequences, vocab_size=200):
+    # 1) Pre-check pass (optional)
+    debug_pretok = pre_tokenizers.Split(pattern=r" ", behavior="removed")
+    for seq in train_sequences:
+        chunks = debug_pretok.pre_tokenize_str(seq)
+        for chunk, offsets in debug_pretok.pre_tokenize_str(seq):
+            if "O" in chunk:
+                print("Seq")
+                print(seq)
+                print("Pretoken")
+                print(chunks)
+                print(f"Found 'O' in chunk: '{chunk}' within sequence: '{seq}'")
+    # 2) Now train
     tokenizer = Tokenizer(models.BPE())
-    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-    special_tokens = [
-        PAD_TOKEN_STR, UNK_TOKEN_STR,
-        TRA_START, TRB_START, PEP_START, MHC1_START, MHC2_START, END_TOKEN
-    ]
-    trainer = trainers.BpeTrainer(special_tokens=special_tokens, vocab_size = vocab_size)
+    tokenizer.pre_tokenizer = debug_pretok
+    special_tokens = SPECIAL_TOKENS
+    trainer = trainers.BpeTrainer(special_tokens=special_tokens, vocab_size=vocab_size)
+
     tokenizer.train_from_iterator(train_sequences, trainer)
     return tokenizer
 
-# -----------------------------------------------------------------------------
-# 4) High-level Pipeline Functions
-# -----------------------------------------------------------------------------
-def read_all_parquet_in_chunks(parquet_files, batch_size):
+import pyarrow as pa
+import os
+
+def chunked_store_raw_expansions(
+    expansions,
+    arrow_dir,
+    shard_prefix,
+    shard_index
+):
     """
-    Yields dataframes in 'chunk_size' from all .parquet files in 'parquet_dir'.
+    Stores the raw expansions (strings) in a single 'sequence' column in Arrow.
     """
-    dataset = ds.dataset(parquet_files, format="parquet")
-    scanner = dataset.scanner(batch_size=batch_size)
+    # expansions is a list of strings
+    arrow_rows = []
+    for seq in expansions:
+        arrow_rows.append({
+            "sequence": seq
+        })
 
-    for record_batch in scanner.to_batches():
-        df_chunk = pa.Table.from_batches([record_batch]).to_pandas()
-        yield df_chunk
+    table = pa.Table.from_pylist(arrow_rows, schema=pa.schema([
+        pa.field("sequence", pa.string())
+    ]))
 
-def build_all_sequences(parquet_files, batch_size):
+    os.makedirs(arrow_dir, exist_ok=True)
+    shard_path = os.path.join(arrow_dir, f"{shard_prefix}_{shard_index}.arrow")
+    with pa.OSFile(shard_path, "wb") as sink:
+        with pa.RecordBatchFileWriter(sink, table.schema) as writer:
+            writer.write_table(table)
+
+    return len(arrow_rows)
+
+def chunked_encode_and_write(
+    expansions, tokenizer, seq_length, model_type, truncate_long_sequences,
+    arrow_dir, shard_prefix, shard_index
+):
     """
-    Reads all Parquet in chunks, for each row generates permutations,
-    and accumulates in a list. Returns that list of expansions.
+    1) Build an AminoAcidDataset from expansions.
+    2) Iterate over that dataset to produce (input_ids, target_ids).
+    3) Write them to an Arrow file: arrow_dir/shard_prefix_{shard_index}.arrow
     """
-    all_sequences = []
-    total_rows = 0
+    # Build the custom dataset
+    ds = AminoAcidDataset(
+        sequences=expansions,
+        tokenizer=tokenizer,
+        seq_length=seq_length,
+        model_type=model_type,
+        step=1,
+        truncate_long_sequences=truncate_long_sequences
+    )
 
-    # Count total rows to show progress bar
-    ds_ = ds.dataset(parquet_files, format="parquet")
-    total_rows_est = ds_.count_rows()
+    if not ds:  # empty dataset
+        return 0
 
-    with tqdm(total=total_rows_est, desc="Reading & permutations") as pbar:
-        for df_chunk in read_all_parquet_in_chunks(parquet_files, batch_size):
-            chunk_size = len(df_chunk)
-            total_rows += chunk_size
-            local_expansions = []
-            for _, row in df_chunk.iterrows():
-                tagged = row_to_tagged_list(row)
-                if tagged:
-                    perms = generate_permutations_of_tagged(tagged)
-                    local_expansions.extend(perms)
+    # Convert each (x, y) to a dictionary for Arrow
+    arrow_rows = []
+    for i in range(len(ds)):
+        input_tensor, target_tensor = ds[i]  # each is a torch.Tensor
+        arrow_rows.append({
+            "input_ids": input_tensor.tolist(),
+            "target_ids": target_tensor.tolist()
+        })
 
-            all_sequences.extend(local_expansions)
-            pbar.update(chunk_size)
-            pbar.set_postfix({
-                "Rows": total_rows,
-                "TotalSeqs": len(all_sequences),
-            })
+    # Create a PyArrow table
+    table = pa.Table.from_pylist(arrow_rows, schema=pa.schema([
+        pa.field("input_ids", pa.list_(pa.int32())),
+        pa.field("target_ids", pa.list_(pa.int32()))
+    ]))
 
-    return all_sequences
+    # Write to arrow file
+    os.makedirs(arrow_dir, exist_ok=True)
+    shard_path = os.path.join(arrow_dir, f"{shard_prefix}_{shard_index}.arrow")
+    with pa.OSFile(shard_path, "wb") as sink:
+        with pa.RecordBatchFileWriter(sink, table.schema) as writer:
+            writer.write_table(table)
 
-def sample_sequences(all_sequences, percentage):
-    """
-    Randomly sample a given percentage of sequences if 0<percentage<100
-    """
-    if 0 < percentage < 100:
-        sample_size = int(len(all_sequences) * (percentage / 100.0))
-        all_sequences = random.sample(all_sequences, sample_size)
-    return all_sequences
+    return len(ds)
 
-def split_data(all_sequences, train_ratio, val_ratio, seed):
-    """
-    Shuffle + split into train/val/test based on ratios.
-    """
-    random.seed(seed)
-    random.shuffle(all_sequences)
-    total = len(all_sequences)
-    train_end = int(total * train_ratio)
-    val_end   = int(total * (train_ratio + val_ratio))
-
-    train_texts = all_sequences[:train_end]
-    val_texts   = all_sequences[train_end:val_end]
-    test_texts  = all_sequences[val_end:]
-    return train_texts, val_texts, test_texts
-
-def convert_to_hf_dataset(torch_dataset):
-    """
-    Convert a PyTorch dataset returning (x, y) -> HF Dataset with 'input_ids' and 'target_ids'.
-    """
-    data = [torch_dataset[i] for i in range(len(torch_dataset))]
-    input_ids, target_ids = [], []
-    for (x, y) in data:
-        input_ids.append(x.tolist())
-        target_ids.append(y.tolist())
-    return Dataset.from_dict({"input_ids": input_ids, "target_ids": target_ids})
-
-# -----------------------------------------------------------------------------
-# 5) Main Workflow
-# -----------------------------------------------------------------------------
 def main():
     args = parse_args()
     random.seed(args.seed)
     os.makedirs(args.output, exist_ok=True)
 
-    # 1) Collect all .parquet files from each path in args.input
+    # 1) Gather parquet files
     parquet_files = gather_parquet_files(args.input)
     if not parquet_files:
         raise ValueError(f"No .parquet files found in {args.input} directories.")
 
-    # (A) Read + generate expansions
-    all_sequences = build_all_sequences(parquet_files, args.batch_size)
-    if not all_sequences:
-        raise ValueError("No expansions generated from parquet.")
+    # 2) Arrow directories for each split to store chunked shards
+    train_dir = os.path.join(args.output, "train_shards")
+    val_dir   = os.path.join(args.output, "val_shards")
+    test_dir  = os.path.join(args.output, "test_shards")
 
-    # (B) Percentage-based sampling
-    if 0 < args.percentage < 100:
-        all_sequences = sample_sequences(all_sequences, args.percentage)
-        print(f"After sampling {args.percentage}%, sequences = {len(all_sequences)}")
+    # 3) Count total rows for progress
+    ds_ = ds.dataset(parquet_files, format="parquet")
+    total_rows_est = ds_.count_rows()
 
-    # (C) Split data
-    train_texts, val_texts, test_texts = split_data(
-        all_sequences, args.train_ratio, args.val_ratio, args.seed
-    )
-    print(f"Train={len(train_texts)}, Val={len(val_texts)}, Test={len(test_texts)}")
+    # 4) Parallel chunk expansions
+    parquet_dataset = ds.dataset(parquet_files, format="parquet")
+    scanner = parquet_dataset.scanner(batch_size=args.batch_size)
 
-    # (D) Train tokenizer on train set only
-    if not os.path.exists(os.path.join(args.output, "tokenizer.json")) or args.build_tokenizer:
-        tokenizer = train_bpe_tokenizer(train_texts, args.vocab_size)
-        tokenizer.save(os.path.join(args.output, "tokenizer.json"))
-        print(f"Tokenizer saved to file: {os.path.join(args.output, "tokenizer.json")}")
-    else:
-        print("Skipping BPE")
+    pbar = tqdm(total=total_rows_est, desc="Reading & Permutations")
+    futures = []
+    with ProcessPoolExecutor(max_workers=args.max_workers) as executor:
+        for record_batch in scanner.to_batches():
+            df_chunk = pa.Table.from_batches([record_batch]).to_pandas()
+            fut = executor.submit(process_chunk, df_chunk)
+            futures.append((fut, len(df_chunk)))
 
-    # (E) Build PyTorch datasets (RNN or Transformer mode)
-    train_ds = AminoAcidDataset(
-        sequences=train_texts,
-        tokenizer=tokenizer,
-        seq_length=args.seq_length,
-        model_type=args.model_type,
-        step=1,
-        truncate_long_sequences=args.truncate_long_sequences
-    )
-    val_ds = AminoAcidDataset(
-        sequences=val_texts,
-        tokenizer=tokenizer,
-        seq_length=args.seq_length,
-        model_type=args.model_type,
-        step=1,
-        truncate_long_sequences=args.truncate_long_sequences
-    )
-    test_ds = AminoAcidDataset(
-        sequences=test_texts,
-        tokenizer=tokenizer,
-        seq_length=args.seq_length,
-        model_type=args.model_type,
-        step=1,
-        truncate_long_sequences=args.truncate_long_sequences
-    )
-    print(f"train_ds: {len(train_ds)}, val_ds: {len(val_ds)}, test_ds: {len(test_ds)}")
+        expansions_buffer = []
+        for chunk_idx, (fut, chunk_size) in enumerate(futures):
+            expansions = fut.result()
+            pbar.update(chunk_size)
 
-    # (F) (Optional) Convert to Hugging Face dataset
-    hf_train = convert_to_hf_dataset(train_ds)
-    hf_val   = convert_to_hf_dataset(val_ds)
-    hf_test  = convert_to_hf_dataset(test_ds)
-    ds_dict  = DatasetDict({"train": hf_train, "validation": hf_val, "test": hf_test})
+            # 4a) If 0<percentage<100, sample expansions
+            if 0 < args.percentage < 100:
+                sample_size = int(len(expansions) * (args.percentage / 100.0))
+                expansions = random.sample(expansions, sample_size)
+
+            # 4b) Shuffle expansions and split them
+            random.shuffle(expansions)
+            n = len(expansions)
+            train_end = int(n * args.train_ratio)
+            val_end   = int(n * (args.train_ratio + args.val_ratio))
+
+            chunk_train = expansions[:train_end]
+            chunk_val   = expansions[train_end:val_end]
+            chunk_test  = expansions[val_end:]
+
+            # We store train expansions if we need to build tokenizer from them later
+            expansions_buffer.extend(chunk_train)
+
+        pbar.close()
+
+    # 5) Build or load tokenizer
+    tokenizer_path = os.path.join(args.output, "tokenizer.json")
+
+    if args.tokenizer_type == "bert":
+        print("Using a BERT tokenizer from Hugging Face Transformers.")
+        # If user wants a standard checkpoint (e.g., 'bert-base-cased'):
+        tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
+
+        # Optionally add special tokens you want:
+        additional_tokens = SPECIAL_TOKENS
+        tokenizer.add_special_tokens({"additional_special_tokens": additional_tokens})
+        # This won't produce a 'tokenizer.json' with your BERT tokenizer in the same
+        # format as the 'tokenizers' library, but we can still handle saving a slow
+        # or fast tokenizer. Let's do a safe_pretrained approach below:
+        tokenizer.save_pretrained(args.output)
+        print(f"BERT tokenizer saved to {args.output}")
+
+    else:  # "bpe"
+        if not os.path.exists(tokenizer_path) or args.build_tokenizer:
+            print("Building a new BPE tokenizer from the collected train expansions...")
+            tokenizer = train_bpe_tokenizer(expansions_buffer, vocab_size=args.vocab_size)
+            tokenizer.save(tokenizer_path)
+            print(f"BPE tokenizer saved at {tokenizer_path}")
+        else:
+            print("Tokenizer file found. Loading existing BPE tokenizer...")
+            tokenizer = Tokenizer.from_file(tokenizer_path)
+
+    # 6) We must now re-process the chunks *again*, but this time we have the tokenizer.
+    #    Because we never wrote expansions out to disk in step 4, we must do it once more
+    #    to produce the final arrow shards with (input_ids, target_ids).
+    #    To avoid reading the entire expansions into memory, let's do chunk expansions again, 
+    #    but now we do on-the-fly encoding & arrow writing for each chunk.
+
+    # We'll repeat the scanning logic, but each chunk is *immediately* turned into 
+    # train/val/test arrow shards (input_ids + target_ids).
+
+    print("Second pass: building final arrow shards with tokenized (input_ids, target_ids).")
+    # Reset the scanner
+    parquet_dataset = ds.dataset(parquet_files, format="parquet")
+    scanner2 = parquet_dataset.scanner(batch_size=args.batch_size)
+
+    # We'll track how many shards we write per split
+    train_shard_count = 0
+    val_shard_count   = 0
+    test_shard_count  = 0
+
+    # In parallel or single-thread? Typically single-thread is simpler 
+    # because we must write arrow files from each chunk. 
+    # We'll do single-thread to avoid collisions writing shards. 
+    # (One can do it with e.g. locked counters, but let's keep it simpler.)
+
+    pbar2 = tqdm(total=total_rows_est, desc="Second Pass: Tokenizing & Writing Shards")
+    for record_batch in scanner2.to_batches():
+        df_chunk = pa.Table.from_batches([record_batch]).to_pandas()
+        expansions = process_chunk(df_chunk)  # expansions is a list of raw text
+        pbar2.update(len(df_chunk))
+
+        # sample expansions
+        if 0 < args.percentage < 100:
+            sample_size = int(len(expansions) * (args.percentage / 100.0))
+            expansions = random.sample(expansions, sample_size)
+
+        # split
+        random.shuffle(expansions)
+        n = len(expansions)
+        train_end = int(n * args.train_ratio)
+        val_end   = int(n * (args.train_ratio + args.val_ratio))
+
+        chunk_train = expansions[:train_end]
+        chunk_val   = expansions[train_end:val_end]
+        chunk_test  = expansions[val_end:]
+
+        # 6a) Encode train chunk & write arrow
+        if args.tokenizer_type == "bert":
+            # ================ BERT branch: store raw expansions only ================
+            if chunk_train:
+                n_train = chunked_store_raw_expansions(
+                    expansions=chunk_train,
+                    arrow_dir=train_dir,
+                    shard_prefix="train",
+                    shard_index=train_shard_count
+                )
+                train_shard_count += 1
+
+            if chunk_val:
+                n_val = chunked_store_raw_expansions(
+                    expansions=chunk_val,
+                    arrow_dir=val_dir,
+                    shard_prefix="val",
+                    shard_index=val_shard_count
+                )
+                val_shard_count += 1
+
+            if chunk_test:
+                n_test = chunked_store_raw_expansions(
+                    expansions=chunk_test,
+                    arrow_dir=test_dir,
+                    shard_prefix="test",
+                    shard_index=test_shard_count
+                )
+                test_shard_count += 1
+
+        else:
+            # ================ BPE branch: use your existing custom logic ================
+            if chunk_train:
+                n_train = chunked_encode_and_write(
+                    expansions=chunk_train,
+                    tokenizer=tokenizer,
+                    seq_length=args.seq_length,
+                    model_type=args.model_type,
+                    truncate_long_sequences=args.truncate_long_sequences,
+                    arrow_dir=train_dir,
+                    shard_prefix="train",
+                    shard_index=train_shard_count
+                )
+                train_shard_count += 1
+
+            if chunk_val:
+                n_val = chunked_encode_and_write(
+                    expansions=chunk_val,
+                    tokenizer=tokenizer,
+                    seq_length=args.seq_length,
+                    model_type=args.model_type,
+                    truncate_long_sequences=args.truncate_long_sequences,
+                    arrow_dir=val_dir,
+                    shard_prefix="val",
+                    shard_index=val_shard_count
+                )
+                val_shard_count += 1
+
+            if chunk_test:
+                n_test = chunked_encode_and_write(
+                    expansions=chunk_test,
+                    tokenizer=tokenizer,
+                    seq_length=args.seq_length,
+                    model_type=args.model_type,
+                    truncate_long_sequences=args.truncate_long_sequences,
+                    arrow_dir=test_dir,
+                    shard_prefix="test",
+                    shard_index=test_shard_count
+                )
+                test_shard_count += 1
+    pbar2.close()
+
+    # 7) Now we have multiple shard files in train_dir, val_dir, test_dir.
+    #    We'll load them into a huggingface DatasetDict.
+    print("Loading final shards into a Hugging Face DatasetDict...")
+
+    from datasets import load_dataset
+
+    train_shards = sorted(glob.glob(os.path.join(train_dir, "train_*.arrow")))
+    val_shards   = sorted(glob.glob(os.path.join(val_dir,   "val_*.arrow")))
+    test_shards  = sorted(glob.glob(os.path.join(test_dir,  "test_*.arrow")))
+
+    # load_dataset(..., split="train") merges them
+    train_ds = load_dataset("arrow", data_files=train_shards, split="train")
+    val_ds   = load_dataset("arrow", data_files=val_shards,   split="train")
+    test_ds  = load_dataset("arrow", data_files=test_shards,  split="train")
+
+    ds_dict = DatasetDict({
+        "train": train_ds,
+        "validation": val_ds,
+        "test": test_ds
+    })
+
+    # 8) Save final dataset
     ds_dict.save_to_disk(args.output)
-    print("HF dataset saved.")
-
-    print("All done!")
+    print("All done! Final dataset saved to:", args.output)
 
 if __name__ == "__main__":
     main()
