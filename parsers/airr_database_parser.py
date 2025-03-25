@@ -62,8 +62,8 @@ class DatabaseParser:
         vdjdb_table = dd.read_csv(
             database_path, sep="\t",
             assume_missing=True,
-            dtype={'d.beta': 'str', 'meta.epitope.id': 'str'}
-        )
+
+            dtype=str, na_filter=False)
         if self.test:
             vdjdb_table = vdjdb_table.sample(frac=0.1, random_state=21)
         # Define column renaming mapping
@@ -91,7 +91,7 @@ class DatabaseParser:
 
         # Filter and rename columns lazily
         vdjdb_table = vdjdb_table.loc[
-            (vdjdb_table['species'] == 'HomoSapiens') & (vdjdb_table['vdjdb.score'] > 0),
+            (vdjdb_table['species'] == 'HomoSapiens') & (vdjdb_table['vdjdb.score'] != '0'),
             list(relevant_columns.keys()) + ['vdjdb.score']
         ].rename(columns=relevant_columns)
 
@@ -175,7 +175,7 @@ class DatabaseParser:
             study_id = file_path.stem  # Extract study_id from filename
 
             # Read the file lazily
-            tcr_table = dd.read_csv(file_path, sep="\t", dtype="str", assume_missing=True)
+            tcr_table = dd.read_csv(file_path, sep="\t", assume_missing=True, dtype=str, na_filter=False)
             if self.test:
                 tcr_table = tcr_table.sample(frac=0.1, random_state=21)
             # Rename columns for consistency
@@ -227,7 +227,7 @@ class DatabaseParser:
         database_path = self.config['databases']['mcpas_tcr']
         
         # Read the McPAS-TCR data using Dask
-        mcpastcr_table = dd.read_csv(database_path, assume_missing=True, dtype="str")
+        mcpastcr_table = dd.read_csv(database_path, assume_missing=True, dtype=str, na_filter=False)
         if self.test:
                 mcpastcr_table = mcpastcr_table.sample(frac=0.1, random_state=21)
         # Rename columns for consistency
@@ -322,7 +322,6 @@ class DatabaseParser:
         tcell_table = dd.read_csv(
             database_path, 
             sep="\t",
-            dtype="str",
             names=[
                 'study_id', 'epitope_type', 'peptide', 'epitope_reference_name',
                 'epitope_source_molecule', 'epitope_source_organism',
@@ -331,8 +330,7 @@ class DatabaseParser:
                 'assay_response', 'assay_outcome', 'assay_subject_count',
                 'assay_positive_count', 'source_tissue', 'mhc_restriction'
             ],
-            header=0
-        )
+            header=0, dtype=str, na_filter=False)
         if self.test:
                 tcell_table = tcell_table.sample(frac=0.1, random_state=21)
         # Drop rows where 'study_id' is missing and keep only positive assay outcomes
@@ -447,8 +445,7 @@ class DatabaseParser:
             sep="\t",
             names=column_names,
             header=0,
-            dtype="str"
-        ).dropna(subset=['study_id'])
+            dtype=str, na_filter=False)
 
         if self.test:
                 mhc_ligand_table = mhc_ligand_table.sample(frac=0.1, random_state=21)
@@ -554,8 +551,7 @@ class DatabaseParser:
             sep="\t",
             names=column_names,
             header=0,
-            dtype="str"
-        )
+            dtype=str, na_filter=False)
 
         if self.test:
                 receptor_table = receptor_table.sample(frac=0.1, random_state=21)
@@ -663,12 +659,11 @@ class DatabaseParser:
         database_table = dd.read_csv(
             database_path,
             sep="\t",
-            dtype=str,
             usecols=[
                 'data_processing_id', 'repertoire_id', 'cell_id', 'clone_id', 'productive',
                 'locus', 'v_call', 'd_call', 'j_call', 'junction_aa'
-            ]
-        )
+            ],
+            dtype=str, na_filter=False)
 
         if self.test:
                 database_table = database_table.sample(frac=0.1, random_state=21)
@@ -734,12 +729,11 @@ class DatabaseParser:
         tcr_table = dd.read_csv(
             database_path,
             sep="\t",
-            dtype=str,
             usecols=[
                 'repertoire_id', 'cell_id', 'clone_id', 'productive', 'locus',
                 'v_call', 'd_call', 'j_call', 'junction_aa'
-            ]
-        )
+            ],
+            dtype=str, na_filter=False)
 
         if self.test:
                 tcr_table = tcr_table.sample(frac=0.1, random_state=21)
