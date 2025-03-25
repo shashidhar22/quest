@@ -190,6 +190,7 @@ def format_combined_tcell(barcode, index, tra, trb):
             'trb': trb[0]
         })
 
+   
     # Create the sequence column
     result_dict['sequence'] = ' '.join(
         filter(None, [result_dict.get('tra'), result_dict.get('trb')])
@@ -232,11 +233,11 @@ def process_barcode_group(df):
                 formatted_contigs.append(result_dict)
         elif tra_seqs:  # TRA only
             for index, tra in enumerate(tra_seqs, start=1):
-                result_dict = format_combined_tcell(barcode, index, tra, None, tra_only=True)
+                result_dict = format_combined_tcell(barcode, index, tra, '', tra_only=True)
                 formatted_contigs.append(result_dict)
         elif trb_seqs:  # TRB only
             for index, trb in enumerate(trb_seqs, start=1):
-                result_dict = format_combined_tcell(barcode, index, None, trb, tra_only=False)
+                result_dict = format_combined_tcell(barcode, index, '', trb, tra_only=False)
                 formatted_contigs.append(result_dict)
     return pd.DataFrame(formatted_contigs)
 
@@ -254,17 +255,58 @@ def standardize_sequence(df):
     """
     fixed_columns = [
         'source', 'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
-        'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
+        'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'peptide', 'mhc_one',
+        'mhc_two', 'sequence'
     ]
 
     # Define metadata for all columns
-    meta = OrderedDict({col: 'object' for col in fixed_columns})
+    meta = OrderedDict({col: 'string[pyarrow]' for col in fixed_columns})
 
     # Ensure all columns are present by adding missing columns with default value None
     def add_missing_columns(partition):
         for col in fixed_columns:
             if col not in partition.columns:
-                partition[col] = None
+                partition[col] = ''
+        partition = partition[meta.keys()]
+        return partition
+
+    def reorder_columns(df, columns):
+    # Reindex with the correct order
+        return df[columns]
+
+    # Apply the function to each partition and enforce fixed columns
+    df = df.map_partitions(add_missing_columns, meta=meta)
+
+    # Reorder columns to match the fixed set
+    df = df.map_partitions(reorder_columns, columns=fixed_columns)
+
+    return df
+
+def standardize_mri(df):
+    """
+    Ensure the Dask DataFrame has the fixed set of columns.
+    Missing columns are added with default values (None).
+    Columns are reordered to match the fixed set.
+
+    Args:
+        df (dd.DataFrame): Input Dask DataFrame.
+
+    Returns:
+        dd.DataFrame: Standardized Dask DataFrame.
+    """
+    fixed_columns = ['tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene', 'trb',
+        'trbd_gene', 'trbj_gene', 'trbv_gene', 'peptide', 'mhc_one', 'mhc_two', 
+        'sequence', 'repertoire_id', 'study_id', 'category', 'molecule_type',
+        'host_organism', 'source']
+
+    # Define metadata for all columns
+    meta = OrderedDict({col: 'string[pyarrow]' for col in fixed_columns})
+
+    # Ensure all columns are present by adding missing columns with default value None
+    def add_missing_columns(partition):
+        for col in fixed_columns:
+            if col not in partition.columns:
+                partition[col] = ''
         partition = partition[meta.keys()]
         return partition
 
