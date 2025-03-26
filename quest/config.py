@@ -5,6 +5,9 @@ SWEEP_CONFIG = {
     "metric": {"name": "val_loss", "goal": "minimize"},
     "parameters": {
         "batch_size": {"values": [64, 128, 256, 512]},
+        "data_size": {"values": [0.1, 10, 50, 100]},
+        "sequence_length": {"values": [12, 18, 32, 64, 128]},
+        "vocab_size": {"values": [27, 50, 100, 1000, 10000]},
         "embedding_dim": {"values": [64, 128, 256, 512]},
         "hidden_dim": {"values": [64, 128, 256, 512]},
         "num_layers": {"values": [1, 2, 3, 4, 5]},
