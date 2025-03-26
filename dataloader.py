@@ -43,7 +43,7 @@ def parse_args():
                         help="Rows per Parquet chunk.")
     parser.add_argument("--seed", type=int, default=1234,
                         help="Random seed.")
-    parser.add_argument("--model_type", type=str, default="transformer",
+    parser.add_argument("-m", "--model_type", type=str, default="transformer",
                         choices=["transformer", "rnn"],
                         help="Transformer or RNN mode in AminoAcidDataset.")
     parser.add_argument("--truncate_long_sequences", action="store_true",
