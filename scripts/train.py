@@ -30,7 +30,8 @@ def train_model(config=None, sweep=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', '--dataset', type=str, required=True)
-    parser.add_argument('-s', '--sweep', action='store_true')
+    parser.add_argument('-s', '--sweep', type='store_true')
+    parser.add_argument('-i', '--sweepid', type=int, default=0)
     parser.add_argument('-m', '--model', type=str, choices=['lstm', 'bilstm', 'transformer', 'bert'], default='lstm')
     parser.add_argument('-l', '--log', type=str, default='temp/logs')
     parser.add_argument('-r', '--resume', action='store_true')
@@ -80,18 +81,26 @@ def main():
         if args.tokenizer:
             tokenizer_path = args.tokenizer
         else:
-            tokenizer_path = f'{args.dataset}/tokenizer.json'
+            tokenizer_path = None
         if not args.checkpoint:
             checkpoint_path = f'data/models/{args.model}.pt'
         else:
             checkpoint_path = args.checkpoint
         if args.sweep:
             # Modify your SWEEP_CONFIG to set the dataset
-            SWEEP_CONFIG['parameters']['dataset'] = {'value': args.dataset}
+            percentages = SWEEP_CONFIG['parameters']['data_size']['values']
+            slen = SWEEP_CONFIG['parameters']['sequence_length']['values']
+            vocab = SWEEP_CONFIG['parameters']['vocab_size']['values']
+
+            datasets = [ f"{args.dataset}_{p}P_{s}L_{v}V" for p in percentages for s in slen for v in vocab]
+            SWEEP_CONFIG['parameters']['dataset'] = {'value': datasets}
             SWEEP_CONFIG['parameters']['tokenizer_path'] = {'value': tokenizer_path}
             SWEEP_CONFIG['parameters']['method'] = {'value': 'bayes'}
-            sweep_id = wandb.sweep(SWEEP_CONFIG, project="quest_sweep")
-            wandb.agent(sweep_id, function=lambda: train_model(wandb.config, args.sweep), count=50)
+            if args.sweepid:
+                sweep_id = args.sweepid
+            else:
+                sweep_id = wandb.sweep(SWEEP_CONFIG, project="quest_lstm_sweep")
+            wandb.agent(sweep_id, function=lambda: train_model(wandb.config, args.sweep), count=10)
         else:
             config = DEFAULT_CONFIGS[args.model].copy()
             config['checkpoint_path'] = checkpoint_path
