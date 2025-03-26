@@ -192,7 +192,10 @@ class Trainer:
         test_ds = ds_dict["test"]
 
         # Construct the paths to the token mapping files
-        tokenizer_path = self.config['tokenizer_path']
+        if self.config["tokenizer_path"]:
+            tokenizer_path = self.config["tokenizer_path"]
+        else:
+            tokenizer_path = self.config['dataset'] + "/tokenizer.json"
         raw_tokenizer = Tokenizer.from_file(tokenizer_path)
         tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw_tokenizer, 
                                             eos_token="[END]",
