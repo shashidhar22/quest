@@ -78,60 +78,54 @@ def parse_file(file_path, config_path):
 
     return mri_df, seq_df
 
-def parse_in_batches(file_paths, config_path, output_mri_path, output_seq_path, batch_size=1):
-    """
-    Process the given file_paths in batches of 10 files, parse them into
-    MRI and SEQ DataFrames, then write each batch to a separate Parquet file
-    in the same folder.
-    """
-    # Ensure output directories exist
+def parse_files_individually(file_paths, config_path, output_mri_path, output_seq_path):
     os.makedirs(output_mri_path, exist_ok=True)
     os.makedirs(output_seq_path, exist_ok=True)
 
-    batch_idx = 0
-
-    for start_idx in range(0, len(file_paths), batch_size):
-        # Grab up to 10 files in this batch
-        chunk_paths = file_paths[start_idx : start_idx + batch_size]
-
-        mri_frames = []
-        seq_frames = []
-
-        for file_path in chunk_paths:
-            mri_df, seq_df = parse_file(file_path, config_path)
-            if mri_df is not None and seq_df is not None:
-                mri_frames.append(mri_df)
-                seq_frames.append(seq_df)
-
-        if not mri_frames and not seq_frames:
+    for file_path in file_paths:
+        mri_dd, seq_dd = parse_file(file_path, config_path)
+        if mri_dd is None or seq_dd is None:
             continue
 
-        # Combine & write if we have any MRI data in this batch
-        if mri_frames:
-            combined_mri = dd.concat(mri_frames, interleave_partitions=True)
-            # Reset index so it won't complain about divisions
-            combined_mri = combined_mri.reset_index(drop=True)
-            mri_batch_file = os.path.join(output_mri_path, f"mri_batch_{batch_idx}.parquet")
-            combined_mri.to_parquet(
-                mri_batch_file,
-                engine="pyarrow",
-                write_index=False
-            )
-            logging.info(f"Wrote MRI batch {batch_idx} to {mri_batch_file}")
+        # Convert to Dask DataFrame if they aren’t already
+        # (Only necessary if parse_file returns pandas DataFrames)
+        #mri_dd = parse_file(mri_df, npartitions=1)
+        #seq_dd = dd.from_pandas(seq_df, npartitions=1)
 
-        # Combine & write if we have any Sequence data in this batch
-        if seq_frames:
-            combined_seq = dd.concat(seq_frames, interleave_partitions=True)
-            combined_seq = combined_seq.reset_index(drop=True)
-            seq_batch_file = os.path.join(output_seq_path, f"seq_batch_{batch_idx}.parquet")
-            combined_seq.to_parquet(
-                seq_batch_file,
-                engine="pyarrow",
-                write_index=False
-            )
-            logging.info(f"Wrote SEQ batch {batch_idx} to {seq_batch_file}")
+        # Build output filenames that match the input file stem
+        # e.g. /path/to/input/tcr_data.csv -> "tcr_data_mri.parquet"
+        parquet_basename = file_path.stem
+        mri_parquet_name = f"{parquet_basename}_mri.parquet"
+        seq_parquet_name = f"{parquet_basename}_seq.parquet"
 
-        batch_idx += 1
+        # Full path to output locations
+        mri_output_file = os.path.join(output_mri_path, mri_parquet_name)
+        seq_output_file = os.path.join(output_seq_path, seq_parquet_name)
+
+        # Convert schema to PyArrow for Parquet writing
+        mri_column_types = {"tid": "string", "tra": "string", "trad_gene": "string",
+            "traj_gene": "string", "trav_gene": "string", "trb": "string",
+            "trbd_gene": "string", "trbj_gene": "string", "trbv_gene": "string",
+            "peptide": "string", "mhc_one": "string", "mhc_two": "string",
+            "sequence": "string", "repertoire_id": "string", "study_id": "string",
+            "category": "string", "molecule_type": "string", "host_organism": "string",
+            "source": "string"}
+        
+        seq_column_types = {"source": "string", "tid": "string",
+            "tra": "string", "trad_gene": "string", "traj_gene": "string",
+            "trav_gene": "string", "trb": "string", "trbd_gene": "string",
+            "trbj_gene": "string", "trbv_gene": "string", "peptide": "string",
+            "mhc_one": "string", "mhc_two": "string", "sequence": "string"}
+
+        mri_dd = mri_dd.astype(mri_column_types)
+        seq_dd = seq_dd.astype(seq_column_types)
+        # Write each DataFrame to its own Parquet
+        mri_dd.to_parquet(mri_output_file, engine="pyarrow", write_index=False)
+        seq_dd.to_parquet(seq_output_file, engine="pyarrow", write_index=False)
+
+        logging.info(f"Wrote MRI to {mri_output_file}")
+        logging.info(f"Wrote SEQ to {seq_output_file}")
+
 
 def main(config_path, verbose=True):
     setup_logger(verbose)
@@ -158,11 +152,12 @@ def main(config_path, verbose=True):
         logging.info(f"Processing category '{category.name}' with {len(tcr_files)} files")
 
         # Output directories for MRI and sequence parquet
-        output_mri_path = os.path.join(output_path, "mri/airr_ngs_data", category.name)
-        output_seq_path = os.path.join(output_path, "sequence/airr_ngs_data", category.name)
+        output_mri_path = os.path.join(output_path, "mri/airr_ngs_data")
+        output_seq_path = os.path.join(output_path, "sequence/airr_ngs_data")
 
-        # Process the files in batches of 1000 and write results
-        parse_in_batches(tcr_files, format_path, output_mri_path, output_seq_path)
+        # Process the files individually and write results
+        parse_files_individually(tcr_files, format_path, output_mri_path, output_seq_path)
+
 
     logging.info("Parsing completed!")
 
