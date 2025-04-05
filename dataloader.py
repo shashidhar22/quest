@@ -131,6 +131,14 @@ def process_chunk(df_chunk):
         df_chunk.loc[df_chunk["trb"].str.len() < 8, "trb"] = pd.NA
     if "peptide" in df_chunk.columns:
         df_chunk.loc[df_chunk["peptide"].str.len() < 4, "peptide"] = pd.NA
+        
+        # Identify rows that have *only* peptide non-null
+        other_cols = [c for c in df_chunk.columns if c != "peptide"]
+        mask_peptide_only = df_chunk["peptide"].notna() & df_chunk[other_cols].isna().all(axis=1)
+        
+        # Drop those rows
+        df_chunk = df_chunk[~mask_peptide_only]
+
     local_expansions = []
     for row in df_chunk.itertuples(index=False):
         tagged = row_to_tagged_list(row)
@@ -139,18 +147,19 @@ def process_chunk(df_chunk):
             local_expansions.extend(perms)
     return local_expansions
 
+
 def train_bpe_tokenizer(train_sequences, vocab_size=200):
     # 1) Pre-check pass (optional)
     debug_pretok = pre_tokenizers.Split(pattern=r" ", behavior="removed")
-    for seq in train_sequences:
-        chunks = debug_pretok.pre_tokenize_str(seq)
-        for chunk, offsets in debug_pretok.pre_tokenize_str(seq):
-            if "O" in chunk:
-                print("Seq")
-                print(seq)
-                print("Pretoken")
-                print(chunks)
-                print(f"Found 'O' in chunk: '{chunk}' within sequence: '{seq}'")
+    # for seq in train_sequences:
+    #     chunks = debug_pretok.pre_tokenize_str(seq)
+    #     for chunk, offsets in debug_pretok.pre_tokenize_str(seq):
+    #         if "O" in chunk:
+    #             print("Seq")
+    #             print(seq)
+    #             print("Pretoken")
+    #             print(chunks)
+    #             print(f"Found 'O' in chunk: '{chunk}' within sequence: '{seq}'")
     # 2) Now train
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = debug_pretok
@@ -160,8 +169,7 @@ def train_bpe_tokenizer(train_sequences, vocab_size=200):
     tokenizer.train_from_iterator(train_sequences, trainer)
     return tokenizer
 
-import pyarrow as pa
-import os
+
 
 def chunked_store_raw_expansions(
     expansions,
