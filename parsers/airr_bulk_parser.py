@@ -2,11 +2,11 @@ import os
 import re
 import csv
 import yaml
-import dask.dataframe as dd
 import pandas as pd
-
 from collections import OrderedDict
 
+# If these come from another module, just import them.
+# Otherwise, define them here or adapt as needed.
 from .utils import standardize_sequence, standardize_mri
 
 
@@ -15,17 +15,40 @@ class BulkFileParser:
         self.bulk_file = bulk_file
         self.format_config = format_config
         self.test = test
+
         self.repertoire_id = os.path.splitext(os.path.basename(self.bulk_file))[0]
-        self.study_id = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(self.bulk_file))))
+        self.study_id = os.path.basename(
+            os.path.dirname(
+                os.path.dirname(
+                    os.path.dirname(self.bulk_file)
+                )
+            )
+        )
         self.extension = os.path.splitext(self.bulk_file)[1]
         self.format_dict = self._load_format_config()
+
         self.separator = self._detect_delimiter()
         self.bulk_table = self._load_bulk_table()
+
+        # These folder-based attributes may vary based on your directory structure
         self.file_type = os.path.basename(os.path.dirname(self.bulk_file))
-        self.molecule_type = os.path.basename(os.path.dirname(os.path.dirname(self.bulk_file)))   
-        self.study_id = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(self.bulk_file))))
-        self.category = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(self.bulk_file)))))
-        
+        self.molecule_type = os.path.basename(os.path.dirname(os.path.dirname(self.bulk_file)))
+        self.study_id = os.path.basename(
+            os.path.dirname(
+                os.path.dirname(
+                    os.path.dirname(self.bulk_file)
+                )
+            )
+        )
+        self.category = os.path.basename(
+            os.path.dirname(
+                os.path.dirname(
+                    os.path.dirname(
+                        os.path.dirname(self.bulk_file)
+                    )
+                )
+            )
+        )
 
     def _load_format_config(self):
         with open(self.format_config, 'r') as f:
@@ -46,821 +69,628 @@ class BulkFileParser:
                         separator = "\t"
                     else:
                         separator = ","
+
+        # Standardize the detected separator into the delimiter we will use
         if separator == "\t" or self.extension == ".tsv":
             delimiter = "\t"
         elif separator == "," or self.extension == ".csv":
             delimiter = ","
         elif separator == "M":
+            # This was a special case in the original code for a MiTCR file
             delimiter = "M"
+
         return delimiter
 
-
     def _load_bulk_table(self):
+        """
+        Load the file into a pandas DataFrame, applying the detected delimiter.
+        If self.test == True, we sample 10% of the data.
+        """
         if self.separator == "\t":
             try:
-                bulk_table =  dd.read_csv(self.bulk_file, sep="\t", dtype=str, na_filter=False)            
+                df = pd.read_csv(self.bulk_file, sep="\t", dtype=str, na_filter=False)
             except ValueError:
                 return None
         elif self.separator == ",":
-             bulk_table =  dd.read_csv(self.bulk_file, dtype=str, na_filter=False)
+            df = pd.read_csv(self.bulk_file, dtype=str, na_filter=False)
         elif self.separator == "M":
-             bulk_table =  dd.read_csv(self.bulk_file, sep="\t", dtype=str, na_filter=False, skiprows=1)
-        if self.test:
-            bulk_table = bulk_table.sample(frac=0.1, random_state = 21)
-        bulk_table = bulk_table.map_partitions(lambda pdf: pdf.astype("string[pyarrow]"))
+            # Skip the first row for MiTCR
+            df = pd.read_csv(self.bulk_file, sep="\t", dtype=str, na_filter=False, skiprows=1)
 
-        return bulk_table
+        if self.test and df is not None and not df.empty:
+            df = df.sample(frac=0.1, random_state=21)
 
+        # Convert all columns to string explicitly
+        df = df.astype(str)
+
+        return df
 
     def parse(self):
-        if self.bulk_table is None:
+        """
+        Choose the right parse function based on the known column sets.
+        """
+        if self.bulk_table is None or self.bulk_table.empty:
             return None, None
-        if set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_one']):
+
+        known_formats = self.format_dict['bulk']
+
+        if set(self.bulk_table.columns) == set(known_formats['format_one']):
             return self._parse_format_one()
-        elif set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_two']):
+        elif set(self.bulk_table.columns) == set(known_formats['format_two']):
             return self._parse_format_two()
-        elif set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_three']):
+        elif set(self.bulk_table.columns) == set(known_formats['format_three']):
             return self._parse_format_three()
-        elif set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_four']):
+        elif set(self.bulk_table.columns) == set(known_formats['format_four']):
             return self._parse_format_four()
-        elif set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_five']):
+        elif set(self.bulk_table.columns) == set(known_formats['format_five']):
             return self._parse_format_five()
-        elif set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_six']):
+        elif set(self.bulk_table.columns) == set(known_formats['format_six']):
             return self._parse_format_six()
-        elif (set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_seven']) or
-              set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_eight']) or
-              set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_ten'])): 
+        elif (
+            set(self.bulk_table.columns) == set(known_formats['format_seven']) or
+            set(self.bulk_table.columns) == set(known_formats['format_eight']) or
+            set(self.bulk_table.columns) == set(known_formats['format_ten'])
+        ):
             return self._parse_format_seven()
-        elif set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_nine']):
+        elif set(self.bulk_table.columns) == set(known_formats['format_nine']):
             return self._parse_format_nine()
-        elif set(self.bulk_table.columns) == set(self.format_dict['bulk']['format_eleven']):
+        elif set(self.bulk_table.columns) == set(known_formats['format_eleven']):
             return self._parse_format_eleven()
         else:
             raise ValueError("Unrecognized file format!")
-    
+
     def _parse_format_one(self):
         """
-        Parse format one using Dask DataFrame operations only, without calling compute().
+        Example: 
+        Remove columns ['VJCombo', 'Copy', 'ntCDR3', 'NetInsertionLength'], 
+        detect chain type by the first row's VGene, rename accordingly, 
+        return (mri_table, sequence_table).
         """
+
         # Drop unnecessary columns
-        processed = self.bulk_table.drop(
-            columns=['VJCombo', 'Copy', 'ntCDR3', 'NetInsertionLength'], 
+        df = self.bulk_table.drop(
+            columns=['VJCombo', 'Copy', 'ntCDR3', 'NetInsertionLength'],
             errors='ignore'
-        )
+        ).copy()
 
-        # We define a function that renames columns based on chain type
-        # by inspecting the first row of each partition
-        def transform_partition(df):
-            if df.empty:
-                # If partition is empty, just return it
-                return df
+        if df.empty:
+            return None, None
 
-            # Detect chain type from the first row's VGene
-            chain_type = df.iloc[0]['VGene']
+        # Detect chain type from the first row
+        first_vgene = df.iloc[0]['VGene']
+        if 'TRAV' in first_vgene:
+            # This is an alpha chain
+            df = df.rename(
+                columns={
+                    'VGene': 'trav_gene',
+                    'JGene': 'traj_gene',
+                    'aaCDR3': 'tra'
+                }
+            )
+            # Fill missing columns
+            df['trad_gene'] = ''
+            df['trb'] = ''
+            df['trbv_gene'] = ''
+            df['trbj_gene'] = ''
+            df['trbd_gene'] = ''
+            # Make a single sequence column
+            df['sequence'] = df['tra'] + ';'
+        elif 'TRBV' in first_vgene:
+            # This is a beta chain
+            df = df.rename(
+                columns={
+                    'VGene': 'trbv_gene',
+                    'JGene': 'trbj_gene',
+                    'aaCDR3': 'trb'
+                }
+            )
+            df['tra'] = ''
+            df['trav_gene'] = ''
+            df['traj_gene'] = ''
+            df['trad_gene'] = ''
+            df['trbd_gene'] = ''
+            df['sequence'] = df['trb'] + ';'
+        else:
+            raise ValueError(f"Unrecognized chain type in VGene: {first_vgene}")
 
-            if 'TRAV' in chain_type:
-                # Rename columns for TRA chain
-                df = df.rename(
-                    columns={
-                        'VGene': 'trav_gene',
-                        'JGene': 'traj_gene',
-                        'aaCDR3': 'tra'
-                    }
-                )
-                # Insert empty trbd_gene, etc. if needed
-                df['trad_gene'] = ''
-                df['trb'] = ''
-                df['trbv_gene'] = ''
-                df['trbj_gene'] = ''
-                df['trbd_gene'] = ''
-                df['sequence'] = df['tra'] + ';'
-                
-
-            elif 'TRBV' in chain_type:
-                # Rename columns for TRB chain
-                df = df.rename(
-                    columns={
-                        'VGene': 'trbv_gene',
-                        'JGene': 'trbj_gene',
-                        'aaCDR3': 'trb'
-                    }
-                )
-                df['tra'] = ''
-                df['trav_gene'] = ''
-                df['traj_gene'] = ''
-                df['trad_gene'] = ''
-                df['trbd_gene'] = ''
-                df['sequence'] = df['trb'] + ';'
-            else:
-                raise ValueError(f"Unrecognized chain type in VGene: {chain_type}")
-            df = df[['trav_gene', 'traj_gene', 'trad_gene', 'tra', 
-                        'trbv_gene', 'trbj_gene', 'trbd_gene', 'trb', 'sequence']]
-            return df
-
-        
-        # This is the minimal set you'll produce in transform_partition.
-        meta_cols = [
+        # Reorder columns consistently
+        columns_order = [
             'trav_gene', 'traj_gene', 'trad_gene', 'tra',
-            'trbv_gene', 'trbj_gene', 'trbd_gene', 'trb',
-            'sequence' 
+            'trbv_gene', 'trbj_gene', 'trbd_gene', 'trb', 'sequence'
         ]
-        meta = OrderedDict({
-            'trav_gene': 'string[pyarrow]',
-            'traj_gene': 'string[pyarrow]',
-            'trad_gene': 'string[pyarrow]',
-            'tra': 'string[pyarrow]',
-            'trbv_gene': 'string[pyarrow]',
-            'trbj_gene': 'string[pyarrow]',
-            'trbd_gene': 'string[pyarrow]',
-            'trb': 'string[pyarrow]',
-            'sequence': 'string[pyarrow]'
-        })
+        df = df[columns_order]
 
-        # Apply transform lazily on each partition
-        processed = processed.map_partitions(transform_partition, meta=meta)
+        # Build the MRI table
+        mri_table = df.copy()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['host_organism'] = 'human'
+        mri_table['source'] = 'bulk_survey'
 
-        # Now we have either a TRA- or TRB-renamed DataFrame in each partition.
-        # We can continue with the "mri_table" logic:
-        mri_table = processed.assign(
-            repertoire_id=self.repertoire_id,
-            study_id=self.study_id,
-            category=self.category,
-            molecule_type=self.molecule_type,
-            host_organism='human',
-            source='bulk_survey'
-        )
+        # Build the sequence table
+        sequence_table = mri_table[[
+            'trav_gene', 'trad_gene', 'traj_gene', 'tra',
+            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb',
+            'sequence', 'source'
+        ]].copy()
 
-        # Construct the sequence_table from columns
-        # If you want it exactly as in your original code, you can filter the columns you need:
-        sequence_table = mri_table[['trav_gene', 'trad_gene', 'traj_gene', 'tra',
-                                    'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb', 'sequence', 'source']]
-
-        # Standardize them
+        # Standardize
         sequence_table = standardize_sequence(sequence_table)
         mri_table = standardize_mri(mri_table)
-
         return mri_table, sequence_table
 
-
-    
     def _parse_format_two(self):
         """
-        Parse the AIRR dataset in format two using Dask without computing prematurely.
-
-        Returns:
-            tuple: Dask DataFrames for MRI and sequence tables.
+        Format two example.
         """
         # Drop unnecessary columns
         columns_to_drop = [
-            'Read count', 'Percentage', 'CDR3 nucleotide sequence', 
-            'CDR3 nucleotide quality', 'Min quality', 'V segments', 
-            'J segments', 'D segments', 'Last V nucleotide position ', 
-            'First D nucleotide position', 'Last D nucleotide position', 
-            'First J nucleotide position', 'VD insertions', 'DJ insertions', 
+            'Read count', 'Percentage', 'CDR3 nucleotide sequence',
+            'CDR3 nucleotide quality', 'Min quality', 'V segments',
+            'J segments', 'D segments', 'Last V nucleotide position ',
+            'First D nucleotide position', 'Last D nucleotide position',
+            'First J nucleotide position', 'VD insertions', 'DJ insertions',
             'Total insertions'
         ]
+        df = self.bulk_table.drop(columns=columns_to_drop, errors='ignore').copy()
+        if df.empty:
+            return None, None
 
-        mri_table = self.bulk_table.drop(columns=columns_to_drop, errors='ignore')
+        # Detect chain type from the first row
+        first_v = df.iloc[0]['V alleles']
 
-        # Define the final metadata explicitly
-        meta = OrderedDict({
-            'trav_gene': 'string[pyarrow]',
-            'traj_gene': 'string[pyarrow]',
-            'trad_gene': 'string[pyarrow]',
-            'tra': 'string[pyarrow]',
-            'trbv_gene': 'string[pyarrow]',
-            'trbj_gene': 'string[pyarrow]',
-            'trbd_gene': 'string[pyarrow]',
-            'trb': 'string[pyarrow]',
-            'sequence': 'string[pyarrow]'
-        })
+        if 'TRAV' in first_v:
+            # alpha chain
+            df = df.rename(columns={
+                'V alleles': 'trav_gene',
+                'J alleles': 'traj_gene',
+                'D alleles': 'trad_gene',
+                'CDR3 amino acid sequence': 'tra'
+            })
+            df['sequence'] = df['tra'] + ';'
+            df['trb'] = ''
+            df['trbv_gene'] = ''
+            df['trbj_gene'] = ''
+            df['trbd_gene'] = ''
+        elif 'TRBV' in first_v:
+            # beta chain
+            df = df.rename(columns={
+                'V alleles': 'trbv_gene',
+                'J alleles': 'trbj_gene',
+                'D alleles': 'trbd_gene',
+                'CDR3 amino acid sequence': 'trb'
+            })
+            df['sequence'] = df['trb'] + ';'
+            df['tra'] = ''
+            df['trav_gene'] = ''
+            df['traj_gene'] = ''
+            df['trad_gene'] = ''
+        else:
+            raise ValueError(f"Unrecognized chain type in V alleles: {first_v}")
 
-        # Process each partition to detect chain type and transform columns
-        def process_partition(partition):
-            if partition.empty:
-                return pd.DataFrame(columns=meta.keys())
+        # Reorder columns
+        columns_order = [
+            'trav_gene', 'traj_gene', 'trad_gene', 'tra',
+            'trbv_gene', 'trbj_gene', 'trbd_gene', 'trb', 'sequence'
+        ]
+        df = df[columns_order]
 
-            # Detect chain type from the first row in the partition
-            chain_type = partition.iloc[0]['V alleles']
+        # Build MRI and sequence tables
+        mri_table = df.copy()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['host_organism'] = 'human'
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['source'] = 'bulk_survey'
 
-            if "TRAV" in chain_type:
-                # Rename columns for TRA chain
-                partition = partition.rename(columns={
-                    'V alleles': 'trav_gene',
-                    'J alleles': 'traj_gene',
-                    'D alleles': 'trad_gene',
-                    'CDR3 amino acid sequence': 'tra'
-                })
-                partition['sequence'] = partition['tra'] + ';'
-                partition['trb'] = ''
-                partition['trbv_gene'] = ''
-                partition['trbj_gene'] = ''
-                partition['trbd_gene'] = ''
-            elif "TRBV" in chain_type:
-                # Rename columns for TRB chain
-                partition = partition.rename(columns={
-                    'V alleles': 'trbv_gene',
-                    'J alleles': 'trbj_gene',
-                    'D alleles': 'trbd_gene',
-                    'CDR3 amino acid sequence': 'trb'
-                })
-                partition['sequence'] = partition['trb'] + ';'
-                partition['tra'] = ''
-                partition['trav_gene'] = ''
-                partition['traj_gene'] = ''
-                partition['trad_gene'] = ''
-            else:
-                raise ValueError(f"Unrecognized chain type in V alleles: {chain_type}")
+        sequence_table = mri_table.drop_duplicates(subset=['sequence']).copy()
 
-            # Ensure the output matches the metadata
-            return partition[meta.keys()]
-
-        # Apply the transformation lazily to all partitions
-        mri_table = mri_table.map_partitions(process_partition, meta=meta)
-
-        # Deduplicate the sequence table and standardize it
-        sequence_table = mri_table.drop_duplicates(subset=['sequence'])
-
-        # Add metadata lazily
-        mri_table = mri_table.assign(
-            repertoire_id=self.repertoire_id,
-            study_id=self.study_id,
-            host_organism='human',
-            category=self.category,
-            molecule_type=self.molecule_type,
-            source='bulk_survey'
-        )
-        sequence_table['source'] = 'bulk_survey'
-
+        # Standardize
         mri_table = standardize_mri(mri_table)
         sequence_table = standardize_sequence(sequence_table)
-
         return mri_table, sequence_table
 
-    
     def _parse_format_three(self):
         """
-        Parse the AIRR dataset in format three using Dask without premature computations.
-
-        Returns:
-            tuple: Dask DataFrames for MRI and sequence tables.
+        Format three example.
         """
         # Drop unnecessary columns
         columns_to_drop = [
-            'Count', 'Percentage', 'CDR3 nucleotide sequence', 
-            'Last V nucleotide position', 'First D nucleotide position', 
-            'Last D nucleotide position', 'First J nucleotide position', 
+            'Count', 'Percentage', 'CDR3 nucleotide sequence',
+            'Last V nucleotide position', 'First D nucleotide position',
+            'Last D nucleotide position', 'First J nucleotide position',
             'Good events', 'Total events', 'Good reads', 'Total reads'
         ]
-        mri_table = self.bulk_table.drop(columns=columns_to_drop, errors='ignore')
+        df = self.bulk_table.drop(columns=columns_to_drop, errors='ignore').copy()
+        if df.empty:
+            return None, None
 
-        # Define meta for the resulting DataFrame
-        meta = OrderedDict({
-            'trav_gene': 'string[pyarrow]', 'trad_gene': 'string[pyarrow]', 'traj_gene': 'string[pyarrow]', 'tra': 'string[pyarrow]',
-            'trbv_gene': 'string[pyarrow]', 'trbd_gene': 'string[pyarrow]', 'trbj_gene': 'string[pyarrow]', 'trb': 'string[pyarrow]',
-            'sequence': 'string[pyarrow]'
-        })
+        # Detect chain type from the first row's V segments
+        first_v = df.iloc[0]['V segments']
+        if 'TRAV' in first_v:
+            df = df.rename(columns={
+                'V segments': 'trav_gene',
+                'J segments': 'traj_gene',
+                'D segments': 'trad_gene',
+                'CDR3 amino acid sequence': 'tra'
+            })
+            df['sequence'] = df['tra'] + ';'
+            df['trb'] = ''
+            df['trbv_gene'] = ''
+            df['trbj_gene'] = ''
+            df['trbd_gene'] = ''
+        elif 'TRBV' in first_v:
+            df = df.rename(columns={
+                'V segments': 'trbv_gene',
+                'J segments': 'trbj_gene',
+                'D segments': 'trbd_gene',
+                'CDR3 amino acid sequence': 'trb'
+            })
+            df['sequence'] = df['trb'] + ';'
+            df['tra'] = ''
+            df['trav_gene'] = ''
+            df['traj_gene'] = ''
+            df['trad_gene'] = ''
+        else:
+            raise ValueError(f"Unrecognized chain type in V segments: {first_v}")
 
-        # Process each partition to detect chain type and transform columns
-        def process_partition(partition):
-            if partition.empty:
-                # Return an empty DataFrame with the expected columns
-                return pd.DataFrame(columns=meta.keys())
+        columns_order = [
+            'trav_gene', 'traj_gene', 'trad_gene', 'tra',
+            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb', 'sequence'
+        ]
+        df = df[columns_order]
 
-            # Detect chain type from the first non-null value in 'V segments'
-            chain_type = partition['V segments'].dropna().iloc[0]
+        # Build MRI and sequence tables
+        mri_table = df.copy()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['host_organism'] = 'human'
+        mri_table['source'] = 'bulk_survey'
 
-            if "TRAV" in chain_type:
-                # Rename columns for TRA chain
-                partition = partition.rename(columns={
-                    'V segments': 'trav_gene',
-                    'J segments': 'traj_gene',
-                    'D segments': 'trad_gene',
-                    'CDR3 amino acid sequence': 'tra'
-                })
-                partition['sequence'] = partition['tra'] + ';'
-                partition['trb'] = ''
-                partition['trbv_gene'] = ''
-                partition['trbj_gene'] = ''
-                partition['trbd_gene'] = ''
-            elif "TRBV" in chain_type:
-                # Rename columns for TRB chain
-                partition = partition.rename(columns={
-                    'V segments': 'trbv_gene',
-                    'J segments': 'trbj_gene',
-                    'D segments': 'trbd_gene',
-                    'CDR3 amino acid sequence': 'trb'
-                })
-                partition['sequence'] = partition['trb'] + ';'
-                partition['tra'] = ''
-                partition['trav_gene'] = ''
-                partition['traj_gene'] = ''
-                partition['trad_gene'] = ''
-            else:
-                raise ValueError(f"Unrecognized chain type in V segments: {chain_type}")
+        sequence_table = df.drop_duplicates(subset=['sequence']).copy()
+        sequence_table['source'] = 'bulk_survey'
 
-            # Reorder and return the partition with fixed columns
-            return partition[meta.keys()]
-
-        # Apply the transformation lazily to all partitions
-        mri_table = mri_table.map_partitions(process_partition, meta=meta)
-
-        # Deduplicate the sequence table and standardize it
-        sequence_table = mri_table.drop_duplicates(subset=['sequence'])
-
-        # Add metadata lazily
-        mri_table = mri_table.assign(
-            repertoire_id=self.repertoire_id,
-            study_id=self.study_id,
-            category=self.category,
-            molecule_type=self.molecule_type,
-            host_organism='human',
-            source='bulk_survey'
-        )
-        sequence_table = sequence_table.assign(source='bulk_survey')
+        # Standardize
         mri_table = standardize_mri(mri_table)
         sequence_table = standardize_sequence(sequence_table)
-
         return mri_table, sequence_table
 
-    
     def _parse_format_four(self):
         """
-        Parse the AIRR dataset in format four using Dask without premature computations.
-
-        Returns:
-            tuple: Dask DataFrames for MRI and sequence tables.
+        Format four example.
         """
-        # Filter rows with frame_type == "In" and select relevant columns
-        processed = self.bulk_table[self.bulk_table['frame_type'] == "In"]
-        processed = processed[['amino_acid', 'v_resolved', 'd_resolved', 'j_resolved']]
+        df = self.bulk_table[self.bulk_table['frame_type'] == "In"].copy()
+        if df.empty:
+            return None, None
 
-        # Fixed column names and metadata for the final DataFrame
-        fixed_columns = [
-            'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
-            'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
-        ]
-        meta = OrderedDict({
-            'tid': 'string[pyarrow]',
-            'tra': 'string[pyarrow]',
-            'trad_gene': 'string[pyarrow]',
-            'traj_gene': 'string[pyarrow]',
-            'trav_gene': 'string[pyarrow]',
-            'trb': 'string[pyarrow]',
-            'trbd_gene': 'string[pyarrow]',
-            'trbj_gene': 'string[pyarrow]',
-            'trbv_gene': 'string[pyarrow]',
-            'sequence': 'string[pyarrow]'
-        })
+        # We only keep the relevant columns
+        df = df[['amino_acid', 'v_resolved', 'd_resolved', 'j_resolved']]
 
-        # Function to process each partition
-        def process_partition(partition):
-            if partition.empty:
-                return pd.DataFrame(columns=fixed_columns)  # Return an empty DataFrame with fixed columns
+        # For each row, figure out if it’s TCRA or TCRB, then place data accordingly
+        transformed_rows = []
+        for _, row in df.iterrows():
+            if 'TCRA' in row['v_resolved']:
+                transformed_rows.append({
+                    'trav_gene': row['v_resolved'],
+                    'traj_gene': row['j_resolved'],
+                    'trad_gene': row['d_resolved'],
+                    'tra': row['amino_acid'],
+                    'trbv_gene': '',
+                    'trbj_gene': '',
+                    'trbd_gene': '',
+                    'trb': '',
+                })
+            elif 'TCRB' in row['v_resolved']:
+                transformed_rows.append({
+                    'trbv_gene': row['v_resolved'],
+                    'trbj_gene': row['j_resolved'],
+                    'trbd_gene': row['d_resolved'],
+                    'trb': row['amino_acid'],
+                    'trav_gene': '',
+                    'traj_gene': '',
+                    'trad_gene': '',
+                    'tra': '',
+                })
+            # Possibly skip TCRD rows or add logic if needed
 
-            formatted_rows = []
-            for _, row in partition.iterrows():
-                if "TCRA" in row['v_resolved']:
-                    formatted_rows.append({
-                        'trav_gene': row['v_resolved'],
-                        'traj_gene': row['j_resolved'],
-                        'trad_gene': row['d_resolved'],
-                        'tra': row['amino_acid']
-                    })
-                elif "TCRB" in row['v_resolved']:
-                    formatted_rows.append({
-                        'trbv_gene': row['v_resolved'],
-                        'trbj_gene': row['j_resolved'],
-                        'trbd_gene': row['d_resolved'],
-                        'trb': row['amino_acid']
-                    })
-                # Skip "TCRD" rows
+        out_df = pd.DataFrame(transformed_rows)
+        if out_df.empty:
+            return None, None
 
-            # Create a DataFrame from the formatted rows
-            result = pd.DataFrame(formatted_rows)
-
-            # Ensure all fixed columns are present
-            for col in fixed_columns:
-                if col not in result.columns:
-                    result[col] = ''  # Add missing columns with default value
-
-            # Return DataFrame with reordered columns
-            return result[fixed_columns]
-
-        # Apply processing lazily to each partition
-        mri_table = processed.map_partitions(process_partition, meta=meta)
-
-        # Deduplicate the sequence table and standardize it
-        sequence_table = mri_table.drop_duplicates(subset=['sequence'])
-
-        # Add the 'sequence' column
-        sequence_table['sequence'] = sequence_table[['tra', 'trb']].map_partitions(
-            lambda df: df.apply(lambda x: ' '.join(y for y in [x['tra'], x['trb']] if y != '') + ';', axis=1),
-            meta=('sequence', 'string[pyarrow]')
+        # Create a 'sequence' column from tra/trb
+        out_df['sequence'] = out_df[['tra', 'trb']].apply(
+            lambda x: ' '.join(y for y in x if y) + ';',
+            axis=1
         )
 
-        # Add metadata lazily to MRI and sequence tables
-        mri_table = mri_table.assign(
-            repertoire_id=self.repertoire_id,
-            study_id=self.study_id,
-            category=self.category,
-            molecule_type=self.molecule_type,
-            host_organism='human',
-            source='bulk_survey'
-        )
-        sequence_table = sequence_table.assign(source='bulk_survey')
+        # Build MRI
+        mri_table = out_df.copy()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['host_organism'] = 'human'
+        mri_table['source'] = 'bulk_survey'
+
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates(subset=['sequence']).copy()
+
+        # Standardize
         mri_table = standardize_mri(mri_table)
         sequence_table = standardize_sequence(sequence_table)
         return mri_table, sequence_table
 
-    
     def _parse_format_five(self):
         """
-        Parse the AIRR dataset in format five using Dask, ensuring lazy processing.
-
-        Returns:
-            tuple: Dask DataFrames for MRI and sequence tables.
+        Format five example.
         """
-        # Filter rows where 'fuction' equals 'in-frame' and select relevant columns
-        processed = self.bulk_table[self.bulk_table['fuction'] == "in-frame"]
-        processed = processed[['#ID', 'V_ref', 'D_ref', 'J_ref', 'CDR3(aa)', 'amino_acid']]
+        df = self.bulk_table[self.bulk_table['fuction'] == "in-frame"].copy()
+        if df.empty:
+            return None, None
 
-        # Define the fixed columns and metadata
-        fixed_columns = [
-            'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
-            'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
-        ]
-        meta = OrderedDict({col: 'string[pyarrow]' for col in fixed_columns})
+        # Relevant columns
+        df = df[['#ID', 'V_ref', 'D_ref', 'J_ref', 'CDR3(aa)', 'amino_acid']]
 
-        # Define the row-level processing function
-        def process_row(row):
-            if "TRAV" in row['V_ref']:
-                return {
+        transformed_rows = []
+        for _, row in df.iterrows():
+            if 'TRAV' in row['V_ref']:
+                transformed_rows.append({
                     'trav_gene': row['V_ref'],
                     'traj_gene': row['J_ref'],
                     'trad_gene': row['D_ref'],
-                    'tra': row['CDR3(aa)']
-                }
-            elif "TRBV" in row['V_ref']:
-                return {
+                    'tra': row['CDR3(aa)'],
+                    'trbv_gene': '',
+                    'trbj_gene': '',
+                    'trbd_gene': '',
+                    'trb': '',
+                })
+            elif 'TRBV' in row['V_ref']:
+                transformed_rows.append({
                     'trbv_gene': row['V_ref'],
                     'trbj_gene': row['J_ref'],
                     'trbd_gene': row['D_ref'],
-                    'trb': row['CDR3(aa)']
-                }
-            return None
+                    'trb': row['CDR3(aa)'],
+                    'trav_gene': '',
+                    'traj_gene': '',
+                    'trad_gene': '',
+                    'tra': '',
+                })
 
-        # Partition-level processing function
-        def process_partition(partition):
-            formatted_rows = []
-            for _, row in partition.iterrows():
-                result = process_row(row)
-                if result is not None:
-                    formatted_rows.append(result)
+        out_df = pd.DataFrame(transformed_rows)
+        if out_df.empty:
+            return None, None
 
-            # Create a DataFrame and ensure all fixed columns are present
-            result_df = pd.DataFrame(formatted_rows)
-            for col in fixed_columns:
-                if col not in result_df.columns:
-                    result_df[col] = ''  # Add missing columns
-            return result_df[fixed_columns]  # Reorder columns
-
-        # Apply partition processing lazily
-        mri_table = processed.map_partitions(process_partition, meta=meta)
-
-        # Deduplicate the sequence table
-        sequence_table = mri_table.drop_duplicates()
-
-        # Add the 'sequence' column
-        def generate_sequence(df):
-            df['sequence'] = df[['tra', 'trb']].apply(
-                lambda x: ' '.join(y for y in [x['tra'], x['trb']] if y != '') + ';', axis=1
-            )
-            return df
-
-        sequence_table = sequence_table.map_partitions(generate_sequence, meta=meta)
-
-        # Add metadata lazily
-        mri_table = mri_table.assign(
-            repertoire_id=self.repertoire_id,
-            study_id=self.study_id,
-            host_organism='human',
-            category=self.category,
-            molecule_type=self.molecule_type,
-            source='bulk_survey'
+        out_df['sequence'] = out_df[['tra', 'trb']].apply(
+            lambda x: ' '.join(y for y in x if y) + ';',
+            axis=1
         )
-        sequence_table = sequence_table.assign(source='bulk_survey')
 
-        # Standardize the sequence table
-        sequence_table = standardize_sequence(sequence_table)
+        # Build MRI
+        mri_table = out_df.copy()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['host_organism'] = 'human'
+        mri_table['source'] = 'bulk_survey'
+
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
+
+        # Standardize
         mri_table = standardize_mri(mri_table)
-
+        sequence_table = standardize_sequence(sequence_table)
         return mri_table, sequence_table
 
-    
     def _parse_format_six(self):
         """
-        Parse the AIRR dataset in format six using Dask, ensuring lazy processing.
-
-        Returns:
-            tuple: Dask DataFrames for MRI and sequence tables.
+        Format six example.
         """
-        # Filter rows where 'fuction' equals 'in-frame' and select relevant columns
-        airr_table = self.bulk_table[self.bulk_table['fuction'] == "in-frame"]
-        airr_table = airr_table[['aminoAcid(CDR3 in lowercase)', 'vGene', 'dGene', 'jGene']]
+        df = self.bulk_table[self.bulk_table['fuction'] == "in-frame"].copy()
+        if df.empty:
+            return None, None
 
-        # Function to find the longest string[pyarrow]etch of lowercase letters
+        df = df[['aminoAcid(CDR3 in lowercase)', 'vGene', 'dGene', 'jGene']]
+
+        # Extract the longest lowercase stretch from 'aminoAcid(CDR3 in lowercase)'
         def longest_lowercase(s):
-            lowercase_stretches = re.findall(r'[a-z]+', s)
-            return max(lowercase_stretches, key=len, default='')
+            matches = re.findall(r'[a-z]+', s)
+            return max(matches, key=len, default='')
 
-        # Apply the longest_lowercase function lazily
-        airr_table['cdr3'] = airr_table['aminoAcid(CDR3 in lowercase)'].map_partitions(
-            lambda partition: partition.apply(longest_lowercase), meta=('cdr3', 'string[pyarrow]')
+        df['cdr3'] = df['aminoAcid(CDR3 in lowercase)'].apply(longest_lowercase)
+
+        transformed_rows = []
+        for _, row in df.iterrows():
+            if 'TRAV' in row['vGene']:
+                transformed_rows.append({
+                    'trav_gene': row['vGene'],
+                    'traj_gene': row['jGene'],
+                    'trad_gene': row['dGene'],
+                    'tra': row['cdr3'],
+                    'trbv_gene': '',
+                    'trbj_gene': '',
+                    'trbd_gene': '',
+                    'trb': '',
+                })
+            elif 'TRBV' in row['vGene']:
+                transformed_rows.append({
+                    'trbv_gene': row['vGene'],
+                    'trbj_gene': row['jGene'],
+                    'trbd_gene': row['dGene'],
+                    'trb': row['cdr3'],
+                    'trav_gene': '',
+                    'traj_gene': '',
+                    'trad_gene': '',
+                    'tra': '',
+                })
+
+        out_df = pd.DataFrame(transformed_rows)
+        if out_df.empty:
+            return None, None
+
+        out_df['sequence'] = out_df[['tra', 'trb']].apply(
+            lambda x: ' '.join(y for y in x if y) + ';',
+            axis=1
         )
 
-        # Define the processing function for each partition
-        def process_partition(partition):
-            formatted_rows = []
+        # Build MRI
+        mri_table = out_df.copy()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['host_organism'] = 'human'
+        mri_table['source'] = 'bulk_survey'
 
-            for _, row in partition.iterrows():
-                if "TRAV" in row['vGene']:
-                    formatted_rows.append({
-                        'trav_gene': row['vGene'],
-                        'traj_gene': row['jGene'],
-                        'trad_gene': row['dGene'],
-                        'tra': row['cdr3'],
-                        'trb': '',
-                        'trbv_gene': '',
-                        'trbj_gene': '',
-                        'trbd_gene': ''
-                    })
-                elif "TRBV" in row['vGene']:
-                    formatted_rows.append({
-                        'trbv_gene': row['vGene'],
-                        'trbj_gene': row['jGene'],
-                        'trbd_gene': row['dGene'],
-                        'trb': row['cdr3'],
-                        'tra': '',
-                        'trav_gene': '',
-                        'traj_gene': '',
-                        'trad_gene': ''
-                    })
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
 
-            # Create a DataFrame and ensure consistent columns
-            result = pd.DataFrame(formatted_rows)
-            for col in self.fixed_columns:
-                if col not in result.columns:
-                    result[col] = ''
-            return result[self.fixed_columns]
-
-        # Apply partition-wise processing
-        meta = {col: 'string[pyarrow]' for col in self.fixed_columns}
-        mri_table = airr_table.map_partitions(process_partition, meta=meta)
-
-        # Deduplicate the sequence table
-        sequence_table = mri_table.drop_duplicates()
-
-        # Add a 'sequence' column lazily
-        def generate_sequence(df):
-            df['sequence'] = df[['tra', 'trb']].apply(
-                lambda x: ' '.join(y for y in [x['tra'], x['trb']] if y != '') + ';', axis=1
-            )
-            return df
-
-        sequence_table = sequence_table.map_partitions(generate_sequence, meta=meta)
-
-        # Add metadata lazily
-        mri_table = mri_table.assign(
-            repertoire_id=self.repertoire_id,
-            study_id=self.study_id,
-            category=self.category,
-            molecule_type=self.molecule_type,
-            host_organism='human',
-            source='bulk_survey'
-        )
-        sequence_table = sequence_table.assign(source='bulk_survey')
-
-        # Standardize sequence table
-        sequence_table = standardize_sequence(sequence_table)
+        # Standardize
         mri_table = standardize_mri(mri_table)
+        sequence_table = standardize_sequence(sequence_table)
         return mri_table, sequence_table
-
-
 
     def _parse_format_seven(self):
         """
-        Parse the AIRR dataset in format seven using Dask for efficient processing.
-
-        Returns:
-            tuple: Dask DataFrames for MRI and sequence tables.
+        Format seven (also used by format eight/ten in original code).
         """
-        # Filter rows where 'sequenceStatus' is "In" and select relevant columns
-        airr_table = self.bulk_table[self.bulk_table['sequenceStatus'] == "In"]
-        airr_table = airr_table[['aminoAcid', 'vMaxResolved', 'dMaxResolved', 'jMaxResolved']]
+        df = self.bulk_table[self.bulk_table['sequenceStatus'] == "In"].copy()
+        if df.empty:
+            return None, None
 
-        # Fill NaN values with a placeholder string
-        airr_table = airr_table.fillna('')
+        df = df[['aminoAcid', 'vMaxResolved', 'dMaxResolved', 'jMaxResolved']]
+        df = df.fillna('')
 
-        # Define fixed columns and metadata
-        fixed_columns = [
-            'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
-            'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
-        ]
-        meta = OrderedDict({col: 'string[pyarrow]' for col in fixed_columns})
+        transformed_rows = []
+        for _, row in df.iterrows():
+            v, d, j = row['vMaxResolved'], row['dMaxResolved'], row['jMaxResolved']
+            if 'TCRAV' in v or 'TCRAJ' in j:
+                transformed_rows.append({
+                    'trav_gene': v,
+                    'traj_gene': j,
+                    'trad_gene': d,
+                    'tra': row['aminoAcid'],
+                    'trbv_gene': '',
+                    'trbj_gene': '',
+                    'trbd_gene': '',
+                    'trb': '',
+                })
+            elif 'TCRBV' in v or 'TCRBJ' in j or 'TCRBD' in d:
+                transformed_rows.append({
+                    'trbv_gene': v,
+                    'trbj_gene': j,
+                    'trbd_gene': d,
+                    'trb': row['aminoAcid'],
+                    'trav_gene': '',
+                    'traj_gene': '',
+                    'trad_gene': '',
+                    'tra': '',
+                })
 
-        # Define a function to process each partition
-        def process_partition(partition):
-            processed_rows = []
-            for _, row in partition.iterrows():
-                if "TCRAV" in row['vMaxResolved'] or "TCRAJ" in row['jMaxResolved']:
-                    processed_rows.append({
-                        'trav_gene': row['vMaxResolved'],
-                        'traj_gene': row['jMaxResolved'],
-                        'trad_gene': row['dMaxResolved'],
-                        'tra': row['aminoAcid'],
-                        'trb': '',
-                        'trbv_gene': '',
-                        'trbj_gene': '',
-                        'trbd_gene': '',
-                    })
-                elif "TCRBV" in row['vMaxResolved'] or "TCRBJ" in row['jMaxResolved'] or "TCRBD" in row['dMaxResolved']:
-                    processed_rows.append({
-                        'trbv_gene': row['vMaxResolved'],
-                        'trbj_gene': row['jMaxResolved'],
-                        'trbd_gene': row['dMaxResolved'],
-                        'trb': row['aminoAcid'],
-                        'tra': '',
-                        'trav_gene': '',
-                        'traj_gene': '',
-                        'trad_gene': '',
-                    })
+        out_df = pd.DataFrame(transformed_rows)
+        if out_df.empty:
+            return None, None
 
-            result = pd.DataFrame(processed_rows)
-            # Ensure all fixed columns are present
-            for col in fixed_columns:
-                if col not in result.columns:
-                    result[col] = ''
-            return result[fixed_columns]
-
-        # Apply the processing function to each partition lazily
-        mri_table = airr_table.map_partitions(process_partition, meta=meta)
-
-        # Drop duplicates in the sequence table
-        sequence_table = mri_table.drop_duplicates()
-
-        # Generate the 'sequence' column
-        def generate_sequence(partition):
-            if len(partition) == 0:
-                # Just return the empty partition as is
-                partition['sequence'] = []
-                return partition
-            
-            # Otherwise, do the apply
-            partition['sequence'] = partition[['tra', 'trb']].apply(
-                lambda row: ' '.join(x for x in [row['tra'], row['trb']] if x) + ';',
-                axis=1
-            )
-            return partition
-
-
-        sequence_table = sequence_table.map_partitions(generate_sequence, meta=meta)
-
-        # Add metadata lazily
-        mri_table = mri_table.assign(
-            repertoire_id=self.repertoire_id,
-            study_id=self.study_id,
-            category=self.category,
-            molecule_type=self.molecule_type,
-            host_organism='human',
-            source='bulk_survey'
+        out_df['sequence'] = out_df[['tra', 'trb']].apply(
+            lambda x: ' '.join(y for y in x if y) + ';',
+            axis=1
         )
-        sequence_table = sequence_table.assign(source='bulk_survey')
 
-        # Standardize sequence table
-        sequence_table = standardize_sequence(sequence_table)
+        # Build MRI
+        mri_table = out_df.copy()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['host_organism'] = 'human'
+        mri_table['source'] = 'bulk_survey'
+
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
+
+        # Standardize
         mri_table = standardize_mri(mri_table)
+        sequence_table = standardize_sequence(sequence_table)
         return mri_table, sequence_table
 
-    
     def _parse_format_nine(self):
         """
-        Parse the AIRR dataset in format nine using Dask for efficient processing.
-
-        Returns:
-            tuple: Dask DataFrames for MRI and sequence tables.
+        Format nine example.
         """
-        # Filter for rows with frame_type "In" and select relevant columns
-        airr_table = self.bulk_table[self.bulk_table['frame_type'] == "In"]
-        airr_table = airr_table[['amino_acid', 'v_gene', 'd_gene', 'j_gene']]
+        df = self.bulk_table[self.bulk_table['frame_type'] == "In"].copy()
+        if df.empty:
+            return None, None
 
-        # Fill NaN values with a placeholder string
-        airr_table = airr_table.fillna('')
+        df = df[['amino_acid', 'v_gene', 'd_gene', 'j_gene']]
+        df = df.fillna('')
 
-        # Define fixed columns and metadata
-        fixed_columns = [
-            'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
-            'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
-        ]
-        meta = OrderedDict({col: 'string[pyarrow]' for col in fixed_columns})
+        transformed_rows = []
+        for _, row in df.iterrows():
+            if 'TCRAV' in row['v_gene']:
+                transformed_rows.append({
+                    'trav_gene': row['v_gene'],
+                    'traj_gene': row['j_gene'],
+                    'trad_gene': row['d_gene'],
+                    'tra': row['amino_acid'],
+                    'trbv_gene': '',
+                    'trbj_gene': '',
+                    'trbd_gene': '',
+                    'trb': '',
+                })
+            elif 'TCRBV' in row['v_gene']:
+                transformed_rows.append({
+                    'trbv_gene': row['v_gene'],
+                    'trbj_gene': row['j_gene'],
+                    'trbd_gene': row['d_gene'],
+                    'trb': row['amino_acid'],
+                    'trav_gene': '',
+                    'traj_gene': '',
+                    'trad_gene': '',
+                    'tra': '',
+                })
 
-        # Define a function to process each partition
-        def process_partition(partition):
-            processed_rows = []
-            for _, row in partition.iterrows():
-                if "TCRAV" in row['v_gene']:
-                    processed_rows.append({
-                        'trav_gene': row['v_gene'],
-                        'traj_gene': row['j_gene'],
-                        'trad_gene': row['d_gene'],
-                        'tra': row['amino_acid'],
-                        'trb': '',
-                        'trbv_gene': '',
-                        'trbj_gene': '',
-                        'trbd_gene': '',
-                    })
-                elif "TCRBV" in row['v_gene']:
-                    processed_rows.append({
-                        'trbv_gene': row['v_gene'],
-                        'trbj_gene': row['j_gene'],
-                        'trbd_gene': row['d_gene'],
-                        'trb': row['amino_acid'],
-                        'tra': '',
-                        'trav_gene': '',
-                        'traj_gene': '',
-                        'trad_gene': '',
-                    })
+        out_df = pd.DataFrame(transformed_rows)
+        if out_df.empty:
+            return None, None
 
-            result = pd.DataFrame(processed_rows)
-            # Ensure all fixed columns are present
-            for col in fixed_columns:
-                if col not in result.columns:
-                    result[col] = ''
-            return result[fixed_columns]
-
-        # Apply the transformation to each partition
-        mri_table = airr_table.map_partitions(process_partition, meta=meta)
-
-        # Deduplicate the sequence table
-        sequence_table = mri_table.drop_duplicates()
-
-        # Generate the 'sequence' column
-        def generate_sequence(partition):
-            if len(partition) == 0:
-                # Just return the empty partition as is
-                partition['sequence'] = []
-                return partition
-            
-            # Otherwise, do the apply
-            partition['sequence'] = partition[['tra', 'trb']].apply(
-                lambda row: ' '.join(x for x in [row['tra'], row['trb']] if x) + ';',
-                axis=1
-            )
-            return partition
-        
-        sequence_table = sequence_table.map_partitions(generate_sequence, meta=meta)
-
-        # Add metadata lazily
-        mri_table = mri_table.assign(
-            repertoire_id=self.repertoire_id,
-            study_id=self.study_id,
-            host_organism='human',
-            category=self.category,
-            molecule_type=self.molecule_type,
-            source='bulk_survey'
+        out_df['sequence'] = out_df[['tra', 'trb']].apply(
+            lambda x: ' '.join(y for y in x if y) + ';',
+            axis=1
         )
-        sequence_table = sequence_table.assign(source='bulk_survey')
 
-        # Standardize the sequence table
-        sequence_table = standardize_sequence(sequence_table)
+        mri_table = out_df.copy()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['host_organism'] = 'human'
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['source'] = 'bulk_survey'
+
+        sequence_table = mri_table.drop_duplicates().copy()
+
+        # Standardize
         mri_table = standardize_mri(mri_table)
+        sequence_table = standardize_sequence(sequence_table)
         return mri_table, sequence_table
 
-    
     def _parse_format_eleven(self):
         """
-        Parse the AIRR dataset in format eleven using Dask without relying on pandas.
-
-        Returns:
-            tuple: Dask DataFrames for MRI and sequence tables.
+        Format eleven example.
         """
-        # Select relevant columns
-        # Assume self.bulk_table is already a Dask DataFrame.
-        airr_table = self.bulk_table[['cdr3_b_aa', 'v_b_gene', 'j_b_gene']]
+        df = self.bulk_table[['cdr3_b_aa', 'v_b_gene', 'j_b_gene']].copy()
+        if df.empty:
+            return None, None
 
-        # Define fixed columns and metadata (using meta only for map_partitions)
-        fixed_columns = [
-            'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
-            'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
-        ]
-        # Here meta is used only in map_partitions; you don't need it for from_delayed.
-        meta = {col: 'object' for col in fixed_columns}
-
-        # Define a function to process rows
-        def process_row(row):
-            if "TRAV" in row['v_b_gene']:
-                return {
-                    'tid': '',
+        transformed_rows = []
+        for _, row in df.iterrows():
+            v_gene = row['v_b_gene']
+            if 'TRAV' in v_gene:
+                transformed_rows.append({
                     'trav_gene': row['v_b_gene'],
                     'traj_gene': row['j_b_gene'],
                     'trad_gene': '',
@@ -870,10 +700,9 @@ class BulkFileParser:
                     'trbd_gene': '',
                     'trb': '',
                     'sequence': f"{row['cdr3_b_aa']};",
-                }
-            elif "TRBV" in row['v_b_gene']:
-                return {
-                    'tid': '',
+                })
+            elif 'TRBV' in v_gene:
+                transformed_rows.append({
                     'trav_gene': '',
                     'traj_gene': '',
                     'trad_gene': '',
@@ -883,41 +712,24 @@ class BulkFileParser:
                     'trbd_gene': '',
                     'trb': row['cdr3_b_aa'],
                     'sequence': f"{row['cdr3_b_aa']};",
-                }
-            return None
+                })
 
-        def process_partition(partition):
-            # Process each row and keep only non-None results
-            rows = [process_row(row) for _, row in partition.iterrows() if process_row(row) is not None]
-            # If no rows processed, return an empty DataFrame with the fixed columns.
-            if not rows:
-                return pd.DataFrame(columns=fixed_columns).astype({col: "object" for col in fixed_columns})
-            # Otherwise, return a DataFrame constructed from the list of dictionaries.
-            partition_table = pd.DataFrame(rows, columns=fixed_columns)
-            return partition_table.astype({col: "object" for col in fixed_columns})
+        out_df = pd.DataFrame(transformed_rows)
+        if out_df.empty:
+            return None, None
 
-        # Apply the processing function to each partition (this returns a Dask DataFrame natively)
-        formatted_sequences = airr_table.map_partitions(process_partition, meta=meta)
+        # Build MRI
+        mri_table = out_df.copy()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['host_organism'] = 'human'
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['source'] = 'bulk_survey'
 
-        # Now, instead of converting from delayed objects, use the resulting Dask DataFrame directly.
-        mri_table = formatted_sequences
+        sequence_table = mri_table.drop_duplicates(subset='sequence').copy()
 
-        # Drop duplicates lazily
-        sequence_table = mri_table.drop_duplicates(subset='sequence')
-
-        # Add metadata columns
-        mri_table = mri_table.assign(
-            repertoire_id=self.repertoire_id,
-            study_id=self.study_id,
-            host_organism='human',
-            category=self.category,
-            molecule_type=self.molecule_type,
-            source='bulk_survey'
-        )
-        sequence_table = sequence_table.assign(source='bulk_survey')
-
-        # Optionally standardize columns with your functions
-        sequence_table = standardize_sequence(sequence_table)
+        # Standardize
         mri_table = standardize_mri(mri_table)
-
+        sequence_table = standardize_sequence(sequence_table)
         return mri_table, sequence_table

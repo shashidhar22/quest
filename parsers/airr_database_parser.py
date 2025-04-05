@@ -1,13 +1,33 @@
 import yaml
 import ijson
 import pandas as pd
-import dask.dataframe as dd
 
 from pathlib import Path
-from dask import delayed 
 from collections import OrderedDict
+from dask import delayed  # <-- NEW: We'll use Dask Delayed for final concatenation
 
-from .utils import parse_imgt_four_digit, transform_mhc_restriction, get_mhc_sequence
+from .utils import (
+    parse_imgt_four_digit,
+    transform_mhc_restriction,
+    get_mhc_sequence
+)
+
+
+@delayed
+def delayed_concat(dataframe_list):
+    """
+    A small helper function (decorated with @delayed) that uses
+    pandas.concat under the hood. This returns a Delayed object;
+    calling .compute() will yield the concatenated pandas DataFrame.
+    """
+    if not dataframe_list:
+        return pd.DataFrame()
+    # Filter out any empty (None or empty) dataframes to avoid concat errors
+    real_dfs = [df for df in dataframe_list if df is not None and not df.empty]
+    if not real_dfs:
+        return pd.DataFrame()
+    return pd.concat(real_dfs, axis=0, ignore_index=True)
+
 
 class DatabaseParser:
     def __init__(self, config_path, test=False):
@@ -16,57 +36,61 @@ class DatabaseParser:
         self.config = self._load_config()
         self.hla_dictionary = parse_imgt_four_digit(self.config['databases']['imgt']['hla_fasta'])
         self.output_path = self.config['outputs']['output_path']
-        
 
     def _load_config(self):
         with open(self.config_path, 'r') as f:
             return yaml.safe_load(f)
-    
-    
 
     def parse(self):
         """
-        Parse the databases specified in the configuration file.
+        Parse each of the individual databases, returning two *delayed* objects:
+            - mri_delayed : a Delayed object that yields a combined MRI table (pandas DataFrame)
+            - seq_delayed : a Delayed object that yields a combined sequence table (pandas DataFrame)
 
-        Returns:
-            tuple: A tuple containing:
-                - pd.DataFrame: Combined sequence data table from CEDAR and IEDB.
-                - pd.DataFrame: Combined MRI (minimum required information) table from CEDAR and IEDB.
+        You can compute them by calling:
+            final_mri = mri_delayed.compute()
+            final_seq = seq_delayed.compute()
+
+        Both final_mri and final_seq will then be normal pandas DataFrames in memory.
         """
-        mri_tables = []
-        sequence_tables = []
-        # Parse each database
-        vdjdb_mri, vdjdb_sequence = self._parse_vdjdb()
-        mcpas_mri, mcpas_sequence = self._parse_mcpas()
-        tcrdb_mri, tcrdb_sequence = self._parse_tcrdb()
-        iedb_mri, iedb_sequence = self._parse_iedb()
-        ireceptor_mri, ireceptor_sequence = self._parse_ireceptor()
-        # Combine tables
-        mri_tables.extend([vdjdb_mri, mcpas_mri, tcrdb_mri, iedb_mri, ireceptor_mri])    
-        sequence_tables.extend([vdjdb_sequence, mcpas_sequence, tcrdb_sequence, iedb_sequence, ireceptor_sequence]) 
-        # Concatenate all DataFrames in the list into a single DataFrame in Dask
-        mri_table = dd.concat(mri_tables, axis=0, interleave_partitions=True)
-        sequence_table = dd.concat(sequence_tables, axis=0, interleave_partitions=True)
-        return mri_table, sequence_table
-        
+        # Gather in-memory DataFrames from each parse method
+        vdjdb_mri, vdjdb_seq = self._parse_vdjdb()
+        mcpas_mri, mcpas_seq = self._parse_mcpas()
+        tcrdb_mri, tcrdb_seq = self._parse_tcrdb()
+        iedb_mri,  iedb_seq  = self._parse_iedb()
+        irec_mri,  irec_seq  = self._parse_ireceptor()
+
+        # Collect them in lists
+        mri_list = [vdjdb_mri, mcpas_mri, tcrdb_mri, iedb_mri, irec_mri]
+        seq_list = [vdjdb_seq, mcpas_seq, tcrdb_seq, iedb_seq, irec_seq]
+
+        # Use our delayed_concat function so that the final concatenation is also lazy
+        mri_delayed = delayed_concat(mri_list)
+        seq_delayed = delayed_concat(seq_list)
+
+        # Return the two Delayed objects
+        return mri_delayed, seq_delayed
+
+    # ----------------------------------------------------------------------
+    #                           VDJdb
+    # ----------------------------------------------------------------------
     def _parse_vdjdb(self):
         """
-        Parse the VDJdb dataset using Dask, ensuring large-scale compatibility.
-
+        Parse the VDJdb dataset using pandas in memory.
         Returns:
-            tuple: Dask DataFrames for MRI table and sequence table.
+            (mri_table, sequence_table)
         """
         database_path = self.config['databases']['vdjdb']
 
-        # Read the VDJdb data lazily
-        vdjdb_table = dd.read_csv(
-            database_path, sep="\t",
-            assume_missing=True,
+        try:
+            df = pd.read_csv(database_path, sep="\t", dtype=str, na_filter=False)
+        except FileNotFoundError:
+            print(f"File not found: {database_path}")
+            return pd.DataFrame(), pd.DataFrame()
 
-            dtype=str, na_filter=False)
-        if self.test:
-            vdjdb_table = vdjdb_table.sample(frac=0.1, random_state=21)
-        # Define column renaming mapping
+        if self.test and not df.empty:
+            df = df.sample(frac=0.1, random_state=21)
+
         relevant_columns = OrderedDict({
             'cdr3.alpha': 'tra',
             'v.alpha': 'trav_gene',
@@ -87,150 +111,145 @@ class DatabaseParser:
             'meta.epitope.id': 'epitope_reference_name',
             'meta.tissue': 'source_tissue',
             'meta.donor.MHC': 'mhc_profile',
+            'vdjdb.score': 'vdjdb_score'
         })
 
-        # Filter and rename columns lazily
-        vdjdb_table = vdjdb_table.loc[
-            (vdjdb_table['species'] == 'HomoSapiens') & (vdjdb_table['vdjdb.score'] != '0'),
-            list(relevant_columns.keys()) + ['vdjdb.score']
-        ].rename(columns=relevant_columns)
+        # Filter for HomoSapiens and 'vdjdb.score' != '0'
+        df = df[
+            (df['species'] == 'HomoSapiens') &
+            (df['vdjdb.score'] != '0')
+        ]
 
-        # Drop unnecessary columns
-        mri_table = vdjdb_table.drop(columns=['vdjdb.score'])
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame()
 
-        # Select relevant columns for sequence table
-        sequence_columns = [
+        df = df[list(relevant_columns.keys())].rename(columns=relevant_columns)
+
+        # MRI table
+        mri_table = df.drop(columns=['vdjdb_score'], errors='ignore').copy()
+
+        # Sequence table
+        seq_cols = [
             'trav_gene', 'traj_gene', 'tra',
             'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb',
             'peptide', 'mhc_restriction', 'mhc_restriction_two'
         ]
-        sequence_table = mri_table[sequence_columns]
+        sequence_table = mri_table[seq_cols].copy()
+        # Transform MHC
+        try:
+            sequence_table['mhc_restriction'] = transform_mhc_restriction(
+                sequence_table['mhc_restriction'], 
+                fasta_dict=self.hla_dictionary)
+            
+        except AttributeError:
+            breakpoint()
+        sequence_table['mhc_restriction_two'] =  transform_mhc_restriction(
+                sequence_table['mhc_restriction_two'], 
+                fasta_dict=self.hla_dictionary)
 
-        # Transform MHC restriction values lazily
-        sequence_table['mhc_restriction'] = sequence_table['mhc_restriction'].map_partitions(
-            lambda partition_series: transform_mhc_restriction(partition_series, fasta_dict=self.hla_dictionary),
-            meta=('mhc_restriction', 'str')
+        sequence_table['mhc_one'] = sequence_table['mhc_restriction'].apply(
+            lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)
         )
-        sequence_table['mhc_restriction_two'] = sequence_table['mhc_restriction_two'].map_partitions(
-            lambda partition_series: transform_mhc_restriction(partition_series, fasta_dict=self.hla_dictionary),
-            meta=('mhc_restriction_two', 'str')
-        )
-
-        # Map MHC sequences lazily
-        sequence_table['mhc_one'] = sequence_table['mhc_restriction'].map_partitions(
-            lambda col: col.apply(lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)),
-            meta=('mhc_one', 'str')
-        )
-        sequence_table['mhc_two'] = sequence_table['mhc_restriction_two'].map_partitions(
-            lambda col: col.apply(lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)),
-            meta=('mhc_two', 'str')
+        sequence_table['mhc_two'] = sequence_table['mhc_restriction_two'].apply(
+            lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)
         )
 
-        # Rename and create the 'sequence' column lazily
-        sequence_table = sequence_table.rename(columns={
-            'mhc_restriction': 'mhc_one_id', 'mhc_restriction_two': 'mhc_two_id'
-        })
-        sequence_table['sequence'] = sequence_table[['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']].map_partitions(
-            lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'str')
-        )
+        # Rename columns and build final sequence
+        sequence_table.rename(columns={
+            'mhc_restriction': 'mhc_one_id',
+            'mhc_restriction_two': 'mhc_two_id'
+        }, inplace=True)
 
-        # Add metadata lazily
+        def build_sequence(row):
+            parts = []
+            for val in [row['tra'], row['trb'], row['peptide'], row['mhc_one'], row['mhc_two']]:
+                if pd.notna(val) and val:
+                    parts.append(str(val))
+            return ' '.join(parts) + ';'
+
+        sequence_table['sequence'] = sequence_table.apply(build_sequence, axis=1)
         sequence_table['source'] = 'vdjdb'
-
-        # Drop duplicates lazily
-        sequence_table = sequence_table.drop_duplicates()
+        sequence_table.drop_duplicates(inplace=True)
 
         return mri_table, sequence_table
-        
+
+    # ----------------------------------------------------------------------
+    #                           TCRdb
+    # ----------------------------------------------------------------------
     def _parse_tcrdb(self):
         """
-        Parse the TCRdb dataset using Dask, ensuring compatibility with large datasets.
-
+        Parse the TCRdb dataset (all *.tsv files) using pandas in memory.
         Returns:
-            tuple: Dask DataFrames for MRI table and sequence table.
+            (mri_table, sequence_table)
         """
         database_path = Path(self.config['databases']['tcrdb'])
-        
-        # Gather all .tsv files in the directory and its subdirectories
-        tcrdb_file_list = list(database_path.rglob("*.tsv"))
+        tsv_files = list(database_path.rglob("*.tsv"))
+        if not tsv_files:
+            print(f"No TSV files found in {database_path}")
+            return pd.DataFrame(), pd.DataFrame()
 
-        if not tcrdb_file_list:
-            raise FileNotFoundError(f"No TSV files found in {database_path}")
+        all_mri = []
+        for file_path in tsv_files:
+            try:
+                tcr = pd.read_csv(file_path, sep="\t", dtype=str, na_filter=False)
+            except FileNotFoundError:
+                continue
+            if tcr.empty:
+                continue
 
-        # Define metadata for Dask
-        meta = OrderedDict({
-            'study_id': 'str',
-            'repertoire_id': 'str',
-            'trbv_gene': 'str',
-            'trbd_gene': 'str',
-            'trbj_gene': 'str',
-            'trb': 'str',
-            'sequence': 'str'
-        })
-
-        # Load all files lazily using Dask
-        tcrdb_tables = []
-        for file_path in tcrdb_file_list:
-            study_id = file_path.stem  # Extract study_id from filename
-
-            # Read the file lazily
-            tcr_table = dd.read_csv(file_path, sep="\t", assume_missing=True, dtype=str, na_filter=False)
             if self.test:
-                tcr_table = tcr_table.sample(frac=0.1, random_state=21)
-            # Rename columns for consistency
-            tcr_table = tcr_table.rename(columns={
+                tcr = tcr.sample(frac=0.1, random_state=21)
+
+            study_id = file_path.stem
+            tcr.rename(columns={
                 'RunId': 'repertoire_id',
                 'Vregion': 'trbv_gene',
                 'Dregion': 'trbd_gene',
                 'Jregion': 'trbj_gene',
                 'AASeq': 'trb'
-            })
+            }, inplace=True)
+            tcr.replace('Unknown', '', inplace=True)
 
-            # Drop unnecessary columns
-            tcr_table = tcr_table.drop(columns=['cloneFraction'], errors='ignore')
+            keep_cols = ['repertoire_id', 'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']
+            tcr = tcr[keep_cols]
+            tcr['study_id'] = study_id
+            all_mri.append(tcr)
 
-            # Replace 'Unknown' with NaN
-            tcr_table = tcr_table.replace('Unknown', '')
+        if not all_mri:
+            return pd.DataFrame(), pd.DataFrame()
 
-            # Assign metadata lazily
-            tcr_table = tcr_table.assign(study_id=study_id)
+        mri_table = pd.concat(all_mri, ignore_index=True)
 
-            # Select only required columns
-            tcr_table = tcr_table[['study_id', 'repertoire_id', 'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']]
-            
-            # Append processed table to list
-            tcrdb_tables.append(tcr_table)
-
-        # Concatenate all processed tables lazily
-        mri_table = dd.concat(tcrdb_tables, axis=0, interleave_partitions=True)
-
-        # Create the sequence table
-        sequence_table = mri_table[['trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']].copy()
-        sequence_table = sequence_table.assign(
-            sequence=sequence_table['trb'] + ';',
-            source='tcrdb'
-        )
-
-        # Drop duplicates lazily
-        sequence_table = sequence_table.drop_duplicates()
+        seq_cols = ['trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']
+        sequence_table = mri_table[seq_cols].copy()
+        sequence_table['sequence'] = sequence_table['trb'].apply(lambda x: x + ';' if x else '')
+        sequence_table['source'] = 'tcrdb'
+        sequence_table.drop_duplicates(inplace=True)
 
         return mri_table, sequence_table
 
+    # ----------------------------------------------------------------------
+    #                           McPAS-TCR
+    # ----------------------------------------------------------------------
     def _parse_mcpas(self):
         """
-        Parse the McPAS-TCR dataset using Dask, ensuring compatibility with large datasets.
-
+        Parse McPAS-TCR with pandas in memory.
         Returns:
-            tuple: Dask DataFrames for MRI table and sequence table.
+            (mri_table, sequence_table)
         """
         database_path = self.config['databases']['mcpas_tcr']
-        
-        # Read the McPAS-TCR data using Dask
-        mcpastcr_table = dd.read_csv(database_path, assume_missing=True, dtype=str, na_filter=False)
+        try:
+            df = pd.read_csv(database_path, dtype=str, na_filter=False)
+        except FileNotFoundError:
+            print(f"File not found: {database_path}")
+            return pd.DataFrame(), pd.DataFrame()
+
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
         if self.test:
-                mcpastcr_table = mcpastcr_table.sample(frac=0.1, random_state=21)
-        # Rename columns for consistency
+            df = df.sample(frac=0.1, random_state=21)
+
         rename_columns = {
             'TRAV': 'trav_gene',
             'TRAJ': 'traj_gene',
@@ -249,172 +268,198 @@ class DatabaseParser:
             'Pathology': 'epitope_source_organism',
             'MHC': 'mhc_restriction'
         }
-        mcpastcr_table = mcpastcr_table.rename(columns=rename_columns)
+        df.rename(columns=rename_columns, inplace=True)
 
-        # Add metadata columns lazily
-        mcpastcr_table = mcpastcr_table.assign(data_source='McPAS-TCR', study_id_type='PMID')
-
-        # Standardized MRI table with selected metadata columns
-        metadata_columns = [
-            'data_source', 'study_id', 'study_id_type', 'host_organism', 'trav_gene', 'traj_gene',
-            'tra_junction_aa', 'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb_junction_aa',
-            'peptide', 'epitope_reference_name', 'epitope_source_molecule', 'epitope_source_organism',
+        meta_cols = [
+            'study_id', 'host_organism', 'trav_gene', 'traj_gene',
+            'tra_junction_aa', 'trbv_gene', 'trbd_gene', 'trbj_gene',
+            'trb_junction_aa', 'peptide', 'epitope_reference_name',
+            'epitope_source_molecule', 'epitope_source_organism',
             'mhc_restriction', 'assay_method'
         ]
-        mri_table = mcpastcr_table[metadata_columns]
+        for c in meta_cols:
+            if c not in df.columns:
+                df[c] = ""
 
-        # Sequence Table Columns
-        sequence_columns = [
-            'trav_gene', 'traj_gene', 'tra_junction_aa', 'trbv_gene', 'trbd_gene',
-            'trbj_gene', 'trb_junction_aa', 'peptide', 'mhc_restriction'
+        mri_table = df[meta_cols].copy()
+        mri_table['data_source'] = 'McPAS-TCR'
+        mri_table['study_id_type'] = 'PMID'
+
+        seq_cols = [
+            'trav_gene', 'traj_gene', 'tra_junction_aa',
+            'trbv_gene', 'trbd_gene', 'trbj_gene',
+            'trb_junction_aa', 'peptide', 'mhc_restriction'
         ]
-        sequence_table = mri_table[sequence_columns].copy()
+        sequence_table = mri_table[seq_cols].copy()
 
-        # Process MHC restriction using map_partitions
-        sequence_table['mhc_restriction'] = sequence_table['mhc_restriction'].map_partitions(
-            lambda partition_series: transform_mhc_restriction(partition_series, fasta_dict=self.hla_dictionary),
-            meta=('mhc_restriction', 'str')
+        sequence_table['mhc_restriction'] = transform_mhc_restriction(
+            sequence_table['mhc_restriction'], fasta_dict=self.hla_dictionary)
+        sequence_table['mhc_one'] = sequence_table['mhc_restriction'].apply(
+            lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)
         )
 
-        # Map MHC sequences based on restriction
-        sequence_table['mhc_one'] = sequence_table['mhc_restriction'].map_partitions(
-            lambda df: df.apply(lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)),
-            meta=('mhc_one', 'str')
-        )
+        # Expand multiple peptides
+        sequence_table['peptide'] = sequence_table['peptide'].apply(lambda x: x.split('/') if x else [])
+        sequence_table = sequence_table.explode('peptide').reset_index(drop=True)
 
-        # Expand peptides lazily
-        sequence_table = sequence_table.assign(peptide=sequence_table['peptide'].str.split('/')).explode('peptide')
+        sequence_table.rename(columns={
+            'tra_junction_aa': 'tra',
+            'trb_junction_aa': 'trb'
+        }, inplace=True)
 
-        # Rename junction columns for consistency
-        sequence_table = sequence_table.rename(
-            columns={'tra_junction_aa': 'tra', 'trb_junction_aa': 'trb'}
-        )
+        def build_sequence(row):
+            parts = []
+            for val in [row['tra'], row['trb'], row['peptide'], row['mhc_one']]:
+                if pd.notna(val) and val:
+                    parts.append(str(val))
+            return ' '.join(parts) + ';'
 
-        # Generate the 'sequence' column lazily
-        sequence_table['sequence'] = sequence_table[['tra', 'trb', 'peptide', 'mhc_one']].map_partitions(
-            lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'str')
-        )
-
-        # Final selection and deduplication
-        sequence_columns_final = [
-            'trav_gene', 'traj_gene', 'tra', 'trbv_gene', 'trbj_gene', 'trbd_gene',
-            'trb', 'peptide', 'mhc_restriction', 'mhc_one', 'sequence'
+        sequence_table['sequence'] = sequence_table.apply(build_sequence, axis=1)
+        final_cols = [
+            'trav_gene', 'traj_gene', 'tra',
+            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb',
+            'peptide', 'mhc_restriction', 'mhc_one', 'sequence'
         ]
-        sequence_table = sequence_table[sequence_columns_final].assign(source='McPAS-TCR')
-        sequence_table = sequence_table.drop_duplicates()
+        for c in final_cols:
+            if c not in sequence_table.columns:
+                sequence_table[c] = ''
+
+        sequence_table = sequence_table[final_cols].copy()
+        sequence_table['source'] = 'McPAS-TCR'
+        sequence_table.drop_duplicates(inplace=True)
 
         return mri_table, sequence_table
-    
+
+    # ----------------------------------------------------------------------
+    #                           IEDB / CEDAR
+    # ----------------------------------------------------------------------
+    def _parse_iedb(self):
+        """
+        Parses data from IEDB and CEDAR, combining T-cell, MHC-ligand, and receptor data.
+        Returns: (mri_table, sequence_table)
+        """
+        # --- CEDAR ---
+        cedar_tcell_mri, cedar_tcell_seq = self._parse_iedb_tcr('cedar')
+        cedar_mhc_mri, cedar_mhc_seq = self._parse_iedb_mhc('cedar')
+        cedar_tcr_mri, cedar_tcr_seq = self._parse_iedb_receptor('cedar')
+
+        cedar_mri = pd.concat([cedar_tcell_mri, cedar_tcr_mri, cedar_mhc_mri], ignore_index=True).drop_duplicates()
+        cedar_seq = pd.concat([cedar_tcell_seq, cedar_tcr_seq, cedar_mhc_seq], ignore_index=True).drop_duplicates()
+        cedar_seq['source'] = 'cedar'
+
+        # --- IEDB ---
+        iedb_tcell_mri, iedb_tcell_seq = self._parse_iedb_tcr('iedb')
+        iedb_mhc_mri, iedb_mhc_seq = self._parse_iedb_mhc('iedb')
+        iedb_tcr_mri, iedb_tcr_seq = self._parse_iedb_receptor('iedb')
+
+        iedb_mri = pd.concat([iedb_tcell_mri, iedb_tcr_mri, iedb_mhc_mri], ignore_index=True).drop_duplicates()
+        iedb_seq = pd.concat([iedb_tcell_seq, iedb_tcr_seq, iedb_mhc_seq], ignore_index=True).drop_duplicates()
+        iedb_seq['source'] = 'iedb'
+
+        # Combine
+        combined_seq = pd.concat([cedar_seq, iedb_seq], ignore_index=True).drop_duplicates()
+        combined_mri = pd.concat([cedar_mri, iedb_mri], ignore_index=True).drop_duplicates()
+
+        return combined_mri, combined_seq
+
     def _parse_iedb_tcr(self, source):
         """
-        Parses IEDB T-cell assay data using Dask for efficient handling of large datasets.
-
-        Args:
-            source (str): Data source key from the config file.
-
-        Returns:
-            tuple: Dask DataFrames for MRI table and sequence table.
+        Parses T-cell assay data from IEDB or CEDAR (similar structure).
+        Returns: (mri_table, sequence_table)
         """
-        database_path = self.config['databases'][source]['tcell_assay']
+        db_cfg = self.config['databases'].get(source, {})
+        if 'tcell_assay' not in db_cfg:
+            return pd.DataFrame(), pd.DataFrame()
 
-        # Load T-cell assay data lazily
-        tcell_table = dd.read_csv(
-            database_path, 
-            sep="\t",
-            names=[
-                'study_id', 'epitope_type', 'peptide', 'epitope_reference_name',
-                'epitope_source_molecule', 'epitope_source_organism',
-                'epitope_source_species', 'host_organism', 'host_population',
-                'host_sex', 'host_age', 'host_mhc_profile', 'assay_method',
-                'assay_response', 'assay_outcome', 'assay_subject_count',
-                'assay_positive_count', 'source_tissue', 'mhc_restriction'
-            ],
-            header=0, dtype=str, na_filter=False)
+        file_path = db_cfg['tcell_assay']
+        col_names = [
+            'study_id', 'epitope_type', 'peptide', 'epitope_reference_name',
+            'epitope_source_molecule', 'epitope_source_organism',
+            'epitope_source_species', 'host_organism', 'host_population',
+            'host_sex', 'host_age', 'host_mhc_profile', 'assay_method',
+            'assay_response', 'assay_outcome', 'assay_subject_count',
+            'assay_positive_count', 'source_tissue', 'mhc_restriction'
+        ]
+        try:
+            df = pd.read_csv(file_path, sep="\t", names=col_names, header=0, dtype=str, na_filter=False)
+        except FileNotFoundError:
+            print(f"File not found: {file_path}")
+            return pd.DataFrame(), pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
         if self.test:
-                tcell_table = tcell_table.sample(frac=0.1, random_state=21)
-        # Drop rows where 'study_id' is missing and keep only positive assay outcomes
-        tcell_table = tcell_table.dropna(subset=['study_id'])
-        tcell_table = tcell_table[tcell_table['assay_outcome'] == "Positive"]
+            df = df.sample(frac=0.1, random_state=21)
 
-        # Define MRI Table with selected metadata
-        mri_table = tcell_table.assign(
-            data_source=f"{source}_tcell_assay",
-            study_id_type="PMID"
-        )[[  # Keep only relevant columns
-            'data_source', 'study_id', 'study_id_type', 'host_organism', 
-            'host_population', 'host_age', 'host_sex', 'host_mhc_profile', 
-            'source_tissue', 'epitope_type', 'peptide', 'epitope_reference_name', 
-            'epitope_source_molecule', 'epitope_source_organism', 'mhc_restriction', 
-            'assay_method', 'assay_response', 'assay_outcome', 'assay_subject_count', 
-            'assay_positive_count'
-        ]]
+        df.dropna(subset=['study_id'], inplace=True)
+        df = df[df['assay_outcome'].eq("Positive")]
 
-        # Create Sequence Table from relevant columns
-        sequence_table = mri_table[['peptide', 'mhc_restriction']].copy()
+        df['data_source'] = f"{source}_tcell_assay"
+        df['study_id_type'] = "PMID"
 
-        # Process MHC alleles (split multiple MHCs if present)
-        def process_mhc(df):
-            df['mhc_restriction_two'] = df['mhc_restriction'].str.split('/').str[1]
-            df['mhc_restriction'] = df['mhc_restriction'].str.split('/').str[0]
-            return df
+        keep_mri = [
+            'data_source', 'study_id', 'study_id_type', 'host_organism',
+            'host_population', 'host_age', 'host_sex', 'host_mhc_profile',
+            'source_tissue', 'epitope_type', 'peptide', 'epitope_reference_name',
+            'epitope_source_molecule', 'epitope_source_organism',
+            'mhc_restriction', 'assay_method', 'assay_response',
+            'assay_outcome', 'assay_subject_count', 'assay_positive_count'
+        ]
+        mri_table = df[keep_mri].copy()
 
-        sequence_table = sequence_table.map_partitions(process_mhc, meta={
-            'peptide': 'str',
-            'mhc_restriction': 'str',
-            'mhc_restriction_two': 'str'
-        })
+        seq_table = df[['peptide', 'mhc_restriction']].copy()
 
-        sequence_table['mhc_restriction'] = sequence_table['mhc_restriction'].map_partitions(
-            lambda partition_series: transform_mhc_restriction(partition_series, fasta_dict=self.hla_dictionary),
-            meta=('mhc_restriction', 'str')
+        # Split MHC on '/'
+        mhc_1, mhc_2 = [], []
+        for val in seq_table['mhc_restriction']:
+            parts = val.split('/') if val else []
+            mhc_1.append(parts[0] if len(parts) > 0 else '')
+            mhc_2.append(parts[1] if len(parts) > 1 else '')
+        seq_table['mhc_restriction'] = mhc_1
+        seq_table['mhc_restriction_two'] = mhc_2
+
+        seq_table['mhc_restriction'] = transform_mhc_restriction(
+            seq_table['mhc_restriction'],  self.hla_dictionary)
+        seq_table['mhc_restriction_two'] = transform_mhc_restriction(
+            seq_table['mhc_restriction_two'], self.hla_dictionary)
+
+        seq_table['mhc_one'] = seq_table['mhc_restriction'].apply(
+            lambda x: get_mhc_sequence(x, self.hla_dictionary)
+        )
+        seq_table['mhc_two'] = seq_table['mhc_restriction_two'].apply(
+            lambda x: get_mhc_sequence(x, self.hla_dictionary)
         )
 
+        seq_table['peptide'] = seq_table['peptide'].apply(lambda x: x.split('+')[0] if x else '')
 
-        sequence_table['mhc_restriction_two'] = sequence_table['mhc_restriction_two'].map_partitions(
-            lambda partition_series: transform_mhc_restriction(partition_series, fasta_dict=self.hla_dictionary),
-            meta=('mhc_restriction_two', 'str')
-        )
+        def build_sequence(row):
+            parts = []
+            for v in [row['peptide'], row['mhc_one'], row['mhc_two']]:
+                if v and pd.notna(v):
+                    parts.append(v)
+            return ' '.join(parts) + ';'
 
-        # Map MHC alleles to their sequences
-        sequence_table['mhc_one'] = sequence_table['mhc_restriction'].map_partitions(
-            lambda df: df.apply(lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)),
-            meta=('mhc_one', 'str')
-        )
-        sequence_table['mhc_two'] = sequence_table['mhc_restriction_two'].map_partitions(
-            lambda df: df.apply(lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)),
-            meta=('mhc_two', 'str')
-        )
-
-        # Standardize peptide sequences by extracting the first peptide when multiple exist
-        sequence_table['peptide'] = sequence_table['peptide'].str.split('+').str[0].str.strip()
-
-        # Generate 'sequence' column lazily
-        sequence_table['sequence'] = sequence_table[['peptide', 'mhc_one', 'mhc_two']].map_partitions(
-            lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'str')
-        )
-
-        # Rename MHC columns for clarity
-        sequence_table = sequence_table.rename(columns={
+        seq_table['sequence'] = seq_table.apply(build_sequence, axis=1)
+        seq_table.rename(columns={
             'mhc_restriction': 'mhc_one_id',
             'mhc_restriction_two': 'mhc_two_id'
-        })[['peptide', 'mhc_one_id', 'mhc_one', 'mhc_two_id', 'mhc_two', 'sequence']]
+        }, inplace=True)
+        seq_cols = ['peptide', 'mhc_one_id', 'mhc_one', 'mhc_two_id', 'mhc_two', 'sequence']
+        seq_table = seq_table[seq_cols].drop_duplicates()
 
-        return mri_table, sequence_table
-    
+        return mri_table, seq_table
+
     def _parse_iedb_mhc(self, source):
         """
-        Parses MHC ligand assay data from IEDB or CEDAR using Dask for efficient large-scale processing.
-
-        Args:
-            source (str): Data source key from the config file.
-
-        Returns:
-            tuple: Dask DataFrames for MRI table and sequence table.
+        Parses MHC-ligand data from IEDB or CEDAR.
+        Returns: (mri_table, sequence_table)
         """
-        # Define column names based on the database source
-        col_names = {
+        db_cfg = self.config['databases'].get(source, {})
+        if 'mhc_ligand' not in db_cfg:
+            return pd.DataFrame(), pd.DataFrame()
+
+        file_path = db_cfg['mhc_ligand']
+        col_map = {
             "iedb": [
                 'study_id', 'epitope_type', 'peptide', 'epitope_reference_name',
                 'epitope_source_molecule', 'epitope_source_organism',
@@ -428,97 +473,100 @@ class DatabaseParser:
                 'epitope_source_organism', 'epitope_source_species',
                 'host_organism', 'host_population', 'host_sex', 'host_age',
                 'host_mhc_profile', 'assay_method', 'assay_response',
-                'assay_subject_count', 'assay_positive_count',
-                'source_tissue', 'mhc_restriction'
+                'assay_subject_count', 'assay_positive_count', 'source_tissue',
+                'mhc_restriction'
             ]
         }
-        
-        # Validate source type
-        column_names = col_names.get(source.lower())
-        if not column_names:
-            raise ValueError(f"Unsupported database: {source}")
+        columns = col_map.get(source.lower(), [])
+        if not columns:
+            return pd.DataFrame(), pd.DataFrame()
 
-        # Load the dataset lazily
-        database_path = self.config['databases'][source]['mhc_ligand']
-        mhc_ligand_table = dd.read_csv(
-            database_path,
-            sep="\t",
-            names=column_names,
-            header=0,
-            dtype=str, na_filter=False)
+        try:
+            df = pd.read_csv(
+                file_path,
+                sep="\t",
+                names=columns,
+                header=0,
+                dtype=str,
+                na_filter=False
+            )
+        except FileNotFoundError:
+            print(f"File not found: {file_path}")
+            return pd.DataFrame(), pd.DataFrame()
+
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame()
 
         if self.test:
-                mhc_ligand_table = mhc_ligand_table.sample(frac=0.1, random_state=21)
+            df = df.sample(frac=0.1, random_state=21)
 
-        # Filter for positive assay outcomes (if column exists)
-        if 'assay_outcome' in mhc_ligand_table.columns:
-            mhc_ligand_table = mhc_ligand_table[mhc_ligand_table['assay_outcome'] == "Positive"]
+        if 'assay_outcome' in df.columns:
+            df = df[df['assay_outcome'] == "Positive"]
 
-        # Assign metadata lazily
-        mri_table = mhc_ligand_table.assign(
-            data_source=f"{source}_mhc_ligand_assay",
-            study_id_type="PMID"
-        )[[  # Select relevant columns
+        df['data_source'] = f"{source}_mhc_ligand_assay"
+        df['study_id_type'] = "PMID"
+
+        keep_cols = [
             'data_source', 'study_id', 'study_id_type', 'host_organism',
             'host_population', 'host_age', 'host_sex', 'host_mhc_profile',
             'source_tissue', 'epitope_type', 'peptide', 'epitope_source_molecule',
             'epitope_source_organism', 'mhc_restriction', 'assay_method',
             'assay_response', 'assay_subject_count', 'assay_positive_count'
-        ]]
+        ]
+        for c in keep_cols:
+            if c not in df.columns:
+                df[c] = ""
 
-        # Create sequence table
-        sequence_table = mri_table[['peptide', 'mhc_restriction']]
+        mri_table = df[keep_cols].copy()
 
-        # Efficiently split and process MHC chains using Dask `.str.split()`
-        sequence_table['mhc_restriction_two'] = sequence_table['mhc_restriction'].str.split('/').str[1]
-        sequence_table['mhc_restriction'] = sequence_table['mhc_restriction'].str.split('/').str[0]
+        seq_table = df[['peptide', 'mhc_restriction']].copy()
+        mhc_1, mhc_2 = [], []
+        for val in seq_table['mhc_restriction']:
+            parts = val.split('/') if val else []
+            mhc_1.append(parts[0] if len(parts) > 0 else '')
+            mhc_2.append(parts[1] if len(parts) > 1 else '')
+        seq_table['mhc_restriction'] = mhc_1
+        seq_table['mhc_restriction_two'] = mhc_2
 
-        # Transform MHC alleles into standardized IMGT HLA notation
-        sequence_table['mhc_restriction'] = sequence_table['mhc_restriction'].map_partitions(
-            lambda partition_series: transform_mhc_restriction(partition_series, fasta_dict=self.hla_dictionary),
-            meta=('mhc_restriction', 'str')
+        seq_table['mhc_restriction'] = transform_mhc_restriction(
+            seq_table['mhc_restriction'], self.hla_dictionary)
+        seq_table['mhc_restriction_two'] = transform_mhc_restriction(
+            seq_table['mhc_restriction_two'], self.hla_dictionary)
+        seq_table['mhc_one'] = seq_table['mhc_restriction'].apply(
+            lambda x: get_mhc_sequence(x, self.hla_dictionary)
         )
-        sequence_table['mhc_restriction_two'] = sequence_table['mhc_restriction_two'].map_partitions(
-            lambda partition_series: transform_mhc_restriction(partition_series, fasta_dict=self.hla_dictionary),
-            meta=('mhc_restriction_two', 'str')
-        )
-
-        # Map MHC alleles to sequences
-        sequence_table['mhc_one'] = sequence_table['mhc_restriction'].map_partitions(
-            lambda df: df.apply(lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)),
-            meta=('mhc_one', 'str')
-        )
-        sequence_table['mhc_two'] = sequence_table['mhc_restriction_two'].map_partitions(
-            lambda df: df.apply(lambda x: get_mhc_sequence(x, fasta_dict=self.hla_dictionary)),
-            meta=('mhc_two', 'str')
+        seq_table['mhc_two'] = seq_table['mhc_restriction_two'].apply(
+            lambda x: get_mhc_sequence(x, self.hla_dictionary)
         )
 
-        # Generate the 'sequence' column lazily
-        sequence_table['sequence'] = sequence_table[['peptide', 'mhc_one', 'mhc_two']].map_partitions(
-            lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'str')
-        )
+        def build_sequence(row):
+            parts = []
+            for v in [row['peptide'], row['mhc_one'], row['mhc_two']]:
+                if v and pd.notna(v):
+                    parts.append(v)
+            return ' '.join(parts) + ';'
 
-        # Rename and select final columns
-        sequence_table = sequence_table.rename(columns={
+        seq_table['sequence'] = seq_table.apply(build_sequence, axis=1)
+        seq_table.rename(columns={
             'mhc_restriction': 'mhc_one_id',
             'mhc_restriction_two': 'mhc_two_id'
-        })[['peptide', 'mhc_one_id', 'mhc_one', 'mhc_two_id', 'mhc_two', 'sequence']]
+        }, inplace=True)
+        final_cols = ['peptide', 'mhc_one_id', 'mhc_one', 'mhc_two_id', 'mhc_two', 'sequence']
+        seq_table = seq_table[final_cols].drop_duplicates()
 
-        return mri_table, sequence_table
-    
+        return mri_table, seq_table
+
     def _parse_iedb_receptor(self, source):
         """
-        Parses receptor assay data from IEDB or CEDAR using Dask for efficient large-scale processing.
-
-        Args:
-            source (str): Data source key from the config file.
-
-        Returns:
-            tuple: Dask DataFrames for MRI table and sequence table.
+        Parses receptor assay data from IEDB or CEDAR.
+        Returns: (mri_table, sequence_table)
         """
-        # Define column names based on the database source
-        col_names = {
+        db_cfg = self.config['databases'].get(source, {})
+        if 'receptor' not in db_cfg:
+            return pd.DataFrame(), pd.DataFrame()
+
+        file_path = db_cfg['receptor']
+        col_map = {
             "iedb": [
                 'study_id', 'recepetor_reference_name', 'receptor_type', 'peptide',
                 'epitope_source_molecule', 'epitope_source_organism',
@@ -538,344 +586,99 @@ class DatabaseParser:
                 'trb_cdr2'
             ]
         }
+        columns = col_map.get(source.lower(), [])
+        if not columns:
+            return pd.DataFrame(), pd.DataFrame()
 
-        # Validate source type
-        column_names = col_names.get(source.lower())
-        if not column_names:
-            raise ValueError(f"Unsupported database: {source}")
-
-        # Load the dataset lazily
-        database_path = self.config['databases'][source]['receptor']
-        receptor_table = dd.read_csv(
-            database_path,
-            sep="\t",
-            names=column_names,
-            header=0,
-            dtype=str, na_filter=False)
+        try:
+            df = pd.read_csv(
+                file_path,
+                sep="\t",
+                names=columns,
+                header=0,
+                dtype=str,
+                na_filter=False
+            )
+        except FileNotFoundError:
+            print(f"File not found: {file_path}")
+            return pd.DataFrame(), pd.DataFrame()
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame()
 
         if self.test:
-                receptor_table = receptor_table.sample(frac=0.1, random_state=21)
+            df = df.sample(frac=0.1, random_state=21)
 
-        # Process `study_id` for CEDAR datasets (extract numeric ID)
-        if source.lower() == "cedar":
-            receptor_table['study_id'] = receptor_table['study_id'].str.extract(r'(\d{7})')[0]
+        if source.lower() == 'cedar':
+            df['study_id'] = df['study_id'].str.extract(r'(\d{7})')[0]
 
-        # Standardize `study_id` format lazily
-        receptor_table['study_id'] = receptor_table['study_id'].astype(str).map_partitions(
-            lambda df: df.apply(lambda x: f"{source.upper()}{x}" if pd.notna(x) else x),
-            meta=('study_id', 'str')
-        )
+        def fix_study_id(x):
+            if pd.notna(x) and x:
+                return f"{source.upper()}{x}"
+            return x
+        df['study_id'] = df['study_id'].apply(fix_study_id)
 
-        # Define the MRI table
-        mri_table = receptor_table.assign(
-            data_source=f"{source}_receptor_table",
-            study_id_type=source.upper(),
-            host_organism="human"  # Assume host organism is human
-        )[[  # Keep only relevant columns
+        df['data_source'] = f"{source}_receptor_table"
+        df['study_id_type'] = source.upper()
+        df['host_organism'] = "human"
+
+        keep_mri = [
             'data_source', 'study_id', 'study_id_type', 'host_organism',
             'trav_gene', 'trad_gene', 'traj_gene', 'tra_junction_aa',
             'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb_junction_aa',
             'peptide', 'epitope_source_molecule', 'epitope_source_organism'
-        ]]
+        ]
+        for c in keep_mri:
+            if c not in df.columns:
+                df[c] = ""
 
-        # Define the sequence table
-        sequence_table = mri_table[[
-            'trav_gene', 'trad_gene', 'traj_gene', 'trbv_gene', 'trbd_gene',
-            'trbj_gene', 'peptide', 'tra_junction_aa', 'trb_junction_aa'
-        ]].rename(columns={
+        mri_table = df[keep_mri].copy()
+
+        seq_cols = [
+            'trav_gene', 'trad_gene', 'traj_gene',
+            'trbv_gene', 'trbd_gene', 'trbj_gene',
+            'peptide', 'tra_junction_aa', 'trb_junction_aa'
+        ]
+        sequence_table = mri_table[seq_cols].copy()
+        sequence_table.rename(columns={
             'tra_junction_aa': 'tra',
             'trb_junction_aa': 'trb'
-        })
+        }, inplace=True)
 
-        # Standardize peptide sequences using `.str.split()`
-        sequence_table['peptide'] = sequence_table['peptide'].str.split('+').str[0].str.strip()
-
-        # Drop duplicates lazily
-        sequence_table = sequence_table.drop_duplicates()
-
-        # Generate the 'sequence' column lazily
-        sequence_table['sequence'] = sequence_table[['tra', 'trb', 'peptide']].map_partitions(
-            lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'str')
+        # Keep first peptide if multiple
+        sequence_table['peptide'] = sequence_table['peptide'].apply(
+            lambda x: x.split('+')[0] if x else ''
         )
 
-        # Select final columns for the sequence table
-        sequence_table = sequence_table[[
-            'trav_gene', 'trad_gene', 'traj_gene', 'tra',
-            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb',
-            'peptide', 'sequence'
-        ]]
+        def build_sequence(row):
+            parts = []
+            for val in [row['tra'], row['trb'], row['peptide']]:
+                if pd.notna(val) and val:
+                    parts.append(val)
+            return ' '.join(parts) + ';'
 
-        return mri_table, sequence_table
-    
-    def _parse_iedb(self):
-        """
-        Parses data from IEDB and CEDAR using Dask, ensuring efficient large-scale processing.
+        sequence_table['sequence'] = sequence_table.apply(build_sequence, axis=1)
+        sequence_table.drop_duplicates(inplace=True)
 
-        Returns:
-            tuple: Dask DataFrames for MRI table and sequence table.
-        """
-        # Load and parse data from CEDAR
-        cedar_tcell_mri_table, cedar_tcell_sequence_table = self._parse_iedb_tcr('cedar')
-        cedar_mhc_mri_table, cedar_mhc_sequence_table = self._parse_iedb_mhc('cedar')
-        cedar_tcr_mri_table, cedar_tcr_sequence_table = self._parse_iedb_receptor('cedar')
-        print('Parsed CEDAR')
+        final_cols = [
+            'trav_gene', 'trad_gene', 'traj_gene',
+            'tra', 'trbv_gene', 'trbd_gene', 'trbj_gene',
+            'trb', 'peptide', 'sequence'
+        ]
+        for c in final_cols:
+            if c not in sequence_table.columns:
+                sequence_table[c] = ''
 
-        # Concatenate CEDAR MRI and sequence tables lazily
-        cedar_mri_table = dd.concat([cedar_tcell_mri_table, cedar_tcr_mri_table, cedar_mhc_mri_table]).drop_duplicates()
-        cedar_sequence_table = dd.concat([cedar_tcell_sequence_table, cedar_tcr_sequence_table, cedar_mhc_sequence_table]).drop_duplicates()
-        cedar_sequence_table = cedar_sequence_table.assign(source='cedar')
-
-        # Load and parse data from IEDB
-        iedb_tcell_mri_table, iedb_tcell_sequence_table = self._parse_iedb_tcr('iedb')
-        iedb_mhc_mri_table, iedb_mhc_sequence_table = self._parse_iedb_mhc('iedb')
-        iedb_tcr_mri_table, iedb_tcr_sequence_table = self._parse_iedb_receptor('iedb')
-        print('Parsed IEDB')
-
-        # Concatenate IEDB MRI and sequence tables lazily
-        iedb_mri_table = dd.concat([iedb_tcell_mri_table, iedb_tcr_mri_table, iedb_mhc_mri_table]).drop_duplicates()
-        iedb_sequence_table = dd.concat([iedb_tcell_sequence_table, iedb_tcr_sequence_table, iedb_mhc_sequence_table]).drop_duplicates()
-        iedb_sequence_table = iedb_sequence_table.assign(source='iedb')
-
-        # Combine data from both CEDAR and IEDB databases lazily
-        sequence_table = dd.concat([cedar_sequence_table, iedb_sequence_table]).reset_index(drop=True)
-        mri_table = dd.concat([cedar_mri_table, iedb_mri_table]).reset_index(drop=True)
-
+        sequence_table = sequence_table[final_cols]
         return mri_table, sequence_table
 
-    def _parse_paired_ireceptor(self, source):
-        """
-        Parses iReceptor paired-chain data using Dask, ensuring large-scale compatibility.
-
-        Args:
-            source (str): Source identifier (e.g., 'tcr', 'bcr').
-
-        Returns:
-            tuple: Dask DataFrames for MRI table and sequence table.
-        """
-        database_path = self.config['databases']['ireceptor'][source]['database']
-        
-        # Read iReceptor data lazily
-        database_table = dd.read_csv(
-            database_path,
-            sep="\t",
-            usecols=[
-                'data_processing_id', 'repertoire_id', 'cell_id', 'clone_id', 'productive',
-                'locus', 'v_call', 'd_call', 'j_call', 'junction_aa'
-            ],
-            dtype=str, na_filter=False)
-
-        if self.test:
-                database_table = database_table.sample(frac=0.1, random_state=21)
-
-        # Filter productive rows lazily
-        database_table = database_table[database_table['productive'] == 'T']
-
-        # Function to process TRA and TRB chains
-        def process_chain(df, chain_type, rename_map):
-            df = df[df['locus'] == chain_type].rename(columns=rename_map)
-            return df.drop(columns=['locus', 'repertoire_id', 'productive'], errors='ignore')
-
-        # Column mappings
-        tra_map = {'v_call': 'trav_gene', 'd_call': 'trad_gene', 'j_call': 'traj_gene', 'junction_aa': 'tra'}
-        trb_map = {'v_call': 'trbv_gene', 'd_call': 'trbd_gene', 'j_call': 'trbj_gene', 'junction_aa': 'trb'}
-
-        # Process TRA and TRB chains lazily
-        tra_table = database_table.map_partitions(process_chain, chain_type='TRA', 
-            rename_map=tra_map, meta={'trav_gene': 'str', 'trad_gene': 'str', 
-                                      'traj_gene': 'str', 'tra': 'str', 
-                                      'cell_id': 'str', 'clone_id': 'str', 'data_processing_id': 'str'})
-        
-        trb_table = database_table.map_partitions(process_chain, chain_type='TRB',
-            rename_map=trb_map, meta={'trbv_gene': 'str', 'trbd_gene': 'str',
-                                      'trbj_gene': 'str', 'trb': 'str',
-                                      'cell_id': 'str', 'clone_id': 'str', 'data_processing_id': 'str'})
-
-        # Merge TRA and TRB tables lazily
-        mri_table = dd.merge(tra_table, trb_table, on=['data_processing_id', 'cell_id', 'clone_id'], how='outer').rename(columns={'data_processing_id': 'repertoire_id'})
-
-        # Drop unnecessary columns
-        mri_table = mri_table.drop(columns=['cell_id', 'clone_id'], errors='ignore')
-
-        # Create sequence table lazily
-        sequence_table = mri_table[['trav_gene', 'traj_gene', 'tra', 'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']]
-
-        # Generate 'sequence' column lazily
-        sequence_table['sequence'] = sequence_table[['tra', 'trb']].map_partitions(
-            lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'str')
-        )
-
-        # Drop duplicates lazily
-        sequence_table = sequence_table.drop_duplicates()
-        # Add source column lazily
-        sequence_table = sequence_table.assign(source=f"ireceptor_{source}")
-
-        return mri_table, sequence_table
-    
-    def _parse_bulk_ireceptor(self, source):
-        """
-        Parses bulk iReceptor data using Dask, ensuring large-scale compatibility.
-
-        Args:
-            source (str): Source identifier (e.g., 'tcr', 'bcr').
-
-        Returns:
-            tuple: Dask DataFrames for MRI table and sequence table.
-        """
-        database_path = self.config['databases']['ireceptor'][source]['database']
-        
-        # Read the bulk iReceptor data lazily
-        tcr_table = dd.read_csv(
-            database_path,
-            sep="\t",
-            usecols=[
-                'repertoire_id', 'cell_id', 'clone_id', 'productive', 'locus',
-                'v_call', 'd_call', 'j_call', 'junction_aa'
-            ],
-            dtype=str, na_filter=False)
-
-        if self.test:
-                tcr_table = tcr_table.sample(frac=0.1, random_state=21)
-        # Filter for productive sequences lazily
-        mri_table = tcr_table[tcr_table['productive'] == 'T'].drop(columns=['productive'])
-
-        # Define renaming maps for TRA and TRB chains
-        rename_maps = {
-            'TRA': {'v_call': 'trav_gene', 'd_call': 'trad_gene', 'j_call': 'traj_gene', 'junction_aa': 'tra'},
-            'TRB': {'v_call': 'trbv_gene', 'd_call': 'trbd_gene', 'j_call': 'trbj_gene', 'junction_aa': 'trb'}
-        }
-
-        # Function to process TRA and TRB chains
-        def process_chain(df, locus, rename_map):
-            if locus == 'TRA':
-                correct_order = [
-                    'tra', 
-                    'trav_gene', 
-                    'trad_gene', 
-                    'traj_gene', 
-                    'repertoire_id', 
-                    'cell_id', 
-                    'clone_id',
-                    'locus'
-                ]
-                df = df.reindex(columns=correct_order)
-            elif locus == 'TRB':
-                correct_order = [
-                    'trb', 
-                    'trbv_gene', 
-                    'trbd_gene', 
-                    'trbj_gene', 
-                    'repertoire_id', 
-                    'cell_id', 
-                    'clone_id',
-                    'locus'
-                ]
-                df = df.reindex(columns=correct_order)
-            return df[df['locus'] == locus].rename(columns=rename_map).drop(columns=['locus'], errors='ignore')
-        
-
-        # Process TRA and TRB lazily using map_partitions
-        tra_table = mri_table.map_partitions(process_chain, locus='TRA', rename_map=rename_maps['TRA'], meta={'tra': 'str', 'trav_gene': 'str', 'trad_gene': 'str', 'traj_gene': 'str', 'repertoire_id': 'str', 'cell_id': 'str', 'clone_id': 'str'})
-        trb_table = mri_table.map_partitions(process_chain, locus='TRB', rename_map=rename_maps['TRB'], meta={'trb': 'str', 'trbv_gene': 'str', 'trbd_gene': 'str', 'trbj_gene': 'str', 'repertoire_id': 'str', 'cell_id': 'str', 'clone_id': 'str'})
-
-        # Merge TRA and TRB tables lazily
-        sequence_table = dd.concat([tra_table, trb_table], interleave_partitions=True)
-
-        # Generate 'sequence' column lazily
-        sequence_table['sequence'] = sequence_table[['tra', 'trb']].map_partitions(
-            lambda df: df.apply(lambda row: ' '.join(str(x) for x in row if pd.notna(x)) + ';', axis=1),
-            meta=('sequence', 'str')
-        )
-
-        # Drop unnecessary columns
-        sequence_table = sequence_table.drop(columns=['repertoire_id', 'cell_id', 'clone_id'], errors='ignore')
-
-        # Add source column lazily
-        sequence_table = sequence_table.assign(source=f"ireceptor_{source}")
-
-        return mri_table, sequence_table
-    
-    def _parse_json_ireceptor(self, source):
-        """
-        Parses iReceptor JSON metadata lazily using Dask, ensuring large-scale compatibility.
-
-        Args:
-            source (str): Source identifier (e.g., 'ireceptor', 'other_db').
-
-        Returns:
-            dd.DataFrame: Dask DataFrame with parsed metadata.
-        """
-        metadata_path = self.config['databases']['ireceptor'][source]['metadata']
-
-        # Define function to process a single JSON entry
-        def process_repertoire(repertoire, database):
-            """
-            Parses a single repertoire JSON str.
-            """
-            try:
-                # Extract primary metadata fields
-                repertoire_dict = {
-                    'study_id': repertoire['study']['study_id'],
-                    'repertoire_id': (
-                        repertoire['repertoire_id']
-                        if database == "ireceptor"
-                        else repertoire['data_processing'][0]['data_processing_id']
-                    ),
-                    'host_organism': repertoire['subject']['species']['label'],
-                    'condition_studies': (
-                        repertoire['subject']['diagnosis'][0]['study_group_description']
-                        + (' ' + repertoire['subject']['diagnosis'][0]['disease_diagnosis']['label']
-                        if repertoire['subject']['diagnosis'][0]['disease_diagnosis']['label'] else '')
-                    ),
-                    'age': repertoire['subject'].get('age', ''),
-                    'sex': repertoire['subject'].get('sex', ''),
-                    'population_surveyed': repertoire['subject'].get('race', ''),
-                    'source_tissue': repertoire['sample'][0]['tissue']['label'] if repertoire.get('sample') else '',
-                }
-
-                # Extract MHC profile (if available)
-                mhc_list = set()
-                if 'genotype' in repertoire['subject']:
-                    for mhc_genotypes in repertoire['subject']['genotype'].get('mhc_genotype_set', {}).get('mhc_genotype_list', []):
-                        for allele in mhc_genotypes.get('mhc_alleles', []):
-                            if allele.get('allele_designation'):
-                                mhc_list.add(allele['allele_designation'])
-
-                repertoire_dict['mhc_profile'] = ','.join(sorted(mhc_list)) if mhc_list else ''
-                return repertoire_dict
-            except Exception as e:
-                print(f"Error processing repertoire: {e}")
-                return None  # Skip invalid entries
-
-        # Stream JSON lazily and process repertoires in parallel
-        with open(metadata_path, 'r') as meta_file:
-            repertoires = [
-                delayed(process_repertoire)(item, source)
-                for item in ijson.items(meta_file, "Repertoire.item")
-            ]
-
-        # Convert processed JSON strs to a Dask DataFrame lazily
-        metadata_table = dd.from_delayed([
-            delayed(pd.DataFrame)([r]) for r in repertoires if r is not None
-        ])
-
-        # Drop duplicate rows lazily
-        metadata_table = metadata_table.drop_duplicates()
-
-        return metadata_table
-    
+    # ----------------------------------------------------------------------
+    #                           iReceptor
+    # ----------------------------------------------------------------------
     def _parse_ireceptor(self):
         """
-        Parses multiple iReceptor datasets using Dask, ensuring scalable and efficient processing.
-
-        Returns:
-            tuple: (mri_table, sequence_table) as Dask DataFrames.
+        Parses multiple iReceptor datasets using pandas in memory, merges each
+        with JSON metadata. Returns (mri_table, sequence_table).
         """
-        # Load HLA dictionary lazily
-        hla_dictionary = parse_imgt_four_digit(self.config['databases']['imgt']['hla_fasta'])
-
-        # Define databases and parsing functions
         databases = {
             "airr_covid": (self._parse_paired_ireceptor, 'airr_covid'),
             "paone": (self._parse_bulk_ireceptor, 'paone'),
@@ -885,52 +688,289 @@ class DatabaseParser:
             "vdjserver": (self._parse_bulk_ireceptor, 'vdjserver'),
         }
 
-        sequence_tables = []
-        mri_tables = []
+        all_mri = []
+        all_sequences = []
 
-        def process_data(parse_function, db_name):
-            """
-            Helper function to process each database.
-            """
-            # Parse TCR and sequence tables
-            tcr_table, sequence_table = parse_function(db_name)
-
-            # Parse metadata using Dask
+        for db_key, (parse_func, db_name) in databases.items():
+            db_mri, db_seq = parse_func(db_name)
             metadata_table = self._parse_json_ireceptor(db_name)
-            
-            # Ensure `repertoire_id` is consistent
+
+            if db_mri.empty or metadata_table.empty:
+                continue
+
             metadata_table['repertoire_id'] = metadata_table['repertoire_id'].astype(str)
-            tcr_table['repertoire_id'] = tcr_table['repertoire_id'].astype(str)
+            db_mri['repertoire_id'] = db_mri['repertoire_id'].astype(str)
 
-            # Merge metadata with TCR table lazily
-            merged_table = dd.merge(metadata_table, tcr_table, on="repertoire_id", how="inner")
+            merged_mri = pd.merge(metadata_table, db_mri, on='repertoire_id', how='inner')
+            if not merged_mri.empty:
+                all_mri.append(merged_mri)
+            if not db_seq.empty:
+                all_sequences.append(db_seq)
 
-            print(f"{db_name} formatted")
-            return sequence_table, merged_table
+        if all_mri:
+            final_mri = pd.concat(all_mri, ignore_index=True)
+        else:
+            final_mri = pd.DataFrame()
 
-        # Process each database in parallel
-        for db_key, (parse_function, db_name) in databases.items():
-            db_path = self.config['databases']['ireceptor'][db_key]['database']
-            metadata_path = self.config['databases']['ireceptor'][db_key]['metadata']
+        if all_sequences:
+            # Standardize columns
+            seq_standard_cols = [
+                'trav_gene', 'traj_gene', 'tra',
+                'trbv_gene', 'trbd_gene', 'trbj_gene',
+                'trb', 'sequence', 'source'
+            ]
+            normalized_seq_tables = []
+            for df in all_sequences:
+                for c in seq_standard_cols:
+                    if c not in df.columns:
+                        df[c] = ''
+                df = df[seq_standard_cols]
+                normalized_seq_tables.append(df)
+            final_seq = pd.concat(normalized_seq_tables, ignore_index=True)
+        else:
+            final_seq = pd.DataFrame()
 
-            seq_table, mri_table = process_data(parse_function, db_name)
+        return final_mri, final_seq
 
-            sequence_tables.append(seq_table)
-            mri_tables.append(mri_table)
+    def _parse_json_ireceptor(self, source):
+        """
+        Parses iReceptor JSON metadata using ijson, building a single
+        pandas DataFrame in memory.
+        """
+        db_cfg = self.config['databases'].get('ireceptor', {})
+        if source not in db_cfg:
+            return pd.DataFrame()
+        meta_info = db_cfg[source].get('metadata', '')
+        if not meta_info:
+            return pd.DataFrame()
 
-        # Define standardized columns
-        standardized_columns = ['trav_gene', 'traj_gene', 'tra', 'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb', 'sequence', 'source']
+        repertoires_data = []
+        with open(meta_info, 'r') as f:
+            parser = ijson.items(f, 'Repertoire.item')
+            for item in parser:
+                rep = self._process_repertoire_json(item, source)
+                if rep:
+                    repertoires_data.append(rep)
 
-        # Ensure all sequence tables conform to the standardized format
-        sequence_tables = [seq_table[standardized_columns] for seq_table in sequence_tables]
+        if not repertoires_data:
+            return pd.DataFrame()
+        df = pd.DataFrame(repertoires_data).drop_duplicates()
+        return df
 
-        # Define metadata schema for lazy concatenation
-        meta = {col: 'str' for col in standardized_columns}
+    def _process_repertoire_json(self, repertoire, database):
+        """
+        Helper to parse a single repertoire JSON object from iReceptor metadata.
+        """
+        try:
+            study_id = repertoire['study']['study_id']
+            if database == "ireceptor":
+                rep_id = repertoire['repertoire_id']
+            else:
+                data_proc = repertoire.get('data_processing', [])
+                rep_id = data_proc[0]['data_processing_id'] if data_proc else ''
 
-        # Concatenate all sequence tables lazily
-        sequence_table = dd.concat(sequence_tables, meta=meta).reset_index(drop=True)
-        
-        # Concatenate all MRI tables lazily
-        mri_table = dd.concat(mri_tables).reset_index(drop=True)
+            subject = repertoire.get('subject', {})
+            host_organism = subject.get('species', {}).get('label', '')
+            diagnosis = subject.get('diagnosis', [{}])[0] if 'diagnosis' in subject else {}
+            condition_studies = diagnosis.get('study_group_description', '')
+            disease_label = diagnosis.get('disease_diagnosis', {}).get('label', '')
+            if disease_label:
+                condition_studies += f" {disease_label}"
+
+            age = subject.get('age', '')
+            sex = subject.get('sex', '')
+            population_surveyed = subject.get('race', '')
+            sample_info = repertoire.get('sample', [{}])
+            source_tissue = sample_info[0].get('tissue', {}).get('label', '') if sample_info else ''
+
+            mhc_list = set()
+            genotype = subject.get('genotype', {})
+            mhc_set = genotype.get('mhc_genotype_set', {})
+            for mhc_obj in mhc_set.get('mhc_genotype_list', []):
+                for allele in mhc_obj.get('mhc_alleles', []):
+                    allele_designation = allele.get('allele_designation', '')
+                    if allele_designation:
+                        mhc_list.add(allele_designation)
+
+            return {
+                'study_id': study_id,
+                'repertoire_id': str(rep_id),
+                'host_organism': host_organism,
+                'condition_studies': condition_studies,
+                'age': age,
+                'sex': sex,
+                'population_surveyed': population_surveyed,
+                'source_tissue': source_tissue,
+                'mhc_profile': ','.join(sorted(mhc_list)) if mhc_list else ''
+            }
+        except Exception as e:
+            print(f"Error processing repertoire: {e}")
+            return None
+
+    def _parse_paired_ireceptor(self, source):
+        """
+        Parses iReceptor paired-chain data (TRA + TRB) using pandas.
+        Returns: (mri_table, sequence_table)
+        """
+        db_cfg = self.config['databases'].get('ireceptor', {})
+        if source not in db_cfg:
+            return pd.DataFrame(), pd.DataFrame()
+
+        db_path = db_cfg[source].get('database', '')
+        if not db_path:
+            return pd.DataFrame(), pd.DataFrame()
+
+        try:
+            df = pd.read_csv(db_path, sep="\t", dtype=str, na_filter=False)
+        except FileNotFoundError:
+            print(f"File not found: {db_path}")
+            return pd.DataFrame(), pd.DataFrame()
+
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        if self.test:
+            df = df.sample(frac=0.1, random_state=21)
+
+        df = df[df['productive'] == 'T']
+        tra_df = df[df['locus'] == 'TRA']
+        trb_df = df[df['locus'] == 'TRB']
+
+        tra_df = tra_df.drop(columns=['repertoire_id'], errors='ignore')
+        trb_df = trb_df.drop(columns=['repertoire_id'], errors='ignore')
+        tra_df = tra_df.rename(columns={
+            'v_call': 'trav_gene',
+            'd_call': 'trad_gene',
+            'j_call': 'traj_gene',
+            'junction_aa': 'tra',
+            'data_processing_id': 'repertoire_id'
+        })
+        trb_df = trb_df.rename(columns={
+            'v_call': 'trbv_gene',
+            'd_call': 'trbd_gene',
+            'j_call': 'trbj_gene',
+            'junction_aa': 'trb',
+            'data_processing_id': 'repertoire_id'
+        })
+
+        keep_tra = ['repertoire_id', 'cell_id', 'clone_id', 'trav_gene', 'trad_gene', 'traj_gene', 'tra']
+        keep_trb = ['repertoire_id', 'cell_id', 'clone_id', 'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']
+        tra_df = tra_df[keep_tra]
+        trb_df = trb_df[keep_trb]
+
+        try:
+            mri_table = pd.merge(tra_df, trb_df, how='outer', on=['repertoire_id', 'cell_id', 'clone_id'])
+        except ValueError:
+            breakpoint()
+        seq_cols = ['trav_gene', 'traj_gene', 'tra', 'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']
+        sequence_table = mri_table[seq_cols].copy()
+
+        def build_seq(row):
+            parts = []
+            for val in [row['tra'], row['trb']]:
+                if pd.notna(val) and val:
+                    parts.append(str(val))
+            return ' '.join(parts) + ';'
+
+        sequence_table['sequence'] = sequence_table.apply(build_seq, axis=1)
+        sequence_table['source'] = f"ireceptor_{source}"
+        sequence_table.drop_duplicates(inplace=True)
+
+        mri_table.drop(columns=['cell_id', 'clone_id'], inplace=True, errors='ignore')
+
+        return mri_table, sequence_table
+
+    def _parse_bulk_ireceptor(self, source):
+        """
+        Parses bulk iReceptor data (TRA or TRB) using pandas.
+        Returns: (mri_table, sequence_table)
+        """
+        db_cfg = self.config['databases'].get('ireceptor', {})
+        if source not in db_cfg:
+            return pd.DataFrame(), pd.DataFrame()
+
+        db_path = db_cfg[source].get('database', '')
+        if not db_path:
+            return pd.DataFrame(), pd.DataFrame()
+
+        try:
+            df = pd.read_csv(db_path, sep="\t", dtype=str, na_filter=False)
+        except FileNotFoundError:
+            print(f"File not found: {db_path}")
+            return pd.DataFrame(), pd.DataFrame()
+
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        if self.test:
+            df = df.sample(frac=0.1, random_state=21)
+
+        df = df[df['productive'] == 'T']
+
+        keep = ['repertoire_id', 'cell_id', 'clone_id', 'locus', 'v_call', 'd_call', 'j_call', 'junction_aa']
+        for c in keep:
+            if c not in df.columns:
+                df[c] = ''
+        df = df[keep]
+
+        out_rows = []
+        for _, row in df.iterrows():
+            if row['locus'] == 'TRA':
+                out_rows.append({
+                    'repertoire_id': row['repertoire_id'],
+                    'cell_id': row['cell_id'],
+                    'clone_id': row['clone_id'],
+                    'tra': row['junction_aa'],
+                    'trav_gene': row['v_call'],
+                    'trad_gene': row['d_call'],
+                    'traj_gene': row['j_call'],
+                    'trb': '',
+                    'trbv_gene': '',
+                    'trbd_gene': '',
+                    'trbj_gene': ''
+                })
+            elif row['locus'] == 'TRB':
+                out_rows.append({
+                    'repertoire_id': row['repertoire_id'],
+                    'cell_id': row['cell_id'],
+                    'clone_id': row['clone_id'],
+                    'tra': '',
+                    'trav_gene': '',
+                    'trad_gene': '',
+                    'traj_gene': '',
+                    'trb': row['junction_aa'],
+                    'trbv_gene': row['v_call'],
+                    'trbd_gene': row['d_call'],
+                    'trbj_gene': row['j_call']
+                })
+            else:
+                # skip if it's not TRA or TRB
+                continue
+
+        if not out_rows:
+            return pd.DataFrame(), pd.DataFrame()
+
+        final_df = pd.DataFrame(out_rows)
+
+        def build_seq(row):
+            parts = []
+            for val in [row['tra'], row['trb']]:
+                if pd.notna(val) and val:
+                    parts.append(str(val))
+            return ' '.join(parts) + ';'
+
+        final_df['sequence'] = final_df.apply(build_seq, axis=1)
+        final_df['source'] = f"ireceptor_{source}"
+
+        mri_cols = ['repertoire_id', 'cell_id', 'clone_id']
+        mri_table = final_df[mri_cols].copy()
+
+        seq_cols = [
+            'tra', 'trb', 'trav_gene', 'trad_gene',
+            'traj_gene', 'trbv_gene', 'trbd_gene',
+            'trbj_gene', 'sequence', 'source'
+        ]
+        sequence_table = final_df[seq_cols].copy()
+        sequence_table.drop_duplicates(inplace=True)
 
         return mri_table, sequence_table
