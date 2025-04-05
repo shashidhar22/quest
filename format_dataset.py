@@ -102,6 +102,13 @@ def parse_files_individually(file_paths, config_path, output_mri_path, output_se
         mri_output_file = os.path.join(output_mri_path, mri_parquet_name)
         seq_output_file = os.path.join(output_seq_path, seq_parquet_name)
 
+        # Resume check: if both Parquet files exist, skip
+        if os.path.exists(mri_output_file) and os.path.exists(seq_output_file):
+            logging.info(
+                f"Skipping file {file_path} because {mri_output_file} and {seq_output_file} already exist."
+            )
+            continue
+
         # Convert schema to PyArrow for Parquet writing
         mri_column_types = {"tid": "string", "tra": "string", "trad_gene": "string",
             "traj_gene": "string", "trav_gene": "string", "trb": "string",
