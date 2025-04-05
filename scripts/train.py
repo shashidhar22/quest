@@ -30,8 +30,8 @@ def train_model(config=None, sweep=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', '--dataset', type=str, required=True)
-    parser.add_argument('-s', '--sweep', type='store_true')
-    parser.add_argument('-i', '--sweepid', type=int, default=0)
+    parser.add_argument('-s', '--sweep', action='store_true')
+    parser.add_argument('-i', '--sweepid', type=str)
     parser.add_argument('-m', '--model', type=str, choices=['lstm', 'bilstm', 'transformer', 'bert'], default='lstm')
     parser.add_argument('-l', '--log', type=str, default='temp/logs')
     parser.add_argument('-r', '--resume', action='store_true')
@@ -56,7 +56,6 @@ def main():
             # Modify your SWEEP_CONFIG to set the dataset
             SWEEP_CONFIG['parameters']['dataset'] = {'value': args.dataset}
             SWEEP_CONFIG['parameters']['tokenizer_path'] = {'value': tokenizer_path}
-            SWEEP_CONFIG['parameters']['method'] = {'value': 'bayes'}
             sweep_id = wandb.sweep(SWEEP_CONFIG, project="quest_sweep")
 
             # This function needs to pass a DICT to train_bert_with_transformers
