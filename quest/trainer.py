@@ -203,7 +203,10 @@ class Trainer:
                                             pad_token="[PAD]")
         with open(tokenizer_path, 'r', encoding='utf-8') as f:
             tokenizer_data = json.load(f)
-
+        # Explicitly set the pad token
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        tokenizer.pad_token = '[PAD]'
+        tokenizer.pad_token = "[PAD]"
         vocab_dict = tokenizer_data['model']['vocab']
         idx_to_token = {v: k for k, v in vocab_dict.items()}
         #dataset_folder = self.config["dataset"]
@@ -309,6 +312,8 @@ class Trainer:
                 self.config["model_type"], vocab_size, self.config["embedding_dim"],
                 self.config["hidden_dim"], self.config["num_layers"]
             ).to(device)
+        
+        #self.model.config.pad_token_id = self.tokenizer.convert_tokens_to_ids("[PAD]")
         if self.is_distributed:
             self.model = DDP(self.model, device_ids=[self.local_rank])
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=pad_token_id)
@@ -572,9 +577,9 @@ class Trainer:
                     pred_ids = predicted_sequences[b].cpu().tolist()
 
                     # Decode using your _decode_ids method
-                    input_str = self._decode_ids(inpt_ids)
-                    gold_str = self._decode_ids(gold_ids)
-                    pred_str = self._decode_ids(pred_ids)
+                    input_str = self.tokenizer.decode(inpt_ids, skip_special_tokens=True)
+                    gold_str = self.tokenizer.decode(gold_ids, skip_special_tokens=True)
+                    pred_str = self.tokenizer.decode(pred_ids, skip_special_tokens=True)
 
                     pred_buffer.append((f"Batch {batch_idx}, Seq {b}", input_str, gold_str, pred_str))
                         

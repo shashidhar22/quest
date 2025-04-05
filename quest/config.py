@@ -16,6 +16,7 @@ SWEEP_CONFIG = {
         "model_type": {"values": ["lstm"]},
         "resume_training": {"values": [False]},
         "write_checkpoint": {"values": [False]},
+        "method": {'value': 'bayes'},
     },
 }
 
@@ -26,12 +27,12 @@ DEFAULT_CONFIGS = {
         "hidden_dim": 512,
         "num_layers": 3,
         "learning_rate": 1e-4,
-        "num_epochs": 80,
+        "num_epochs": 160,
         "model_type": "lstm",
         "model_patience": 5,
         "resume_training": False,
-        "write_checkpoint": True,
-        "early_stop": False,
+        "write_checkpoint": False,
+        "early_stop": True,
 
     },
     "bilstm": {
