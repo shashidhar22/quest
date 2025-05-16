@@ -5,13 +5,19 @@ import pandas as pd
 from pathlib import Path
 from collections import OrderedDict
 from dask import delayed  # <-- NEW: We'll use Dask Delayed for final concatenation
-
+import logging
+import time
+from functools import partial   # only if you need it elsewhere
+import gc
+import os
+from typing import Optional, Tuple
 from .utils import (
     parse_imgt_four_digit,
     transform_mhc_restriction,
     get_mhc_sequence
 )
-
+import dask.dataframe as dd
+from dask.dataframe import merge as dd_merge
 
 @delayed
 def delayed_concat(dataframe_list):
@@ -36,40 +42,74 @@ class DatabaseParser:
         self.config = self._load_config()
         self.hla_dictionary = parse_imgt_four_digit(self.config['databases']['imgt']['hla_fasta'])
         self.output_path = self.config['outputs']['output_path']
+        self._mri_dir = Path(self.output_path) / "mri"
+        self._seq_dir = Path(self.output_path) / "seq"
 
     def _load_config(self):
         with open(self.config_path, 'r') as f:
             return yaml.safe_load(f)
 
-    def parse(self):
+    def parse(
+        self,
+        out_prefix: Optional[Path] = None,
+        compression: str = "snappy",
+    ) -> Tuple[Path, Path]:
         """
-        Parse each of the individual databases, returning two *delayed* objects:
-            - mri_delayed : a Delayed object that yields a combined MRI table (pandas DataFrame)
-            - seq_delayed : a Delayed object that yields a combined sequence table (pandas DataFrame)
-
-        You can compute them by calling:
-            final_mri = mri_delayed.compute()
-            final_seq = seq_delayed.compute()
-
-        Both final_mri and final_seq will then be normal pandas DataFrames in memory.
+        Parse each of the individual databases and return two *dask.delayed* objects:
+            - mri_delayed : combined MRI table
+            - seq_delayed : combined sequence table
         """
-        # Gather in-memory DataFrames from each parse method
-        vdjdb_mri, vdjdb_seq = self._parse_vdjdb()
-        mcpas_mri, mcpas_seq = self._parse_mcpas()
-        tcrdb_mri, tcrdb_seq = self._parse_tcrdb()
-        iedb_mri,  iedb_seq  = self._parse_iedb()
-        irec_mri,  irec_seq  = self._parse_ireceptor()
+        log = logging.getLogger(__name__)
+        log.info("⇢ Starting parse()")
 
-        # Collect them in lists
-        mri_list = [vdjdb_mri, mcpas_mri, tcrdb_mri, iedb_mri, irec_mri]
-        seq_list = [vdjdb_seq, mcpas_seq, tcrdb_seq, iedb_seq, irec_seq]
+        # name, function pairs in the order you want them run
+        parse_fns = [
+            ("vdjdb",   self._parse_vdjdb),
+            ("mcpas",   self._parse_mcpas),
+            ("tcrdb",   self._parse_tcrdb),
+            ("iedb",    self._parse_iedb),
+        ]
 
-        # Use our delayed_concat function so that the final concatenation is also lazy
-        mri_delayed = delayed_concat(mri_list)
-        seq_delayed = delayed_concat(seq_list)
+        mri_list, seq_list = [], []
 
-        # Return the two Delayed objects
-        return mri_delayed, seq_delayed
+        for label, fn in parse_fns:
+            if os.path.exists(self._mri_dir / f"{label}_mri.parquet"):
+                log.info("  • %s: skipped (already parsed)", label)
+                continue
+            log.info("  ↳ Parsing %s …", label)
+            t0 = time.time()
+            mri_df, seq_df = fn()  # each helper returns *combined* tables
+            dt = time.time() - t0
+            log.info(
+                "    ✓ %s done in %.2fs (MRI rows=%s, Seq rows=%s)",
+                label,
+                dt,
+                f"{len(mri_df):,}",
+                f"{len(seq_df):,}",
+            )
+
+            # Write the aggregated result as well (handy for global analyses)
+            if not mri_df.empty:
+                mri_path = self._mri_dir / f"{label}_mri.parquet"
+                mri_df.to_parquet(mri_path, engine="pyarrow", compression=compression, index=False)
+            if not seq_df.empty:
+                seq_path = self._seq_dir / f"{label}_seq.parquet"
+                seq_df.to_parquet(seq_path, engine="pyarrow", compression=compression, index=False)
+
+            # Free RAM ASAP
+            del mri_df, seq_df
+            gc.collect()
+
+        # --- iReceptor ---
+        log.info("  ↳ Parsing iReceptor …")
+        self._parse_ireceptor()
+
+        #log.info("⇢ Building delayed concatenations")
+        #mri_delayed = delayed_concat(mri_list)
+        #seq_delayed = delayed_concat(seq_list)
+
+        #log.info("⇢ parse() finished—returning Delayed objects")
+        #return mri_delayed, seq_delayed
 
     # ----------------------------------------------------------------------
     #                           VDJdb
@@ -676,61 +716,236 @@ class DatabaseParser:
     # ----------------------------------------------------------------------
     def _parse_ireceptor(self):
         """
-        Parses multiple iReceptor datasets using pandas in memory, merges each
-        with JSON metadata. Returns (mri_table, sequence_table).
+        Same high-level logic as before, but the per-database frames are now
+        dask.dataframe.DataFrame objects.  We only call .compute() when we
+        actually *need* an in-memory result (e.g. checking for emptiness).
         """
+        log = logging.getLogger(__name__)
+
         databases = {
-            "airr_covid": (self._parse_paired_ireceptor, 'airr_covid'),
-            "paone": (self._parse_bulk_ireceptor, 'paone'),
-            "patwo": (self._parse_bulk_ireceptor, 'patwo'),
-            "pathree": (self._parse_paired_ireceptor, 'pathree'),
-            "umunster": (self._parse_bulk_ireceptor, 'umunster'),
-            "vdjserver": (self._parse_bulk_ireceptor, 'vdjserver'),
+            "airr_covid": (self._parse_paired_ireceptor, "airr_covid"),
+            "paone":      (self._parse_bulk_ireceptor,   "paone"),
+            "patwo":      (self._parse_bulk_ireceptor,   "patwo"),
+            "pathree":    (self._parse_paired_ireceptor, "pathree"),
+            "umunster":   (self._parse_bulk_ireceptor,   "umunster"),
+            "vdjserver":  (self._parse_bulk_ireceptor,   "vdjserver"),
         }
 
-        all_mri = []
-        all_sequences = []
+        # canonical column order for sequence Parquet files
+        seq_cols = [
+            "trav_gene", "traj_gene", "tra",
+            "trbv_gene", "trbd_gene", "trbj_gene",
+            "trb", "sequence", "source",
+        ]
 
         for db_key, (parse_func, db_name) in databases.items():
-            db_mri, db_seq = parse_func(db_name)
-            metadata_table = self._parse_json_ireceptor(db_name)
+            if os.path.exists(self._mri_dir / f"ireceptor_{db_name}_mri.parquet"):
+                log.info("  • %s: skipped (already parsed)", db_key)
+                continue
+            log.info("    ↪ %s …", db_key)
+            t0 = time.time()
 
-            if db_mri.empty or metadata_table.empty:
+            # ---- TSV → Dask --------------------------------------------------
+            db_mri, db_seq = parse_func(db_name)          # dask frames now
+
+            # ---- tiny JSON metadata is still small → pandas, then dask ------
+            meta_pdf = self._parse_json_ireceptor(db_name)   # pandas
+            if meta_pdf.empty:
+                log.warning("      • %s: skipped (no metadata)", db_key)
+                continue
+            meta_dd = dd.from_pandas(meta_pdf.astype({"repertoire_id": "string"}),
+                                    npartitions=1)
+
+            if db_mri.npartitions == 0:                     # nothing parsed
+                log.warning("      • %s: skipped (empty)", db_key)
                 continue
 
-            metadata_table['repertoire_id'] = metadata_table['repertoire_id'].astype(str)
-            db_mri['repertoire_id'] = db_mri['repertoire_id'].astype(str)
+            # ensure ‘repertoire_id’ is string on both sides
+            db_mri  = db_mri.astype({"repertoire_id": "string"})
+            merged  = dd_merge(meta_dd, db_mri,
+                            on="repertoire_id", how="inner")
 
-            merged_mri = pd.merge(metadata_table, db_mri, on='repertoire_id', how='inner')
-            if not merged_mri.empty:
-                all_mri.append(merged_mri)
-            if not db_seq.empty:
-                all_sequences.append(db_seq)
+            # ---------- Parquet dump (single_file=True keeps the old naming) -
+            mri_path = self._mri_dir / f"ireceptor_{db_name}_mri.parquet"
+            seq_path = self._seq_dir / f"ireceptor_{db_name}_seq.parquet"
 
-        if all_mri:
-            final_mri = pd.concat(all_mri, ignore_index=True)
-        else:
-            final_mri = pd.DataFrame()
+            if merged.map_partitions(len).sum().compute() > 0:
+                merged.to_parquet(mri_path,
+                                engine="pyarrow",
+                                compression="snappy",
+                                write_index=False,
+                                single_file=True)
 
-        if all_sequences:
-            # Standardize columns
-            seq_standard_cols = [
-                'trav_gene', 'traj_gene', 'tra',
-                'trbv_gene', 'trbd_gene', 'trbj_gene',
-                'trb', 'sequence', 'source'
-            ]
-            normalized_seq_tables = []
-            for df in all_sequences:
-                for c in seq_standard_cols:
-                    if c not in df.columns:
-                        df[c] = ''
-                df = df[seq_standard_cols]
-                normalized_seq_tables.append(df)
-            final_seq = pd.concat(normalized_seq_tables, ignore_index=True)
-        else:
-            final_seq = pd.DataFrame()
+            # pad missing cols once, then write
+            for c in seq_cols:
+                if c not in db_seq.columns:
+                    db_seq[c] = ""
+            db_seq = db_seq[seq_cols]
 
-        return final_mri, final_seq
+            if db_seq.map_partitions(len).sum().compute() > 0:
+                db_seq.to_parquet(seq_path,
+                                engine="pyarrow",
+                                compression="snappy",
+                                write_index=False,
+                                single_file=True)
+
+            log.info("      ✓ %s parsed & saved (%.2fs)", db_key, time.time() - t0)
+
+            # GC not really needed with dask, but keep it symmetrical
+            del db_mri, db_seq, merged, meta_dd, meta_pdf
+            gc.collect()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # helper: TRA + TRB (paired) TSV                                              
+    # ──────────────────────────────────────────────────────────────────────────
+    def _parse_paired_ireceptor(self, source):
+        """
+        Reads a *tab-separated* paired-chain file with Dask.
+        Returns: (mri_ddf, seq_ddf)
+        """
+        cfg = self.config["databases"].get("ireceptor", {})
+        db_path = cfg.get(source, {}).get("database", "")
+        if not db_path:
+            return dd.from_pandas(pd.DataFrame(), 1), dd.from_pandas(pd.DataFrame(), 1)
+
+        # 1 Lazy read --------------------------------------------------------
+        df = dd.read_csv(db_path,
+                        sep="\t",
+                        dtype=str,
+                        na_filter=False,
+                        blocksize="64 MB",
+                        assume_missing=True)
+
+        if self.test:
+            df = df.sample(frac=0.10, random_state=21)
+
+        df = df[df["productive"] == "T"]
+
+        tra = df[df.locus == "TRA"]
+        trb = df[df.locus == "TRB"]
+
+        tra = tra.drop("repertoire_id", axis=1, errors="ignore").rename(columns={
+            "v_call": "trav_gene",
+            "d_call": "trad_gene",
+            "j_call": "traj_gene",
+            "junction_aa": "tra",
+            "data_processing_id": "repertoire_id",
+        })
+
+        trb = trb.drop("repertoire_id", axis=1, errors="ignore").rename(columns={
+            "v_call": "trbv_gene",
+            "d_call": "trbd_gene",
+            "j_call": "trbj_gene",
+            "junction_aa": "trb",
+            "data_processing_id": "repertoire_id",
+        })
+
+        keep_tra = ["repertoire_id", "cell_id", "clone_id",
+                    "trav_gene", "trad_gene", "traj_gene", "tra"]
+        keep_trb = ["repertoire_id", "cell_id", "clone_id",
+                    "trbv_gene", "trbd_gene", "trbj_gene", "trb"]
+
+        tra = tra[keep_tra]
+        trb = trb[keep_trb]
+
+        mri   = dd_merge(tra, trb, how="outer",
+                        on=["repertoire_id", "cell_id", "clone_id"])
+        seq_cols = ["trav_gene", "traj_gene", "tra",
+                    "trbv_gene", "trbd_gene", "trbj_gene", "trb"]
+
+        seq = mri[seq_cols].copy()
+
+        # 2 row-wise build of ‘sequence’ column ------------------------------
+        def _build_seq(row):
+            parts = []
+            for v in (row["tra"], row["trb"]):
+                if v:
+                    parts.append(str(v))
+            return " ".join(parts) + ";"
+
+        seq["sequence"] = seq.apply(_build_seq, axis=1,
+                                    meta=("sequence", "object"))
+        seq["source"] = f"ireceptor_{source}"
+        seq = seq.drop_duplicates()
+
+        # MRI table doesn’t need cell/clone ids downstream
+        mri = mri.drop(["cell_id", "clone_id"], axis=1, errors="ignore")
+
+        return mri, seq
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # helper: bulk (single-chain) TSV                                            
+    # ──────────────────────────────────────────────────────────────────────────
+    def _parse_bulk_ireceptor(self, source):
+        """
+        Bulk TRA or TRB file → Dask.
+        """
+        cfg = self.config["databases"].get("ireceptor", {})
+        db_path = cfg.get(source, {}).get("database", "")
+        if not db_path:
+            return dd.from_pandas(pd.DataFrame(), 1), dd.from_pandas(pd.DataFrame(), 1)
+
+        df = dd.read_csv(db_path,
+                        sep="\t",
+                        dtype=str,
+                        na_filter=False,
+                        blocksize="64 MB",
+                        assume_missing=True)
+
+        if self.test:
+            df = df.sample(frac=0.10, random_state=21)
+
+        df  = df[df.productive == "T"]
+
+        keep = ["repertoire_id", "cell_id", "clone_id",
+                "locus", "v_call", "d_call", "j_call", "junction_aa"]
+        for c in keep:
+            if c not in df.columns:
+                df[c] = ""
+
+        df = df[keep]
+
+        # build long → wide exactly as before (but vectorised)
+        tra = df[df.locus == "TRA"].assign(
+            trb="", trbv_gene="", trbd_gene="", trbj_gene=""
+        ).rename(columns={
+            "junction_aa": "tra",
+            "v_call": "trav_gene",
+            "d_call": "trad_gene",
+            "j_call": "traj_gene",
+        })
+
+        trb = df[df.locus == "TRB"].assign(
+            tra="", trav_gene="", trad_gene="", traj_gene=""
+        ).rename(columns={
+            "junction_aa": "trb",
+            "v_call": "trbv_gene",
+            "d_call": "trbd_gene",
+            "j_call": "trbj_gene",
+        })
+
+        final = dd.concat([tra, trb], axis=0)
+
+        def _build_seq(row):
+            parts = []
+            for v in (row["tra"], row["trb"]):
+                if v:
+                    parts.append(str(v))
+            return " ".join(parts) + ";"
+
+        final["sequence"] = final.apply(_build_seq, axis=1,
+                                        meta=("sequence", "object"))
+        final["source"] = f"ireceptor_{source}"
+
+        mri_cols = ["repertoire_id", "cell_id", "clone_id"]
+        mri  = final[mri_cols].copy()
+
+        seq_cols = ["tra", "trb", "trav_gene", "trad_gene", "traj_gene",
+                    "trbv_gene", "trbd_gene", "trbj_gene",
+                    "sequence", "source"]
+        seq  = final[seq_cols].drop_duplicates()
+
+        return mri, seq
 
     def _parse_json_ireceptor(self, source):
         """
@@ -806,171 +1021,3 @@ class DatabaseParser:
         except Exception as e:
             print(f"Error processing repertoire: {e}")
             return None
-
-    def _parse_paired_ireceptor(self, source):
-        """
-        Parses iReceptor paired-chain data (TRA + TRB) using pandas.
-        Returns: (mri_table, sequence_table)
-        """
-        db_cfg = self.config['databases'].get('ireceptor', {})
-        if source not in db_cfg:
-            return pd.DataFrame(), pd.DataFrame()
-
-        db_path = db_cfg[source].get('database', '')
-        if not db_path:
-            return pd.DataFrame(), pd.DataFrame()
-
-        try:
-            df = pd.read_csv(db_path, sep="\t", dtype=str, na_filter=False)
-        except FileNotFoundError:
-            print(f"File not found: {db_path}")
-            return pd.DataFrame(), pd.DataFrame()
-
-        if df.empty:
-            return pd.DataFrame(), pd.DataFrame()
-
-        if self.test:
-            df = df.sample(frac=0.1, random_state=21)
-
-        df = df[df['productive'] == 'T']
-        tra_df = df[df['locus'] == 'TRA']
-        trb_df = df[df['locus'] == 'TRB']
-
-        tra_df = tra_df.drop(columns=['repertoire_id'], errors='ignore')
-        trb_df = trb_df.drop(columns=['repertoire_id'], errors='ignore')
-        tra_df = tra_df.rename(columns={
-            'v_call': 'trav_gene',
-            'd_call': 'trad_gene',
-            'j_call': 'traj_gene',
-            'junction_aa': 'tra',
-            'data_processing_id': 'repertoire_id'
-        })
-        trb_df = trb_df.rename(columns={
-            'v_call': 'trbv_gene',
-            'd_call': 'trbd_gene',
-            'j_call': 'trbj_gene',
-            'junction_aa': 'trb',
-            'data_processing_id': 'repertoire_id'
-        })
-
-        keep_tra = ['repertoire_id', 'cell_id', 'clone_id', 'trav_gene', 'trad_gene', 'traj_gene', 'tra']
-        keep_trb = ['repertoire_id', 'cell_id', 'clone_id', 'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']
-        tra_df = tra_df[keep_tra]
-        trb_df = trb_df[keep_trb]
-
-        try:
-            mri_table = pd.merge(tra_df, trb_df, how='outer', on=['repertoire_id', 'cell_id', 'clone_id'])
-        except ValueError:
-            breakpoint()
-        seq_cols = ['trav_gene', 'traj_gene', 'tra', 'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']
-        sequence_table = mri_table[seq_cols].copy()
-
-        def build_seq(row):
-            parts = []
-            for val in [row['tra'], row['trb']]:
-                if pd.notna(val) and val:
-                    parts.append(str(val))
-            return ' '.join(parts) + ';'
-
-        sequence_table['sequence'] = sequence_table.apply(build_seq, axis=1)
-        sequence_table['source'] = f"ireceptor_{source}"
-        sequence_table.drop_duplicates(inplace=True)
-
-        mri_table.drop(columns=['cell_id', 'clone_id'], inplace=True, errors='ignore')
-
-        return mri_table, sequence_table
-
-    def _parse_bulk_ireceptor(self, source):
-        """
-        Parses bulk iReceptor data (TRA or TRB) using pandas.
-        Returns: (mri_table, sequence_table)
-        """
-        db_cfg = self.config['databases'].get('ireceptor', {})
-        if source not in db_cfg:
-            return pd.DataFrame(), pd.DataFrame()
-
-        db_path = db_cfg[source].get('database', '')
-        if not db_path:
-            return pd.DataFrame(), pd.DataFrame()
-
-        try:
-            df = pd.read_csv(db_path, sep="\t", dtype=str, na_filter=False)
-        except FileNotFoundError:
-            print(f"File not found: {db_path}")
-            return pd.DataFrame(), pd.DataFrame()
-
-        if df.empty:
-            return pd.DataFrame(), pd.DataFrame()
-
-        if self.test:
-            df = df.sample(frac=0.1, random_state=21)
-
-        df = df[df['productive'] == 'T']
-
-        keep = ['repertoire_id', 'cell_id', 'clone_id', 'locus', 'v_call', 'd_call', 'j_call', 'junction_aa']
-        for c in keep:
-            if c not in df.columns:
-                df[c] = ''
-        df = df[keep]
-
-        out_rows = []
-        for _, row in df.iterrows():
-            if row['locus'] == 'TRA':
-                out_rows.append({
-                    'repertoire_id': row['repertoire_id'],
-                    'cell_id': row['cell_id'],
-                    'clone_id': row['clone_id'],
-                    'tra': row['junction_aa'],
-                    'trav_gene': row['v_call'],
-                    'trad_gene': row['d_call'],
-                    'traj_gene': row['j_call'],
-                    'trb': '',
-                    'trbv_gene': '',
-                    'trbd_gene': '',
-                    'trbj_gene': ''
-                })
-            elif row['locus'] == 'TRB':
-                out_rows.append({
-                    'repertoire_id': row['repertoire_id'],
-                    'cell_id': row['cell_id'],
-                    'clone_id': row['clone_id'],
-                    'tra': '',
-                    'trav_gene': '',
-                    'trad_gene': '',
-                    'traj_gene': '',
-                    'trb': row['junction_aa'],
-                    'trbv_gene': row['v_call'],
-                    'trbd_gene': row['d_call'],
-                    'trbj_gene': row['j_call']
-                })
-            else:
-                # skip if it's not TRA or TRB
-                continue
-
-        if not out_rows:
-            return pd.DataFrame(), pd.DataFrame()
-
-        final_df = pd.DataFrame(out_rows)
-
-        def build_seq(row):
-            parts = []
-            for val in [row['tra'], row['trb']]:
-                if pd.notna(val) and val:
-                    parts.append(str(val))
-            return ' '.join(parts) + ';'
-
-        final_df['sequence'] = final_df.apply(build_seq, axis=1)
-        final_df['source'] = f"ireceptor_{source}"
-
-        mri_cols = ['repertoire_id', 'cell_id', 'clone_id']
-        mri_table = final_df[mri_cols].copy()
-
-        seq_cols = [
-            'tra', 'trb', 'trav_gene', 'trad_gene',
-            'traj_gene', 'trbv_gene', 'trbd_gene',
-            'trbj_gene', 'sequence', 'source'
-        ]
-        sequence_table = final_df[seq_cols].copy()
-        sequence_table.drop_duplicates(inplace=True)
-
-        return mri_table, sequence_table
