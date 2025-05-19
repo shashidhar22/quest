@@ -14,6 +14,14 @@ mamba env create -f env/environment.yaml
 
 Additional pre-requisites include setting up your `wandb`. We are using `wandb` to log training metrics and at this time, the scripts will not work without having `wandb` configured on your profile.
 
+### Pre-requisites:
+- [Python 3.12 or higher]
+- [PyTorch 2.7.0 or higher; with CUDA 11.8 or higher](https://pytorch.org/get-started/locally/)
+- [HuggingFace Datasets library](https://huggingface.co/docs/datasets/en/installation)
+- [HuggingFace Transformers library](https://huggingface.co/docs/transformers/en/installation)
+- [HuggingFace Tokenizers library](https://huggingface.co/docs/transformers/en/installation)
+- [HuggingFace Accelerate library]
+
 ## Format sequencing data and public databases:
 
 The current training dataset includes sequencing data generated from various platforms across 32 published studies and 3 internal studies. Additionally, we have included the following public databases: VDJdb, Tcrdb, McPAS-TCR, iReceptor, IEDB, and CEDAR. There is no one standard format for the sequencing data and public databases. Therefore, we have provided scripts to format the data into a standard format. This is a one time pre-processing task and will be deprecated in the future (once we have released the dataset). The script below generates two standard formats, MRI (minimal required information) and Sequence format. 
