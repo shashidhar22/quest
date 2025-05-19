@@ -12,15 +12,18 @@ mkdir wandb # Store wandb logs
 mamba env create -f env/environment.yaml
 ```
 
-Additional pre-requisites include setting up your `wandb`. We are using `wandb` to log training metrics and at this time, the scripts will not work without having `wandb` configured on your profile.
+Additional pre-requisites include: 
 
-### Pre-requisites:
 - [Python 3.12 or higher]
 - [PyTorch 2.7.0 or higher; with CUDA 11.8 or higher](https://pytorch.org/get-started/locally/)
 - [HuggingFace Datasets library](https://huggingface.co/docs/datasets/en/installation)
 - [HuggingFace Transformers library](https://huggingface.co/docs/transformers/en/installation)
 - [HuggingFace Tokenizers library](https://huggingface.co/docs/transformers/en/installation)
-- [HuggingFace Accelerate library]
+- [HuggingFace Accelerate library](https://huggingface.co/docs/accelerate/en/basic_tutorials/install)
+- [WandB](https://docs.wandb.ai/quickstart)
+- [HuggingFace CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli)
+
+We are using `wandb` to log training metrics and at this time, the scripts will not work without having `wandb` configured on your profile.
 
 ## Format sequencing data and public databases:
 
