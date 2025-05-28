@@ -57,6 +57,27 @@ class AminoAcidDataset(Dataset):
         self.samples = []
         self._build_samples(sequences)
 
+    def __repr__(self):
+        """
+        Human-readable summary that shows the dataset size and (for a quick sanity
+        check) the first sample’s decoded input and target strings.
+        """
+        header = f"{self.__class__.__name__}(num_samples={len(self)})"
+        if not self.samples:                     # empty dataset
+            return header
+
+        # Grab the first (X, Y) pair and decode token-ids → string
+        x_ids, y_ids = self.samples[0]
+        input_str  = self.tokenizer.decode(x_ids, skip_special_tokens=True)
+        target_str = self.tokenizer.decode(y_ids, skip_special_tokens=True)
+
+        return (
+            f"{header}\n"
+            f"  input : {input_str}\n"
+            f"  target: {target_str}"
+        )
+
+
     def _build_samples(self, sequences):
         if self.model_type == "rnn":
             self._build_rnn_samples(sequences)

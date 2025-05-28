@@ -247,7 +247,6 @@ def process_barcode_group(df):
     return pd.DataFrame(formatted_contigs)
 
 
-@delayed
 def standardize_sequence(df):
     """
     Standardize an in-memory pandas DataFrame to ensure it has a fixed set of columns
@@ -259,8 +258,7 @@ def standardize_sequence(df):
     fixed_columns = [
         'source', 'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
         'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'peptide', 'mhc_one',
-        'mhc_two', 'sequence'
-    ]
+        'mhc_two']
 
     # Add missing columns
     for col in fixed_columns:
@@ -269,10 +267,10 @@ def standardize_sequence(df):
 
     # Reindex to canonical order
     df = df[fixed_columns].copy()
+    df = df.fillna("").astype(str)
     return df
 
 
-@delayed
 def standardize_mri(df):
     """
     Standardize an in-memory pandas DataFrame to ensure it has a fixed set of columns
@@ -294,4 +292,5 @@ def standardize_mri(df):
             df[col] = ''
 
     df = df[fixed_columns].copy()
+    df = df.fillna("").astype(str)
     return df

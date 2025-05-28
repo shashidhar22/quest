@@ -19,6 +19,7 @@ class PairedFileParser:
         self.paired_file = paired_file
         self.test = test
 
+    
         self.repertoire_id = os.path.splitext(os.path.basename(self.paired_file))[0]
         self.file_type = os.path.basename(os.path.dirname(self.paired_file))
         self.molecule_type = os.path.basename(os.path.dirname(os.path.dirname(self.paired_file)))
@@ -117,6 +118,8 @@ class PairedFileParser:
             return pd.DataFrame(), pd.DataFrame()
 
         mri_table = pd.DataFrame(formatted_contigs)
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates()
         # Add metadata
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
@@ -125,12 +128,8 @@ class PairedFileParser:
         mri_table['host_organism'] = self.host_organism
         mri_table['source'] = self.source
 
-        # Build sequence table
-        seq_cols = [
-            'source', 'tra', 'trad_gene', 'traj_gene', 'trav_gene',
-            'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'sequence'
-        ]
-        sequence_table = mri_table[seq_cols].drop_duplicates()
+        # Annotate sequence table 
+        sequence_table['source'] = self.source
 
         # Standardize
         sequence_table = standardize_sequence(sequence_table)
@@ -175,37 +174,19 @@ class PairedFileParser:
         if not parsed_rows:
             return pd.DataFrame(), pd.DataFrame()
 
-        parsed_table = pd.DataFrame(parsed_rows)
-
+        mri_table = pd.DataFrame(parsed_rows)
+        sequence_table = mri_table.copy().drop_duplicates()
         # Add metadata
-        parsed_table['repertoire_id'] = self.repertoire_id
-        parsed_table['study_id'] = self.study_id
-        parsed_table['category'] = self.category
-        parsed_table['molecule_type'] = self.molecule_type
-        parsed_table['host_organism'] = self.host_organism
-        parsed_table['source'] = self.source
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['host_organism'] = self.host_organism
+        mri_table['source'] = self.source
 
-        # Build MRI table
-        mri_table = parsed_table.copy()
-
-        # Build sequence table
-        # If 'tra' or 'trb' is present, build combined sequence
-        def build_sequence(row):
-            parts = []
-            if 'tra' in row and row['tra']:
-                parts.append(str(row['tra']))
-            if 'trb' in row and row['trb']:
-                parts.append(str(row['trb']))
-            return ' '.join(parts) + ';' if parts else ''
-
-        parsed_table['sequence'] = parsed_table.apply(build_sequence, axis=1)
-        seq_cols = ['source', 'tra', 'trb', 'sequence']
-        for gene_col in ['trav_gene','trad_gene','traj_gene','trbv_gene','trbd_gene','trbj_gene']:
-            if gene_col in parsed_table.columns:
-                seq_cols.insert(-1, gene_col)
-        # Keep only columns that exist
-        sequence_table = parsed_table[[c for c in seq_cols if c in parsed_table.columns]].drop_duplicates()
-
+        # Add metadata to sequence table
+        sequence_table['source'] = self.source
+        
         # Standardize
         sequence_table = standardize_sequence(sequence_table)
         mri_table = standardize_mri(mri_table)
@@ -270,25 +251,19 @@ class PairedFileParser:
         if not formatted_results:
             return pd.DataFrame(), pd.DataFrame()
 
-        result_df = pd.DataFrame(formatted_results)
+        mri_table = pd.DataFrame(formatted_results)
+        sequence_table = mri_table.copy().drop_duplicates()
         # Add metadata
-        result_df['repertoire_id'] = self.repertoire_id
-        result_df['study_id'] = self.study_id
-        result_df['host_organism'] = self.host_organism
-        result_df['source'] = self.source
-        result_df['category'] = self.category
-        result_df['molecule_type'] = self.molecule_type
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['host_organism'] = self.host_organism
+        mri_table['source'] = self.source
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
 
-        # MRI
-        mri_table = result_df.copy()
-
-        # Sequence table
-        seq_cols = [
-            'source', 'trav_gene', 'trad_gene', 'traj_gene', 'tra',
-            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb', 'sequence'
-        ]
-        sequence_table = result_df[seq_cols].drop_duplicates()
-
+        # Annotate sequence table
+        sequence_table['source'] = self.source
+        
         # Standardize
         sequence_table = standardize_sequence(sequence_table)
         mri_table = standardize_mri(mri_table)

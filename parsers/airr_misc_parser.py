@@ -102,20 +102,20 @@ class MiscFileParser:
 
         # Compare with known format columns
         if columns_set == set(known_formats['format_one']):
-            return self._parse_format_one()
+            mri_table, sequence_table = self._parse_format_one()
         elif columns_set == set(known_formats['format_two']):
-            return self._parse_format_two()
+            mri_table, sequence_table = self._parse_format_two()
         elif columns_set == set(known_formats['format_three']):
-            return self._parse_format_three()
+            mri_table, sequence_table = self._parse_format_three()
         elif columns_set == set(known_formats['format_four']):
-            return self._parse_format_four()
+            mri_table, sequence_table = self._parse_format_four()
         elif columns_set == set(known_formats['format_five']):
-            return self._parse_format_five()
+            mri_table, sequence_table = self._parse_format_five()
         elif columns_set == set(known_formats['format_six']):
-            return self._parse_format_six()
+            mri_table, sequence_table = self._parse_format_six()
         else:
             raise ValueError("Unrecognized file format!")
-
+        return mri_table, sequence_table
     # ----------------------------------------------------------------------
     #                          FORMAT ONE
     # ----------------------------------------------------------------------
@@ -153,27 +153,26 @@ class MiscFileParser:
                         'tid': str(idx),
                         'tra': tra,
                         'trb': trb,
-                        'sequence': f"{tra} {trb};"
                     })
             elif tra_list:
                 for tra in tra_list:
                     parsed_rows.append({
                         'tid': str(idx),
                         'tra': tra,
-                        'sequence': f"{tra};"
                     })
             elif trb_list:
                 for trb in trb_list:
                     parsed_rows.append({
                         'tid': str(idx),
                         'trb': trb,
-                        'sequence': f"{trb};"
                     })
 
         if not parsed_rows:
             return pd.DataFrame(), pd.DataFrame()
 
         mri_table = pd.DataFrame(parsed_rows)
+        # Build the sequence table
+        sequence_table = mri_table[['tra', 'trb']].drop_duplicates()
         # Add metadata
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
@@ -182,8 +181,8 @@ class MiscFileParser:
         mri_table['host_organism'] = self.host_organism
         mri_table['source'] = self.source
 
-        # Build the sequence table
-        sequence_table = mri_table[['source', 'tra', 'trb', 'sequence']].drop_duplicates()
+        # Add metadata to sequence table
+        sequence_table['source'] = self.source
 
         # Standardize
         sequence_table = standardize_sequence(sequence_table)
@@ -221,35 +220,33 @@ class MiscFileParser:
                         'tid': tid,
                         'tra': tra,
                         'trb': trb,
-                        'sequence': f"{tra} {trb};"
                     })
             elif tra_list:
                 for tra in tra_list:
                     parsed_rows.append({
                         'tid': tid,
                         'tra': tra,
-                        'sequence': f"{tra};"
                     })
             elif trb_list:
                 for trb in trb_list:
                     parsed_rows.append({
                         'tid': tid,
                         'trb': trb,
-                        'sequence': f"{trb};"
                     })
 
         if not parsed_rows:
             return pd.DataFrame(), pd.DataFrame()
 
         mri_table = pd.DataFrame(parsed_rows)
+        seq_table = mri_table[['tra', 'trb']].drop_duplicates()
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['category'] = self.category
         mri_table['molecule_type'] = self.molecule_type
         mri_table['host_organism'] = self.host_organism
         mri_table['source'] = self.source
+        seq_table['source'] = self.source
 
-        seq_table = mri_table[['source', 'tra', 'trb', 'sequence']].drop_duplicates()
         seq_table = standardize_sequence(seq_table)
         mri_table = standardize_mri(mri_table)
 
@@ -295,35 +292,23 @@ class MiscFileParser:
             'j_gene': 'trbj_gene'
         }, inplace=True)
 
-        combined = pd.concat([tra_df, trb_df], ignore_index=True)
-        if combined.empty:
+        mri_table = pd.concat([tra_df, trb_df], ignore_index=True)
+        if mri_table.empty:
             return pd.DataFrame(), pd.DataFrame()
+        seq_table = mri_table.copy().drop_duplicates()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['host_organism'] = self.host_organism
+        mri_table['source'] = self.source
+        seq_table['source'] = self.source
+    
 
-        combined['repertoire_id'] = self.repertoire_id
-        combined['study_id'] = self.study_id
-        combined['category'] = self.category
-        combined['molecule_type'] = self.molecule_type
-        combined['host_organism'] = self.host_organism
-        combined['source'] = self.source
-
-        def build_sequence(row):
-            parts = []
-            if 'tra' in row and row['tra']:
-                parts.append(str(row['tra']))
-            if 'trb' in row and row['trb']:
-                parts.append(str(row['trb']))
-            return ' '.join(parts) + ';' if parts else ''
-
-        combined['sequence'] = combined.apply(build_sequence, axis=1)
-
-        seq_table = combined[[
-            'source', 'trav_gene', 'trad_gene', 'traj_gene', 'tra',
-            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb', 'sequence'
-        ]].drop_duplicates()
-
+        
         seq_table = standardize_sequence(seq_table)
-        combined = standardize_mri(combined)
-        return combined, seq_table
+        mri_table = standardize_mri(mri_table)
+        return mri_table, seq_table
 
     # ----------------------------------------------------------------------
     #                          FORMAT FOUR
@@ -367,7 +352,6 @@ class MiscFileParser:
                         'tid': tid,
                         'tra': tra,
                         'trb': trb,
-                        'sequence': f"{tra} {trb};",
                         'repertoire_id': row['sample_name'],
                         'condition': row['condition']
                     })
@@ -377,7 +361,6 @@ class MiscFileParser:
                     parsed_rows.append({
                         'tid': tid,
                         'tra': tra,
-                        'sequence': f"{tra};",
                         'repertoire_id': row['sample_name'],
                         'condition': row['condition']
                     })
@@ -387,7 +370,6 @@ class MiscFileParser:
                     parsed_rows.append({
                         'tid': tid,
                         'trb': trb,
-                        'sequence': f"{trb};",
                         'repertoire_id': row['sample_name'],
                         'condition': row['condition']
                     })
@@ -401,7 +383,8 @@ class MiscFileParser:
         mri_table['source'] = 'single_cell'
         mri_table['host_organism'] = 'human'
 
-        seq_table = mri_table.drop(columns=['tid', 'condition']).copy()
+        seq_table = mri_table.drop(columns=['tid', 'condition']).copy().drop_duplicates()
+        seq_table['source'] = 'single_cell'
         seq_table = standardize_sequence(seq_table)
         mri_table = standardize_mri(mri_table)
         return mri_table, seq_table
@@ -415,11 +398,11 @@ class MiscFileParser:
         'PatientID'=>'patient_id', 'CDR3A'=>'tra', 'TRAV'=>'trav_gene', 'TRAD'=>'trad_gene', 'TRAJ'=>'traj_gene',
         'CDR3B'=>'trb', 'TRBV'=>'trbv_gene', 'TRBD'=>'trbd_gene', 'TRBJ'=>'trbj_gene'
         """
-        df = self.misc_table.copy()
-        if df.empty:
+        mri_table = self.misc_table.copy()
+        if mri_table.empty:
             return pd.DataFrame(), pd.DataFrame()
 
-        df.rename(columns={
+        mri_table.rename(columns={
             'orig.ident': 'repertoire_id',
             'barcode': 'tid',
             'Tissue': 'source_tissue',
@@ -433,34 +416,20 @@ class MiscFileParser:
             'TRBD': 'trbd_gene',
             'TRBJ': 'trbj_gene'
         }, inplace=True)
+        sequence_table = mri_table.drop(columns=['source_tissue', 'patient_id', 'tid', 'repertoire_id']).copy().drop_duplicates()
+        mri_table['repertoire_id'] = self.repertoire_id
+        mri_table['study_id'] = self.study_id
+        mri_table['category'] = self.category
+        mri_table['molecule_type'] = self.molecule_type
+        mri_table['host_organism'] = self.host_organism
+        mri_table['source'] = self.source
 
-        df['repertoire_id'] = self.repertoire_id
-        df['study_id'] = self.study_id
-        df['category'] = self.category
-        df['molecule_type'] = self.molecule_type
-        df['host_organism'] = self.host_organism
-        df['source'] = self.source
-
-        def build_sequence(row):
-            parts = []
-            if pd.notna(row['tra']) and row['tra']:
-                parts.append(str(row['tra']))
-            if pd.notna(row['trb']) and row['trb']:
-                parts.append(str(row['trb']))
-            return ' '.join(parts) + ';' if parts else ''
-
-        df['sequence'] = df.apply(build_sequence, axis=1)
-
-        seq_cols = [
-            'source', 'trav_gene', 'trad_gene', 'traj_gene', 'tra',
-            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb', 'sequence'
-        ]
-        sequence_table = df[seq_cols].drop_duplicates()
+        
+        sequence_table['source'] = self.source
 
         sequence_table = standardize_sequence(sequence_table)
-        df = standardize_mri(df)
-        return df, sequence_table
-
+        mri_table = standardize_mri(mri_table)
+        return mri_table, sequence_table   
     # ----------------------------------------------------------------------
     #                          FORMAT SIX
     # ----------------------------------------------------------------------
@@ -488,17 +457,9 @@ class MiscFileParser:
                     'trad_gene': row['d'],
                     'traj_gene': row['j'],
                     'tra': row['cdr3aa'],
-                    'trbv_gene': '',
-                    'trbd_gene': '',
-                    'trbj_gene': '',
-                    'trb': ''
                 })
             elif 'TRBV' in v_gene:
                 parsed_rows.append({
-                    'trav_gene': '',
-                    'trad_gene': '',
-                    'traj_gene': '',
-                    'tra': '',
                     'trbv_gene': row['v'],
                     'trbd_gene': row['d'],
                     'trbj_gene': row['j'],
@@ -510,29 +471,16 @@ class MiscFileParser:
             return pd.DataFrame(), pd.DataFrame()
 
         mri_table = pd.DataFrame(parsed_rows)
+        sequence_table = mri_table.copy().drop_duplicates()
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['host_organism'] = self.host_organism
         mri_table['source'] = self.source
         mri_table['category'] = self.category
         mri_table['molecule_type'] = self.molecule_type
-
-        def build_sequence(row):
-            parts = []
-            if row.get('tra') and row['tra']:
-                parts.append(str(row['tra']))
-            if row.get('trb') and row['trb']:
-                parts.append(str(row['trb']))
-            return ' '.join(parts) + ';' if parts else ''
-
-        mri_table['sequence'] = mri_table.apply(build_sequence, axis=1)
-        mri_table.drop_duplicates(inplace=True)
-
-        seq_cols = [
-            'source', 'trav_gene', 'trad_gene', 'traj_gene', 'tra',
-            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb', 'sequence'
-        ]
-        sequence_table = mri_table[seq_cols].drop_duplicates()
+        sequence_table['source'] = self.source
+        
+        
 
         sequence_table = standardize_sequence(sequence_table)
         mri_table = standardize_mri(mri_table)

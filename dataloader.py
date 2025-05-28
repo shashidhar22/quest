@@ -22,9 +22,7 @@ from quest.dataset import AminoAcidDataset
 
 # Constants
 from quest.constants import (
-    SPECIAL_TOKENS, TRA_TOKENS, TRB_TOKENS, PEP_TOKENS, MHC1_TOKENS, 
-    MHC2_TOKENS,   PEP_START, MHC1_START, MHC2_START,
-    END_TOKEN, PAD_TOKEN_STR, UNK_TOKEN_STR
+    BPE_TOKENS, PROT_BERT_TOKENS, BERT_TOKENS,
 )
 
 def parse_args():
@@ -44,7 +42,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=1234,
                         help="Random seed.")
     parser.add_argument("-m", "--model_type", type=str, default="transformer",
-                        choices=["transformer", "rnn"],
+                        choices=["transformer", "rnn", "protbert", "bert", "esm", "llama"],
                         help="Transformer or RNN mode in AminoAcidDataset.")
     parser.add_argument("--truncate_long_sequences", action="store_true",
                         help="Truncate sequences longer than seq_length (transformer mode).")
@@ -58,13 +56,6 @@ def parse_args():
                         help="Vocabulary size for BPE tokenizer.")
     parser.add_argument("--max_workers", type=int, default=None,
                         help="Number of parallel processes (defaults to all cores).")
-    parser.add_argument(
-        "--tokenizer_type",
-        type=str,
-        default="bpe",
-        choices=["bpe", "bert"],
-        help="Choose whether to build/use BPE tokenizer or a pretrained BERT tokenizer."
-    )
     return parser.parse_args()
 
 def gather_parquet_files(paths):
@@ -87,14 +78,14 @@ def safe_get(row, key):
         return ""
     return val
 
-def row_to_tagged_list(row):
+def tag_bpe(row):
     """Convert relevant columns into a list of tagged sub-sequences."""
     mapping = [
-        ("tra", TRA_TOKENS),
-        ("trb", TRB_TOKENS),
-        ("peptide",PEP_TOKENS),
-        ("mhc_one", MHC1_TOKENS),
-        ("mhc_two", MHC2_TOKENS),
+        ("tra", BPE_TOKENS["tra_tokens"]),
+        ("trb", BPE_TOKENS["trb_tokens"]),
+        ("peptide", BPE_TOKENS["pep_tokens"]),
+        ("mhc_one", BPE_TOKENS["mho_tokens"]),
+        ("mhc_two", BPE_TOKENS["mht_tokens"]),
     ]
     tagged = []
     for col, tokens in mapping:
@@ -103,22 +94,51 @@ def row_to_tagged_list(row):
         if val and is_valid_sequence(val):
             if 'O' in val or '[' in val or ']' in val:
                 breakpoint()
+            val = " ".join(list(val))
             tagged.append(f"{start_tk} {val} {end_tk}")
     return tagged
 
-def generate_permutations_of_tagged(tagged):
+def tag_protbert(row):
+    tagged = []
+    sep_tk = PROT_BERT_TOKENS["sep_token"][0]
+    for col in ["tra", "trb", "peptide", "mhc_one", "mhc_two"]:
+        val = safe_get(row, col)
+        if val and is_valid_sequence(val):
+            val = " ".join(list(val))
+            tagged.append(f"{val} {sep_tk}")
+    return tagged
+
+def tag_bert(row):
+    tagged = []
+    sep_tk = BERT_TOKENS["sep_token"][0]
+    for col in ["tra", "trb", "peptide", "mhc_one", "mhc_two"]:
+        val = safe_get(row, col)
+        if val and is_valid_sequence(val):
+            val = " ".join(list(val))
+            tagged.append(f"{val} {sep_tk}")
+    return tagged
+
+def tag_esm2(row):
+
+def generate_permutations_of_tagged(tagged, model_tags):
     """Generate permutations of the tagged sequences."""
     if not tagged:
         return []
     results = []
     n = len(tagged)
+    cls_token = model_tags["cls_token"][0]
+    end_token = model_tags["end_token"][0]
     for r in range(1, n + 1):
         for perm in permutations(tagged, r):
-            sequence = " ".join(perm) + " [END]"
+            sequence = " ".join(perm)
+            if cls_token:
+                sequence = f"{cls_token} " + sequence
+            if end_token:
+                sequence += f" {end_token}"
             results.append(sequence)
     return results
 
-def process_chunk(df_chunk):
+def process_chunk(df_chunk, model_type="rnn"):
     """
     Expand a single chunk:
       - row_to_tagged_list()
@@ -141,9 +161,25 @@ def process_chunk(df_chunk):
 
     local_expansions = []
     for row in df_chunk.itertuples(index=False):
-        tagged = row_to_tagged_list(row)
+        if model_type == "rnn" or model_type == "transformer":
+            tagged = tag_bpe(row)
+            model_tags = BPE_TOKENS
+        elif model_type == "protbert":
+            # For ProtBERT, we use a different tagging scheme
+            tagged = tag_protbert(row)
+            model_tags = PROT_BERT_TOKENS
+        elif model_type == "bert":
+            # For BERT, we use a different tagging scheme
+            tagged = tag_bert(row)
+            model_tags = BERT_TOKENS
+        #elif model_type == "esm":
+        #    # For ESM, we use a different tagging scheme
+        #    tagged = tag_esm(row)
+        #elif model_type == "llama":
+        #    # For Llama, we use a different tagging scheme
+        #    tagged = tag_llama(row)
         if tagged:
-            perms = generate_permutations_of_tagged(tagged)
+            perms = generate_permutations_of_tagged(tagged, model_tags)
             local_expansions.extend(perms)
     return local_expansions
 
@@ -151,32 +187,16 @@ def process_chunk(df_chunk):
 def train_bpe_tokenizer(train_sequences, vocab_size=200):
     # 1) Pre-check pass (optional)
     debug_pretok = pre_tokenizers.Split(pattern=r" ", behavior="removed")
-    # for seq in train_sequences:
-    #     chunks = debug_pretok.pre_tokenize_str(seq)
-    #     for chunk, offsets in debug_pretok.pre_tokenize_str(seq):
-    #         if "O" in chunk:
-    #             print("Seq")
-    #             print(seq)
-    #             print("Pretoken")
-    #             print(chunks)
-    #             print(f"Found 'O' in chunk: '{chunk}' within sequence: '{seq}'")
     # 2) Now train
     tokenizer = Tokenizer(models.BPE())
     tokenizer.pre_tokenizer = debug_pretok
-    special_tokens = SPECIAL_TOKENS
+    special_tokens = [token for tklist in BPE_TOKENS.values() for token in tklist if token is not None]
     trainer = trainers.BpeTrainer(special_tokens=special_tokens, vocab_size=vocab_size)
 
     tokenizer.train_from_iterator(train_sequences, trainer)
     return tokenizer
 
-
-
-def chunked_store_raw_expansions(
-    expansions,
-    arrow_dir,
-    shard_prefix,
-    shard_index
-):
+def chunked_store_raw_expansions(expansions, arrow_dir, shard_prefix, shard_index):
     """
     Stores the raw expansions (strings) in a single 'sequence' column in Arrow.
     """
@@ -273,7 +293,7 @@ def main():
     with ProcessPoolExecutor(max_workers=args.max_workers) as executor:
         for record_batch in scanner.to_batches():
             df_chunk = pa.Table.from_batches([record_batch]).to_pandas()
-            fut = executor.submit(process_chunk, df_chunk)
+            fut = executor.submit(process_chunk, df_chunk, model_type=args.model_type)
             futures.append((fut, len(df_chunk)))
 
         expansions_buffer = []
@@ -304,21 +324,8 @@ def main():
     # 5) Build or load tokenizer
     tokenizer_path = os.path.join(args.output, "tokenizer.json")
 
-    if args.tokenizer_type == "bert":
-        print("Using a BERT tokenizer from Hugging Face Transformers.")
-        # If user wants a standard checkpoint (e.g., 'bert-base-cased'):
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
 
-        # Optionally add special tokens you want:
-        additional_tokens = SPECIAL_TOKENS
-        tokenizer.add_special_tokens({"additional_special_tokens": additional_tokens})
-        # This won't produce a 'tokenizer.json' with your BERT tokenizer in the same
-        # format as the 'tokenizers' library, but we can still handle saving a slow
-        # or fast tokenizer. Let's do a safe_pretrained approach below:
-        tokenizer.save_pretrained(args.output)
-        print(f"BERT tokenizer saved to {args.output}")
-
-    else:  # "bpe"
+    if args.model_type == "rnn" or args.model_type == "transformer":  # "bpe"
         if not os.path.exists(tokenizer_path) or args.build_tokenizer:
             print("Building a new BPE tokenizer from the collected train expansions...")
             tokenizer = train_bpe_tokenizer(expansions_buffer, vocab_size=args.vocab_size)
@@ -355,7 +362,7 @@ def main():
     pbar2 = tqdm(total=total_rows_est, desc="Second Pass: Tokenizing & Writing Shards")
     for record_batch in scanner2.to_batches():
         df_chunk = pa.Table.from_batches([record_batch]).to_pandas()
-        expansions = process_chunk(df_chunk)  # expansions is a list of raw text
+        expansions = process_chunk(df_chunk, model_type=args.model_type)  # expansions is a list of raw text
         pbar2.update(len(df_chunk))
 
         # sample expansions
@@ -374,36 +381,7 @@ def main():
         chunk_test  = expansions[val_end:]
 
         # 6a) Encode train chunk & write arrow
-        if args.tokenizer_type == "bert":
-            # ================ BERT branch: store raw expansions only ================
-            if chunk_train:
-                n_train = chunked_store_raw_expansions(
-                    expansions=chunk_train,
-                    arrow_dir=train_dir,
-                    shard_prefix="train",
-                    shard_index=train_shard_count
-                )
-                train_shard_count += 1
-
-            if chunk_val:
-                n_val = chunked_store_raw_expansions(
-                    expansions=chunk_val,
-                    arrow_dir=val_dir,
-                    shard_prefix="val",
-                    shard_index=val_shard_count
-                )
-                val_shard_count += 1
-
-            if chunk_test:
-                n_test = chunked_store_raw_expansions(
-                    expansions=chunk_test,
-                    arrow_dir=test_dir,
-                    shard_prefix="test",
-                    shard_index=test_shard_count
-                )
-                test_shard_count += 1
-
-        else:
+        if args.model_type == "rnn" or args.model_type == "transformer":  # "bpe"
             # ================ BPE branch: use your existing custom logic ================
             if chunk_train:
                 n_train = chunked_encode_and_write(
@@ -438,6 +416,34 @@ def main():
                     seq_length=args.seq_length,
                     model_type=args.model_type,
                     truncate_long_sequences=args.truncate_long_sequences,
+                    arrow_dir=test_dir,
+                    shard_prefix="test",
+                    shard_index=test_shard_count
+                )
+                test_shard_count += 1
+        else:
+            # ================ For pre-trained models: store raw expansions only ================
+            if chunk_train:
+                n_train = chunked_store_raw_expansions(
+                    expansions=chunk_train,
+                    arrow_dir=train_dir,
+                    shard_prefix="train",
+                    shard_index=train_shard_count
+                )
+                train_shard_count += 1
+
+            if chunk_val:
+                n_val = chunked_store_raw_expansions(
+                    expansions=chunk_val,
+                    arrow_dir=val_dir,
+                    shard_prefix="val",
+                    shard_index=val_shard_count
+                )
+                val_shard_count += 1
+
+            if chunk_test:
+                n_test = chunked_store_raw_expansions(
+                    expansions=chunk_test,
                     arrow_dir=test_dir,
                     shard_prefix="test",
                     shard_index=test_shard_count

@@ -110,7 +110,7 @@ class BulkFileParser:
         Choose the right parse function based on the known column sets.
         """
         if self.bulk_table is None or self.bulk_table.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         known_formats = self.format_dict['bulk']
 
@@ -154,7 +154,7 @@ class BulkFileParser:
         ).copy()
 
         if df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         # Detect chain type from the first row
         first_vgene = df.iloc[0]['VGene']
@@ -167,14 +167,7 @@ class BulkFileParser:
                     'aaCDR3': 'tra'
                 }
             )
-            # Fill missing columns
-            df['trad_gene'] = ''
-            df['trb'] = ''
-            df['trbv_gene'] = ''
-            df['trbj_gene'] = ''
-            df['trbd_gene'] = ''
-            # Make a single sequence column
-            df['sequence'] = df['tra'] + ';'
+            
         elif 'TRBV' in first_vgene:
             # This is a beta chain
             df = df.rename(
@@ -184,24 +177,16 @@ class BulkFileParser:
                     'aaCDR3': 'trb'
                 }
             )
-            df['tra'] = ''
-            df['trav_gene'] = ''
-            df['traj_gene'] = ''
-            df['trad_gene'] = ''
-            df['trbd_gene'] = ''
-            df['sequence'] = df['trb'] + ';'
         else:
             raise ValueError(f"Unrecognized chain type in VGene: {first_vgene}")
 
-        # Reorder columns consistently
-        columns_order = [
-            'trav_gene', 'traj_gene', 'trad_gene', 'tra',
-            'trbv_gene', 'trbj_gene', 'trbd_gene', 'trb', 'sequence'
-        ]
-        df = df[columns_order]
-
         # Build the MRI table
         mri_table = df.copy()
+
+        # Build the sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
+
+        # Annotate the sequence table        
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['category'] = self.category
@@ -209,12 +194,8 @@ class BulkFileParser:
         mri_table['host_organism'] = 'human'
         mri_table['source'] = 'bulk_survey'
 
-        # Build the sequence table
-        sequence_table = mri_table[[
-            'trav_gene', 'trad_gene', 'traj_gene', 'tra',
-            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb',
-            'sequence', 'source'
-        ]].copy()
+        # Annotate the sequence table
+        sequence_table['source'] = 'bulk_survey_format_one'
 
         # Standardize
         sequence_table = standardize_sequence(sequence_table)
@@ -236,7 +217,7 @@ class BulkFileParser:
         ]
         df = self.bulk_table.drop(columns=columns_to_drop, errors='ignore').copy()
         if df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         # Detect chain type from the first row
         first_v = df.iloc[0]['V alleles']
@@ -249,11 +230,6 @@ class BulkFileParser:
                 'D alleles': 'trad_gene',
                 'CDR3 amino acid sequence': 'tra'
             })
-            df['sequence'] = df['tra'] + ';'
-            df['trb'] = ''
-            df['trbv_gene'] = ''
-            df['trbj_gene'] = ''
-            df['trbd_gene'] = ''
         elif 'TRBV' in first_v:
             # beta chain
             df = df.rename(columns={
@@ -262,32 +238,24 @@ class BulkFileParser:
                 'D alleles': 'trbd_gene',
                 'CDR3 amino acid sequence': 'trb'
             })
-            df['sequence'] = df['trb'] + ';'
-            df['tra'] = ''
-            df['trav_gene'] = ''
-            df['traj_gene'] = ''
-            df['trad_gene'] = ''
         else:
             raise ValueError(f"Unrecognized chain type in V alleles: {first_v}")
 
-        # Reorder columns
-        columns_order = [
-            'trav_gene', 'traj_gene', 'trad_gene', 'tra',
-            'trbv_gene', 'trbj_gene', 'trbd_gene', 'trb', 'sequence'
-        ]
-        df = df[columns_order]
 
         # Build MRI and sequence tables
         mri_table = df.copy()
+        sequence_table = mri_table.drop_duplicates().copy()
+
+        # Annotate MRI table
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['host_organism'] = 'human'
         mri_table['category'] = self.category
         mri_table['molecule_type'] = self.molecule_type
-        mri_table['source'] = 'bulk_survey'
+        mri_table['source'] = 'bulk_survey_format_two'
 
-        sequence_table = mri_table.drop_duplicates(subset=['sequence']).copy()
-
+        # Annotate sequence table
+        sequence_table['source'] = 'bulk_survey_format_two'
         # Standardize
         mri_table = standardize_mri(mri_table)
         sequence_table = standardize_sequence(sequence_table)
@@ -306,7 +274,7 @@ class BulkFileParser:
         ]
         df = self.bulk_table.drop(columns=columns_to_drop, errors='ignore').copy()
         if df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         # Detect chain type from the first row's V segments
         first_v = df.iloc[0]['V segments']
@@ -317,11 +285,6 @@ class BulkFileParser:
                 'D segments': 'trad_gene',
                 'CDR3 amino acid sequence': 'tra'
             })
-            df['sequence'] = df['tra'] + ';'
-            df['trb'] = ''
-            df['trbv_gene'] = ''
-            df['trbj_gene'] = ''
-            df['trbd_gene'] = ''
         elif 'TRBV' in first_v:
             df = df.rename(columns={
                 'V segments': 'trbv_gene',
@@ -329,32 +292,23 @@ class BulkFileParser:
                 'D segments': 'trbd_gene',
                 'CDR3 amino acid sequence': 'trb'
             })
-            df['sequence'] = df['trb'] + ';'
-            df['tra'] = ''
-            df['trav_gene'] = ''
-            df['traj_gene'] = ''
-            df['trad_gene'] = ''
         else:
             raise ValueError(f"Unrecognized chain type in V segments: {first_v}")
 
-        columns_order = [
-            'trav_gene', 'traj_gene', 'trad_gene', 'tra',
-            'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb', 'sequence'
-        ]
-        df = df[columns_order]
-
+        
         # Build MRI and sequence tables
         mri_table = df.copy()
+        # Build the sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
+        # Annotate MRI table
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['category'] = self.category
         mri_table['molecule_type'] = self.molecule_type
         mri_table['host_organism'] = 'human'
-        mri_table['source'] = 'bulk_survey'
-
-        sequence_table = df.drop_duplicates(subset=['sequence']).copy()
-        sequence_table['source'] = 'bulk_survey'
-
+        mri_table['source'] = 'bulk_survey_format_three'
+        # Annotate sequence table
+        sequence_table['source'] = 'bulk_survey_format_three'
         # Standardize
         mri_table = standardize_mri(mri_table)
         sequence_table = standardize_sequence(sequence_table)
@@ -366,7 +320,7 @@ class BulkFileParser:
         """
         df = self.bulk_table[self.bulk_table['frame_type'] == "In"].copy()
         if df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         # We only keep the relevant columns
         df = df[['amino_acid', 'v_resolved', 'd_resolved', 'j_resolved']]
@@ -379,46 +333,36 @@ class BulkFileParser:
                     'trav_gene': row['v_resolved'],
                     'traj_gene': row['j_resolved'],
                     'trad_gene': row['d_resolved'],
-                    'tra': row['amino_acid'],
-                    'trbv_gene': '',
-                    'trbj_gene': '',
-                    'trbd_gene': '',
-                    'trb': '',
+                    'tra': row['amino_acid']
                 })
             elif 'TCRB' in row['v_resolved']:
                 transformed_rows.append({
                     'trbv_gene': row['v_resolved'],
                     'trbj_gene': row['j_resolved'],
                     'trbd_gene': row['d_resolved'],
-                    'trb': row['amino_acid'],
-                    'trav_gene': '',
-                    'traj_gene': '',
-                    'trad_gene': '',
-                    'tra': '',
-                })
+                    'trb': row['amino_acid']})
             # Possibly skip TCRD rows or add logic if needed
 
         out_df = pd.DataFrame(transformed_rows)
         if out_df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
-        # Create a 'sequence' column from tra/trb
-        out_df['sequence'] = out_df[['tra', 'trb']].apply(
-            lambda x: ' '.join(y for y in x if y) + ';',
-            axis=1
-        )
-
+    
         # Build MRI
         mri_table = out_df.copy()
+
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
+        # Annotate MRI table
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['category'] = self.category
         mri_table['molecule_type'] = self.molecule_type
         mri_table['host_organism'] = 'human'
-        mri_table['source'] = 'bulk_survey'
+        mri_table['source'] = 'bulk_survey_format_four'
 
         # Build sequence table
-        sequence_table = mri_table.drop_duplicates(subset=['sequence']).copy()
+        sequence_table['source'] = 'bulk_survey_format_four'
 
         # Standardize
         mri_table = standardize_mri(mri_table)
@@ -431,7 +375,7 @@ class BulkFileParser:
         """
         df = self.bulk_table[self.bulk_table['fuction'] == "in-frame"].copy()
         if df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         # Relevant columns
         df = df[['#ID', 'V_ref', 'D_ref', 'J_ref', 'CDR3(aa)', 'amino_acid']]
@@ -443,44 +387,34 @@ class BulkFileParser:
                     'trav_gene': row['V_ref'],
                     'traj_gene': row['J_ref'],
                     'trad_gene': row['D_ref'],
-                    'tra': row['CDR3(aa)'],
-                    'trbv_gene': '',
-                    'trbj_gene': '',
-                    'trbd_gene': '',
-                    'trb': '',
-                })
+                    'tra': row['CDR3(aa)']})
             elif 'TRBV' in row['V_ref']:
                 transformed_rows.append({
                     'trbv_gene': row['V_ref'],
                     'trbj_gene': row['J_ref'],
                     'trbd_gene': row['D_ref'],
-                    'trb': row['CDR3(aa)'],
-                    'trav_gene': '',
-                    'traj_gene': '',
-                    'trad_gene': '',
-                    'tra': '',
-                })
+                    'trb': row['CDR3(aa)'],})
 
         out_df = pd.DataFrame(transformed_rows)
         if out_df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
-        out_df['sequence'] = out_df[['tra', 'trb']].apply(
-            lambda x: ' '.join(y for y in x if y) + ';',
-            axis=1
-        )
-
+        
         # Build MRI
         mri_table = out_df.copy()
+
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
+        # Annotate MRI table
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['category'] = self.category
         mri_table['molecule_type'] = self.molecule_type
         mri_table['host_organism'] = 'human'
-        mri_table['source'] = 'bulk_survey'
+        mri_table['source'] = 'bulk_survey_format_five'
 
-        # Build sequence table
-        sequence_table = mri_table.drop_duplicates().copy()
+        # Annotate sequence table
+        sequence_table['source'] = 'bulk_survey_format_five'
 
         # Standardize
         mri_table = standardize_mri(mri_table)
@@ -493,7 +427,7 @@ class BulkFileParser:
         """
         df = self.bulk_table[self.bulk_table['fuction'] == "in-frame"].copy()
         if df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         df = df[['aminoAcid(CDR3 in lowercase)', 'vGene', 'dGene', 'jGene']]
 
@@ -512,10 +446,6 @@ class BulkFileParser:
                     'traj_gene': row['jGene'],
                     'trad_gene': row['dGene'],
                     'tra': row['cdr3'],
-                    'trbv_gene': '',
-                    'trbj_gene': '',
-                    'trbd_gene': '',
-                    'trb': '',
                 })
             elif 'TRBV' in row['vGene']:
                 transformed_rows.append({
@@ -523,32 +453,26 @@ class BulkFileParser:
                     'trbj_gene': row['jGene'],
                     'trbd_gene': row['dGene'],
                     'trb': row['cdr3'],
-                    'trav_gene': '',
-                    'traj_gene': '',
-                    'trad_gene': '',
-                    'tra': '',
                 })
 
         out_df = pd.DataFrame(transformed_rows)
         if out_df.empty:
-            return None, None
-
-        out_df['sequence'] = out_df[['tra', 'trb']].apply(
-            lambda x: ' '.join(y for y in x if y) + ';',
-            axis=1
-        )
+            return pd.DataFrame(), pd.DataFrame()
 
         # Build MRI
         mri_table = out_df.copy()
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
+        # Annotate MRI table
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['category'] = self.category
         mri_table['molecule_type'] = self.molecule_type
         mri_table['host_organism'] = 'human'
-        mri_table['source'] = 'bulk_survey'
+        mri_table['source'] = 'bulk_survey_format_six'
 
-        # Build sequence table
-        sequence_table = mri_table.drop_duplicates().copy()
+        # Annotate sequence table
+        sequence_table['source'] = 'bulk_survey_format_six'
 
         # Standardize
         mri_table = standardize_mri(mri_table)
@@ -561,7 +485,7 @@ class BulkFileParser:
         """
         df = self.bulk_table[self.bulk_table['sequenceStatus'] == "In"].copy()
         if df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         df = df[['aminoAcid', 'vMaxResolved', 'dMaxResolved', 'jMaxResolved']]
         df = df.fillna('')
@@ -575,10 +499,6 @@ class BulkFileParser:
                     'traj_gene': j,
                     'trad_gene': d,
                     'tra': row['aminoAcid'],
-                    'trbv_gene': '',
-                    'trbj_gene': '',
-                    'trbd_gene': '',
-                    'trb': '',
                 })
             elif 'TCRBV' in v or 'TCRBJ' in j or 'TCRBD' in d:
                 transformed_rows.append({
@@ -586,32 +506,26 @@ class BulkFileParser:
                     'trbj_gene': j,
                     'trbd_gene': d,
                     'trb': row['aminoAcid'],
-                    'trav_gene': '',
-                    'traj_gene': '',
-                    'trad_gene': '',
-                    'tra': '',
                 })
 
         out_df = pd.DataFrame(transformed_rows)
         if out_df.empty:
-            return None, None
-
-        out_df['sequence'] = out_df[['tra', 'trb']].apply(
-            lambda x: ' '.join(y for y in x if y) + ';',
-            axis=1
-        )
+            return pd.DataFrame(), pd.DataFrame()
 
         # Build MRI
         mri_table = out_df.copy()
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
+        # Annotate MRI table
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['category'] = self.category
         mri_table['molecule_type'] = self.molecule_type
         mri_table['host_organism'] = 'human'
-        mri_table['source'] = 'bulk_survey'
+        mri_table['source'] = 'bulk_survey_format_seven'
 
-        # Build sequence table
-        sequence_table = mri_table.drop_duplicates().copy()
+        # Annotate sequence table
+        sequence_table['source'] = 'bulk_survey_format_seven'
 
         # Standardize
         mri_table = standardize_mri(mri_table)
@@ -624,7 +538,7 @@ class BulkFileParser:
         """
         df = self.bulk_table[self.bulk_table['frame_type'] == "In"].copy()
         if df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         df = df[['amino_acid', 'v_gene', 'd_gene', 'j_gene']]
         df = df.fillna('')
@@ -637,10 +551,6 @@ class BulkFileParser:
                     'traj_gene': row['j_gene'],
                     'trad_gene': row['d_gene'],
                     'tra': row['amino_acid'],
-                    'trbv_gene': '',
-                    'trbj_gene': '',
-                    'trbd_gene': '',
-                    'trb': '',
                 })
             elif 'TCRBV' in row['v_gene']:
                 transformed_rows.append({
@@ -648,30 +558,25 @@ class BulkFileParser:
                     'trbj_gene': row['j_gene'],
                     'trbd_gene': row['d_gene'],
                     'trb': row['amino_acid'],
-                    'trav_gene': '',
-                    'traj_gene': '',
-                    'trad_gene': '',
-                    'tra': '',
                 })
 
         out_df = pd.DataFrame(transformed_rows)
         if out_df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
-        out_df['sequence'] = out_df[['tra', 'trb']].apply(
-            lambda x: ' '.join(y for y in x if y) + ';',
-            axis=1
-        )
-
+        # Build MRI
         mri_table = out_df.copy()
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
+        # Annotate MRI table
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['host_organism'] = 'human'
         mri_table['category'] = self.category
         mri_table['molecule_type'] = self.molecule_type
-        mri_table['source'] = 'bulk_survey'
-
-        sequence_table = mri_table.drop_duplicates().copy()
+        mri_table['source'] = 'bulk_survey_format_nine'
+        # Annotate sequence table
+        sequence_table['source'] = 'bulk_survey_format_nine'
 
         # Standardize
         mri_table = standardize_mri(mri_table)
@@ -684,7 +589,7 @@ class BulkFileParser:
         """
         df = self.bulk_table[['cdr3_b_aa', 'v_b_gene', 'j_b_gene']].copy()
         if df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         transformed_rows = []
         for _, row in df.iterrows():
@@ -693,41 +598,32 @@ class BulkFileParser:
                 transformed_rows.append({
                     'trav_gene': row['v_b_gene'],
                     'traj_gene': row['j_b_gene'],
-                    'trad_gene': '',
                     'tra': row['cdr3_b_aa'],
-                    'trbv_gene': '',
-                    'trbj_gene': '',
-                    'trbd_gene': '',
-                    'trb': '',
-                    'sequence': f"{row['cdr3_b_aa']};",
                 })
             elif 'TRBV' in v_gene:
                 transformed_rows.append({
-                    'trav_gene': '',
-                    'traj_gene': '',
-                    'trad_gene': '',
-                    'tra': '',
                     'trbv_gene': row['v_b_gene'],
                     'trbj_gene': row['j_b_gene'],
-                    'trbd_gene': '',
                     'trb': row['cdr3_b_aa'],
-                    'sequence': f"{row['cdr3_b_aa']};",
                 })
 
         out_df = pd.DataFrame(transformed_rows)
         if out_df.empty:
-            return None, None
+            return pd.DataFrame(), pd.DataFrame()
 
         # Build MRI
         mri_table = out_df.copy()
+        # Build sequence table
+        sequence_table = mri_table.drop_duplicates().copy()
+        # Annotate MRI table
         mri_table['repertoire_id'] = self.repertoire_id
         mri_table['study_id'] = self.study_id
         mri_table['host_organism'] = 'human'
         mri_table['category'] = self.category
         mri_table['molecule_type'] = self.molecule_type
-        mri_table['source'] = 'bulk_survey'
-
-        sequence_table = mri_table.drop_duplicates(subset='sequence').copy()
+        mri_table['source'] = 'bulk_survey_format_eleven'
+        # Annotate sequence table
+        sequence_table['source'] = 'bulk_survey_format_eleven'
 
         # Standardize
         mri_table = standardize_mri(mri_table)

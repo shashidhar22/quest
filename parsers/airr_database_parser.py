@@ -200,14 +200,8 @@ class DatabaseParser:
             'mhc_restriction_two': 'mhc_two_id'
         }, inplace=True)
 
-        def build_sequence(row):
-            parts = []
-            for val in [row['tra'], row['trb'], row['peptide'], row['mhc_one'], row['mhc_two']]:
-                if pd.notna(val) and val:
-                    parts.append(str(val))
-            return ' '.join(parts) + ';'
+        
 
-        sequence_table['sequence'] = sequence_table.apply(build_sequence, axis=1)
         sequence_table['source'] = 'vdjdb'
         sequence_table.drop_duplicates(inplace=True)
 
@@ -262,7 +256,6 @@ class DatabaseParser:
 
         seq_cols = ['trbv_gene', 'trbd_gene', 'trbj_gene', 'trb']
         sequence_table = mri_table[seq_cols].copy()
-        sequence_table['sequence'] = sequence_table['trb'].apply(lambda x: x + ';' if x else '')
         sequence_table['source'] = 'tcrdb'
         sequence_table.drop_duplicates(inplace=True)
 
@@ -347,19 +340,10 @@ class DatabaseParser:
             'trb_junction_aa': 'trb'
         }, inplace=True)
 
-        def build_sequence(row):
-            parts = []
-            for val in [row['tra'], row['trb'], row['peptide'], row['mhc_one']]:
-                if pd.notna(val) and val:
-                    parts.append(str(val))
-            return ' '.join(parts) + ';'
-
-        sequence_table['sequence'] = sequence_table.apply(build_sequence, axis=1)
         final_cols = [
             'trav_gene', 'traj_gene', 'tra',
             'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb',
-            'peptide', 'mhc_restriction', 'mhc_one', 'sequence'
-        ]
+            'peptide', 'mhc_restriction', 'mhc_one']
         for c in final_cols:
             if c not in sequence_table.columns:
                 sequence_table[c] = ''
@@ -472,19 +456,12 @@ class DatabaseParser:
 
         seq_table['peptide'] = seq_table['peptide'].apply(lambda x: x.split('+')[0] if x else '')
 
-        def build_sequence(row):
-            parts = []
-            for v in [row['peptide'], row['mhc_one'], row['mhc_two']]:
-                if v and pd.notna(v):
-                    parts.append(v)
-            return ' '.join(parts) + ';'
-
-        seq_table['sequence'] = seq_table.apply(build_sequence, axis=1)
+        
         seq_table.rename(columns={
             'mhc_restriction': 'mhc_one_id',
             'mhc_restriction_two': 'mhc_two_id'
         }, inplace=True)
-        seq_cols = ['peptide', 'mhc_one_id', 'mhc_one', 'mhc_two_id', 'mhc_two', 'sequence']
+        seq_cols = ['peptide', 'mhc_one_id', 'mhc_one', 'mhc_two_id', 'mhc_two']
         seq_table = seq_table[seq_cols].drop_duplicates()
 
         return mri_table, seq_table
@@ -579,19 +556,12 @@ class DatabaseParser:
             lambda x: get_mhc_sequence(x, self.hla_dictionary)
         )
 
-        def build_sequence(row):
-            parts = []
-            for v in [row['peptide'], row['mhc_one'], row['mhc_two']]:
-                if v and pd.notna(v):
-                    parts.append(v)
-            return ' '.join(parts) + ';'
-
-        seq_table['sequence'] = seq_table.apply(build_sequence, axis=1)
+        
         seq_table.rename(columns={
             'mhc_restriction': 'mhc_one_id',
             'mhc_restriction_two': 'mhc_two_id'
         }, inplace=True)
-        final_cols = ['peptide', 'mhc_one_id', 'mhc_one', 'mhc_two_id', 'mhc_two', 'sequence']
+        final_cols = ['peptide', 'mhc_one_id', 'mhc_one', 'mhc_two_id', 'mhc_two']
         seq_table = seq_table[final_cols].drop_duplicates()
 
         return mri_table, seq_table
@@ -689,21 +659,13 @@ class DatabaseParser:
             lambda x: x.split('+')[0] if x else ''
         )
 
-        def build_sequence(row):
-            parts = []
-            for val in [row['tra'], row['trb'], row['peptide']]:
-                if pd.notna(val) and val:
-                    parts.append(val)
-            return ' '.join(parts) + ';'
-
-        sequence_table['sequence'] = sequence_table.apply(build_sequence, axis=1)
+        
         sequence_table.drop_duplicates(inplace=True)
 
         final_cols = [
             'trav_gene', 'trad_gene', 'traj_gene',
             'tra', 'trbv_gene', 'trbd_gene', 'trbj_gene',
-            'trb', 'peptide', 'sequence'
-        ]
+            'trb', 'peptide']
         for c in final_cols:
             if c not in sequence_table.columns:
                 sequence_table[c] = ''
@@ -735,7 +697,7 @@ class DatabaseParser:
         seq_cols = [
             "trav_gene", "traj_gene", "tra",
             "trbv_gene", "trbd_gene", "trbj_gene",
-            "trb", "sequence", "source",
+            "trb", "source",
         ]
 
         for db_key, (parse_func, db_name) in databases.items():
@@ -753,7 +715,7 @@ class DatabaseParser:
             if meta_pdf.empty:
                 log.warning("      • %s: skipped (no metadata)", db_key)
                 continue
-            meta_dd = dd.from_pandas(meta_pdf.astype({"repertoire_id": "string"}),
+            meta_dd = dd.from_pandas(meta_pdf.astype({"repertoire_id": "string[pyarrow]"}),
                                     npartitions=1)
 
             if db_mri.npartitions == 0:                     # nothing parsed
@@ -761,20 +723,19 @@ class DatabaseParser:
                 continue
 
             # ensure ‘repertoire_id’ is string on both sides
-            db_mri  = db_mri.astype({"repertoire_id": "string"})
+            db_mri  = db_mri.astype({"repertoire_id": "string[pyarrow]"})
             merged  = dd_merge(meta_dd, db_mri,
                             on="repertoire_id", how="inner")
 
             # ---------- Parquet dump (single_file=True keeps the old naming) -
             mri_path = self._mri_dir / f"ireceptor_{db_name}_mri.parquet"
             seq_path = self._seq_dir / f"ireceptor_{db_name}_seq.parquet"
-
+            breakpoint
             if merged.map_partitions(len).sum().compute() > 0:
                 merged.to_parquet(mri_path,
                                 engine="pyarrow",
                                 compression="snappy",
-                                write_index=False,
-                                single_file=True)
+                                write_index=False)
 
             # pad missing cols once, then write
             for c in seq_cols:
@@ -786,8 +747,7 @@ class DatabaseParser:
                 db_seq.to_parquet(seq_path,
                                 engine="pyarrow",
                                 compression="snappy",
-                                write_index=False,
-                                single_file=True)
+                                write_index=False)
 
             log.info("      ✓ %s parsed & saved (%.2fs)", db_key, time.time() - t0)
 
@@ -855,16 +815,7 @@ class DatabaseParser:
 
         seq = mri[seq_cols].copy()
 
-        # 2 row-wise build of ‘sequence’ column ------------------------------
-        def _build_seq(row):
-            parts = []
-            for v in (row["tra"], row["trb"]):
-                if v:
-                    parts.append(str(v))
-            return " ".join(parts) + ";"
-
-        seq["sequence"] = seq.apply(_build_seq, axis=1,
-                                    meta=("sequence", "object"))
+        
         seq["source"] = f"ireceptor_{source}"
         seq = seq.drop_duplicates()
 
@@ -933,16 +884,14 @@ class DatabaseParser:
                     parts.append(str(v))
             return " ".join(parts) + ";"
 
-        final["sequence"] = final.apply(_build_seq, axis=1,
-                                        meta=("sequence", "object"))
+        
         final["source"] = f"ireceptor_{source}"
 
         mri_cols = ["repertoire_id", "cell_id", "clone_id"]
         mri  = final[mri_cols].copy()
 
         seq_cols = ["tra", "trb", "trav_gene", "trad_gene", "traj_gene",
-                    "trbv_gene", "trbd_gene", "trbj_gene",
-                    "sequence", "source"]
+                    "trbv_gene", "trbd_gene", "trbj_gene", "source"]
         seq  = final[seq_cols].drop_duplicates()
 
         return mri, seq
