@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
-Evaluate any Hugging Face *masked-language-model* checkpoint by streaming
-a dataset folder from an S3 bucket with a full progress bar.
+Evaluate any Hugging Face *masked-language-model* checkpoint using Accelerate
+to run on all available GPUs.
 """
 import argparse, math, torch, json, s3fs
 from datasets import load_dataset
@@ -11,102 +11,103 @@ from transformers import (
     DataCollatorForLanguageModeling,
 )
 from tqdm.auto import tqdm
+from accelerate import Accelerator, DataLoaderConfiguration        
 
-# CLI section remains the same...
+# -------------------------------- CLI --------------------------------
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--s3_folder_path", required=True,
-                   help="S3 path to the PARENT dataset folder, e.g. 's3://my-bucket/my-hf-dataset/'.")
-    p.add_argument("--model_name",  required=True,
-                   help="Model card / Hub ID, e.g. 'Rostlab/prot_bert' or 'bert-base-uncased'.")
+                   help="S3 path to the PARENT dataset folder.")
+    p.add_argument("--model_name",     required=True,
+                   help="Model card / Hub ID.")
     p.add_argument("--max_len", type=int, required=True,
-                   help="Maximum sequence length for truncation.")
-    p.add_argument("--batch_size",  type=int, default=8)
-    p.add_argument("--mlm_prob",    type=float, default=0.15)
-    p.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
+                   help="Maximum sequence length.")
+    p.add_argument("--batch_size", type=int, default=8,
+                   help="Per-GPU batch size.")
+    p.add_argument("--mlm_prob", type=float, default=0.15)
     return p.parse_args()
 
-
-# ---------------------------------------------------------------
-# main
-# ---------------------------------------------------------------
+# -------------------------------- main --------------------------------
 def main():
-    args   = parse_args()
-    device = torch.device(args.device)
+    conf = DataLoaderConfiguration(dispatch_batches=False, split_batches=True)
+    accelerator = Accelerator(dataloader_config = conf)
 
-    # 1️⃣  Hub pull
-    print(f"🔄  Loading model and tokenizer for '{args.model_name}'...")
+    args = parse_args()
+
+    # 1️⃣  Model & tokenizer
+    accelerator.print(f"🔄  Loading model and tokenizer for '{args.model_name}'...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     model     = AutoModelForMaskedLM.from_pretrained(args.model_name, trust_remote_code=True)
-    model.to(device).eval()
 
+    # 2️⃣  Dataset
     s3_root_path = args.s3_folder_path.rstrip('/')
-
-    # NEW: Step 2️⃣a - Get the total number of examples for the progress bar
-    print("🔎  Reading dataset metadata for total count...")
     s3 = s3fs.S3FileSystem()
-    info_path = f"{s3_root_path}/test/dataset_info.json" # Path to the specific split's info
-    with s3.open(info_path, 'r') as f:
+    with s3.open(f"{s3_root_path}/train/dataset_info.json") as f:
         metadata = json.load(f)
-    
     num_examples = metadata['splits']['train']['num_examples']
-    num_batches = math.ceil(num_examples / args.batch_size)
-    print(f"✅  Found {num_examples} examples, which will be processed in {num_batches} batches.")
 
-
-    # 2️⃣b  Dataset → Define file paths and stream from S3
-    data_files = {
-        "test": f"{s3_root_path}/test/*.arrow",
-    }
-    
-    raw_ds_dict = load_dataset("arrow", data_files=data_files, streaming=True)
-    dataset_to_eval = raw_ds_dict["test"]
-    
-    print(f"▶️   Starting streaming of 'test' split from: {args.s3_folder_path}")
+    raw_ds_dict = load_dataset("arrow",
+                               data_files={"train": f"{s3_root_path}/train/*.arrow"},
+                               streaming=True)
+    dataset_to_eval = raw_ds_dict["train"]
 
     def tokenize_function(examples):
-        return tokenizer(
-            examples["sequence"],
-            truncation=True,
-            max_length=args.max_len,
-        )
+        return tokenizer(examples["sequence"],
+                         truncation=True, max_length=args.max_len)
 
     first_example = next(iter(dataset_to_eval))
-    tokenized_ds = dataset_to_eval.map(
-        tokenize_function,
-        remove_columns=first_example.keys(),
-    )
-    tokenized_ds = tokenized_ds.with_format("torch")
+    tokenized_ds = (dataset_to_eval
+                    .map(tokenize_function,
+                         remove_columns=first_example.keys())
+                    .with_format("torch"))
 
-    # 3️⃣  Loader + collator
+    # 3️⃣  Dataloader (per-GPU batch) — drop_last avoids uneven final batches
     collator = DataCollatorForLanguageModeling(
         tokenizer, mlm=True, mlm_probability=args.mlm_prob
     )
-    loader = DataLoader(tokenized_ds, batch_size=args.batch_size, collate_fn=collator)
+    loader = DataLoader(tokenized_ds,
+                        batch_size=args.batch_size,
+                        collate_fn=collator,
+                        drop_last=True,       # ⬅️ key line
+                        pin_memory=True)
 
-    # 4️⃣  Eval
-    losses, correct, masked = [], 0, 0
-    # MODIFIED: Pass the calculated `num_batches` to tqdm's `total` argument
-    for batch in tqdm(loader, total=num_batches, desc="Evaluating test data"):
-        batch = {k: v.to(device) for k, v in batch.items()}
+    # Prepare for DDP / device placement
+    model, loader = accelerator.prepare(model, loader)
+    model.eval()
+
+    # Fixed progress-bar length for all ranks
+    num_batches = math.ceil(num_examples /
+                            (args.batch_size * accelerator.num_processes))
+    progress_bar = tqdm(range(num_batches),
+                        disable=not accelerator.is_main_process,
+                        desc="Evaluating")
+
+    # 4️⃣  Evaluation loop (unchanged)
+    all_losses, all_correct, all_masked = [], [], []
+    for batch in loader:
         with torch.no_grad():
             out = model(**batch)
-        losses.append(out.loss.item())
 
-        m = batch["labels"] != -100
+        m     = batch["labels"] != -100
         preds = out.logits.argmax(dim=-1)
-        correct += (preds[m] == batch["labels"][m]).sum().item()
-        masked  += m.sum().item()
 
-    avg_loss = sum(losses) / len(losses)
-    print("\n----- MLM evaluation -----")
-    print(f"model            : {args.model_name}")
-    print(f"dataset          : {args.s3_folder_path}")
-    print(f"avg loss         : {avg_loss:.4f}")
-    print(f"perplexity       : {math.exp(avg_loss):.2f}")
-    print(f"mask accuracy    : {100*correct/masked:.2f} %")
-    print("--------------------------------")
+        all_losses.append(accelerator.gather_for_metrics(out.loss.reshape(1, -1)))
+        all_correct.append(accelerator.gather_for_metrics((preds[m] == batch["labels"][m]).sum()))
+        all_masked.append(accelerator.gather_for_metrics(m.sum()))
+        progress_bar.update(1)
 
+    total_loss   = torch.cat([l.flatten() for l in all_losses]).mean().item()
+    total_correct = torch.cat(all_correct).sum().item()
+    total_masked  = torch.cat(all_masked).sum().item()
+
+    if accelerator.is_main_process:
+        print("\n----- MLM evaluation -----")
+        print(f"model            : {args.model_name}")
+        print(f"dataset          : {args.s3_folder_path}")
+        print(f"avg loss         : {total_loss:.4f}")
+        print(f"perplexity       : {math.exp(total_loss):.2f}")
+        print(f"mask accuracy    : {100*total_correct/total_masked:.2f} %")
+        print("--------------------------------")
 
 if __name__ == "__main__":
     main()
