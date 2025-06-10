@@ -1,75 +1,60 @@
 #!/usr/bin/env python
 """
 Evaluate any Hugging Face *masked-language-model* checkpoint using Accelerate
-to run on all available GPUs.
+to run on all available GPUs **with a pre-tokenised dataset**.
 """
-import argparse, math, torch, json, s3fs
-from datasets import load_dataset
+import argparse, math, torch, os
+from datasets import load_from_disk
 from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer, AutoModelForMaskedLM,
     DataCollatorForLanguageModeling,
 )
 from tqdm.auto import tqdm
-from accelerate import Accelerator, DataLoaderConfiguration        
+from accelerate import Accelerator, DataLoaderConfiguration
 
-# -------------------------------- CLI --------------------------------
+# ──────────────── CLI ────────────────
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--s3_folder_path", required=True,
-                   help="S3 path to the PARENT dataset folder.")
+    p.add_argument("--tok_cache_dir", required=True,
+                   help="Folder that contains the *pre-tokenised* dataset.")
     p.add_argument("--model_name",     required=True,
                    help="Model card / Hub ID.")
-    p.add_argument("--max_len", type=int, required=True,
-                   help="Maximum sequence length.")
     p.add_argument("--batch_size", type=int, default=8,
                    help="Per-GPU batch size.")
     p.add_argument("--mlm_prob", type=float, default=0.15)
     return p.parse_args()
 
-# -------------------------------- main --------------------------------
+# ──────────────── main ───────────────
 def main():
-    conf = DataLoaderConfiguration(dispatch_batches=False, split_batches=True)
-    accelerator = Accelerator(dataloader_config = conf)
+    conf = DataLoaderConfiguration(dispatch_batches=True, split_batches=True)
+    accelerator = Accelerator(dataloader_config=conf, mixed_precision="bf16")
 
     args = parse_args()
 
     # 1️⃣  Model & tokenizer
-    accelerator.print(f"🔄  Loading model and tokenizer for '{args.model_name}'...")
+    accelerator.print(f"🔄  Loading model and tokenizer for '{args.model_name}'…")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     model     = AutoModelForMaskedLM.from_pretrained(args.model_name, trust_remote_code=True)
 
-    # 2️⃣  Dataset
-    s3_root_path = args.s3_folder_path.rstrip('/')
-    s3 = s3fs.S3FileSystem()
-    with s3.open(f"{s3_root_path}/train/dataset_info.json") as f:
-        metadata = json.load(f)
-    num_examples = metadata['splits']['train']['num_examples']
+    # 2️⃣  Dataset (already tokenised → just load)
+    accelerator.print(f"📂  Loading tokenised dataset from {args.tok_cache_dir}")
+    tokenized_ds = load_from_disk(args.tok_cache_dir).with_format("torch")
+    num_examples = len(tokenized_ds)
 
-    raw_ds_dict = load_dataset("arrow",
-                               data_files={"train": f"{s3_root_path}/train/*.arrow"},
-                               streaming=True)
-    dataset_to_eval = raw_ds_dict["train"]
-
-    def tokenize_function(examples):
-        return tokenizer(examples["sequence"],
-                         truncation=True, max_length=args.max_len)
-
-    first_example = next(iter(dataset_to_eval))
-    tokenized_ds = (dataset_to_eval
-                    .map(tokenize_function,
-                         remove_columns=first_example.keys())
-                    .with_format("torch"))
-
-    # 3️⃣  Dataloader (per-GPU batch) — drop_last avoids uneven final batches
+    # 3️⃣  Dataloader (per-GPU batch)
     collator = DataCollatorForLanguageModeling(
-        tokenizer, mlm=True, mlm_probability=args.mlm_prob
+        tokenizer, mlm=True, mlm_probability=args.mlm_prob, pad_to_multiple_of=8
     )
-    loader = DataLoader(tokenized_ds,
-                        batch_size=args.batch_size,
-                        collate_fn=collator,
-                        drop_last=True,       # ⬅️ key line
-                        pin_memory=True)
+    loader = DataLoader(
+        tokenized_ds,
+        batch_size=args.batch_size,
+        num_workers=12,              # keep the GPUs fed
+        persistent_workers=True,
+        collate_fn=collator,
+        drop_last=True,
+        pin_memory=True,
+    )
 
     # Prepare for DDP / device placement
     model, loader = accelerator.prepare(model, loader)
@@ -103,7 +88,7 @@ def main():
     if accelerator.is_main_process:
         print("\n----- MLM evaluation -----")
         print(f"model            : {args.model_name}")
-        print(f"dataset          : {args.s3_folder_path}")
+        print(f"dataset (cached) : {args.tok_cache_dir}")
         print(f"avg loss         : {total_loss:.4f}")
         print(f"perplexity       : {math.exp(total_loss):.2f}")
         print(f"mask accuracy    : {100*total_correct/total_masked:.2f} %")
