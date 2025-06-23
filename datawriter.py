@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-
-
-import argparse, os, sys, time, uuid
+import os
+os.environ["HF_DATASETS_DISABLE_PROGRESS_BAR"] = "1"
+import shutil
+import argparse, sys, time, uuid
 from itertools import combinations
 from typing import Dict, List
 
@@ -23,8 +24,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Generate combo_ids from an S3 Parquet corpus"
     )
-    p.add_argument("--s3-prefix",  nargs="+", required=True,
-                   help="Top-level S3 prefix containing *.parquet shards "
+    p.add_argument("--path",  nargs="+", required=True,
+                   help="Top-level S3/local prefix containing *.parquet shards "
                         "(wildcard **/*.parquet is appended automatically)")
     p.add_argument("--model-name", required=True,
                    choices=["bert", "protbert", "esm", "llama"],
@@ -66,7 +67,7 @@ END_STYLE = {
 
 def explode_row(row: Dict[str, str], join_fn, start_fn, end_fn) -> List[Dict[str, object]]:
     """Return list of {combo_id, combo_feats} for one source row."""
-    present = [(row[f], f) for f in FIELDS if row[f]]
+    present = [(row[f], f) for f in row.keys() if row[f]]
     combos = []
     for r in range(1, len(present) + 1):
         for combo in combinations(present, r):
@@ -107,33 +108,86 @@ def main() -> None:
     aws_access_key_id = args.s3_key or os.getenv("AWS_ACCESS_KEY_ID")
     aws_secret_access_key = args.s3_secret or os.getenv("AWS_SECRET_ACCESS_KEY")
     aws_session_token = args.s3_token or os.getenv("AWS_SESSION_TOKEN")
-    fs = s3fs.S3FileSystem(
+    
+    def is_remote(p: str) -> bool:
+        return p.startswith("s3://")
+
+    s3_fs = s3fs.S3FileSystem(
         key=aws_access_key_id,
         secret=aws_secret_access_key,
         token=aws_session_token
     )
-
+    local_fs = fsspec.filesystem("file")
+    
+    def list_parquet(prefix: str) -> list[str]:
+        """Return absolute paths (with scheme for S3) for every *.parquet under `prefix`."""
+        if is_remote(prefix):
+            key = prefix[5:].rstrip("/")                       # strip “s3://”
+            return [f"s3://{p}" for p in s3_fs.glob(f"{key}/**/*.parquet")]
+        else:
+            return [str(p) for p in Path(prefix).rglob("*.parquet")]
+    
     def count_rows(prefix: str) -> int:
-        base = prefix.replace("s3://", "").rstrip("/")
-        return pds.dataset(base, format="parquet", filesystem=fs).count_rows()
+        if is_remote(prefix):
+            key = prefix[5:].rstrip("/")
+            return pds.dataset(key, format="parquet", filesystem=s3_fs).count_rows()
+        else:
+            return pds.dataset(prefix, format="parquet").count_rows()
 
-    total_rows = sum(count_rows(p) for p in args.s3_prefix)
+    def load_one(path: str):
+        """
+        Return a 🤗 Dataset for `path`, which may be
+        • a single *.parquet file, or
+        • a directory / prefix that contains many *.parquet shards.
+
+        Handles both local files and s3:// URIs.
+        """
+
+        def _local_file_list(p: Path) -> list[str]:
+            if p.is_dir():
+                files = [str(f) for f in p.rglob("*.parquet")]
+                if not files:
+                    raise ValueError(f"{p} is a directory but no *.parquet inside")
+                return files
+            return [str(p)]
+
+        def _s3_file_list(uri: str) -> list[str]:
+            key = uri[5:] if uri.startswith("s3://") else uri        # strip scheme
+            if s3_fs.isdir(key):
+                files = s3_fs.glob(f"{key.rstrip('/')}/**/*.parquet")
+                if not files:
+                    raise ValueError(f"s3://{key} is a prefix but no *.parquet inside")
+                return [f"s3://{obj}" for obj in files]               # re-add scheme
+            return [uri if uri.startswith("s3://") else f"s3://{key}"]
+
+        if is_remote(path):
+            data_files     = _s3_file_list(path)
+            storage_opts   = {"key": args.s3_key,
+                            "secret": args.s3_secret,
+                            "token": args.s3_token}
+        else:
+            data_files     = _local_file_list(Path(path))
+            storage_opts   = None
+
+        return load_dataset(
+            "parquet",
+            data_files=data_files,
+            split="train",
+            features=features,
+            storage_options=storage_opts,
+        )
+
+    total_rows = sum(count_rows(p) for p in args.path)
     print(f"[INFO] Total source rows across prefixes: {total_rows:,}")
 
-    wildcards = [
-        prefix.rstrip("/") + "/**/*.parquet"
-        for prefix in args.s3_prefix            # now a list
-    ]
-    print(f"[INFO] Streaming from {wildcards}")
-
-
     union_cols  = set()
-    all_files = [f                          # one flat list
-             for pattern in args.s3_prefix   # iterate prefixes
-             for f in sorted(fs.glob(f'{pattern.rstrip('/')}/**/*.parquet'))]
+    all_files = [p for prefix in args.path for p in list_parquet(prefix)]    
 
     for f in all_files:
-        schema = pds.dataset(f's3://{f}').schema             # no data read
+        if is_remote(f):
+            schema = pds.dataset(f's3://{f}').schema             # no data read
+        else:
+            schema = pds.dataset(f).schema
         union_cols.update(schema.names)
 
     # deterministic order → HF keeps it
@@ -142,42 +196,23 @@ def main() -> None:
     # Build a Feature spec (all nullable strings here; adjust types if you like)
     features = Features({c: Value("string") for c in union_cols})
 
-    def load_one(path):
-        """Return a HF Dataset with the full column set (missing ⇒ null)."""
-
-        if fs.isdir(path):
-            file_list = [f"s3://{p}" for p in fs.glob(f"{path.rstrip('/')}/**/*.parquet")]
-            if not file_list:
-                raise ValueError(f"{path} is a dir but no *.parquet inside")
-            data_files = file_list
-        else:
-            data_files = f"s3://{path}"
-        ds = load_dataset("parquet", data_files=data_files, split="train", features=features)
-        
-
-
-        # (Optional) drop columns you truly don't care about
-        # ds = ds.remove_columns(["mhc_restriction", "trad_gene"])
-
-        return ds
-
+    
     # Load & stitch
-    chunks = [load_one(f) for f in all_files]
+
+
+    chunks = []
+    for f in tqdm(all_files, desc="Loading Parquet shards"):
+        chunks.append(load_one(f))           # your existing helper
+
     ds = concatenate_datasets(chunks)
 
-
-    # Keep only needed fields (fill missing with "")
-    ds = ds.map(lambda ex: {k: ex.get(k, "") for k in FIELDS},
-                batched=True,
-                batch_size=args.batch_size,)
-
+    ds = ds.remove_columns([c for c in ds.column_names if c not in FIELDS])
     # Arrow writer setup
     schema = pa.schema([
         ("combo_id", pa.string()),
         ("combo_feats", pa.list_(pa.string())),
     ])
     feat_counts = Counter()
-
     tmp_local = f"/tmp/{uuid.uuid4()}.parquet"
     writer = pq.ParquetWriter(tmp_local, schema, compression="zstd")
 
@@ -186,7 +221,6 @@ def main() -> None:
 
     pbar = tqdm(total=total_rows, unit="rows")
 
-
     for batch in ds.iter(batch_size=args.batch_size):
         n_src = len(batch["tra"])
         rows_in += n_src
@@ -194,7 +228,7 @@ def main() -> None:
 
         # explode inside Python
         for idx in range(n_src):
-            row = {f: batch[f][idx] for f in FIELDS}
+            row = {f: batch[f][idx] for f in batch.keys()}
             for combo in explode_row(row, join_fn, start_fn, end_fn):
                 out_batch["combo_id"].append(combo["combo_id"])
                 out_batch["combo_feats"].append(combo["combo_feats"])
@@ -206,14 +240,18 @@ def main() -> None:
         
     writer.close()
     pbar.close()
+    
+   
+    
+    
     # Copy to final destination
     if args.output.startswith("s3://"):
-        dst = args.output.rstrip("/") + "/combos.parquet"
+        dst = args.output.rstrip("/") + f"/{args.model_name}_combos.parquet"
         fs.put(tmp_local, dst)
-        os.remove(tmp_local)
+        #shutil.move(tmp_local, args.output)  # move to avoid overwriting
         print(f"[DONE] Wrote {rows_out:,} combos to {dst}")
     else:
-        os.rename(tmp_local, args.output)
+        shutil.move(tmp_local, args.output)
         print(f"[DONE] Wrote {rows_out:,} combos to {args.output}")
 
     elapsed = time.time() - t0
