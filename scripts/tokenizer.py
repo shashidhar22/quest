@@ -1,72 +1,86 @@
 #!/usr/bin/env python
 """
-preprocess_tok.py
-─────────────────
-One-time script that:
-  1. Downloads the raw Arrow shards from S3
-  2. Tokenises every sequence with the specified model tokenizer
-  3. Saves the tokenised dataset to /opt/dlami/nvme/tok_<model>_max<LEN>
-
-Only rank-0 does the heavy lifting; other ranks just wait and load.
+Fast multi-process tokenisation with 🤗 Accelerate.
+g4dn.12xlarge → 4 GPU-backed processes × 12 CPU workers each.
 """
-
-import argparse, os, json
-from datasets import load_dataset, load_from_disk
+import argparse, os, shutil
+from datasets import load_dataset, concatenate_datasets, Dataset
 from transformers import AutoTokenizer
 from accelerate import Accelerator
 
-# ─────────────────────── CLI ────────────────────────
+# ───────────── CLI ─────────────
 p = argparse.ArgumentParser()
-p.add_argument("--model_name", required=True,
-               help="HF checkpoint with a compatible tokenizer")
-p.add_argument("--s3_root",    required=True,
-               help="s3://… folder that contains test/*.arrow")
+p.add_argument("--model_name", required=True)
+p.add_argument("--s3_root",    required=True)
 p.add_argument("--max_len",    type=int, required=True)
+p.add_argument("--cache_dir",  default="/opt/dlami/nvme")
+p.add_argument("--batch_size", type=int, default=2000)   # per proc
+p.add_argument("--num_proc",   type=int, default=12)     # CPU workers / proc
 args = p.parse_args()
 
-# ────────────────── Accelerator setup ───────────────
+# ────────── Accelerator ─────────
 acc = Accelerator()
-rank0 = acc.is_main_process
-acc.print = acc.print if rank0 else (lambda *a, **k: None)
+rank, world = acc.process_index, acc.num_processes
+rank0       = rank == 0
+barrier     = acc.wait_for_everyone
 
-# ────────────────── Paths & cache dirs ──────────────
-tok_cache = f"/opt/dlami/nvme/tok_{args.model_name.replace('/', '_')}_max{args.max_len}"
-os.makedirs(tok_cache, exist_ok=True)   # harmless if already there
+# ───────── Paths ────────────────
+base_cache = f"{args.cache_dir}/tok_{args.model_name.replace('/','_')}_max{args.max_len}"
+shard_dir  = f"{base_cache}/shard_{rank}"
+final_dir  = f"{base_cache}/full"
+os.makedirs(shard_dir, exist_ok=True)
 
-# ─────────────────── Rank-0 work ────────────────────
-if rank0 and not os.listdir(tok_cache):
-    acc.print(f"🔑  Loading tokenizer:  {args.model_name}")
-    tok = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+# Stop early if the full cache already exists
+if os.path.isdir(final_dir):
+    if rank0:
+        acc.print(f"✅  Using existing cache → {final_dir}")
+    barrier(); exit()
 
-    acc.print("⬇️   Loading raw Arrow shards from S3 …")
-    raw_ds = load_dataset(
-        "arrow",
-        data_files={"test": f"{args.s3_root.rstrip('/')}/test/*.arrow"},
-        # non-streaming → we need real data to map over
-    )["test"]
+# ───────── Tokeniser ────────────
+if rank0:  acc.print(f"🔑  Loading tokenizer '{args.model_name}'")
+tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
 
-    def tok_fn(batch):
-        return tok(batch["sequence"],
-                   truncation=True,
-                   max_length=args.max_len)
+# ───────── Load & SHARD dataset ─
+if rank0:  acc.print("⬇️   Loading raw Arrow shards from S3 …")
+raw = load_dataset("arrow",
+                   data_files={"test": f"{args.s3_root.rstrip('/')}/test/*.arrow"},
+                   split="test")                 # one Arrow dataset
+shard = raw.shard(num_shards=world, index=rank, contiguous=True)
 
-    acc.print("🛠️   Tokenising … (this can take a while)")
-    (raw_ds
-        .map(tok_fn,
-             remove_columns=["sequence"],
-             batched=True,            # speeds things up
-             batch_size=1000,
-             num_proc=32,             # g5.12xlarge → 96 vCPUs
-             load_from_cache_file=False)
-        .save_to_disk(tok_cache))
+# ───────── Tokenise slice ───────
+def tok_fn(batch):
+    return tokenizer(batch["combo_id"],
+                     truncation=True,
+                     max_length=args.max_len)
 
-    acc.print(f"✅  Saved tokenised set → {tok_cache}")
+acc.print(f"🛠️   Rank {rank}/{world-1}: tokenising {len(shard):,} rows …")
+tok_ds: Dataset = (
+    shard.map(tok_fn,
+              batched=True,
+              batch_size=args.batch_size,
+              num_proc=args.num_proc,
+              remove_columns=["combo_id"],
+              load_from_cache_file=False)
+)
+tok_ds.save_to_disk(shard_dir)
+acc.print(f"💾  Rank {rank}: wrote shard to {shard_dir}")
 
-# ───── All other ranks wait for the cache, then exit ─────
-acc.wait_for_everyone()
+# ───────── Merge on rank-0 ───────
+barrier()
+if rank0:
+    acc.print("🔗  Concatenating shards …")
+    shards = [load_dataset("arrow", data_files={})
+              for _ in range(world)]  # placeholder list
+    # quicker: load_from_disk once per shard
+    shards = [Dataset.load_from_disk(f"{base_cache}/shard_{i}") for i in range(world)]
+    full   = concatenate_datasets(shards)
+    full.save_to_disk(final_dir)
+    acc.print(f"✅  All done → {final_dir}")
+
+    # optional clean-up to reclaim NVMe space
+    for i in range(world):
+        shutil.rmtree(f"{base_cache}/shard_{i}", ignore_errors=True)
+
+barrier()
 if not rank0:
-    acc.print(f"Using cached dataset at {tok_cache}")
-
-# If you want to sanity-check it:
-# ds = load_from_disk(tok_cache)
-# print(ds[0])
+    acc.print(f"🟢  Rank {rank}: finished, cache ready at {final_dir}")
