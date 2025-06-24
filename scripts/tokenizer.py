@@ -1,86 +1,66 @@
 #!/usr/bin/env python
 """
-Fast multi-process tokenisation with 🤗 Accelerate.
-g4dn.12xlarge → 4 GPU-backed processes × 12 CPU workers each.
+tokenise_saved_ds.py
+────────────────────
+Load an existing HF dataset from disk, tokenise every row with a chosen
+tokeniser, and write a new DatasetDict.
+
+• Handles single-split folders and full DatasetDict layouts.
+• Uses writer_batch_size so memory stays small during the map.
+• Multi-process friendly (--num_proc).
 """
-import argparse, os, shutil
-from datasets import load_dataset, concatenate_datasets, Dataset
+import argparse, pathlib
+from datasets import load_from_disk, DatasetDict, Features, Value, Sequence
 from transformers import AutoTokenizer
-from accelerate import Accelerator
+import tqdm
 
-# ───────────── CLI ─────────────
-p = argparse.ArgumentParser()
-p.add_argument("--model_name", required=True)
-p.add_argument("--s3_root",    required=True)
-p.add_argument("--max_len",    type=int, required=True)
-p.add_argument("--cache_dir",  default="/opt/dlami/nvme")
-p.add_argument("--batch_size", type=int, default=2000)   # per proc
-p.add_argument("--num_proc",   type=int, default=12)     # CPU workers / proc
-args = p.parse_args()
+# ── CLI ─────────────────────────────────────────────────────────────────
+argp = argparse.ArgumentParser()
+argp.add_argument("--model_name", required=True)
+argp.add_argument("--in_dir",     required=True, help="Path written by save_to_disk")
+argp.add_argument("--out_dir",    required=True, help="Where to save tokenised data")
+argp.add_argument("--max_len",    type=int, default=1024)
+argp.add_argument("--batch_size", type=int, default=2_000)
+argp.add_argument("--num_proc",   type=int, default=8)
+argp.add_argument("--writer_batch_size", type=int, default=1_000)
+args = argp.parse_args()
 
-# ────────── Accelerator ─────────
-acc = Accelerator()
-rank, world = acc.process_index, acc.num_processes
-rank0       = rank == 0
-barrier     = acc.wait_for_everyone
+in_dir  = pathlib.Path(args.in_dir).expanduser()
+out_dir = pathlib.Path(args.out_dir).expanduser()
+out_dir.mkdir(parents=True, exist_ok=True)
 
-# ───────── Paths ────────────────
-base_cache = f"{args.cache_dir}/tok_{args.model_name.replace('/','_')}_max{args.max_len}"
-shard_dir  = f"{base_cache}/shard_{rank}"
-final_dir  = f"{base_cache}/full"
-os.makedirs(shard_dir, exist_ok=True)
+# ── Tokeniser ───────────────────────────────────────────────────────────
+tok = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
 
-# Stop early if the full cache already exists
-if os.path.isdir(final_dir):
-    if rank0:
-        acc.print(f"✅  Using existing cache → {final_dir}")
-    barrier(); exit()
-
-# ───────── Tokeniser ────────────
-if rank0:  acc.print(f"🔑  Loading tokenizer '{args.model_name}'")
-tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-
-# ───────── Load & SHARD dataset ─
-if rank0:  acc.print("⬇️   Loading raw Arrow shards from S3 …")
-raw = load_dataset("arrow",
-                   data_files={"test": f"{args.s3_root.rstrip('/')}/test/*.arrow"},
-                   split="test")                 # one Arrow dataset
-shard = raw.shard(num_shards=world, index=rank, contiguous=True)
-
-# ───────── Tokenise slice ───────
 def tok_fn(batch):
-    return tokenizer(batch["combo_id"],
-                     truncation=True,
-                     max_length=args.max_len)
+    return tok(batch["combo_id"], truncation=True, max_length=args.max_len)
 
-acc.print(f"🛠️   Rank {rank}/{world-1}: tokenising {len(shard):,} rows …")
-tok_ds: Dataset = (
-    shard.map(tok_fn,
-              batched=True,
-              batch_size=args.batch_size,
-              num_proc=args.num_proc,
-              remove_columns=["combo_id"],
-              load_from_cache_file=False)
-)
-tok_ds.save_to_disk(shard_dir)
-acc.print(f"💾  Rank {rank}: wrote shard to {shard_dir}")
+# ── Load existing dataset ------------------------------------------------
+raw = load_from_disk(in_dir)
+if isinstance(raw, DatasetDict):
+    splits = raw
+else:                                # single-split folder
+    splits = DatasetDict({"train": raw})
 
-# ───────── Merge on rank-0 ───────
-barrier()
-if rank0:
-    acc.print("🔗  Concatenating shards …")
-    shards = [load_dataset("arrow", data_files={})
-              for _ in range(world)]  # placeholder list
-    # quicker: load_from_disk once per shard
-    shards = [Dataset.load_from_disk(f"{base_cache}/shard_{i}") for i in range(world)]
-    full   = concatenate_datasets(shards)
-    full.save_to_disk(final_dir)
-    acc.print(f"✅  All done → {final_dir}")
+print("Loaded splits :", list(splits.keys()))
 
-    # optional clean-up to reclaim NVMe space
-    for i in range(world):
-        shutil.rmtree(f"{base_cache}/shard_{i}", ignore_errors=True)
+# ── Tokenise every split -------------------------------------------------
+tokenised_splits = {}
+for name, ds in splits.items():
+    print(f"🛠️  Tokenising split '{name}' ({len(ds):,} rows)")
+    processed = ds.map(
+        tok_fn,
+        batched=True,
+        batch_size=args.batch_size,
+        num_proc=args.num_proc,
+        writer_batch_size=args.writer_batch_size,
+        remove_columns=[c for c in ds.column_names if c != "combo_id"],
+        desc=f"{name} - tokenising",
+    )
+    tokenised_splits[name] = processed
 
-barrier()
-if not rank0:
-    acc.print(f"🟢  Rank {rank}: finished, cache ready at {final_dir}")
+tok_ds = DatasetDict(tokenised_splits)
+
+# ── Save -----------------------------------------------------------------
+tok_ds.save_to_disk(out_dir)
+print(f"✅  Tokenised dataset saved to {out_dir}")

@@ -1,98 +1,119 @@
 #!/usr/bin/env python
 """
-Evaluate any Hugging Face *masked-language-model* checkpoint using Accelerate
-to run on all available GPUs **with a pre-tokenised dataset**.
+evaluate_mlm.py
+────────────────────────────────────────────────────────
+Evaluate an MLM checkpoint on the *test* split of a pre-tokenised
+dataset saved with `save_to_disk`.
+
+• Handles both single-split datasets and full DatasetDicts.
+• Accelerate multi-GPU / BF16 ready.
+• Reports loss, perplexity, and mask accuracy.
 """
-import argparse, math, torch, os
-from datasets import load_from_disk
+import argparse, math, os, torch
+from datasets import load_from_disk, Dataset
 from torch.utils.data import DataLoader
 from transformers import (
-    AutoTokenizer, AutoModelForMaskedLM,
     DataCollatorForLanguageModeling,
+    AutoTokenizer, AutoModelForMaskedLM,
 )
 from tqdm.auto import tqdm
 from accelerate import Accelerator, DataLoaderConfiguration
 
-# ──────────────── CLI ────────────────
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--tok_cache_dir", required=True,
-                   help="Folder that contains the *pre-tokenised* dataset.")
-    p.add_argument("--model_name",     required=True,
-                   help="Model card / Hub ID.")
-    p.add_argument("--batch_size", type=int, default=8,
-                   help="Per-GPU batch size.")
-    p.add_argument("--mlm_prob", type=float, default=0.15)
-    return p.parse_args()
+# ─── CLI ────────────────────────────────────────────────────────────────
+p = argparse.ArgumentParser()
+p.add_argument("--tok_cache_dir", required=True, help="`save_to_disk` folder")
+p.add_argument("--model_name",    required=True)
+p.add_argument("--batch_size",    type=int, default=8)
+p.add_argument("--mlm_prob",      type=float, default=0.15)
+args = p.parse_args()
 
-# ──────────────── main ───────────────
-def main():
-    conf = DataLoaderConfiguration(dispatch_batches=True, split_batches=True)
-    accelerator = Accelerator(dataloader_config=conf, mixed_precision="bf16")
+# ─── Accelerator setup ─────────────────────────────────────────────────
+conf = DataLoaderConfiguration(dispatch_batches=True, split_batches=True)
+accelerator = Accelerator(dataloader_config=conf, mixed_precision="bf16")
 
-    args = parse_args()
+# ─── 1️⃣  Model & tokenizer ────────────────────────────────────────────
+accelerator.print(f"🔄  Loading model '{args.model_name}'")
+tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+model     = AutoModelForMaskedLM.from_pretrained(args.model_name, trust_remote_code=True)
 
-    # 1️⃣  Model & tokenizer
-    accelerator.print(f"🔄  Loading model and tokenizer for '{args.model_name}'…")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    model     = AutoModelForMaskedLM.from_pretrained(args.model_name, trust_remote_code=True)
+# ─── 2️⃣  Load *test* split only ───────────────────────────────────────
+accelerator.print(f"📂  Loading cached dataset from {args.tok_cache_dir}")
+raw = load_from_disk(args.tok_cache_dir)
 
-    # 2️⃣  Dataset (already tokenised → just load)
-    accelerator.print(f"📂  Loading tokenised dataset from {args.tok_cache_dir}")
-    tokenized_ds = load_from_disk(args.tok_cache_dir).with_format("torch")
-    num_examples = len(tokenized_ds)
+if isinstance(raw, Dataset):
+    test_ds = raw                                  # single-split folder
+else:                                              # DatasetDict
+    if "test" not in raw:
+        raise ValueError("'test' split not found in the cache directory")
+    test_ds = raw["test"]
 
-    # 3️⃣  Dataloader (per-GPU batch)
+num_examples = len(test_ds)
+accelerator.print(f"📝  test split rows: {num_examples:,}")
+
+# ── NEW: keep only tensor columns ───────────────────────────────────────
+tensor_cols = {"input_ids", "attention_mask", "labels"}
+keep        = [c for c in test_ds.column_names if c in tensor_cols]
+test_ds     = test_ds.remove_columns([c for c in test_ds.column_names if c not in keep])
+
+# make sure tensors are PyTorch
+test_ds = test_ds.with_format("torch")
+
+# ─── 3️⃣  DataLoader & collator ────────────────────────────────────────
+needs_masking = "labels" not in test_ds.column_names
+if needs_masking:
     collator = DataCollatorForLanguageModeling(
-        tokenizer, mlm=True, mlm_probability=args.mlm_prob, pad_to_multiple_of=8
+        tokenizer,
+        mlm=True,
+        mlm_probability=args.mlm_prob,
+        pad_to_multiple_of=8,
     )
-    loader = DataLoader(
-        tokenized_ds,
-        batch_size=args.batch_size,
-        num_workers=12,              # keep the GPUs fed
-        persistent_workers=True,
-        collate_fn=collator,
-        drop_last=True,
-        pin_memory=True,
-    )
+else:
+    collator = None   # dataset already has labels
 
-    # Prepare for DDP / device placement
-    model, loader = accelerator.prepare(model, loader)
-    model.eval()
+loader = DataLoader(
+    test_ds,
+    batch_size=args.batch_size,
+    num_workers=min(8, os.cpu_count() // accelerator.num_processes),
+    persistent_workers=True,
+    collate_fn=collator,
+    drop_last=False,
+    pin_memory=True,
+)
 
-    # Fixed progress-bar length for all ranks
-    num_batches = math.ceil(num_examples /
-                            (args.batch_size * accelerator.num_processes))
-    progress_bar = tqdm(range(num_batches),
-                        disable=not accelerator.is_main_process,
-                        desc="Evaluating")
+model, loader = accelerator.prepare(model, loader)
+model.eval()
 
-    # 4️⃣  Evaluation loop (unchanged)
-    all_losses, all_correct, all_masked = [], [], []
-    for batch in loader:
-        with torch.no_grad():
-            out = model(**batch)
+# ─── 4️⃣  Evaluation loop ──────────────────────────────────────────────
+num_batches = len(loader)
+pbar = tqdm(range(num_batches),
+            disable=not accelerator.is_main_process,
+            desc="Evaluating")
 
-        m     = batch["labels"] != -100
-        preds = out.logits.argmax(dim=-1)
+tot_loss, tot_correct, tot_masked = 0.0, 0, 0
+for batch in loader:
+    with torch.no_grad():
+        out = model(**batch)
 
-        all_losses.append(accelerator.gather_for_metrics(out.loss.reshape(1, -1)))
-        all_correct.append(accelerator.gather_for_metrics((preds[m] == batch["labels"][m]).sum()))
-        all_masked.append(accelerator.gather_for_metrics(m.sum()))
-        progress_bar.update(1)
+    # gather loss (scalar) across processes
+    tot_loss += accelerator.gather_for_metrics(out.loss.detach().reshape(1)).sum().item()
 
-    total_loss   = torch.cat([l.flatten() for l in all_losses]).mean().item()
-    total_correct = torch.cat(all_correct).sum().item()
-    total_masked  = torch.cat(all_masked).sum().item()
+    # mask accuracy
+    m     = batch["labels"] != -100
+    preds = out.logits.argmax(dim=-1)
+    tot_correct += accelerator.gather_for_metrics((preds[m] == batch["labels"][m]).sum()).sum().item()
+    tot_masked  += accelerator.gather_for_metrics(m.sum()).sum().item()
 
-    if accelerator.is_main_process:
-        print("\n----- MLM evaluation -----")
-        print(f"model            : {args.model_name}")
-        print(f"dataset (cached) : {args.tok_cache_dir}")
-        print(f"avg loss         : {total_loss:.4f}")
-        print(f"perplexity       : {math.exp(total_loss):.2f}")
-        print(f"mask accuracy    : {100*total_correct/total_masked:.2f} %")
-        print("--------------------------------")
+    pbar.update(1)
 
-if __name__ == "__main__":
-    main()
+avg_loss   = tot_loss / num_batches
+perplexity = math.exp(avg_loss)
+mask_acc   = 100 * tot_correct / tot_masked
+
+if accelerator.is_main_process:
+    print("\n----- MLM evaluation -----")
+    print(f"model            : {args.model_name}")
+    print(f"dataset (test)   : {args.tok_cache_dir}")
+    print(f"avg loss         : {avg_loss:.4f}")
+    print(f"perplexity       : {perplexity:.2f}")
+    print(f"mask accuracy    : {mask_acc:.2f} %")
+    print("--------------------------------")
