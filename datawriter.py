@@ -1,267 +1,218 @@
 #!/usr/bin/env python
-import os
-os.environ["HF_DATASETS_DISABLE_PROGRESS_BAR"] = "1"
-import shutil
-import argparse, sys, time, uuid
+# -*- coding: utf-8 -*-
+"""
+data_writer_tokeniser.py  –  *map‑only version*
+──────────────────────────────────────────────
+• Reads Parquet shards (local or s3://)
+• Splits 80 / 10 / 10 → train / val / test
+• Two branches controlled by --model-name
+
+  1.  bert | protbert | esm | llama
+        explode → HF tokenizer → DatasetDict
+
+  2.  custom-rnn | custom-transformer
+        ▸ train a BPE tokenizer on **train** split
+        ▸ tag sequences with custom boundary tokens
+        ▸ encode via AminoAcidDataset **inside datasets.map**
+        ▸ returns DatasetDict with {input_ids,target_ids}
+
+No manual pyarrow writing — all handled by 🤗 datasets `map`.
+"""
+
+import os, argparse, multiprocessing as mp
 from itertools import combinations
-from typing import Dict, List
+from pathlib  import Path
+from typing   import List, Dict
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-from datasets import load_dataset, Features, Value, concatenate_datasets
-import s3fs 
-import fsspec
-
+import pandas as pd
 import pyarrow.dataset as pds
-from tqdm import tqdm
-from pathlib import Path
-from collections import Counter
+from datasets import (load_dataset, concatenate_datasets,
+                      Dataset, DatasetDict, Features, Value)
+from transformers import AutoTokenizer
+from tqdm.auto import tqdm
+import s3fs, torch
+from tokenizers import Tokenizer, pre_tokenizers, trainers
+from torch.utils.data import Dataset as TorchDataset
 
-###############################################################################
-# 1. CLI
-###############################################################################
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Generate combo_ids from an S3 Parquet corpus"
-    )
-    p.add_argument("--path",  nargs="+", required=True,
-                   help="Top-level S3/local prefix containing *.parquet shards "
-                        "(wildcard **/*.parquet is appended automatically)")
-    p.add_argument("--model-name", required=True,
-                   choices=["bert", "protbert", "esm", "llama"],
-                   help="Concatenation style for combo_id")
-    p.add_argument("--output", required=True,
-                   help="Destination path (local folder or s3://...)")
-    p.add_argument("--batch-size", type=int, default=50_000,
-                   help="Rows to stream from Arrow at a time (default=50 000)")
-    p.add_argument("--s3-key", default=os.getenv("AWS_ACCESS_KEY_ID"),
-                   help="AWS key (env AWS_ACCESS_KEY_ID is fallback)")
-    p.add_argument("--s3-secret", default=os.getenv("AWS_SECRET_ACCESS_KEY"),
-                   help="AWS secret (env AWS_SECRET_ACCESS_KEY is fallback)")
-    p.add_argument("--s3-token", default=os.getenv("AWS_SESSION_TOKEN"),
-                   help="AWS session token (optional)")
+# ── universal constants ────────────────────────────────────────────────
+FIELDS = ["tra","trb","peptide","mhc_one","mhc_two"]
+START_STYLE = {m: (lambda s: "[CLS] "+s) for m in ("bert","protbert")}|{"esm":lambda s:s,"llama":lambda s:s}
+JOIN_STYLE  = {m: (lambda t: " [SEP] ".join(t)) for m in ("bert","protbert")}|{"esm":lambda t:" ".join(t),"llama":lambda t:" ".join(t)}
+END_STYLE   = {m: (lambda s: f"{s} [SEP]") for m in ("bert","protbert")}|{"esm":lambda s:s,"llama":lambda s:s}
+
+# BPE boundary tokens ----------------------------------------------------
+BPE_TOKENS = {
+    "pad_token": ["[PAD]"], "unk_token": ["[UNK]"], "end_token": ["[END]"],
+    "tra_tokens": ["[TRA]", "[ETRA]"], "trb_tokens": ["[TRB]", "[ETRB]"],
+    "pep_tokens": ["[PEP]", "[EPEP]"], "mho_tokens": ["[MHO]", "[EMHO]"],
+    "mht_tokens": ["[MHT]", "[EMHT]"],
+}
+PAD_TOKEN_STR = "[PAD]"; PAD_TOKEN_ID = 0
+
+# ── helper: ProtBERT‑style explode ─────────────────────────────────────-
+
+def explode_example(ex, join_fn, start_fn, end_fn):
+    present=[(ex.get(f),f) for f in FIELDS if ex.get(f)]
+    ids,feats=[],[]
+    for r in range(1,len(present)+1):
+        for combo in combinations(present,r):
+            vals,fs=zip(*combo)
+            if fs[0]=="peptide": continue
+            ids.append(end_fn(start_fn(join_fn(vals))))
+            feats.append(fs)
+    return {"combo_id":ids,"combo_feats":feats}
+
+# ── helpers for custom BPE path ─────────────────────────────────────────
+
+_valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
+
+def is_valid_sequence(seq:str):
+    return isinstance(seq,str) and seq and all(c in _valid_aa for c in seq)
+
+def safe_get(row,key):
+    v=row.get(key,"")
+    return "" if v in (None,"NA") or (isinstance(v,float) and pd.isna(v)) else v
+
+def tag_bpe(row):
+    mapping=[("tra","tra_tokens"),("trb","trb_tokens"),("peptide","pep_tokens"),
+             ("mhc_one","mho_tokens"),("mhc_two","mht_tokens")]
+    tagged=[]
+    for col,tkkey in mapping:
+        val=safe_get(row,col)
+        if val and is_valid_sequence(val):
+            start_tk,end_tk=BPE_TOKENS[tkkey]
+            tagged.append(f"{start_tk} {' '.join(val)} {end_tk}")
+    return tagged
+
+def train_bpe_tokenizer(seqs:List[str], vocab_size:int):
+    tok=Tokenizer(models.BPE())
+    tok.pre_tokenizer=pre_tokenizers.Split(pattern=r" ", behavior="removed")
+    special=[t for pair in BPE_TOKENS.values() for t in pair if t]
+    tok.train_from_iterator(seqs, trainers.BpeTrainer(special_tokens=special,vocab_size=vocab_size))
+    return tok
+
+class AminoAcidDataset(TorchDataset):
+    def __init__(self, sequences, tokenizer, seq_len=128, model="rnn", step=1, tr_long=True):
+        self.tok, self.seq_len=tokenizer,seq_len; self.model=model; self.step=step; self.tr_long=tr_long
+        self.pad_id=tokenizer.token_to_id(PAD_TOKEN_STR) or PAD_TOKEN_ID; self.samples=[]; self._build(sequences)
+    def _build(self, seqs):
+        return self._build_rnn(seqs) if self.model=="rnn" else self._build_tx(seqs)
+    def _build_rnn(self, seqs):
+        for s in seqs:
+            ids=self.tok.encode(s).ids
+            if len(ids)>=self.seq_len+1:
+                n=(len(ids)-(self.seq_len+1))//self.step+1
+                for i in range(n):
+                    chunk=ids[i*self.step:i*self.step+self.seq_len+1]
+                    self.samples.append((chunk[:-1],chunk[1:]))
+            else:
+                pad=ids+[self.pad_id]*((self.seq_len+1)-len(ids))
+                self.samples.append((pad[:-1],pad[1:]))
+    def _build_tx(self, seqs):
+        for s in seqs:
+            ids=self.tok.encode(s).ids
+            if len(ids)>self.seq_len and self.tr_long:
+                ids=ids[:self.seq_len]
+            if len(ids)<self.seq_len:
+                ids+=[self.pad_id]*(self.seq_len-len(ids))
+            if len(ids)>=2:
+                self.samples.append((ids[:-1],ids[1:]))
+    def __len__(self): return len(self.samples)
+    def __getitem__(self,i):
+        x,y=self.samples[i]; return torch.tensor(x),torch.tensor(y)
+
+def encode_bpe_batch(batch,*,tokenizer,seq_len,model_type,trunc_long):
+    out_in,out_tgt=[],[]
+    for tagged_seq in batch["tagged"]:
+        ds=AminoAcidDataset([tagged_seq],tokenizer,seq_len,model_type,tr_long=trunc_long)
+        for x,y in ds:
+            out_in.append(x.tolist()); out_tgt.append(y.tolist())
+    return {"input_ids":out_in,"target_ids":out_tgt}
+
+# ── CLI -----------------------------------------------------------------
+
+def cli():
+    p=argparse.ArgumentParser()
+    p.add_argument("--path",nargs="+",required=True)
+    p.add_argument("--model-name",required=True,
+                   choices=["bert","protbert","esm","llama","custom-rnn","custom-transformer"])
+    p.add_argument("--output",required=True)
+    p.add_argument("--max-len",type=int,default=1024)
+    p.add_argument("--bpe-vocab",type=int,default=200)
+    p.add_argument("--truncate-long",action="store_true")
+    p.add_argument("--s3-key",default=os.getenv("AWS_ACCESS_KEY_ID"))
+    p.add_argument("--s3-secret",default=os.getenv("AWS_SECRET_ACCESS_KEY"))
+    p.add_argument("--s3-token",default=os.getenv("AWS_SESSION_TOKEN"))
     return p.parse_args()
 
+# ── MAIN ----------------------------------------------------------------
 
-###############################################################################
-# 2. Combo / join helpers
-###############################################################################
-FIELDS = ["tra", "trb", "peptide", "mhc_one", "mhc_two"]
+def main():
+    args=cli(); is_remote=lambda p:p.startswith("s3://")
+    s3_fs=s3fs.S3FileSystem(key=args.s3_key,secret=args.s3_secret,token=args.s3_token)
 
-START_STYLE = {
-    # model-specific starting characters for combo_id
-    "bert":      lambda vals: "[CLS] " + vals,
-    "protbert":  lambda vals: "[CLS] " + vals,
-}
+    # collect parquet
+    def lp(pref):
+        if is_remote(pref):
+            key=pref[5:].rstrip("/"); return ([f"s3://{p}" for p in s3_fs.glob(f"{key}/**/*.parquet")] if s3_fs.isdir(key) else [pref])
+        p=Path(pref); return [str(f) for f in (p.rglob("*.parquet") if p.is_dir() else [p])]
+    files=[f for p in args.path for f in lp(p)]
 
-JOIN_STYLE = {
-    # model-specific separators or ordering rules
-    "bert":      lambda vals: " [SEP] ".join(vals),
-    "protbert":  lambda vals: " [SEP] ".join(vals),
-}
+    # schema union
+    union=set()
+    for f in files:
+        union.update(pds.dataset(f,format="parquet",filesystem=s3_fs if is_remote(f) else None).schema.names)
+    features=Features({c:Value("string") for c in sorted(union)})
 
-END_STYLE = {
-    "bert":     lambda vals: f"{vals} [SEP]",
-    "protbert": lambda vals: f"{vals} [SEP]",
-}
+    def load_one(f):
+        opts={"key":args.s3_key,"secret":args.s3_secret,"token":args.s3_token} if is_remote(f) else None
+        return load_dataset("parquet",data_files=[f],split="train",features=features,storage_options=opts)
+    base=concatenate_datasets([load_one(f) for f in tqdm(files,desc="load")])
+    base=base.remove_columns([c for c in union if c not in FIELDS])
 
-def explode_row(row: Dict[str, str], join_fn, start_fn, end_fn) -> List[Dict[str, object]]:
-    """Return list of {combo_id, combo_feats} for one source row."""
-    present = [(row[f], f) for f in row.keys() if row[f]]
-    combos = []
-    for r in range(1, len(present) + 1):
-        for combo in combinations(present, r):
-            vals, feats = zip(*combo)
-            combos.append({
-                "combo_id":   end_fn(start_fn(join_fn(vals))),
-                "combo_feats": list(feats),
-            })
-    return combos
+    # split 80/10/10
+    step1=base.train_test_split(test_size=0.10,shuffle=True,seed=42)
+    tr_val=step1["train"].train_test_split(test_size=0.111111,shuffle=True,seed=42)
+    splits={"train":tr_val["train"],"val":tr_val["test"],"test":step1["test"]}
 
-def harmonise(table: pa.Table) -> pa.Table:
-    want = {
-        "mhc_one_id":  pa.string(),
-        "mhc_two_id":  pa.string(),
-        "mhc_two":     pa.string(),
-        "trad_gene":   pa.string(),
-        "mhc_restriction": pa.string(),   # keep for old files
-    }
-    for col, dtype in want.items():
-        if col not in table.column_names:
-            table = table.append_column(col, pa.nulls(len(table), type=dtype))
-    return table
+    out=Path(args.output); out.mkdir(parents=True,exist_ok=True)
 
-###############################################################################
-# 3. Main driver
-###############################################################################
-def main() -> None:
-    args = parse_args()
-    join_fn = JOIN_STYLE[args.model_name]
-    start_fn = START_STYLE[args.model_name]
-    end_fn = END_STYLE[args.model_name]
-    # storage_options for datasets, s3fs & fsspec
-    storage = {"key": args.s3_key, "secret": args.s3_secret}
-    if args.s3_token:
-        storage["token"] = args.s3_token
+    # ------------------------------------------------------------------
+    if args.model_name in {"bert","protbert","esm","llama"}:
+        join,start,end=JOIN_STYLE[args.model_name],START_STYLE[args.model_name],END_STYLE[args.model_name]
+        hf_tok=AutoTokenizer.from_pretrained(args.model_name,trust_remote_code=True)
+        def tok_fn(b):
+            return hf_tok(b["combo_id"],truncation=True,max_length=args.max_len)
+        def proc(ds):
+            exploded=ds.map(explode_example,batched=False,
+                             fn_kwargs=dict(join_fn=join,start_fn=start,end_fn=end),
+                             num_proc=max(1,mp.cpu_count()-2))
+            return exploded.map(tok_fn,batched=True,batch_size=2000,writer_batch_size=1000,
+                                 remove_columns=["combo_feats"],num_proc=max(1,mp.cpu_count()-2))
+        final={n:proc(ds) for n,ds in splits.items()}
 
-    # Run aws configure to set up credentials
-    aws_access_key_id = args.s3_key or os.getenv("AWS_ACCESS_KEY_ID")
-    aws_secret_access_key = args.s3_secret or os.getenv("AWS_SECRET_ACCESS_KEY")
-    aws_session_token = args.s3_token or os.getenv("AWS_SESSION_TOKEN")
-    
-    def is_remote(p: str) -> bool:
-        return p.startswith("s3://")
+    else:  # custom BPE -------------------------------------------------
+        # train tokenizer on train split
+        train_tag=[s for row in splits["train"].map(lambda r:{"tag":tag_bpe(r)},num_proc=max(1,mp.cpu_count()-2))["tag"] for s in row]
+        bpe_tok=train_bpe_tokenizer(train_tag, vocab_size=args.bpe_vocab)
+        model_type="rnn" if "rnn" in args.model_name else "transformer"
+        def proc(ds):
+            # tag each row
+            tagged=ds.map(lambda r:{"tagged":tag_bpe(r)},remove_columns=[c for c in ds.column_names if c not in FIELDS],
+                         num_proc=max(1,mp.cpu_count()-2))
+            return tagged.map(
+                encode_bpe_batch,
+                batched=True,
+                batch_size=1000,
+                writer_batch_size=1000,
+                fn_kwargs=dict(tokenizer=bpe_tok,seq_len=args.max_len,model_type=model_type,trunc_long=args.truncate_long),
+                remove_columns=["tagged"],
+                num_proc=max(1,mp.cpu_count()-2),
+                desc="encode")
+        final={n:proc(ds) for n,ds in splits.items()}
 
-    s3_fs = s3fs.S3FileSystem(
-        key=aws_access_key_id,
-        secret=aws_secret_access_key,
-        token=aws_session_token
-    )
-    local_fs = fsspec.filesystem("file")
-    
-    def list_parquet(prefix: str) -> list[str]:
-        """Return absolute paths (with scheme for S3) for every *.parquet under `prefix`."""
-        if is_remote(prefix):
-            key = prefix[5:].rstrip("/")                       # strip “s3://”
-            return [f"s3://{p}" for p in s3_fs.glob(f"{key}/**/*.parquet")]
-        else:
-            return [str(p) for p in Path(prefix).rglob("*.parquet")]
-    
-    def count_rows(prefix: str) -> int:
-        if is_remote(prefix):
-            key = prefix[5:].rstrip("/")
-            return pds.dataset(key, format="parquet", filesystem=s3_fs).count_rows()
-        else:
-            return pds.dataset(prefix, format="parquet").count_rows()
+    DatasetDict(final).save_to_disk(str(out))
+    print(f"✅ saved dataset to {out}")
 
-    def load_one(path: str):
-        """
-        Return a 🤗 Dataset for `path`, which may be
-        • a single *.parquet file, or
-        • a directory / prefix that contains many *.parquet shards.
-
-        Handles both local files and s3:// URIs.
-        """
-
-        def _local_file_list(p: Path) -> list[str]:
-            if p.is_dir():
-                files = [str(f) for f in p.rglob("*.parquet")]
-                if not files:
-                    raise ValueError(f"{p} is a directory but no *.parquet inside")
-                return files
-            return [str(p)]
-
-        def _s3_file_list(uri: str) -> list[str]:
-            key = uri[5:] if uri.startswith("s3://") else uri        # strip scheme
-            if s3_fs.isdir(key):
-                files = s3_fs.glob(f"{key.rstrip('/')}/**/*.parquet")
-                if not files:
-                    raise ValueError(f"s3://{key} is a prefix but no *.parquet inside")
-                return [f"s3://{obj}" for obj in files]               # re-add scheme
-            return [uri if uri.startswith("s3://") else f"s3://{key}"]
-
-        if is_remote(path):
-            data_files     = _s3_file_list(path)
-            storage_opts   = {"key": args.s3_key,
-                            "secret": args.s3_secret,
-                            "token": args.s3_token}
-        else:
-            data_files     = _local_file_list(Path(path))
-            storage_opts   = None
-
-        return load_dataset(
-            "parquet",
-            data_files=data_files,
-            split="train",
-            features=features,
-            storage_options=storage_opts,
-        )
-
-    total_rows = sum(count_rows(p) for p in args.path)
-    print(f"[INFO] Total source rows across prefixes: {total_rows:,}")
-
-    union_cols  = set()
-    all_files = [p for prefix in args.path for p in list_parquet(prefix)]    
-
-    for f in all_files:
-        if is_remote(f):
-            schema = pds.dataset(f's3://{f}').schema             # no data read
-        else:
-            schema = pds.dataset(f).schema
-        union_cols.update(schema.names)
-
-    # deterministic order → HF keeps it
-    union_cols  = sorted(union_cols)
-
-    # Build a Feature spec (all nullable strings here; adjust types if you like)
-    features = Features({c: Value("string") for c in union_cols})
-
-    
-    # Load & stitch
-
-
-    chunks = []
-    for f in tqdm(all_files, desc="Loading Parquet shards"):
-        chunks.append(load_one(f))           # your existing helper
-
-    ds = concatenate_datasets(chunks)
-
-    ds = ds.remove_columns([c for c in ds.column_names if c not in FIELDS])
-    # Arrow writer setup
-    schema = pa.schema([
-        ("combo_id", pa.string()),
-        ("combo_feats", pa.list_(pa.string())),
-    ])
-    feat_counts = Counter()
-    tmp_local = f"/tmp/{uuid.uuid4()}.parquet"
-    writer = pq.ParquetWriter(tmp_local, schema, compression="zstd")
-
-    rows_in, rows_out = 0, 0
-    t0 = time.time()
-
-    pbar = tqdm(total=total_rows, unit="rows")
-
-    for batch in ds.iter(batch_size=args.batch_size):
-        n_src = len(batch["tra"])
-        rows_in += n_src
-        out_batch = {"combo_id": [], "combo_feats": []}
-
-        # explode inside Python
-        for idx in range(n_src):
-            row = {f: batch[f][idx] for f in batch.keys()}
-            for combo in explode_row(row, join_fn, start_fn, end_fn):
-                out_batch["combo_id"].append(combo["combo_id"])
-                out_batch["combo_feats"].append(combo["combo_feats"])
-                rows_out += 1
-                feat_counts[tuple(combo["combo_feats"])] += 1
-        pbar.update(n_src)
-        pbar.set_postfix(combos=rows_out, refresh=False)
-        writer.write_table(pa.Table.from_pydict(out_batch, schema=schema))
-        
-    writer.close()
-    pbar.close()
-    
-   
-    
-    
-    # Copy to final destination
-    if args.output.startswith("s3://"):
-        dst = args.output.rstrip("/") + f"/{args.model_name}_combos.parquet"
-        fs.put(tmp_local, dst)
-        #shutil.move(tmp_local, args.output)  # move to avoid overwriting
-        print(f"[DONE] Wrote {rows_out:,} combos to {dst}")
-    else:
-        shutil.move(tmp_local, args.output)
-        print(f"[DONE] Wrote {rows_out:,} combos to {args.output}")
-
-    elapsed = time.time() - t0
-    print(f"Elapsed: {elapsed/3600:.2f} h  |  "
-          f"{rows_in:,} source rows  |  "
-          f"{rows_out:,} combos")
-    print("\nCounts per combo_feats:")
-    for feats, n in sorted(feat_counts.items(), key=lambda x: (-len(x[0]), x[0])):
-        feat_label = ",".join(feats)
-        print(f"{feat_label:<30} : {n:,}")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
