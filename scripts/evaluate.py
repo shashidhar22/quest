@@ -39,36 +39,28 @@ model     = AutoModelForMaskedLM.from_pretrained(args.model_name, trust_remote_c
 # ─── 2️⃣  Load *test* split only ───────────────────────────────────────
 accelerator.print(f"📂  Loading cached dataset from {args.tok_cache_dir}")
 raw = load_from_disk(args.tok_cache_dir)
+test_ds = raw["test"] if not isinstance(raw, Dataset) else raw
 
-if isinstance(raw, Dataset):
-    test_ds = raw                                  # single-split folder
-else:                                              # DatasetDict
-    if "test" not in raw:
-        raise ValueError("'test' split not found in the cache directory")
-    test_ds = raw["test"]
-
+if "labels" in test_ds.column_names:
+    test_ds = test_ds.remove_columns("labels")
+    
 num_examples = len(test_ds)
 accelerator.print(f"📝  test split rows: {num_examples:,}")
 
-# ── NEW: keep only tensor columns ───────────────────────────────────────
-tensor_cols = {"input_ids", "attention_mask", "labels"}
-keep        = [c for c in test_ds.column_names if c in tensor_cols]
-test_ds     = test_ds.remove_columns([c for c in test_ds.column_names if c not in keep])
-
+# keep only tensor columns
+tensor_cols = {"input_ids", "attention_mask"}          # ← no "labels" here
+test_ds = test_ds.remove_columns([c for c in test_ds.column_names
+                                  if c not in tensor_cols]).with_format("torch")
 # make sure tensors are PyTorch
 test_ds = test_ds.with_format("torch")
 
 # ─── 3️⃣  DataLoader & collator ────────────────────────────────────────
-needs_masking = "labels" not in test_ds.column_names
-if needs_masking:
-    collator = DataCollatorForLanguageModeling(
-        tokenizer,
-        mlm=True,
-        mlm_probability=args.mlm_prob,
-        pad_to_multiple_of=8,
-    )
-else:
-    collator = None   # dataset already has labels
+collator = DataCollatorForLanguageModeling(
+    tokenizer,
+    mlm=True,
+    mlm_probability=args.mlm_prob,
+    pad_to_multiple_of=8,
+)
 
 loader = DataLoader(
     test_ds,
@@ -102,7 +94,7 @@ for batch in loader:
     preds = out.logits.argmax(dim=-1)
     tot_correct += accelerator.gather_for_metrics((preds[m] == batch["labels"][m]).sum()).sum().item()
     tot_masked  += accelerator.gather_for_metrics(m.sum()).sum().item()
-
+    breakpoint()
     pbar.update(1)
 
 avg_loss   = tot_loss / num_batches
