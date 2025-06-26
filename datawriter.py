@@ -26,13 +26,25 @@ from typing   import List, Dict
 
 import pandas as pd
 import pyarrow.dataset as pds
-from datasets import (load_dataset, concatenate_datasets,
+from datasets import (load_dataset, concatenate_datasets, 
                       Dataset, DatasetDict, Features, Value)
+from datasets.data_files import DataFilesList
 from transformers import AutoTokenizer
 from tqdm.auto import tqdm
 import s3fs, torch
 from tokenizers import Tokenizer, pre_tokenizers, trainers
 from torch.utils.data import Dataset as TorchDataset
+from concurrent.futures import ThreadPoolExecutor
+
+# -- model cards ------------------------------------------------
+MODEL_CARDS = {
+    "bert": "google-bert/bert-base-uncased",
+    "protbert": "Rostlab/prot_bert",
+    "esm": "EvolutionaryScale/esm3-sm-open-v1",
+    "llama": "meta-llama/Llama-3.1-8B-Instruct",
+    "lstm": "rnn",
+    "transformer": "tranformer",
+}
 
 # ── universal constants ────────────────────────────────────────────────
 FIELDS = ["tra","trb","peptide","mhc_one","mhc_two"]
@@ -51,13 +63,15 @@ PAD_TOKEN_STR = "[PAD]"; PAD_TOKEN_ID = 0
 
 # ── helper: ProtBERT‑style explode ─────────────────────────────────────-
 
-def explode_example(ex, join_fn, start_fn, end_fn):
+def explode_example(ex, join_fn, start_fn, end_fn, model_name="bert"):
     present=[(ex.get(f),f) for f in FIELDS if ex.get(f)]
     ids,feats=[],[]
     for r in range(1,len(present)+1):
         for combo in combinations(present,r):
             vals,fs=zip(*combo)
             if fs[0]=="peptide": continue
+            if model_name == "protbert":
+                vals = tuple([' '.join(list(v)) for v in vals]) # ProtBERT expects space-separated sequences
             ids.append(end_fn(start_fn(join_fn(vals))))
             feats.append(fs)
     return {"combo_id":ids,"combo_feats":feats}
@@ -120,7 +134,19 @@ class AminoAcidDataset(TorchDataset):
     def __len__(self): return len(self.samples)
     def __getitem__(self,i):
         x,y=self.samples[i]; return torch.tensor(x),torch.tensor(y)
-
+        
+def load_single_dataset(data_file, storage_options):
+    """
+    Worker function to load a single dataset file. This will be executed
+    in parallel by the ThreadPoolExecutor.
+    """
+    return load_dataset(
+        "parquet",
+        data_files=str(data_file),
+        split="train",
+        storage_options=storage_options
+    )
+    
 def encode_bpe_batch(batch,*,tokenizer,seq_len,model_type,trunc_long):
     out_in,out_tgt=[],[]
     for tagged_seq in batch["tagged"]:
@@ -135,7 +161,7 @@ def cli():
     p=argparse.ArgumentParser()
     p.add_argument("--path",nargs="+",required=True)
     p.add_argument("--model-name",required=True,
-                   choices=["bert","protbert","esm","llama","custom-rnn","custom-transformer"])
+                   choices=["bert","protbert","esm","llama","lstm","transformer"])
     p.add_argument("--output",required=True)
     p.add_argument("--max-len",type=int,default=1024)
     p.add_argument("--bpe-vocab",type=int,default=200)
@@ -148,27 +174,44 @@ def cli():
 # ── MAIN ----------------------------------------------------------------
 
 def main():
-    args=cli(); is_remote=lambda p:p.startswith("s3://")
-    s3_fs=s3fs.S3FileSystem(key=args.s3_key,secret=args.s3_secret,token=args.s3_token)
+    args=cli()
+    is_remote=any(p.startswith("s3://") for p in args.path)
+    s3_options = {
+        "key": args.s3_key,
+        "secret": args.s3_secret,
+        "token": args.s3_token,
+    } if is_remote else None
 
-    # collect parquet
-    def lp(pref):
-        if is_remote(pref):
-            key=pref[5:].rstrip("/"); return ([f"s3://{p}" for p in s3_fs.glob(f"{key}/**/*.parquet")] if s3_fs.isdir(key) else [pref])
-        p=Path(pref); return [str(f) for f in (p.rglob("*.parquet") if p.is_dir() else [p])]
-    files=[f for p in args.path for f in lp(p)]
+    # 1. Expand the glob pattern to get a definitive list of all data files/dirs.
+    #    `args.path` is a list of patterns, e.g., ["s3://.../**/*.parquet"]
+    print("Resolving data files from glob pattern...")
+    resolved_data_files = DataFilesList.from_patterns(args.path)
+    print(f"Found {len(resolved_data_files)} individual dataset files/directories.")
 
-    # schema union
-    union=set()
-    for f in files:
-        union.update(pds.dataset(f,format="parquet",filesystem=s3_fs if is_remote(f) else None).schema.names)
-    features=Features({c:Value("string") for c in sorted(union)})
-
-    def load_one(f):
-        opts={"key":args.s3_key,"secret":args.s3_secret,"token":args.s3_token} if is_remote(f) else None
-        return load_dataset("parquet",data_files=[f],split="train",features=features,storage_options=opts)
-    base=concatenate_datasets([load_one(f) for f in tqdm(files,desc="load")])
-    base=base.remove_columns([c for c in union if c not in FIELDS])
+    # 2. Load each file/dir as a separate Dataset object.
+    #    This allows each one to have its own unique schema initially.
+    all_datasets = []
+    # Use a ThreadPoolExecutor to manage a pool of threads for I/O tasks.
+    # The `with` statement ensures threads are properly closed.
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        # Create a partial function to pass the constant `s3_options` to the worker
+        from functools import partial
+        worker_fn = partial(load_single_dataset, storage_options=s3_options)
+        # executor.map applies the worker function to each file in parallel.
+        # We wrap it in tqdm for a progress bar and list() to gather all results.
+        print(f"Loading files in parallel with up to {executor._max_workers} workers...")
+        all_datasets = list(
+            tqdm(
+                executor.map(worker_fn, resolved_data_files),
+                total=len(resolved_data_files),
+                desc="Loading files in parallel"
+            )
+        )
+    # 3. Concatenate the list of datasets into one.
+    #    This function smartly unifies the schemas.
+    print("Concatenating datasets and unifying schemas...")
+    base = concatenate_datasets(all_datasets)
+    print("Finished concatenating.")
 
     # split 80/10/10
     step1=base.train_test_split(test_size=0.10,shuffle=True,seed=42)
@@ -177,15 +220,18 @@ def main():
 
     out=Path(args.output); out.mkdir(parents=True,exist_ok=True)
 
+    model_name=MODEL_CARDS[args.model_name]
+    print(f"Using model {model_name} for tokenization")
     # ------------------------------------------------------------------
     if args.model_name in {"bert","protbert","esm","llama"}:
         join,start,end=JOIN_STYLE[args.model_name],START_STYLE[args.model_name],END_STYLE[args.model_name]
-        hf_tok=AutoTokenizer.from_pretrained(args.model_name,trust_remote_code=True)
+       
+        hf_tok=AutoTokenizer.from_pretrained(model_name,trust_remote_code=True)
         def tok_fn(b):
             return hf_tok(b["combo_id"],truncation=True,max_length=args.max_len)
         def proc(ds):
             exploded=ds.map(explode_example,batched=False,
-                             fn_kwargs=dict(join_fn=join,start_fn=start,end_fn=end),
+                             fn_kwargs=dict(join_fn=join,start_fn=start,end_fn=end, model_name=args.model_name),
                              num_proc=max(1,mp.cpu_count()-2))
             return exploded.map(tok_fn,batched=True,batch_size=2000,writer_batch_size=1000,
                                  remove_columns=["combo_feats"],num_proc=max(1,mp.cpu_count()-2))
@@ -195,7 +241,6 @@ def main():
         # train tokenizer on train split
         train_tag=[s for row in splits["train"].map(lambda r:{"tag":tag_bpe(r)},num_proc=max(1,mp.cpu_count()-2))["tag"] for s in row]
         bpe_tok=train_bpe_tokenizer(train_tag, vocab_size=args.bpe_vocab)
-        model_type="rnn" if "rnn" in args.model_name else "transformer"
         def proc(ds):
             # tag each row
             tagged=ds.map(lambda r:{"tagged":tag_bpe(r)},remove_columns=[c for c in ds.column_names if c not in FIELDS],
@@ -205,7 +250,7 @@ def main():
                 batched=True,
                 batch_size=1000,
                 writer_batch_size=1000,
-                fn_kwargs=dict(tokenizer=bpe_tok,seq_len=args.max_len,model_type=model_type,trunc_long=args.truncate_long),
+                fn_kwargs=dict(tokenizer=bpe_tok,seq_len=args.max_len,model_type=model_name,trunc_long=args.truncate_long),
                 remove_columns=["tagged"],
                 num_proc=max(1,mp.cpu_count()-2),
                 desc="encode")
