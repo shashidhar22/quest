@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-data_writer_tokeniser.py  –  *map‑only version*
+data_writer_tokeniser.py  *map-only version*
 ──────────────────────────────────────────────
 • Reads Parquet shards (local or s3://)
-• Splits 80 / 10 / 10 → train / val / test
+• Splits 80/10/10 → train / val / test
 • Two branches controlled by --model-name
 
   1.  bert | protbert | esm | llama
@@ -16,7 +16,7 @@ data_writer_tokeniser.py  –  *map‑only version*
         ▸ encode via AminoAcidDataset **inside datasets.map**
         ▸ returns DatasetDict with {input_ids,target_ids}
 
-No manual pyarrow writing — all handled by 🤗 datasets `map`.
+No manual pyarrow writing — all handled by hf dataset `map`.
 """
 
 import os, argparse, multiprocessing as mp
@@ -29,7 +29,7 @@ import pyarrow.dataset as pds
 from datasets import (load_dataset, concatenate_datasets, 
                       Dataset, DatasetDict, Features, Value)
 from datasets.data_files import DataFilesList
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 from tqdm.auto import tqdm
 import s3fs, torch
 from tokenizers import Tokenizer, pre_tokenizers, trainers
@@ -63,19 +63,66 @@ PAD_TOKEN_STR = "[PAD]"; PAD_TOKEN_ID = 0
 
 # ── helper: ProtBERT‑style explode ─────────────────────────────────────-
 
-def explode_example(ex, join_fn, start_fn, end_fn, model_name="bert"):
-    present=[(ex.get(f),f) for f in FIELDS if ex.get(f)]
-    ids,feats=[],[]
-    for r in range(1,len(present)+1):
-        for combo in combinations(present,r):
-            vals,fs=zip(*combo)
-            if fs[0]=="peptide": continue
-            if model_name == "protbert":
-                vals = tuple([' '.join(list(v)) for v in vals]) # ProtBERT expects space-separated sequences
-            ids.append(end_fn(start_fn(join_fn(vals))))
-            feats.append(fs)
-    return {"combo_id":ids,"combo_feats":feats}
+def debug_row(dataset, index):
+    """
+    Prints the content and type of key fields for a specific row index.
+    """
+    print(f"\n--- 🕵️  Debugging Row at Index: {index} ---")
+    try:
+        example = dataset[index]
+        present_count = 0
+        for field in ["tra", "trb", "peptide", "mhc_one", "mhc_two"]:
+            value = example.get(field)
+            is_valid_str = isinstance(value, str) and value and value != "NA"
 
+            print(f"  - Field: '{field}'")
+            print(f"    Value: {repr(value)}")
+            print(f"    Type: {type(value)}")
+            print(f"    Passes Check: {is_valid_str}")
+            if is_valid_str:
+                present_count += 1
+        print(f"--- Total Valid Features Found in this Row: {present_count} ---")
+    except IndexError:
+        print(f"--- Error: Index {index} is out of bounds for this dataset ---")
+        
+        
+def explode_example(ex, join_fn, start_fn, end_fn, model_name="bert"):
+    # Step 1: Gather all valid, non-empty features from the input row.
+    present_features = []
+    for f in FIELDS:
+        val = ex.get(f)
+        if isinstance(val, str) and val and val != "NA":
+            present_features.append((val, f))
+
+    # If there are no valid features in this row, exit early.
+    if not present_features:
+        return {"combo_id": [], "combo_feats": []}
+
+    # Step 2: Generate ALL possible combinations first.
+    generated_ids = []
+    generated_feats = []
+    for r in range(1, len(present_features) + 1):
+        for combo in combinations(present_features, r):
+            vals, fs = zip(*combo) # fs is a tuple like ('tra', 'trb')
+            vals = [val.split('+')[0].strip() if '+' in val else val for val in vals]
+            if model_name == "protbert":
+                vals = tuple(' '.join(list(v)) for v in vals)
+
+            generated_ids.append(end_fn(start_fn(join_fn(vals))))
+            generated_feats.append(fs)
+
+    # Step 3: Now, in a separate, clear step, filter out the results we don't want.
+    final_ids = []
+    final_feats = []
+    for i, feats_tuple in enumerate(generated_feats):
+        # The only condition we want to filter is where the combo is ONLY the peptide
+        if feats_tuple == ('peptide',):
+            continue  # Skip this one
+
+        # Otherwise, keep the generated combination
+        final_ids.append(generated_ids[i])
+        final_feats.append(feats_tuple)
+    return {"combo_id": final_ids, "combo_feats": final_feats}
 # ── helpers for custom BPE path ─────────────────────────────────────────
 
 _valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
@@ -147,6 +194,12 @@ def load_single_dataset(data_file, storage_options):
         storage_options=storage_options
     )
     
+# ─── Worker function for MLM masking ─────────────────────────────────────-
+def apply_masking_to_batch(batch, collator):
+    list_of_examples = [{k: v[i] for k, v in batch.items() if k in ("input_ids", "attention_mask")} for i in range(len(batch["input_ids"]))]
+    collated_batch = collator(list_of_examples)
+    return collated_batch
+    
 def encode_bpe_batch(batch,*,tokenizer,seq_len,model_type,trunc_long):
     out_in,out_tgt=[],[]
     for tagged_seq in batch["tagged"]:
@@ -162,10 +215,14 @@ def cli():
     p.add_argument("--path",nargs="+",required=True)
     p.add_argument("--model-name",required=True,
                    choices=["bert","protbert","esm","llama","lstm","transformer"])
-    p.add_argument("--output",required=True)
+    p.add_argument("--output-raw", required=True, help="Path to save the tokenized dataset with text columns.")
+    p.add_argument("--output-processed", required=True, help="Path to save the final dataset with MLM labels and no text.")
+
     p.add_argument("--max-len",type=int,default=1024)
     p.add_argument("--bpe-vocab",type=int,default=200)
     p.add_argument("--truncate-long",action="store_true")
+    p.add_argument("--mlm-prob",type=float,default=0.15,
+                   help="Probability of masking tokens in MLM. Default is 0.15.")
     p.add_argument("--s3-key",default=os.getenv("AWS_ACCESS_KEY_ID"))
     p.add_argument("--s3-secret",default=os.getenv("AWS_SECRET_ACCESS_KEY"))
     p.add_argument("--s3-token",default=os.getenv("AWS_SESSION_TOKEN"))
@@ -193,7 +250,7 @@ def main():
     all_datasets = []
     # Use a ThreadPoolExecutor to manage a pool of threads for I/O tasks.
     # The `with` statement ensures threads are properly closed.
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=16) as executor:
         # Create a partial function to pass the constant `s3_options` to the worker
         from functools import partial
         worker_fn = partial(load_single_dataset, storage_options=s3_options)
@@ -208,17 +265,21 @@ def main():
             )
         )
     # 3. Concatenate the list of datasets into one.
-    #    This function smartly unifies the schemas.
+    #    This function  unifies the schemas.
     print("Concatenating datasets and unifying schemas...")
     base = concatenate_datasets(all_datasets)
     print("Finished concatenating.")
+
 
     # split 80/10/10
     step1=base.train_test_split(test_size=0.10,shuffle=True,seed=42)
     tr_val=step1["train"].train_test_split(test_size=0.111111,shuffle=True,seed=42)
     splits={"train":tr_val["train"],"val":tr_val["test"],"test":step1["test"]}
 
-    out=Path(args.output); out.mkdir(parents=True,exist_ok=True)
+    out_raw = Path(args.output_raw)
+    out_processed = Path(args.output_processed)
+    out_raw.mkdir(parents=True, exist_ok=True)
+    out_processed.mkdir(parents=True, exist_ok=True)
 
     model_name=MODEL_CARDS[args.model_name]
     print(f"Using model {model_name} for tokenization")
@@ -227,16 +288,63 @@ def main():
         join,start,end=JOIN_STYLE[args.model_name],START_STYLE[args.model_name],END_STYLE[args.model_name]
        
         hf_tok=AutoTokenizer.from_pretrained(model_name,trust_remote_code=True)
-        def tok_fn(b):
-            return hf_tok(b["combo_id"],truncation=True,max_length=args.max_len)
-        def proc(ds):
-            exploded=ds.map(explode_example,batched=False,
-                             fn_kwargs=dict(join_fn=join,start_fn=start,end_fn=end, model_name=args.model_name),
-                             num_proc=max(1,mp.cpu_count()-2))
-            return exploded.map(tok_fn,batched=True,batch_size=2000,writer_batch_size=1000,
-                                 remove_columns=["combo_feats"],num_proc=max(1,mp.cpu_count()-2))
-        final={n:proc(ds) for n,ds in splits.items()}
+        def tok_fn(batch, tokenizer, max_len):
+            """
+            This function performs two actions in one pass:
+            1. Flattens the malformed `combo_id` column.
+            2. Tokenizes the clean, flattened data.
+            3. Overwrites the old `combo_id` with the clean version.
+            """
+            # batch["combo_id"] is a list of lists, e.g., [['str_a'], ['str_b']]
+            # Flatten it, ensuring we handle potential empty lists gracefully.
+            clean_ids = [item[0] for item in batch["combo_id"] if item]
 
+            # Tokenize the clean list of strings
+            tokenized_output = tokenizer(clean_ids, truncation=True, max_length=max_len)
+
+            # Add the clean, flat list back into the output. This will
+            # OVERWRITE the old, messy `combo_id` column.
+            tokenized_output["combo_id"] = clean_ids
+
+            return tokenized_output
+        def proc(ds):
+            """
+            Manually explodes the dataset to ensure each feature combination
+            becomes its own unique row, then tokenizes the result.
+            """
+            # Step 1: Manually build the exploded lists in Python
+            all_combo_ids = []
+            all_combo_feats = []
+            print(f"Manually exploding {len(ds):,} rows for the '{ds.split}' split...")
+            for example in tqdm(ds, desc=f"Exploding {ds.split}"):
+                exploded_data = explode_example(example, join, start, end, model_name=args.model_name)
+                all_combo_ids.extend(exploded_data["combo_id"])
+                all_combo_feats.extend(exploded_data["combo_feats"])
+
+            # Step 2: Create a new, correctly structured dataset from the lists
+            exploded_dataset = Dataset.from_dict({
+                "combo_id": all_combo_ids,
+                "combo_feats": all_combo_feats
+            })
+            print(f"Explosion complete. New size for '{ds.split}': {len(exploded_dataset):,} rows")
+
+            # Step 3: Tokenize the new, clean dataset
+            def tokenize_clean_batch(batch):
+                return hf_tok(batch["combo_id"], truncation=True, max_length=args.max_len)
+
+            tokenized_dataset = exploded_dataset.map(
+                tokenize_clean_batch,
+                batched=True,
+                batch_size=2000,
+                num_proc=16,
+            )
+            return tokenized_dataset
+        # 1. Process all splits to get the "raw" tokenized data
+        print("Step 1: Generating 'raw' tokenized dataset with text columns...")
+        raw_final = {n: proc(ds) for n, ds in splits.items()}
+        raw_dataset_dict = DatasetDict(raw_final)
+        
+    
     else:  # custom BPE -------------------------------------------------
         # train tokenizer on train split
         train_tag=[s for row in splits["train"].map(lambda r:{"tag":tag_bpe(r)},num_proc=max(1,mp.cpu_count()-2))["tag"] for s in row]
@@ -254,10 +362,47 @@ def main():
                 remove_columns=["tagged"],
                 num_proc=max(1,mp.cpu_count()-2),
                 desc="encode")
-        final={n:proc(ds) for n,ds in splits.items()}
+        raw_final = {n: proc(ds) for n, ds in splits.items()}
+        raw_dataset_dict = DatasetDict(raw_final)
 
-    DatasetDict(final).save_to_disk(str(out))
-    print(f"✅ saved dataset to {out}")
+    
+
+    # 2. Save the "raw" dataset
+    print(f"💾 Saving raw tokenized dataset to {out_raw}")
+    raw_dataset_dict.save_to_disk(str(out_raw))
+
+    # 3. Create the "processed" dataset for training/evaluation
+    print("Step 2: Creating 'processed' dataset with MLM labels...")
+    processed_dataset_dict = raw_dataset_dict.filter(lambda x: True, num_proc=16) # A simple way to copy
+
+    # Create the MLM collator for masking
+    mlm_collator = DataCollatorForLanguageModeling(
+        tokenizer=hf_tok, mlm=True, mlm_probability=args.mlm_prob
+    )
+    masking_fn = partial(apply_masking_to_batch, collator=mlm_collator)
+
+    # Apply masking to val and test splits
+    for split_name in ["val", "test"]:
+        print(f"Applying MLM masking to '{split_name}' split...")
+        processed_dataset_dict[split_name] = processed_dataset_dict[split_name].map(
+            masking_fn,
+            batched=True,
+            batch_size=1024,
+            num_proc=16
+        )
+    
+    # 4. Remove text columns from all splits for the final processed version
+    print("Removing text columns from processed dataset...")
+    text_columns_to_remove = ["combo_id", "combo_feats", "token_type_ids"]
+    for split_name in ["train", "val", "test"]:
+         processed_dataset_dict[split_name] = processed_dataset_dict[split_name].remove_columns(text_columns_to_remove)
+
+    # 5. Save the final "processed" dataset
+    print(f"💾 Saving processed dataset to {out_processed}")
+    processed_dataset_dict.save_to_disk(str(out_processed))
+    
+    print("✅ All tasks complete.")
+
 
 if __name__=="__main__":
     main()
