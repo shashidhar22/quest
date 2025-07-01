@@ -239,6 +239,8 @@ def main():
         "token": args.s3_token,
     } if is_remote else None
 
+    num_cores = max(1, os.cpu_count() // 4)
+
     # 1. Expand the glob pattern to get a definitive list of all data files/dirs.
     #    `args.path` is a list of patterns, e.g., ["s3://.../**/*.parquet"]
     print("Resolving data files from glob pattern...")
@@ -250,7 +252,7 @@ def main():
     all_datasets = []
     # Use a ThreadPoolExecutor to manage a pool of threads for I/O tasks.
     # The `with` statement ensures threads are properly closed.
-    with ThreadPoolExecutor(max_workers=16) as executor:
+    with ThreadPoolExecutor(max_workers=num_cores) as executor:
         # Create a partial function to pass the constant `s3_options` to the worker
         from functools import partial
         worker_fn = partial(load_single_dataset, storage_options=s3_options)
@@ -307,7 +309,7 @@ def main():
             tokenized_output["combo_id"] = clean_ids
 
             return tokenized_output
-        def proc(ds):
+        def proc(ds, split):
             """
             Manually explodes the dataset to ensure each feature combination
             becomes its own unique row, then tokenizes the result.
@@ -315,7 +317,7 @@ def main():
             # Step 1: Manually build the exploded lists in Python
             all_combo_ids = []
             all_combo_feats = []
-            print(f"Manually exploding {len(ds):,} rows for the '{ds.split}' split...")
+            print(f"Manually exploding {len(ds):,} rows for the '{split}' split...")
             for example in tqdm(ds, desc=f"Exploding {ds.split}"):
                 exploded_data = explode_example(example, join, start, end, model_name=args.model_name)
                 all_combo_ids.extend(exploded_data["combo_id"])
@@ -326,7 +328,7 @@ def main():
                 "combo_id": all_combo_ids,
                 "combo_feats": all_combo_feats
             })
-            print(f"Explosion complete. New size for '{ds.split}': {len(exploded_dataset):,} rows")
+            print(f"Explosion complete. New size for '{split}': {len(exploded_dataset):,} rows")
 
             # Step 3: Tokenize the new, clean dataset
             def tokenize_clean_batch(batch):
@@ -336,7 +338,7 @@ def main():
                 tokenize_clean_batch,
                 batched=True,
                 batch_size=2000,
-                num_proc=16,
+                num_proc=num_cores,
             )
             return tokenized_dataset
         # 1. Process all splits to get the "raw" tokenized data
@@ -352,7 +354,7 @@ def main():
         def proc(ds):
             # tag each row
             tagged=ds.map(lambda r:{"tagged":tag_bpe(r)},remove_columns=[c for c in ds.column_names if c not in FIELDS],
-                         num_proc=max(1,mp.cpu_count()-2))
+                         num_proc=num_cores)
             return tagged.map(
                 encode_bpe_batch,
                 batched=True,
@@ -360,9 +362,9 @@ def main():
                 writer_batch_size=1000,
                 fn_kwargs=dict(tokenizer=bpe_tok,seq_len=args.max_len,model_type=model_name,trunc_long=args.truncate_long),
                 remove_columns=["tagged"],
-                num_proc=max(1,mp.cpu_count()-2),
+                num_proc=num_cores,
                 desc="encode")
-        raw_final = {n: proc(ds) for n, ds in splits.items()}
+        raw_final = {n: proc(ds, n) for n, ds in splits.items()}
         raw_dataset_dict = DatasetDict(raw_final)
 
     
@@ -373,7 +375,7 @@ def main():
 
     # 3. Create the "processed" dataset for training/evaluation
     print("Step 2: Creating 'processed' dataset with MLM labels...")
-    processed_dataset_dict = raw_dataset_dict.filter(lambda x: True, num_proc=16) # A simple way to copy
+    processed_dataset_dict = raw_dataset_dict.filter(lambda x: True, num_proc=num_cores) # A simple way to copy
 
     # Create the MLM collator for masking
     mlm_collator = DataCollatorForLanguageModeling(
@@ -388,7 +390,7 @@ def main():
             masking_fn,
             batched=True,
             batch_size=1024,
-            num_proc=16
+            num_proc=num_cores
         )
     
     # 4. Remove text columns from all splits for the final processed version
