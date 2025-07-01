@@ -343,7 +343,7 @@ def main():
             return tokenized_dataset
         # 1. Process all splits to get the "raw" tokenized data
         print("Step 1: Generating 'raw' tokenized dataset with text columns...")
-        raw_final = {n: proc(ds) for n, ds in splits.items()}
+        raw_final = {n: proc(ds, n) for n, ds in splits.items()}
         raw_dataset_dict = DatasetDict(raw_final)
         
     
