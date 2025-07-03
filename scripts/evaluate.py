@@ -1,94 +1,117 @@
 #!/usr/bin/env python
 """
-evaluate_mlm.py
+evaluate.py
 ────────────────────────────────────────────────────────
-Evaluate an MLM checkpoint on the *test* split of a pre-tokenised
-dataset saved with `save_to_disk`.
-
-• Handles both single-split datasets and full DatasetDicts.
-• Accelerate multi-GPU / BF16 ready.
-• Reports loss, perplexity, and mask accuracy.
+Evaluates a model on a pre-masked, "processed" dataset.
 """
 import argparse, math, os, torch
-from datasets import load_from_disk, Dataset
+from datasets import load_from_disk
 from torch.utils.data import DataLoader
-from transformers import (
-    DataCollatorForLanguageModeling,
-    default_data_collator,
-    DataCollatorWithPadding,
-    AutoTokenizer, AutoModelForMaskedLM,
-)
+from transformers import AutoTokenizer, AutoModelForMaskedLM
 from tqdm.auto import tqdm
-from accelerate import Accelerator, DataLoaderConfiguration
+from accelerate import Accelerator
 
-# ─── CLI ────────────────────────────────────────────────────────────────
-p = argparse.ArgumentParser()
-p.add_argument("--processed_dataset_dir", required=True, help="`save_to_disk` folder")
-p.add_argument("--model_name",    required=True)
-p.add_argument("--batch_size",    type=int, default=8)
-p.add_argument("--mlm_prob",      type=float, default=0.15)
-args = p.parse_args()
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# --- Accelerator and Model loading is the same ---
-accelerator = Accelerator(mixed_precision="fp16")
-accelerator.print(f"🔄  Loading model '{args.model_name}'")
-tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-model = AutoModelForMaskedLM.from_pretrained(args.model_name, trust_remote_code=True)
-accelerator.print("✅ Model loaded. Compiling for performance...")
-model = torch.compile(model)
+# --- A custom, robust data collator to replace the buggy one ---
+def manual_padding_collator(features, pad_token_id=0, pad_label_id=-100):
+    """
+    A simple, manual data collator that correctly handles tensor or list inputs.
+    """
+    batch = {}
+    
+    # Find the longest sequence length in this specific batch
+    max_length = max(len(f["input_ids"]) for f in features)
 
-# --- Data loading is now direct and simple ---
-accelerator.print(f"📂  Loading PROCESSED dataset from {args.processed_dataset_dir}")
-test_ds = load_from_disk(args.processed_dataset_dir)["test"]
-test_ds = test_ds.with_format("torch")
-accelerator.print(f"📝  test split rows: {len(test_ds):,}")
+    for key in features[0].keys():
+        padded_sequences = []
+        padding_value = pad_label_id if key == "labels" else pad_token_id
+        
+        for item in features:
+            sequence = item[key]
+            # --- Convert tensor to list before padding ---
+            # This handles the case where the dataset format is already "torch"
+            if isinstance(sequence, torch.Tensor):
+                sequence = sequence.tolist()
+            
+            padding_needed = max_length - len(sequence)
+            padded_sequences.append(sequence + [padding_value] * padding_needed)
 
-# --- DataLoader uses the default collator ---
-# The data is already masked and contains the `labels` column.
-accelerator.print("Setting up data collator with padding...")
-collator = DataCollatorWithPadding(tokenizer=tokenizer)
-loader = DataLoader(
-    test_ds,
-    batch_size=args.batch_size,
-    num_workers=min(8, os.cpu_count() // accelerator.num_processes),
-    persistent_workers=True,
-    collate_fn=collator, # Use the padding collator
-    drop_last=False,
-    pin_memory=True,
-)
-model, loader = accelerator.prepare(model, loader)
-model.eval()
+        # Convert the final list of padded sequences into a single PyTorch tensor
+        batch[key] = torch.tensor(padded_sequences)
+        
+    return batch
 
-# ─── 4️⃣  Evaluation loop ──────────────────────────────────────────────
-num_batches = len(loader)
-pbar = tqdm(range(num_batches),
-            disable=not accelerator.is_main_process,
-            desc="Evaluating")
+def main():
+    # --- 1. Setup & Arguments ---
+    p = argparse.ArgumentParser(description="Evaluate a pre-trained MLM on a processed dataset.")
+    p.add_argument("--processed_dataset_dir", required=True)
+    p.add_argument("--model_name", required=True)
+    p.add_argument("--batch_size", type=int, default=128)
+    args = p.parse_args()
 
-tot_loss, tot_correct, tot_masked = 0.0, 0, 0
-for batch in loader:
-    with torch.no_grad():
-        out = model(**batch)
+    accelerator = Accelerator(mixed_precision="fp16")
 
-    # gather loss (scalar) across processes
-    tot_loss += accelerator.gather_for_metrics(out.loss.detach().reshape(1)).sum().item()
+    # --- 2. Load Model and Tokenizer ---
+    accelerator.print(f"🔄  Loading model and tokenizer '{args.model_name}'...")
+    model = AutoModelForMaskedLM.from_pretrained(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model = torch.compile(model)
 
-    # mask accuracy
-    m     = batch["labels"] != -100
-    preds = out.logits.argmax(dim=-1)
-    tot_correct += accelerator.gather_for_metrics((preds[m] == batch["labels"][m]).sum()).sum().item()
-    tot_masked  += accelerator.gather_for_metrics(m.sum()).sum().item()
-    pbar.update(1)
+    # --- 3. Load Pre-Processed Data ---
+    accelerator.print(f"📂  Loading PROCESSED dataset from {args.processed_dataset_dir}")
+    test_ds = load_from_disk(args.processed_dataset_dir)["test"]
+    test_ds = test_ds.with_format("torch")
 
-avg_loss   = tot_loss / num_batches
-perplexity = math.exp(avg_loss)
-mask_acc   = 100 * tot_correct / tot_masked
+    # --- 4. Create DataLoader with the NEW Manual Collator ---
+    accelerator.print("Setting up DataLoader with custom manual collator...")
+    
+    # Create a partial function to pass the tokenizer's pad_token_id
+    from functools import partial
+    custom_collator = partial(manual_padding_collator, pad_token_id=tokenizer.pad_token_id)
+    
+    loader = DataLoader(
+        test_ds,
+        batch_size=args.batch_size,
+        collate_fn=custom_collator, # <-- Use new manual collator
+        num_workers=max(1, os.cpu_count() // accelerator.num_processes - 1),
+    )
 
-if accelerator.is_main_process:
-    print("\n----- MLM evaluation -----")
-    print(f"model            : {args.model_name}")
-    print(f"dataset (test)   : {args.tok_cache_dir}")
-    print(f"avg loss         : {avg_loss:.4f}")
-    print(f"perplexity       : {perplexity:.2f}")
-    print(f"mask accuracy    : {mask_acc:.2f} %")
-    print("--------------------------------")
+    model, loader = accelerator.prepare(model, loader)
+    model.eval()
+
+    # --- 5. Evaluation Loop ---
+    pbar = tqdm(range(len(loader)), disable=not accelerator.is_main_process, desc="Evaluating")
+    total_loss, total_correct, total_masked = 0.0, 0, 0
+
+    for batch in loader:
+        with torch.no_grad():
+            outputs = model(**batch)
+
+        total_loss += accelerator.gather_for_metrics(outputs.loss.detach()).sum().item()
+        
+        # Calculate accuracy on masked tokens
+        labels = batch["labels"]
+        mask = labels != -100
+        predictions = outputs.logits.argmax(dim=-1)
+        
+        total_correct += accelerator.gather_for_metrics((predictions[mask] == labels[mask]).sum()).sum().item()
+        total_masked += accelerator.gather_for_metrics(mask.sum()).sum().item()
+        pbar.update(1)
+
+    # --- 6. Report Metrics ---
+    avg_loss = total_loss / len(loader)
+    perplexity = math.exp(avg_loss)
+    mask_accuracy = (total_correct / total_masked) * 100 if total_masked > 0 else 0
+
+    if accelerator.is_main_process:
+        print("\n----- MLM Evaluation Results -----")
+        print(f"  Model            : {args.model_name}")
+        print(f"  Dataset          : {args.processed_dataset_dir}")
+        print(f"  Avg. Loss        : {avg_loss:.4f}")
+        print(f"  Perplexity       : {perplexity:.2f}")
+        print(f"  Mask Accuracy    : {mask_accuracy:.2f} %")
+        print("------------------------------------")
+
+if __name__ == "__main__":
+    main()
