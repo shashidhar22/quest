@@ -185,9 +185,11 @@ def train_lm(config: dict):
         print("LoRA Layers Applied:")
         model.print_trainable_parameters()
 
+    # If using LoRA, we can freeze most of the model parameters
         for name, param in model.named_parameters():
-            if 'embed' in name or 'cls' in name: # 'cls' is the name for the MLM head in BERT-like models
+            if 'cls' in name or 'LMPredictionHead' in name:
                 param.requires_grad = True
+                
     elif config.get("use_lora", False) and objective == "clm":
         # For CLM, the task type is still valid and recommended
         print("⚡️ Applying LoRA configuration for CLM model...")
