@@ -27,6 +27,31 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ---------------------------------------------------------------------
 # 1. Custom Model Definitions
 # ---------------------------------------------------------------------
+# --- Create a new, robust data collator class ---
+class RobustMLMCollator(DataCollatorForLanguageModeling):
+    def __call__(self, examples):
+        # First, let the original collator do its job of creating the masked `labels`.
+        # We set `return_tensors="np"` to get NumPy arrays without padding.
+        batch = super().__call__(examples)
+
+        # Now, we manually pad the batch to the max length in this batch.
+        # This bypasses the buggy internal padding logic.
+        max_length = max(len(x) for x in batch["input_ids"])
+
+        padded_batch = {}
+        for key, value in batch.items():
+            padded_sequences = []
+            # Use -100 for labels padding, and the tokenizer's pad_id for others
+            padding_value = -100 if key == "labels" else self.tokenizer.pad_token_id
+            
+            for sequence in value:
+                padding_needed = max_length - len(sequence)
+                padded_sequences.append(sequence.tolist() + [padding_value] * padding_needed)
+            
+            padded_batch[key] = torch.tensor(padded_sequences)
+            
+        return padded_batch
+
 class CustomRNN(nn.Module):
     """A simple RNN for sequence modeling."""
     def __init__(self, vocab_size, embed_size=128, hidden_size=256, num_layers=2, dropout=0.1):
@@ -102,111 +127,71 @@ def is_main():
 
 def compute_metrics(eval_pred: EvalPrediction):
     logits, labels = eval_pred.predictions, eval_pred.label_ids
-    perplexity = math.exp(eval_pred.metrics["eval_loss"]) if "eval_loss" in eval_pred.metrics else float("inf")
+    # The trainer already calculates loss, so we can access it from metrics
+    loss = eval_pred.metrics.get("eval_loss", 0.0)
+    perplexity = math.exp(loss) if loss < 20 else float("inf")
     mask = labels != -100
     acc = (np.argmax(logits, axis=-1)[mask] == labels[mask]).mean() if mask.sum() > 0 else 0.0
     return {"accuracy": acc, "perplexity": perplexity}
 
 # ---------------------------------------------------------------------
-# 4.  Master training function
+# Master training function
 # ---------------------------------------------------------------------
 def train_lm(config: dict):
-    """Trains an MLM, CLM, or custom model on a raw, tokenized dataset."""
+    """Trains a model on a pre-processed dataset."""
     spec = MODEL_ZOO[config["model_key"].lower()]
     objective = spec["objective"]
 
     if is_main() and config.get("wandb_project"):
         wandb.init(project=config["wandb_project"], config=config)
 
-    # --- Load Data and Tokenizer ---
-    print(f"📂 Loading raw dataset from: {config['dataset_path']}")
+    # --- Load Processed Data and Tokenizer ---
+    print(f"📂 Loading PROCESSED dataset from: {config['dataset_path']}")
     ds = load_from_disk(config["dataset_path"])
 
-    tokenizer_path = spec.get("hf_id") or config.get("tokenizer_path")
-    if not tokenizer_path:
-        raise ValueError("Config must provide 'hf_id' or 'tokenizer_path'.")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    tokenizer_path = spec.get("hf_id")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        print("Tokenizer `pad_token` set to `eos_token`.")
 
-    # --- Data Preparation ---
-    # Prepare labels based on the objective, before removing text columns.
-    if objective == "clm":
-        print("Transforming dataset for Causal Language Modeling...")
-        ds = ds.map(lambda x: {"labels": x["input_ids"]}, num_proc=os.cpu_count())
-    elif objective == "custom":
-        if "target_ids" in ds["train"].column_names:
-            print("Renaming 'target_ids' to 'labels' for custom model training...")
-            ds = ds.rename_column("target_ids", "labels")
-
-    # --- CRITICAL STEP: Remove all non-model columns ---
-    # This ensures the DataCollator only receives columns it can tensorize.
-    model_columns = ["input_ids", "attention_mask", "labels", "token_type_ids"]
-    cols_to_remove = [col for col in ds["train"].column_names if col not in model_columns]
-    if cols_to_remove:
-        print(f"Removing unused columns: {cols_to_remove}")
-        ds = ds.remove_columns(cols_to_remove)
+    # No data prep or column removal is needed, as the processed dataset is ready.
 
     # --- Model and Collator Selection ---
-    collator = None
-    model = None
-    task_type = None
     if objective == "mlm":
         print(f"Loading MLM model: {spec['hf_id']}")
-        model = AutoModelForMaskedLM.from_pretrained(spec['hf_id'], trust_remote_code=True)
-        collator = DataCollatorForLanguageModeling(tokenizer, mlm=True, mlm_probability=config.get("mlm_prob", 0.15))
-    elif objective == "clm":
-        print(f"Loading CLM model: {spec['hf_id']}")
-        model = AutoModelForCausalLM.from_pretrained(spec['hf_id'], trust_remote_code=True)
-        collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
-    else:  # custom
-        print(f"Instantiating custom model: {config['model_key']}")
-        model_config = config.get("model_config", {})
-        if "vocab_size" not in model_config:
-            raise ValueError("Custom models require 'vocab_size' in model_config.")
-        model = spec["model_class"](**model_config)
-        collator = DataCollatorWithPadding(tokenizer=tokenizer)
+        model = AutoModelForMaskedLM.from_pretrained(spec['hf_id'])
+        
+        # --- MODIFICATION: Use our new robust collator ---
+        print("Using RobustMLMCollator for on-the-fly masking and padding.")
+        collator = RobustMLMCollator(
+            tokenizer=tokenizer, 
+            mlm=True, 
+            mlm_probability=config.get("mlm_prob", 0.15)
+        )
+    else:
+        # Handle CLM or other objectives if needed
+        raise NotImplementedError(f"Training for objective '{objective}' not fully implemented.")
 
-    if model is None or collator is None:
-        raise ValueError(f"Could not initialize model or collator for objective '{objective}'")
-    
-    if config.get("use_lora", False) and objective == "mlm":
-        print("⚡️ Applying LoRA configuration for MLM model...")
+
+    model.gradient_checkpointing_enable()
+
+    # Apply LoRA if configured
+    if config.get("use_lora", False):
+        print("⚡️ Applying LoRA configuration...")
         lora_config = LoraConfig(
-            # `task_type` is not specified for MLM fine-tuning
-            inference_mode=False,
             r=config.get("lora_r", 16),
             lora_alpha=config.get("lora_alpha", 32),
+            target_modules=config.get("lora_target_modules", ["query", "value"]),
             lora_dropout=config.get("lora_dropout", 0.05),
-            target_modules=config.get("lora_target_modules", ["query", "key", "value"])
+            bias="none",
         )
         model = get_peft_model(model, lora_config)
-        print("LoRA Layers Applied:")
-        model.print_trainable_parameters()
-
-    # If using LoRA, we can freeze most of the model parameters
+        
+        # Make the MLM head trainable
         for name, param in model.named_parameters():
             if 'cls' in name or 'LMPredictionHead' in name:
                 param.requires_grad = True
-                
-    elif config.get("use_lora", False) and objective == "clm":
-        # For CLM, the task type is still valid and recommended
-        print("⚡️ Applying LoRA configuration for CLM model...")
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,
-                r=config.get("lora_r", 8),
-                lora_alpha=config.get("lora_alpha", 32),
-                lora_dropout=config.get("lora_dropout", 0.1),
-                # Target modules can be model-specific
-                target_modules=config.get("lora_target_modules", ["query", "key", "value"])
-            )
-        model = get_peft_model(model, lora_config)
-        print("LoRA Layers:")
         model.print_trainable_parameters()
-    
-    model.gradient_checkpointing_enable()
 
     # --- Trainer Setup ---
     training_args = TrainingArguments(
@@ -218,17 +203,15 @@ def train_lm(config: dict):
         save_strategy="epoch",
         logging_steps=100,
         report_to="wandb" if config.get("wandb_project") else "none",
-        fp16=config.get("fp16", False),
-        bf16=config.get("bf16", True),
-        gradient_accumulation_steps=config.get("grad_accum", 1),
+        fp16=config.get("fp16", True),
+        bf16=config.get("bf16", False),
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        ddp_find_unused_parameters=False,
-        remove_unused_columns=False, # Important: we already removed them
+        remove_unused_columns=False,
     )
 
-    trainer = Trainer( # We can use the standard Trainer again
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=ds["train"],
@@ -243,19 +226,18 @@ def train_lm(config: dict):
     trainer.train()
     
     print("🏁 Training complete. Evaluating final model...")
-    metrics = trainer.evaluate()
-    print("Final evaluation metrics:")
+    metrics = trainer.evaluate(eval_dataset=ds["test"]) # Evaluate on the test set
+    print("Final test metrics:")
     print(metrics)
 
     if is_main():
         trainer.save_model(os.path.join(config["checkpoint_path"], "best_model"))
         if wandb.run:
-            wandb.log(metrics)
+            wandb.log({"test_metrics": metrics})
             wandb.finish()
 
-# ---------------------------------------------------------------------
-# 5.  CLI Wrapper
-# ---------------------------------------------------------------------
+
+# --- CLI Wrapper ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to JSON config file")
