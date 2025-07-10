@@ -85,6 +85,39 @@ def debug_row(dataset, index):
     except IndexError:
         print(f"--- Error: Index {index} is out of bounds for this dataset ---")
         
+def create_processed_dataset(raw_dict, tokenizer, mlm_prob, num_cores):
+    """
+    Takes a raw dataset dict, applies MLM masking, removes text columns,
+    and returns a final, processed dataset dict.
+    """
+    print("\nCreating 'processed' dataset...")
+    # Create a working copy
+    processed_dict = raw_dict.filter(lambda x: True, num_proc=num_cores)
+
+    # Only perform masking if it's an MLM model
+    if args.model_name in {"bert", "protbert", "esm"}:
+        mlm_collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer, mlm=True, mlm_probability=mlm_prob, return_tensors="np"
+        )
+        masking_fn = partial(apply_masking_to_batch, collator=mlm_collator)
+
+        # Apply masking to all splits
+        for split_name in ["train", "val", "test"]:
+            if split_name in processed_dict and len(processed_dict[split_name]) > 0:
+                print(f"Applying MLM masking to '{split_name}' split...")
+                processed_dict[split_name] = processed_dict[split_name].map(
+                    masking_fn, batched=True, batch_size=1024, num_proc=num_cores
+                )
+    
+    # Unified Cleanup Step
+    print("Removing all non-essential columns from all splits...")
+    final_columns_to_keep = ["input_ids", "attention_mask", "labels"]
+    for split_name in processed_dict:
+        cols_to_remove = [c for c in processed_dict[split_name].column_names if c not in final_columns_to_keep]
+        if cols_to_remove:
+            processed_dict[split_name] = processed_dict[split_name].remove_columns(cols_to_remove)
+            
+    return processed_dict
         
 def explode_example(ex, join_fn, start_fn, end_fn, model_name="bert"):
     # Step 1: Gather all valid, non-empty features from the input row.
@@ -224,9 +257,10 @@ def encode_bpe_batch(batch,*,tokenizer,seq_len,model_type,trunc_long):
 
 def cli():
     p=argparse.ArgumentParser()
-    p.add_argument("--path",nargs="+",required=True)
+    p.add_argument("--path",nargs="+", help="Path to original Parquet files (for a full run).")
     p.add_argument("--model-name",required=True,
                    choices=["bert","protbert","esm","llama","lstm","transformer"])
+    p.add_argument("--input_raw_dir", default=None, help="Optional: Path to an existing 'raw' dataset to start masking from.")
     p.add_argument("--output-raw", required=True, help="Path to save the tokenized dataset with text columns.")
     p.add_argument("--output-processed", required=True, help="Path to save the final dataset with MLM labels and no text.")
 
@@ -279,87 +313,75 @@ def main():
     # --- 2. Process Data Based on Model Type ---
     raw_dataset_dict = None
     model_hf_id = MODEL_CARDS[args.model_name]
-
-    if args.model_name in {"bert", "protbert", "esm", "llama"}:
-        print(f"Using Hugging Face model path for: {model_hf_id}")
-        hf_tok = AutoTokenizer.from_pretrained(model_hf_id, trust_remote_code=True)
-        
-        def proc_hf(ds, split_name_str):
-            join, start, end = JOIN_STYLE[args.model_name], START_STYLE[args.model_name], END_STYLE[args.model_name]
-            all_combo_ids, all_combo_feats = [], []
-            print(f"Manually exploding {len(ds):,} rows for the '{split_name_str}' split...")
-            for example in tqdm(ds, desc=f"Exploding {split_name_str}"):
-                exploded_data = explode_example(example, join, start, end, model_name=args.model_name)
-                all_combo_ids.extend(exploded_data["combo_id"])
-                all_combo_feats.extend(exploded_data["combo_feats"])
-
-            exploded_dataset = Dataset.from_dict({"combo_id": all_combo_ids, "combo_feats": all_combo_feats})
+    raw_dataset_dict = None
+    
+    if args.input_raw_dir:
+        print(f"🚀 Running in Masking-Only Mode.")
+        print(f"   Input 'raw' dataset: {args.input_raw_dir}")
+        raw_dataset_dict = load_from_disk(args.input_raw_dir)
+    else:
+        if args.model_name in {"bert", "protbert", "esm", "llama"}:
+            print(f"Using Hugging Face model path for: {model_hf_id}")
+            hf_tok = AutoTokenizer.from_pretrained(model_hf_id, trust_remote_code=True)
             
-            def tokenize_clean_batch(batch):
-                return hf_tok(batch["combo_id"], truncation=True, max_length=args.max_len)
-            
-            return exploded_dataset.map(tokenize_clean_batch, batched=True, batch_size=2000, num_proc=num_cores)
+            def proc_hf(ds, split_name_str):
+                join, start, end = JOIN_STYLE[args.model_name], START_STYLE[args.model_name], END_STYLE[args.model_name]
+                all_combo_ids, all_combo_feats = [], []
+                print(f"Manually exploding {len(ds):,} rows for the '{split_name_str}' split...")
+                for example in tqdm(ds, desc=f"Exploding {split_name_str}"):
+                    exploded_data = explode_example(example, join, start, end, model_name=args.model_name)
+                    all_combo_ids.extend(exploded_data["combo_id"])
+                    all_combo_feats.extend(exploded_data["combo_feats"])
 
-        raw_final = {n: proc_hf(ds, n) for n, ds in splits.items()}
-        raw_dataset_dict = DatasetDict(raw_final)
+                exploded_dataset = Dataset.from_dict({"combo_id": all_combo_ids, "combo_feats": all_combo_feats})
+                
+                def tokenize_clean_batch(batch):
+                    return hf_tok(batch["combo_id"], truncation=True, max_length=args.max_len)
+                
+                return exploded_dataset.map(tokenize_clean_batch, batched=True, batch_size=2000, num_proc=num_cores)
 
-    else:  # custom BPE path for lstm/transformer
-        print("Using custom BPE model path...")
-        # Train tokenizer on the train split
-        train_tagged_seqs = (s for row in splits["train"].map(lambda r:{"tagged": tag_bpe(r)}, num_proc=num_cores)["tagged"] for s in row)
-        bpe_tok = train_bpe_tokenizer(train_tagged_seqs, vocab_size=args.bpe_vocab)
-        
-        def proc_custom(ds):
-            tagged = ds.map(lambda r: {"tagged": tag_bpe(r)}, remove_columns=ds.column_names, num_proc=num_cores)
-            
-            model_type = "rnn" if args.model_name == "lstm" else "transformer"
-            
-            return tagged.map(
-                encode_bpe_batch,
-                batched=True,
-                batch_size=1000,
-                fn_kwargs=dict(tokenizer=bpe_tok, seq_len=args.max_len, model_type=model_type, trunc_long=args.truncate_long),
-                remove_columns=["tagged"],
-                num_proc=num_cores
-            )
-            
-        raw_final = {n: proc_custom(ds) for n, ds in splits.items()}
-        raw_dataset_dict = DatasetDict(raw_final)
+            raw_final = {n: proc_hf(ds, n) for n, ds in splits.items()}
+            raw_dataset_dict = DatasetDict(raw_final)
 
-    # --- 3. Save the Raw Dataset ---
-    print(f"\n💾 Saving raw tokenized dataset to {out_raw}")
-    raw_dataset_dict.save_to_disk(str(out_raw))
+        else:  # custom BPE path for lstm/transformer
+            print("Using custom BPE model path...")
+            # Train tokenizer on the train split
+            train_tagged_seqs = (s for row in splits["train"].map(lambda r:{"tagged": tag_bpe(r)}, num_proc=num_cores)["tagged"] for s in row)
+            bpe_tok = train_bpe_tokenizer(train_tagged_seqs, vocab_size=args.bpe_vocab)
+            
+            def proc_custom(ds):
+                tagged = ds.map(lambda r: {"tagged": tag_bpe(r)}, remove_columns=ds.column_names, num_proc=num_cores)
+                
+                model_type = "rnn" if args.model_name == "lstm" else "transformer"
+                
+                return tagged.map(
+                    encode_bpe_batch,
+                    batched=True,
+                    batch_size=1000,
+                    fn_kwargs=dict(tokenizer=bpe_tok, seq_len=args.max_len, model_type=model_type, trunc_long=args.truncate_long),
+                    remove_columns=["tagged"],
+                    num_proc=num_cores
+                )
+                
+            raw_final = {n: proc_custom(ds) for n, ds in splits.items()}
+            raw_dataset_dict = DatasetDict(raw_final)
+
+        # --- 3. Save the Raw Dataset ---
+        print(f"\n💾 Saving raw tokenized dataset to {out_raw}")
+        raw_dataset_dict.save_to_disk(str(out_raw))
 
     # --- 4. Create the Final Processed Dataset ---
     print("\nStep 2: Creating 'processed' dataset...")
-    processed_dataset_dict = raw_dataset_dict.filter(lambda x: True, num_proc=num_cores)
-
-    # Only perform masking if it's an MLM model
-    if args.model_name in {"bert", "protbert", "esm"}:
-        print("Applying MLM masking to 'test' split...")
-        mlm_collator = DataCollatorForLanguageModeling(
-            tokenizer=hf_tok, mlm=True, mlm_probability=args.mlm_prob, return_tensors="np"
+    if raw_dataset_dict:
+        processed_dataset = create_processed_dataset(
+            raw_dataset_dict, tokenizer, args.mlm_prob, num_cores
         )
-        masking_fn = partial(apply_masking_to_batch, collator=mlm_collator)
-        
-        if "test" in processed_dataset_dict and len(processed_dataset_dict["test"]) > 0:
-            processed_dataset_dict["test"] = processed_dataset_dict["test"].map(
-                masking_fn, batched=True, batch_size=1024, num_proc=num_cores
-            )
-    
-    # --- 5. Unified Cleanup Step ---
-    print("Removing all non-essential columns from all splits...")
-    final_columns_to_keep = ["input_ids", "attention_mask", "labels"]
-    for split_name in processed_dataset_dict:
-        cols_to_remove = [c for c in processed_dataset_dict[split_name].column_names if c not in final_columns_to_keep]
-        if cols_to_remove:
-            processed_dataset_dict[split_name] = processed_dataset_dict[split_name].remove_columns(cols_to_remove)
-
-    # --- 6. Save the Final Processed Dataset ---
-    print(f"💾 Saving final processed dataset to {out_processed}")
-    processed_dataset_dict.save_to_disk(str(out_processed))
-    
-    print("\n✅ All tasks complete.")
+        out_processed = Path(args.output_processed)
+        print(f"💾 Saving final processed dataset to {out_processed}")
+        processed_dataset.save_to_disk(str(out_processed))
+        print("\n✅ All tasks complete.")
+    else:
+        print("❌ No data was loaded or generated. Exiting.")
 
 
 if __name__=="__main__":
