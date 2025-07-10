@@ -51,6 +51,25 @@ class RobustMLMCollator(DataCollatorForLanguageModeling):
             padded_batch[key] = torch.tensor(padded_sequences)
             
         return padded_batch
+    
+class FastMLMCollator(DataCollatorForLanguageModeling):
+    def __call__(self, examples):
+        # 1. Let the base collator handle the masking.
+        # It returns un-padded numpy arrays because of `return_tensors="np"`.
+        batch = super().__call__(examples)
+
+        # 2. Find the longest sequence in this batch
+        max_length = max(len(x) for x in batch["input_ids"])
+
+        # 3. Use the tokenizer's highly optimized .pad() method.
+        # This performs padding in fast, compiled code, not slow Python loops.
+        batch = self.tokenizer.pad(
+            batch,
+            padding="max_length",
+            max_length=max_length,
+            return_tensors="pt", # Return PyTorch tensors
+        )
+        return batch
 
 class CustomRNN(nn.Module):
     """A simple RNN for sequence modeling."""
@@ -148,13 +167,17 @@ def train_lm(config: dict):
     # --- Load Processed Data and Tokenizer ---
     print(f"📂 Loading PROCESSED dataset from: {config['dataset_path']}")
     ds = load_from_disk(config["dataset_path"])
-
     tokenizer_path = spec.get("hf_id")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # No data prep or column removal is needed, as the processed dataset is ready.
+    # --- Remove unused text columns immediately after loading ---
+    # This ensures only tokenized data is passed to the Trainer.
+    columns_to_remove = [col for col in ["combo_id", "combo_feats"] if col in ds["train"].column_names]
+    if columns_to_remove:
+        print(f"Removing text columns: {columns_to_remove}")
+        ds = ds.remove_columns(columns_to_remove)
 
     # --- Model and Collator Selection ---
     if objective == "mlm":
@@ -162,8 +185,8 @@ def train_lm(config: dict):
         model = AutoModelForMaskedLM.from_pretrained(spec['hf_id'])
         
         # --- MODIFICATION: Use our new robust collator ---
-        print("Using RobustMLMCollator for on-the-fly masking and padding.")
-        collator = RobustMLMCollator(
+        print("Using DataCollatorForLanguageModeling for on-the-fly masking.")
+        collator = DataCollatorForLanguageModeling(
             tokenizer=tokenizer, 
             mlm=True, 
             mlm_probability=config.get("mlm_prob", 0.15)
@@ -203,8 +226,8 @@ def train_lm(config: dict):
         save_strategy="epoch",
         logging_steps=100,
         report_to="wandb" if config.get("wandb_project") else "none",
-        fp16=config.get("fp16", True),
-        bf16=config.get("bf16", False),
+        fp16=config.get("fp16", False),
+        bf16=config.get("bf16", True),
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
