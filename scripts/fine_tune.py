@@ -27,50 +27,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ---------------------------------------------------------------------
 # 1. Custom Model Definitions
 # ---------------------------------------------------------------------
-# --- Create a new, robust data collator class ---
-class RobustMLMCollator(DataCollatorForLanguageModeling):
-    def __call__(self, examples):
-        # First, let the original collator do its job of creating the masked `labels`.
-        # We set `return_tensors="np"` to get NumPy arrays without padding.
-        batch = super().__call__(examples)
-
-        # Now, we manually pad the batch to the max length in this batch.
-        # This bypasses the buggy internal padding logic.
-        max_length = max(len(x) for x in batch["input_ids"])
-
-        padded_batch = {}
-        for key, value in batch.items():
-            padded_sequences = []
-            # Use -100 for labels padding, and the tokenizer's pad_id for others
-            padding_value = -100 if key == "labels" else self.tokenizer.pad_token_id
-            
-            for sequence in value:
-                padding_needed = max_length - len(sequence)
-                padded_sequences.append(sequence.tolist() + [padding_value] * padding_needed)
-            
-            padded_batch[key] = torch.tensor(padded_sequences)
-            
-        return padded_batch
-    
-class FastMLMCollator(DataCollatorForLanguageModeling):
-    def __call__(self, examples):
-        # 1. Let the base collator handle the masking.
-        # It returns un-padded numpy arrays because of `return_tensors="np"`.
-        batch = super().__call__(examples)
-
-        # 2. Find the longest sequence in this batch
-        max_length = max(len(x) for x in batch["input_ids"])
-
-        # 3. Use the tokenizer's highly optimized .pad() method.
-        # This performs padding in fast, compiled code, not slow Python loops.
-        batch = self.tokenizer.pad(
-            batch,
-            padding="max_length",
-            max_length=max_length,
-            return_tensors="pt", # Return PyTorch tensors
-        )
-        return batch
-
 class CustomRNN(nn.Module):
     """A simple RNN for sequence modeling."""
     def __init__(self, vocab_size, embed_size=128, hidden_size=256, num_layers=2, dropout=0.1):
@@ -164,8 +120,8 @@ def train_lm(config: dict):
     if is_main() and config.get("wandb_project"):
         wandb.init(project=config["wandb_project"], config=config)
 
-    # --- Load Processed Data and Tokenizer ---
-    print(f"📂 Loading PROCESSED dataset from: {config['dataset_path']}")
+    # --- Load Pre-tokenized Data and Tokenizer ---
+    print(f"Loading pre-tokenized dataset from: {config['dataset_path']}")
     ds = load_from_disk(config["dataset_path"])
     tokenizer_path = spec.get("hf_id")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -184,7 +140,6 @@ def train_lm(config: dict):
         print(f"Loading MLM model: {spec['hf_id']}")
         model = AutoModelForMaskedLM.from_pretrained(spec['hf_id'])
         
-        # --- MODIFICATION: Use our new robust collator ---
         print("Using DataCollatorForLanguageModeling for on-the-fly masking.")
         collator = DataCollatorForLanguageModeling(
             tokenizer=tokenizer, 
@@ -200,7 +155,7 @@ def train_lm(config: dict):
 
     # Apply LoRA if configured
     if config.get("use_lora", False):
-        print("⚡️ Applying LoRA configuration...")
+        print("Applying LoRA configuration...")
         lora_config = LoraConfig(
             r=config.get("lora_r", 16),
             lora_alpha=config.get("lora_alpha", 32),
@@ -216,10 +171,13 @@ def train_lm(config: dict):
                 param.requires_grad = True
         model.print_trainable_parameters()
 
+    print(f"Creating a smaller validation subset for memory efficiency (100000/{len(ds['val'])}) batches.")
+    eval_subset = ds["val"].shuffle(seed=42).select(range(100000))   
     # --- Trainer Setup ---
     training_args = TrainingArguments(
         output_dir=config["checkpoint_path"],
         num_train_epochs=config["num_epochs"],
+        deepspeed=config.get("deepspeed_config", None),
         per_device_train_batch_size=config["batch_size"],
         per_device_eval_batch_size=config.get("eval_batch_size", config["batch_size"]),
         eval_strategy="epoch",
@@ -229,7 +187,6 @@ def train_lm(config: dict):
         fp16=config.get("fp16", False),
         bf16=config.get("bf16", True),
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
         greater_is_better=False,
         remove_unused_columns=False,
     )
@@ -238,17 +195,17 @@ def train_lm(config: dict):
         model=model,
         args=training_args,
         train_dataset=ds["train"],
-        eval_dataset=ds["val"],
+        eval_dataset=eval_subset,
         data_collator=collator,
         compute_metrics=compute_metrics,
         callbacks=[ClearCudaCacheCallback()],
     )
 
     # --- Train and Evaluate ---
-    print("🚀 Starting training...")
+    print("Starting training...")
     trainer.train()
     
-    print("🏁 Training complete. Evaluating final model...")
+    print("Training complete. Evaluating final model...")
     metrics = trainer.evaluate(eval_dataset=ds["test"]) # Evaluate on the test set
     print("Final test metrics:")
     print(metrics)
