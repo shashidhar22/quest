@@ -188,7 +188,7 @@ def train_lm(config: dict):
         bf16=config.get("bf16", True),
         load_best_model_at_end=True,
         greater_is_better=False,
-        remove_unused_columns=False,
+        remove_unused_columns=False
     )
 
     trainer = Trainer(
