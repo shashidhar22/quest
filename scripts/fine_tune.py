@@ -18,7 +18,62 @@ from transformers import (
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# --- Model Zoo to map config key to Hugging Face ID ---
+# ---------------------------------------------------------------------
+# 1. Custom Model Definitions
+# ---------------------------------------------------------------------
+class CustomRNN(nn.Module):
+    """A simple RNN for sequence modeling."""
+    def __init__(self, vocab_size, embed_size=128, hidden_size=256, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.rnn = nn.LSTM(embed_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.head = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, input_ids, labels=None, **kwargs):
+        x = self.embedding(input_ids)
+        x, _ = self.rnn(x)
+        logits = self.head(x)
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+        return {"loss": loss, "logits": logits}
+
+class CustomTransformer(nn.Module):
+    """A simple Transformer Encoder for sequence modeling."""
+    def __init__(self, vocab_size, embed_size=256, nhead=4, num_layers=2, dim_feedforward=512, dropout=0.1, max_len=512):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_size, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Linear(embed_size, vocab_size)
+        self.pos_encoder = nn.Parameter(torch.zeros(1, max_len, embed_size))
+
+    def forward(self, input_ids, labels=None, **kwargs):
+        seq_len = input_ids.size(1)
+        x = self.embedding(input_ids) + self.pos_encoder[:, :seq_len, :]
+        x = self.transformer_encoder(x)
+        logits = self.head(x)
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+        return {"loss": loss, "logits": logits}
+
+class CompileFriendlyTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        This method is overridden to remove the `num_items_in_batch` argument
+        that is incompatible with a torch.compiled model.
+        """
+        # The Trainer internally adds this for its own bookkeeping
+        if "num_items_in_batch" in inputs:
+            inputs.pop("num_items_in_batch")
+            
+        return super().compute_loss(model, inputs, return_outputs)
+# ---------------------------------------------------------------------
+# 2.  Model Zoo
+# ---------------------------------------------------------------------
 MODEL_ZOO = {
     "bert":     {"hf_id": "bert-base-cased"},
     "protbert": {"hf_id": "Rostlab/prot_bert_bfd"},
@@ -45,23 +100,42 @@ def train_lm(config: dict):
     spec = MODEL_ZOO[config["model_key"].lower()]
     model_hf_id = spec['hf_id']
 
-    # --- Load Model, Tokenizer, and PROCESSED Data ---
-    print(f"📂 Loading PROCESSED dataset from: {config['dataset_path']}")
-    ds = load_from_disk(config['dataset_path'])
-    
-    print(f"🔄 Loading model and tokenizer for: {model_hf_id}")
-    model = AutoModelForMaskedLM.from_pretrained(model_hf_id)
-    tokenizer = AutoTokenizer.from_pretrained(model_hf_id)
+    if is_main() and config.get("wandb_project"):
+        wandb.init(project=config["wandb_project"], config=config)
+
+    # --- Load Pre-tokenized Data and Tokenizer ---
+    print(f"Loading pre-tokenized dataset from: {config['dataset_path']}")
+    ds = load_from_disk(config["dataset_path"])
+    tokenizer_path = spec.get("hf_id")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # The data is pre-masked, so we only need to pad batches.
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # --- LoRA Configuration ---
+    # --- Model and Collator Selection ---
+    if objective == "mlm":
+        print(f"Loading MLM model: {spec['hf_id']}")
+        model = AutoModelForMaskedLM.from_pretrained(spec['hf_id'])
+        
+        print("Using DataCollatorForLanguageModeling for on-the-fly masking.")
+        collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer, 
+            mlm=True, 
+            mlm_probability=config.get("mlm_prob", 0.15)
+        )
+    else:
+        # Handle CLM or other objectives if needed
+        raise NotImplementedError(f"Training for objective '{objective}' not fully implemented.")
+
+
+    model.gradient_checkpointing_enable()
+
+    # Apply LoRA if configured
     if config.get("use_lora", False):
-        print("⚡️ Applying LoRA configuration...")
-        peft_config = LoraConfig(
+        print("Applying LoRA configuration...")
+        lora_config = LoraConfig(
             r=config.get("lora_r", 16),
             lora_alpha=config.get("lora_alpha", 32),
             target_modules=config.get("lora_target_modules", ["query", "value"]),
@@ -75,23 +149,22 @@ def train_lm(config: dict):
             if 'cls' in name or 'LMPredictionHead' in name:
                 param.requires_grad = True
         model.print_trainable_parameters()
-    
+
+    print(f"Creating a smaller validation subset for memory efficiency (100000/{len(ds['val'])}) batches.")
+    eval_subset = ds["val"].shuffle(seed=42).select(range(100000))   
     # --- Trainer Setup ---
     training_args = TrainingArguments(
         output_dir=config["checkpoint_path"],
-        num_train_epochs=config.get("num_epochs", 3),
-        per_device_train_batch_size=config.get("batch_size", 16),
-        per_device_eval_batch_size=config.get("eval_batch_size", 32),
-        gradient_accumulation_steps=config.get("grad_accum", 1),
-        learning_rate=config.get("learning_rate", 2e-5),
-        weight_decay=config.get("weight_decay", 0.01),
+        num_train_epochs=config["num_epochs"],
+        deepspeed=config.get("deepspeed_config", None),
+        per_device_train_batch_size=config["batch_size"],
+        per_device_eval_batch_size=config.get("eval_batch_size", config["batch_size"]),
         eval_strategy="epoch",
         save_strategy="epoch",
         logging_steps=100,
         fp16=config.get("fp16", True),
         bf16=config.get("bf16", False),
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
         greater_is_better=False,
         remove_unused_columns=False,
     )
@@ -100,15 +173,20 @@ def train_lm(config: dict):
         model=model,
         args=training_args,
         train_dataset=ds["train"],
-        eval_dataset=ds["val"],
+        eval_dataset=eval_subset,
         data_collator=collator,
         compute_metrics=compute_metrics,
         callbacks=[ClearCudaCacheCallback()],
     )
 
     # --- Train and Evaluate ---
-    print("🚀 Starting training...")
+    print("Starting training...")
     trainer.train()
+    
+    print("Training complete. Evaluating final model...")
+    metrics = trainer.evaluate(eval_dataset=ds["test"]) # Evaluate on the test set
+    print("Final test metrics:")
+    print(metrics)
 
     print("🏁 Training complete. Evaluating on test set...")
     metrics = trainer.evaluate(eval_dataset=ds["test"])
