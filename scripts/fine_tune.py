@@ -1,3 +1,4 @@
+#! /usr/bin/python3
 import argparse
 import json
 import math
@@ -7,6 +8,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import wandb
+import evaluate
 from datasets import load_from_disk
 from peft import get_peft_model, LoraConfig, TaskType
 from transformers import (
@@ -101,13 +103,17 @@ def is_main():
     return int(os.environ.get("RANK", 0)) == 0
 
 def compute_metrics(eval_pred: EvalPrediction):
+    """Computes accuracy from predictions and labels."""
+    accuracy_metric = evaluate.load("accuracy")
     logits, labels = eval_pred.predictions, eval_pred.label_ids
-    # The trainer already calculates loss, so we can access it from metrics
-    loss = eval_pred.metrics.get("eval_loss", 0.0)
-    perplexity = math.exp(loss) if loss < 20 else float("inf")
+    
     mask = labels != -100
-    acc = (np.argmax(logits, axis=-1)[mask] == labels[mask]).mean() if mask.sum() > 0 else 0.0
-    return {"accuracy": acc, "perplexity": perplexity, "eval_loss": loss}
+    accuracy = accuracy_metric.compute(
+        predictions=np.argmax(logits, axis=-1)[mask], 
+        references=labels[mask]
+    )
+    # Return ONLY the accuracy
+    return accuracy
 
 # ---------------------------------------------------------------------
 # Master training function
@@ -177,6 +183,7 @@ def train_lm(config: dict):
     training_args = TrainingArguments(
         output_dir=config["checkpoint_path"],
         num_train_epochs=config["num_epochs"],
+        label_names=["labels"],
         deepspeed=config.get("deepspeed_config", None),
         per_device_train_batch_size=config["batch_size"],
         per_device_eval_batch_size=config.get("eval_batch_size", config["batch_size"]),
@@ -208,6 +215,14 @@ def train_lm(config: dict):
     
     print("Training complete. Evaluating final model...")
     metrics = trainer.evaluate(eval_dataset=ds["test"]) # Evaluate on the test set
+    
+    try:
+        perplexity = math.exp(metrics["eval_loss"])
+        metrics["eval_perplexity"] = perplexity
+    except OverflowError:
+        metrics["eval_perplexity"] = float("inf")
+    
+    
     print("Final test metrics:")
     print(metrics)
 
