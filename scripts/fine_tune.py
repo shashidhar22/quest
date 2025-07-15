@@ -3,15 +3,19 @@ import argparse
 import json
 import math
 import os
+import pathlib
 import torch
+import torch.nn as nn
 import numpy as np
 import wandb
 import evaluate
 from datasets import load_from_disk
-from peft import get_peft_model, LoraConfig
+from peft import get_peft_model, LoraConfig, TaskType
 from transformers import (
     AutoTokenizer,
     AutoModelForMaskedLM,
+    AutoModelForCausalLM,
+    DataCollatorForLanguageModeling,
     DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
@@ -19,6 +23,7 @@ from transformers import (
     TrainerCallback,
 )
 
+# This is important to prevent hangs in multiprocessing with tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ---------------------------------------------------------------------
@@ -78,16 +83,24 @@ class CompileFriendlyTrainer(Trainer):
 # 2.  Model Zoo
 # ---------------------------------------------------------------------
 MODEL_ZOO = {
-    "bert":     {"hf_id": "bert-base-cased"},
-    "protbert": {"hf_id": "Rostlab/prot_bert_bfd"},
-    "esm":      {"hf_id": "facebook/esm2_t33_650M_UR50D"},
-    # Add other models as needed
+    "bert":     {"hf_id": "bert-base-cased", "objective": "mlm"},
+    "gpt2":     {"hf_id": "gpt2", "objective": "clm"},
+    "llama3":   {"hf_id": "meta-llama/Meta-Llama-3-8B", "objective": "clm"},
+    "esm":      {"hf_id": "facebook/esm2_t33_650M_UR50D", "objective": "mlm"},
+    "protbert": {"hf_id": "Rostlab/prot_bert_bfd", "objective": "mlm"},
+    "custom-rnn": {"model_class": CustomRNN, "objective": "custom"},
+    "custom-transformer": {"model_class": CustomTransformer, "objective": "custom"},
 }
 
-# --- Callbacks and Metric Helpers ---
+# ---------------------------------------------------------------------
+# 3.  Callbacks and Metric Helpers
+# ---------------------------------------------------------------------
 class ClearCudaCacheCallback(TrainerCallback):
     def on_epoch_end(self, args, state, control, **kwargs):
         torch.cuda.empty_cache()
+
+def is_main():
+    return int(os.environ.get("RANK", 0)) == 0
 
 def compute_metrics(eval_pred: EvalPrediction):
     """Computes accuracy from predictions and labels."""
@@ -102,11 +115,13 @@ def compute_metrics(eval_pred: EvalPrediction):
     # Return ONLY the accuracy
     return accuracy
 
-# --- Main Training Function ---
+# ---------------------------------------------------------------------
+# Master training function
+# ---------------------------------------------------------------------
 def train_lm(config: dict):
-    # --- MODIFICATION: Look up model details from MODEL_ZOO ---
+    """Trains a model on a pre-processed dataset."""
     spec = MODEL_ZOO[config["model_key"].lower()]
-    model_hf_id = spec['hf_id']
+    objective = spec["objective"]
 
     if is_main() and config.get("wandb_project"):
         wandb.init(project=config["wandb_project"], config=config)
@@ -114,13 +129,24 @@ def train_lm(config: dict):
     # --- Load Pre-tokenized Data and Tokenizer ---
     print(f"Loading pre-tokenized dataset from: {config['dataset_path']}")
     ds = load_from_disk(config["dataset_path"])
+    
+    print("Sorting dataset by length for efficiency...")
+    for split in ds:
+        ds[split] = ds[split].map(lambda x: {"len": len(x['input_ids'])}, num_proc=os.cpu_count())
+        ds[split] = ds[split].sort("len")
+        ds[split] = ds[split].remove_columns("len")
+        
     tokenizer_path = spec.get("hf_id")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # The data is pre-masked, so we only need to pad batches.
-    collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    # --- Remove unused text columns immediately after loading ---
+    # This ensures only tokenized data is passed to the Trainer.
+    columns_to_remove = [col for col in ["combo_id", "combo_feats"] if col in ds["train"].column_names]
+    if columns_to_remove:
+        print(f"Removing text columns: {columns_to_remove}")
+        ds = ds.remove_columns(columns_to_remove)
 
     # --- Model and Collator Selection ---
     if objective == "mlm":
@@ -150,7 +176,7 @@ def train_lm(config: dict):
             lora_dropout=config.get("lora_dropout", 0.05),
             bias="none",
         )
-        model = get_peft_model(model, peft_config)
+        model = get_peft_model(model, lora_config)
         
         # Make the MLM head trainable
         for name, param in model.named_parameters():
@@ -158,8 +184,13 @@ def train_lm(config: dict):
                 param.requires_grad = True
         model.print_trainable_parameters()
 
-    print(f"Creating a smaller validation subset for memory efficiency (100000/{len(ds['val'])}) batches.")
-    eval_subset = ds["val"].shuffle(seed=42).select(range(100000))   
+    if config.get("test", False):
+        print(f"Creating a smaller validation subset for memory efficiency (100000/{len(ds['val'])}) batches.")
+        train_dataset = ds["train"].shuffle(seed=42).select(range(1000))
+        eval_dataset = ds["val"].shuffle(seed=42).select(range(100))   
+    else:
+        train_dataset = ds["train"]
+        eval_dataset = ds["val"]
     # --- Trainer Setup ---
     training_args = TrainingArguments(
         output_dir=config["checkpoint_path"],
@@ -171,8 +202,9 @@ def train_lm(config: dict):
         eval_strategy="epoch",
         save_strategy="epoch",
         logging_steps=100,
-        fp16=config.get("fp16", True),
-        bf16=config.get("bf16", False),
+        report_to="wandb" if config.get("wandb_project") else "none",
+        fp16=config.get("fp16", False),
+        bf16=config.get("bf16", True),
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -182,8 +214,8 @@ def train_lm(config: dict):
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=ds["train"],
-        eval_dataset=eval_subset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=collator,
         compute_metrics=compute_metrics,
         callbacks=[ClearCudaCacheCallback()],
@@ -198,19 +230,18 @@ def train_lm(config: dict):
     if is_main():
         trainer.save_model(os.path.join(config["checkpoint_path"], "best_model"))
         if wandb.run:
-            wandb.log({"test_metrics": metrics})
             wandb.finish()
 
-    if int(os.environ.get("RANK", 0)) == 0:
-        trainer.save_model(os.path.join(config["checkpoint_path"], "best_model"))
+    trainer.accelerator.wait_for_everyone()
 
 # --- CLI Wrapper ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune a language model on a PRE-PROCESSED dataset.")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to JSON config file")
+    parser.add_argument("--test", action="store_true", help="Run in test mode with a smaller dataset")
     args = parser.parse_args()
     
     with open(args.config, 'r') as f:
         config = json.load(f)
-
+    config["test"] = args.test  # Add test flag to config
     train_lm(config)
