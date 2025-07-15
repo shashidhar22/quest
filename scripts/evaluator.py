@@ -80,47 +80,64 @@ def custom_masking_collator(features, tokenizer, rules):
 
 def log_predictions_to_wandb(all_input_ids, all_labels, all_preds, tokenizer, num_examples=50):
     """
-    Creates and logs a W&B Table with sample predictions.
+    Creates and logs a W&B Table with sequences and per-sequence mask accuracy.
     """
-    
+    print("📊 Generating W&B prediction table...")
 
-    # Combine batches into single tensors
-    flat_input_ids = [item for batch in all_input_ids for item in batch]
-    flat_labels = [item for batch in all_labels for item in batch]
-    flat_preds = [item for batch in all_preds for item in batch]
+    flat_input_ids = [item for batch in all_input_ids for item in batch.tolist()]
+    flat_labels = [item for batch in all_labels for item in batch.tolist()]
+    flat_preds = [item for batch in all_preds for item in batch.tolist()]
     
-    # Randomly sample indices from the entire dataset
-    num_total_examples = len(flat_input_ids)
-    indices_to_log = random.sample(range(num_total_examples), min(num_examples, num_total_examples))
+    indices_to_log = random.sample(range(len(flat_input_ids)), min(num_examples, len(flat_input_ids)))
 
-    # Create a new table with the desired columns
-    table = wandb.Table(columns=["True Sequence", "Predicted Sequence"])
+    # --- MODIFICATION: Add "Mask Accuracy" column ---
+    table = wandb.Table(columns=["True Sequence", "Masked Input", "Predicted Sequence", "Mask Accuracy"])
 
     for i in indices_to_log:
-        # Get the data for one example
         input_ids = flat_input_ids[i]
         labels = flat_labels[i]
         preds = flat_preds[i]
 
-        # Reconstruct the true sequence (ignoring padding)
-        true_tokens = [tok for tok_id, tok in zip(input_ids, tokenizer.convert_ids_to_tokens(input_ids)) if tok_id != tokenizer.pad_token_id]
-
-        # Reconstruct the predicted sequence
+        true_tokens = []
+        masked_tokens = []
         predicted_tokens = []
-        for input_id, label_id, pred_id in zip(input_ids, labels, preds):
-            if input_id == tokenizer.pad_token_id:
-                break # Stop at padding
-            if label_id != -100:
-                # This was a masked token; use the model's prediction
-                predicted_tokens.append(tokenizer.convert_ids_to_tokens(pred_id))
-            else:
-                # This was not a masked token; use the original token
-                predicted_tokens.append(tokenizer.convert_ids_to_tokens(input_id))
         
-        table.add_data(" ".join(true_tokens), " ".join(predicted_tokens))
+        # --- MODIFICATION: Logic to calculate per-sequence accuracy ---
+        correct_predictions = 0
+        total_masked = 0
 
-    # Log the table to W&B
+        for j, label_id in enumerate(labels):
+            if input_ids[j] == tokenizer.pad_token_id:
+                break
+
+            original_token = tokenizer.convert_ids_to_tokens(input_ids[j])
+            true_tokens.append(original_token)
+
+            if label_id != -100: # This was a masked position
+                total_masked += 1
+                predicted_token = tokenizer.convert_ids_to_tokens(preds[j])
+                
+                masked_tokens.append(tokenizer.mask_token)
+                predicted_tokens.append(predicted_token)
+
+                # Check if the prediction was correct
+                if preds[j] == label_id:
+                    correct_predictions += 1
+            else: # This was not masked
+                masked_tokens.append(original_token)
+                predicted_tokens.append(original_token)
+        
+        accuracy = (correct_predictions / total_masked) if total_masked > 0 else 1.0
+        
+        table.add_data(
+            " ".join(true_tokens),
+            " ".join(masked_tokens),
+            " ".join(predicted_tokens),
+            f"{accuracy:.2%}" # Format as a percentage
+        )
+
     wandb.log({"prediction_samples": table})
+    print("✅ Prediction table logged to W&B.")
 
 # ---------------------------------------------------------------------
 # 3. Main Evaluation Function
@@ -128,25 +145,39 @@ def log_predictions_to_wandb(all_input_ids, all_labels, all_preds, tokenizer, nu
 def main():
     args = cli()
     accelerator = Accelerator(mixed_precision="fp16")
-         
-    # --- Load Model and Tokenizer ---
-    accelerator.print(f"Loading model and tokenizer '{args.model_name}'...")
+
+    # --- 1. Load Model, Tokenizer, and Data ---
+    accelerator.print(f"🔄  Loading model and tokenizer '{args.model_name}'...")
     model = AutoModelForMaskedLM.from_pretrained(args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = torch.compile(model)
-
-    # --- Load Data and Optionally Apply Schema ---
-    accelerator.print(f"Loading RAW dataset from {args.raw_dataset_dir}")
-    test_ds = load_from_disk(args.raw_dataset_dir)["test"]
+    
+    accelerator.print(f"📂  Loading RAW dataset from {args.raw_dataset_dir}")
+    # Load the specific split you want to evaluate, e.g., "val" or "test"
+    eval_ds = load_from_disk(args.raw_dataset_dir)["val"] 
+    breakpoint()
+    # --- 2. Setup Collator Based on Workflow ---
     masking_rules = []
     if args.schema_path:
         accelerator.print(f"Applying custom masking schema from {args.schema_path}...")
         with open(args.schema_path, 'r') as f:
             masking_rules = json.load(f).get("masking_rules", [])
+    
+    if masking_rules:
+        # Use the custom collator if rules are provided
+        accelerator.print("Using custom collator for targeted masking.")
+        collator = partial(custom_masking_collator, tokenizer=tokenizer, rules=masking_rules)
+    else:
+        # Default to standard on-the-fly MLM if no schema is given
+        accelerator.print("Using default collator for on-the-fly MLM.")
+        collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer, mlm=True, mlm_probability=args.mlm_prob
+        )
+
         
     # --- Calculate Stats for Logging ---
-    num_sequences = len(test_ds)
-    combo_feats_counts = Counter(tuple(sorted(feats)) for feats in test_ds["combo_feats"])
+    num_sequences = len(eval_ds)
+    combo_feats_counts = Counter(tuple(sorted(feats)) for feats in eval_ds["combo_feats"])
     combo_feats_counts_str_keys = {str('_'.join(key)): value for key, value in combo_feats_counts.items()}
 
     dataset_characteristics = {
@@ -163,24 +194,10 @@ def main():
         accelerator.print(f"Logging to W&B project: {args.wandb_project}")
 
     # --- Create DataLoader with On-the-Fly Masking Collator ---
-    accelerator.print(f"Loading model and tokenizer '{args.model_name}'...")
-    model = AutoModelForMaskedLM.from_pretrained(args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = torch.compile(model)
-
-    if masking_rules:
-        # Use the custom collator if rules are provided
-        from functools import partial
-        collator = partial(custom_masking_collator, tokenizer=tokenizer, rules=masking_rules)
-    else:
-        # Default to standard on-the-fly MLM if no schema is given
-        collator = DataCollatorForLanguageModeling(
-            tokenizer=tokenizer, mlm=True, mlm_probability=args.mlm_prob
-        )
     
     # Remove text columns right before creating the loader
-    cols_to_remove = [c for c in test_ds.column_names if c not in ["input_ids", "attention_mask"]]
-    eval_ds = test_ds.remove_columns(cols_to_remove)
+    cols_to_remove = [c for c in eval_ds.column_names if c not in ["input_ids", "attention_mask"]]
+    eval_ds = eval_ds.remove_columns(cols_to_remove)
     
     loader = DataLoader(
         eval_ds.with_format("torch"),
