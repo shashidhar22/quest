@@ -1,9 +1,12 @@
+#! /usr/bin/python3
 import argparse
 import json
 import math
 import os
 import torch
 import numpy as np
+import wandb
+import evaluate
 from datasets import load_from_disk
 from peft import get_peft_model, LoraConfig
 from transformers import (
@@ -87,12 +90,17 @@ class ClearCudaCacheCallback(TrainerCallback):
         torch.cuda.empty_cache()
 
 def compute_metrics(eval_pred: EvalPrediction):
+    """Computes accuracy from predictions and labels."""
+    accuracy_metric = evaluate.load("accuracy")
     logits, labels = eval_pred.predictions, eval_pred.label_ids
-    loss = eval_pred.metrics.get("eval_loss", 0.0)
-    perplexity = math.exp(loss) if loss > 0 else float("inf")
+    
     mask = labels != -100
-    acc = (np.argmax(logits, axis=-1)[mask] == labels[mask]).mean() if mask.sum() > 0 else 0.0
-    return {"accuracy": acc, "perplexity": perplexity}
+    accuracy = accuracy_metric.compute(
+        predictions=np.argmax(logits, axis=-1)[mask], 
+        references=labels[mask]
+    )
+    # Return ONLY the accuracy
+    return accuracy
 
 # --- Main Training Function ---
 def train_lm(config: dict):
@@ -156,6 +164,7 @@ def train_lm(config: dict):
     training_args = TrainingArguments(
         output_dir=config["checkpoint_path"],
         num_train_epochs=config["num_epochs"],
+        label_names=["labels"],
         deepspeed=config.get("deepspeed_config", None),
         per_device_train_batch_size=config["batch_size"],
         per_device_eval_batch_size=config.get("eval_batch_size", config["batch_size"]),
@@ -165,8 +174,9 @@ def train_lm(config: dict):
         fp16=config.get("fp16", True),
         bf16=config.get("bf16", False),
         load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
         greater_is_better=False,
-        remove_unused_columns=False,
+        remove_unused_columns=False
     )
 
     trainer = Trainer(
@@ -183,14 +193,13 @@ def train_lm(config: dict):
     print("Starting training...")
     trainer.train()
     
-    print("Training complete. Evaluating final model...")
-    metrics = trainer.evaluate(eval_dataset=ds["test"]) # Evaluate on the test set
-    print("Final test metrics:")
-    print(metrics)
-
-    print("🏁 Training complete. Evaluating on test set...")
-    metrics = trainer.evaluate(eval_dataset=ds["test"])
-    print("Final test metrics:", metrics)
+    print("Training complete. Saving best model...")
+    
+    if is_main():
+        trainer.save_model(os.path.join(config["checkpoint_path"], "best_model"))
+        if wandb.run:
+            wandb.log({"test_metrics": metrics})
+            wandb.finish()
 
     if int(os.environ.get("RANK", 0)) == 0:
         trainer.save_model(os.path.join(config["checkpoint_path"], "best_model"))
