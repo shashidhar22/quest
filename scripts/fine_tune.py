@@ -213,19 +213,8 @@ def train_lm(config: dict):
     print("Starting training...")
     trainer.train()
     
-    print("Training complete. Evaluating final model...")
-    metrics = trainer.evaluate(eval_dataset=ds["test"]) # Evaluate on the test set
+    print("Training complete. Saving best model...")
     
-    try:
-        perplexity = math.exp(metrics["eval_loss"])
-        metrics["eval_perplexity"] = perplexity
-    except OverflowError:
-        metrics["eval_perplexity"] = float("inf")
-    
-    
-    print("Final test metrics:")
-    print(metrics)
-
     if is_main():
         trainer.save_model(os.path.join(config["checkpoint_path"], "best_model"))
         if wandb.run:
