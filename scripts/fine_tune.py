@@ -107,7 +107,7 @@ def compute_metrics(eval_pred: EvalPrediction):
     perplexity = math.exp(loss) if loss < 20 else float("inf")
     mask = labels != -100
     acc = (np.argmax(logits, axis=-1)[mask] == labels[mask]).mean() if mask.sum() > 0 else 0.0
-    return {"accuracy": acc, "perplexity": perplexity}
+    return {"accuracy": acc, "perplexity": perplexity, "eval_loss": loss}
 
 # ---------------------------------------------------------------------
 # Master training function
@@ -187,6 +187,7 @@ def train_lm(config: dict):
         fp16=config.get("fp16", False),
         bf16=config.get("bf16", True),
         load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
         greater_is_better=False,
         remove_unused_columns=False
     )
