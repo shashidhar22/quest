@@ -21,9 +21,11 @@ from torch.utils.data import DataLoader
 from transformers import (
     DataCollatorForLanguageModeling,
     AutoTokenizer, AutoModelForMaskedLM,
+    Trainer, TrainingArguments,
 )
 from tqdm.auto import tqdm
 from accelerate import Accelerator
+import time
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -48,15 +50,23 @@ def cli():
 # 2. Helper Functions
 # ---------------------------------------------------------------------
 def custom_masking_collator(features, tokenizer, rules=None, mlm_probability=0.15):
-    """Apply targeted masking based on rules defined in a schema, or random masking if no rules are provided."""
-    import random
-    for item in features:
-        # Convert input_ids and attention_mask to lists to allow in-place modification
-        item["input_ids"] = list(item["input_ids"])
-        if "attention_mask" in item:
-            item["attention_mask"] = list(item["attention_mask"])
+    """Efficiently apply targeted or random masking using tensor operations, minimizing memory usage."""
+    # Convert input_ids and attention_mask to tensors
+    input_ids = [torch.tensor(item["input_ids"]) for item in features]
+    attention_mask = [torch.tensor(item["attention_mask"]) for item in features if "attention_mask" in item]
+    max_len = max(len(ids) for ids in input_ids)
+
+    # Pad input_ids and attention_mask
+    input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
+    if attention_mask:
+        attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    else:
+        attention_mask = None
+
+    labels = torch.full_like(input_ids, -100)
+
+    for i, item in enumerate(features):
         seq_len = len(item["input_ids"])
-        labels = [-100] * seq_len  # Default to ignoring all labels
         if rules:  # Schema-based masking
             item_feats = tuple(sorted(item.get("combo_feats", [])))
             for rule in rules:
@@ -70,39 +80,32 @@ def custom_masking_collator(features, tokenizer, rules=None, mlm_probability=0.1
                         end_idx = start_idx + num_tokens
                     elif action == "mask_slice":
                         start_idx = params["start_index"]
-                        end_idx   = params["end_index"]
+                        end_idx = params["end_index"]
                     else:  # "mask_all" or default
                         start_idx, end_idx = 0, seq_len
 
                     if 0 <= start_idx < end_idx <= seq_len:
-                        labels[start_idx:end_idx] = item["input_ids"][start_idx:end_idx]  # copy token IDs into labels
-                        for idx in range(start_idx, end_idx):
-                            item["input_ids"][idx] = tokenizer.mask_token_id
+                        labels[i, start_idx:end_idx] = input_ids[i, start_idx:end_idx]
+                        input_ids[i, start_idx:end_idx] = tokenizer.mask_token_id
                     break  # Stop after finding the first matching rule
         else:  # Random masking
-            # Exclude special tokens from masking
             special_token_ids = set(tokenizer.all_special_ids)
-            candidate_indices = [i for i, tid in enumerate(item["input_ids"]) if tid not in special_token_ids]
+            candidate_indices = [j for j, tid in enumerate(item["input_ids"]) if tid not in special_token_ids]
             num_to_mask = max(1, int(round(mlm_probability * len(candidate_indices))))
-            mask_indices = random.sample(candidate_indices, min(num_to_mask, len(candidate_indices)))
-            for idx in mask_indices:
-                labels[idx] = item["input_ids"][idx]
-                item["input_ids"][idx] = tokenizer.mask_token_id
-        item["labels"] = labels
+            if len(candidate_indices) > 0:
+                mask_indices = random.sample(candidate_indices, min(num_to_mask, len(candidate_indices)))
+                # Ensure at least one token is masked
+                if len(mask_indices) == 0:
+                    mask_indices = [random.choice(candidate_indices)]
+                mask_indices = torch.tensor(mask_indices, dtype=torch.long)
+                labels[i, mask_indices] = input_ids[i, mask_indices]
+                input_ids[i, mask_indices] = tokenizer.mask_token_id
 
-    
-    # Truncate sequences that are too long before padding
-    
-    # Pad all fields to the same length before calling tokenizer.pad
-    max_len = max(len(item["input_ids"]) for item in features)
-    for item in features:
-        if len(item["input_ids"]) < max_len:
-            item["input_ids"] += [tokenizer.pad_token_id] * (max_len - len(item["input_ids"]))
-        if len(item["labels"]) < max_len:
-            item["labels"] += [-100] * (max_len - len(item["labels"]))
-        if "attention_mask" in item and len(item["attention_mask"]) < max_len:
-            item["attention_mask"] += [0] * (max_len - len(item["attention_mask"]))
-    return tokenizer.pad(features, return_tensors="pt")
+    batch = {"input_ids": input_ids}
+    if attention_mask is not None:
+        batch["attention_mask"] = attention_mask
+    batch["labels"] = labels
+    return batch
 
 def log_predictions_to_wandb(raw_eval_ds, all_input_ids, all_labels, all_preds, tokenizer, num_examples=50):
     """
@@ -185,7 +188,7 @@ def main():
     accelerator.print(f"Loading model and tokenizer '{args.model_name}'...")
     model = AutoModelForMaskedLM.from_pretrained(args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = torch.compile(model)
+    #model = torch.compile(model)
     
     accelerator.print(f"Loading RAW dataset from {args.raw_dataset_dir} (validation split)")
     ds = load_from_disk(args.raw_dataset_dir) 
@@ -263,61 +266,45 @@ def main():
     model, loader = accelerator.prepare(model, loader)
     model.eval()
     
-    # --- Evaluation Loop ---
-    pbar = tqdm(range(len(loader)), disable=not accelerator.is_main_process, desc="Evaluating")
-    total_loss, total_correct, total_masked = 0.0, 0, 0
-    all_input_ids = []
-    all_predictions = []
-    all_labels = []
-    for batch in loader:
-        with torch.no_grad():
-            outputs = model(**batch)  # ** is magic! calls the forward() method of the model
+    # Prepare a batch of features for profiling
+    features = [eval_ds[i] for i in range(128)]  # adjust batch size as needed
 
-        total_loss += accelerator.gather_for_metrics(outputs.loss.detach()).sum().item()
+    # Profile custom collator
+    start = time.time()
+    batch_custom = custom_masking_collator(features, tokenizer, rules=masking_rules, mlm_probability=args.mlm_prob)
+    print("Custom collator time:", time.time() - start)
 
-        labels      = batch["labels"]
-        mask        = labels != -100  # -100: ignore value, not part of MLM loss
-        predictions = outputs.logits.argmax(dim=-1)  # token with highest prob
-        correct     = (predictions[mask] == labels[mask]).sum()
+    # Profile HF collator
+    from transformers import DataCollatorForLanguageModeling
+    hf_collator = DataCollatorForLanguageModeling(tokenizer, mlm=True, mlm_probability=args.mlm_prob)
+    start = time.time()
+    batch_hf = hf_collator(features)
+    print("HF collator time:", time.time() - start)
 
-        total_correct += accelerator.gather_for_metrics(correct).sum().item()
-        total_masked  += accelerator.gather_for_metrics(mask.sum()).sum().item()
-
-        # Save all raw ids, labels, preds so we can build the W&B table (if needed)
-        all_input_ids.append(  accelerator.gather_for_metrics(batch["input_ids"]))
-        all_predictions.append(accelerator.gather_for_metrics(outputs.logits.argmax(dim=-1)))
-        all_labels.append(     accelerator.gather_for_metrics(batch["labels"]))
-        
-        pbar.update(1)
-
-    # --- Calculate + Report Metrics ---
-    avg_loss = total_loss / len(loader)
-    perplexity  = math.exp(avg_loss)
-    mask_accuracy = (total_correct / total_masked) * 100 if total_masked > 0 else 0  # prevent 0/0
-
-    if accelerator.is_main_process:
-        metrics = {
-            "avg_loss": avg_loss, "perplexity": perplexity, "mask_accuracy": mask_accuracy,
-        }
-
-        
-        
-        # Log to terminal
-        print("\n----- MLM Evaluation Results -----")
-        for key, value in metrics.items():
-            print(f"  {key.replace('_', ' ').capitalize():<18}: {value:.4f}")
-        print("------------------------------------")
-
-        # Log to W&B (if enabled) and log an example table
+    # --- Trainer-based evaluation with W&B logging ---
+    if args.wandb_project:
+        training_args = TrainingArguments(
+            output_dir="./results",
+            per_device_eval_batch_size=args.batch_size,
+            dataloader_num_workers=max(1, os.cpu_count() // accelerator.num_processes - 1),
+            fp16=True,
+            report_to=["wandb"],
+            run_name=args.wandb_project,
+            do_train=False,
+            do_eval=True,
+            remove_unused_columns=False,
+        )
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            data_collator=collator,
+            eval_dataset=eval_ds,
+        )
+        eval_results = trainer.evaluate()
+        print("Trainer evaluation results:", eval_results)
         if wandb.run:
-            accelerator.print(f"Logging general metrics to W&B...")
-            wandb.log(metrics)  # loss, perplexity, accuracy
-            accelerator.print(f"Building W&B prediction table (example masked sequences)...")
-            log_predictions_to_wandb(eval_cp, all_input_ids, all_labels, all_predictions, tokenizer)
-            accelerator.print("All metrics and example predictions logged to W&B.")
-            wandb.finish()
-        else:
-            accelerator.print("W&B logging skipped.")
+            wandb.log(eval_results)
+
 
 if __name__ == "__main__":
     main()
