@@ -25,12 +25,15 @@ import multiprocessing as mp
 from itertools import combinations
 from pathlib import Path
 from functools import partial
+from typing import List, Dict
 import s3fs
 from datasets import (load_dataset, concatenate_datasets, Dataset, DatasetDict)
 from datasets.data_files import DataFilesList
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 from tqdm.auto import tqdm
 from concurrent.futures import ThreadPoolExecutor
+import torch
+from torch.utils.data import Dataset as TorchDataset
 
 # -- model cards ------------------------------------------------
 MODEL_CARDS = {
@@ -279,7 +282,7 @@ def main():
         raw_dataset_dict = DatasetDict(raw_final)
 
     # --- 3. Save the Raw Dataset ---
-    out_raw_path = Path(args.output_raw)
+    out_raw_path = args.output_raw
     print(f"Saving raw tokenized dataset to {out_raw_path}")
     
     if out_raw_path.startswith("s3://"):
