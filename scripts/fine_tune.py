@@ -51,10 +51,12 @@ class CustomTransformer(nn.Module):
     """A simple Transformer Encoder for sequence modeling."""
     def __init__(self, vocab_size, embed_size=256, nhead=4, num_layers=2, dim_feedforward=512, dropout=0.1, max_len=512):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_size, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True)
+        self.embedding           = nn.Embedding(vocab_size, embed_size)
+        encoder_layer            = nn.TransformerEncoderLayer(
+            d_model=embed_size, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True
+        )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.head = nn.Linear(embed_size, vocab_size)
+        self.head                = nn.Linear(embed_size, vocab_size)
         self.pos_encoder = nn.Parameter(torch.zeros(1, max_len, embed_size))
 
     def forward(self, input_ids, labels=None, **kwargs):
@@ -122,7 +124,7 @@ def train_lm(config: dict):
     """Trains a model on a pre-processed dataset."""
     spec = MODEL_ZOO[config["model_key"].lower()]
     objective = spec["objective"]
-
+    
     if is_main() and config.get("wandb_project"):
         wandb.init(project=config["wandb_project"], config=config)
 
@@ -138,7 +140,7 @@ def train_lm(config: dict):
         
     tokenizer_path = spec.get("hf_id")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    if tokenizer.pad_token is None:
+    if tokenizer.pad_token is None:  # set default padding
         tokenizer.pad_token = tokenizer.eos_token
 
     # --- Remove unused text columns immediately after loading ---
@@ -152,7 +154,6 @@ def train_lm(config: dict):
     if objective == "mlm":
         print(f"Loading MLM model: {spec['hf_id']}")
         model = AutoModelForMaskedLM.from_pretrained(spec['hf_id'])
-        
         print("Using DataCollatorForLanguageModeling for on-the-fly masking.")
         collator = DataCollatorForLanguageModeling(
             tokenizer=tokenizer, 
@@ -162,11 +163,12 @@ def train_lm(config: dict):
     else:
         # Handle CLM or other objectives if needed
         raise NotImplementedError(f"Training for objective '{objective}' not fully implemented.")
-
-
-    model.gradient_checkpointing_enable()
+    
+    if config.get("gradient_checkpointing", True):
+        model.gradient_checkpointing_enable()
 
     # Apply LoRA if configured
+    lora_applied = False  # to avoid printing the default message if no LoRA params are given
     if config.get("use_lora", False):
         print("Applying LoRA configuration...")
         lora_config = LoraConfig(
@@ -178,15 +180,18 @@ def train_lm(config: dict):
         )
         model = get_peft_model(model, lora_config)
         
-        # Make the MLM head trainable
+        # LoRA will freeze many weights, but ensure the MLM head is trainable
         for name, param in model.named_parameters():
-            if 'cls' in name or 'LMPredictionHead' in name:
-                param.requires_grad = True
+            if "cls" in name or "LMPredictionHead" in name:
+                param.requires_grad = True  # Make these layers trainable
         model.print_trainable_parameters()
+        lora_applied = True
+    elif lora_applied is False:
+        print("No LoRA configuration provided. Full fine-tuning will be performed.")
 
     if config.get("test", False):
-        print(f"Creating a smaller validation subset for memory efficiency (100000/{len(ds['val'])}) batches.")
-        train_dataset = ds["train"].shuffle(seed=42).select(range(1000))
+        print(f"Creating smaller train/val subsets for testing (1000/{len(ds['train'])}, 100/{len(ds['val'])})")
+        train_dataset = ds["train"].shuffle(seed=42).select(range(1000))   # for memory during dev
         eval_dataset = ds["val"].shuffle(seed=42).select(range(100))   
     else:
         train_dataset = ds["train"]
@@ -220,8 +225,6 @@ def train_lm(config: dict):
         compute_metrics=compute_metrics,
         callbacks=[ClearCudaCacheCallback()],
     )
-
-    # --- Train and Evaluate ---
     print("Starting training...")
     trainer.train()
     
