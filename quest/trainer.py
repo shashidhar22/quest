@@ -1,18 +1,13 @@
 import os
-import sys
 import json
 import wandb
 import torch
 import evaluate
-import torchvision
-import pandas as pd
-import plotly.express as px
 import torch.distributed as dist
 
 from tqdm import tqdm
 from functools import partial
 
-from collections import deque
 from datetime import timedelta
 from tokenizers import Tokenizer
 from datasets import load_from_disk
@@ -359,8 +354,6 @@ class Trainer:
                         print(f"[EarlyStopping] Stopping early at epoch {epoch}. Best val_loss={best_val_loss:.4f}")
                     break
 
-        # Commented out test loop for now
-        #self._test_model()
     def _is_main_process(self):
         return (not self.is_distributed) or (self.is_distributed and self.global_rank == 0)
 
