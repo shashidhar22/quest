@@ -1,115 +1,332 @@
 # Quantitative Understanding of Epitope Specificity in T-cells (QUEST)
 
-## Setup:
+## Requirements
 
-To run the data loaders, and training scripts please follow the setup mentioned below:
+To use the distributed training and evaluation scripts, ensure the following Python packages are installed:
 
-```{bash}
-cd quest
-ln -s <path to tcr_llm folder> data/tcr-llm
-ln -s <path to temp directory for checkpoints> temp
-mkdir wandb # Store wandb logs
-mamba env create -f env/environment.yaml
+- torch (>=2.7.0)
+- torchvision
+- torchaudio
+- cudatoolkit (if using GPU)
+- datasets
+- transformers
+- tokenizers
+- accelerate
+- wandb
+- evaluate
+- ray[data,train,tune,serve]
+- peft
+- tqdm
+- scikit-learn
+- s3fs
+
+You can install the core requirements with:
+
+```bash
+pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install -q transformers datasets accelerate wandb evaluate tqdm scikit-learn "ray[default]" peft boto3 s3fs
 ```
 
-Additional pre-requisites include: 
+---
 
-- [Python 3.12 or higher]
-- [PyTorch 2.7.0 or higher; with CUDA 11.8 or higher](https://pytorch.org/get-started/locally/)
-- [HuggingFace Datasets library](https://huggingface.co/docs/datasets/en/installation)
-- [HuggingFace Transformers library](https://huggingface.co/docs/transformers/en/installation)
-- [HuggingFace Tokenizers library](https://huggingface.co/docs/transformers/en/installation)
-- [HuggingFace Accelerate library](https://huggingface.co/docs/accelerate/en/basic_tutorials/install)
-- [WandB](https://docs.wandb.ai/quickstart)
-- [HuggingFace CLI](https://huggingface.co/docs/huggingface_hub/en/guides/cli)
+## Running Scripts with Ray
 
-We are using `wandb` to log training metrics and at this time, the scripts will not work without having `wandb` configured on your profile.
+Ray enables distributed training and evaluation across multiple nodes or GPUs. You can use Ray both locally (on a single machine) or on a cluster (e.g., AWS, using a YAML config).
 
-## Format sequencing data and public databases:
+### 1. Launching a Ray Cluster
 
-The current training dataset includes sequencing data generated from various platforms across 32 published studies and 3 internal studies. Additionally, we have included the following public databases: VDJdb, Tcrdb, McPAS-TCR, iReceptor, IEDB, and CEDAR. There is no one standard format for the sequencing data and public databases. Therefore, we have provided scripts to format the data into a standard format. This is a one time pre-processing task and will be deprecated in the future (once we have released the dataset). The script below generates two standard formats, MRI (minimal required information) and Sequence format. 
+**From a YAML config (cloud/cluster):**
 
-The MRI table contains the followig fields:
-`'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene', 'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 'peptide', 'mhc_one', 'mhc_two', 'sequence', 'repertoire_id', 'study_id', 'category', 'molecule_type', 'host_organism', 'source'`
-
-The Sequence table contains the following fields:
-`'source', 'tid', 'tra', 'trad_gene', 'traj_gene', 'trav_gene', 'trb', 'trbd_gene', 'trbj_gene','trbv_gene', 'peptide', 'mhc_one', 'mhc_two', 'sequence'`
-
-The script `format_dataset.py` can be used to format the data. The script requires the following arguments:
-- `--config_path`: Path to a YAML file that difnes paths for the sequencind data and public databases. 
-
-A configuration file is provided in the `config` folder. The configuration file defines the paths to the sequencing data and public databases. 
-
-The `header_config.yaml` file defines the column names for the sequencing data. 
-
-To format the data, run the following command:
-
-```{bash}
-python format_dataset.py --config_path config/header_config.yaml
+```bash
+ray up <path-to-ray-cluster-yaml>
 ```
 
-**Note**: The current dataset includes over 27000 sequencing runs and 6 public databases. The formatting script will take a long time to run. And it is recommended to run it on a cluster with adequate storage and memory.
+This will start the Ray head and worker nodes as defined in your YAML file.
 
-## Generate HuggingFace datasets:
+**Locally (single machine):**
 
-We use the `datasets` library from HuggingFace to load the data. The script `dataloader.py` can be used to generate the HuggingFace datasets. The script requires the following arguments:
-
-- `-i`: Path to the formatted data in `.parquet` format. Multiple paths can be provided by separating them with a space.
-- `-o`: Path to the output directory where the HuggingFace datasets will be stored.
-- `-p`: Percentage of the dataset that will be used to generate the HuggingFace dataset. This is useful for testing the script on a smaller dataset.
-- `-m`: Model type. The script will generate the HuggingFace dataset based on the model type. The model types include `rnn`, `transformer`.
-- `-v`: Vocabulary size parameter for BPE tokenization. This parameter defines the vocabulary size for the BPE tokenization.
-- `-s`: Sequence length parameter for RNN models. This parameter defines the maximum sequence length for the RNN models.
-- `--build_tokenizer`: If this flag is set, the script will build a tokenizer and save it in the output directory. The tokenizer is used to tokenize the sequences before training the models.
-
-Other optional arguments can be found by running the following command:
-
-```{bash}
-python dataloader.py -h
+```bash
+ray start --head --port=6379
 ```
 
-To generate a HuggingFace dataset for the LSTM model, run the following command:
+### 2. Submitting a Script to the Ray Cluster
 
-```{bash}
-python dataloader.py -i <path to formatted data> -o <output directory> -p 0.01 -m rnn -s 100 -v 100 --build_tokenizer
+**Using `ray submit` (for remote clusters):**
+
+```bash
+ray submit <path-to-ray-cluster-yaml> scripts/<your_script>.py -- <script-args>
 ```
 
-**Note**: While training BERT it is recommended to use the default BERT tokenizer. The script will generate the HuggingFace dataset using the default BERT tokenizer. However, `dataloader.py` can be used to add additional tokens to the BERT tokenizer. The script requires the following arguments
+- The `--` separates Ray arguments from your script's arguments.
+- Example:
 
-
-## Training models:
-
-The script `scripts/train.py` can be used to train multiple models. The model configurations for each type of model is defined in `quest/config.py`. Currently, `train.py` can be used to train LSTM, Bidirectional LSTMs, Transformers, and BERT models. The script requires the following arguments:
- - `-d`: Path to the HuggingFace dataset.
- - `-m`: Model type. The model types include `lstm`, `bilstm`, `transformer`, `bert`.
- - `-t`: Path to the tokenizer. The tokenizer is used to tokenize the sequences before training the models.
- - `-c`: Path to create model checkpoints.
- - `-s`: If this flag is set, the script will perform a hyperparameter sweep. The hyperparameter sweep configurations are defined in `quest/config.py`.
- - `-i`: Wandb Sweep ID. This is used to resume a hyperparameter sweep.
- - `-r`: Resume training. If this flag is set, the script will resume training from the last checkpoint.
-
-The below command can be used to train an LSTM model on a single node with 4 GPUs. The output and error logs are stored in `output.log` and `error.log` respectively:
-
-```{bash}
-PYTHONPATH=$(pwd) torchrun \
-  --nproc_per_node=4 \
-  --nnodes=1 \
-  scripts/train.py \
-  -d <dataset path> \
-  -m lstm \
-  -c <checkpoint path> \
-  --tokenizer <tokenizer path> > output.log 2> error.log
+```bash
+ray submit <path-to-ray-cluster-yaml> scripts/ray_train.py -- --dataset <DATASET_PATH> --model lstm --use-ray --num_workers 4
 ```
 
-**Note**: Here we use WandDB to perform the hyperparameter sweeps. The script `create_sweep.py` can be used to create a sweep. The script requires the following arguments:
-- `-m`: Model type. The model types include `lstm`, `bilstm`, `transformer`, `bert`.
-- `-t`: Path to the tokenizer. The tokenizer is used to tokenize the sequences before training the models.
-- `-d`: Path to the HuggingFace dataset.
+**Using `ray job submit` (Ray 2.x+):**
 
-The script will create a sweep and print the sweep ID. The sweep ID can be used to resume the sweep using the `train.py` script.
+If your cluster is already running, you can submit a job from your local machine:
 
-```{bash}
-PYTHONPATH=$(pwd) torchrun --nproc_per_node=4 --nnodes=1 scripts/train.py -m lstm -i $SWEEP_ID -s
+```bash
+ray job submit --address='ray://<head-node-ip>:10001' -- python scripts/<your_script>.py <script-args>
 ```
 
-**Note**: You will need to setup the following environment variables to get the torchrun working `MASTER_ADDR, MASTER_PORT, NCCL_SOCKET_IFNAME, NCCL_DEBUG, TORCH_NCCL_BLOCKING_WAIT, NCCL_P2P_LEVEL, TORCH_DISTRIBUTED_DEBUG, WANDB_API_KEY, CUDA_VISIBLE_DEVICES`. Add all the environment variables to a `.env` file in the quest project folder and `source` it when launching the script the first time 
+### 3. Monitoring Ray Jobs
+
+- **Ray Dashboard:**
+  - Access the Ray dashboard at `http://<head-node-ip>:8265` (or the port specified in your cluster config).
+  - **If using AWS SSO login and SSM:**
+    - You can port forward the dashboard using AWS SSM:
+      ```bash
+      aws ssm start-session \
+        --target <instance-id> \
+        --document-name AWS-StartPortForwardingSession \
+        --parameters '{"portNumber":["8265"], "localPortNumber":["8265"]}'
+      ```
+    - Replace `<instance-id>` with your Ray head node's EC2 instance ID. This will forward the remote dashboard port 8265 to your local port 8265.
+  - **If using SSH:**
+    - You can use SSH port forwarding if needed:
+      ```bash
+      ssh -L 8265:localhost:8265 <ssh-username>@<head-node-ip>
+      ```
+- **Command-line:**
+  - Check cluster status:
+    ```bash
+    ray status
+    ```
+  - List running jobs:
+    ```bash
+    ray job list
+    ```
+
+### 4. Stopping the Ray Cluster
+
+```bash
+ray down <path-to-ray-cluster-yaml>
+```
+
+---
+
+## Distributed Training and Evaluation Scripts
+
+### 1. Ray-based Evaluation (`ray_evaluator.py`)
+
+This script performs distributed evaluation of a pre-trained Masked Language Model (MLM) using Ray.
+
+**Example usage:**
+
+```bash
+python scripts/ray_evaluator.py \
+  --raw_dataset_dir <RAW_DATASET_DIR> \
+  --model_name <MODEL_NAME_OR_PATH> \
+  --batch_size 128 \
+  --mlm_prob 0.15 \
+  --wandb_project <WANDB_PROJECT_NAME>
+```
+
+- `--raw_dataset_dir`: Path to the raw HuggingFace dataset directory.
+- `--model_name`: Model name or path (e.g., 'Rostlab/prot_bert_bfd').
+- `--batch_size`: Batch size for evaluation.
+- `--mlm_prob`: Masked LM probability.
+- `--wandb_project`: (Optional) W&B project name for logging.
+- `--schema_path`: (Optional) Path to a JSON file with masking schema.
+- `--test`: (Optional) Run on a small subset for testing.
+
+### 2. Ray-based Fine-tuning (`ray_fine_tune.py`)
+
+This script performs distributed fine-tuning of a pre-trained MLM or custom model using Ray and HuggingFace Trainer.
+
+**Example usage:**
+
+```bash
+python scripts/ray_fine_tune.py \
+  --config <CONFIG_JSON_PATH> \
+  --num_workers 8 \
+  --s3_output_path <S3_OUTPUT_PATH>
+```
+
+- `--config`: Path to a JSON config file (see template below).
+- `--num_workers`: Number of Ray workers (GPUs).
+- `--s3_output_path`: (Optional) S3 path to sync the best model after training.
+- `--test`: (Optional) Run in test mode with a smaller dataset.
+
+### 3. Ray-based Training for Custom Models (`ray_train.py`)
+
+This script trains custom LSTM/Transformer models using Ray for distributed training.
+
+**Example usage:**
+
+```bash
+python scripts/ray_train.py \
+  --dataset <DATASET_PATH> \
+  --model <MODEL_TYPE> \
+  --tokenizer <TOKENIZER_PATH> \
+  --use-ray \
+  --num_workers 4
+```
+
+- `--dataset`: Path to the HuggingFace dataset.
+- `--model`: Model type ('lstm', 'bilstm', 'transformer').
+- `--tokenizer`: Path to the tokenizer file.
+- `--use-ray`: Enable Ray distributed training.
+- `--num_workers`: Number of Ray workers (GPUs).
+
+### 5. Running Locally with Ray (Non-Distributed)
+
+You can use Ray for orchestration on a single machine without launching a distributed cluster. This is useful for debugging or running on a single GPU/CPU, but still benefits from Ray's job management and logging.
+
+**Example: Run with a single Ray worker (local, non-distributed):**
+
+```bash
+python scripts/ray_train.py \
+  --dataset <DATASET_PATH> \
+  --model <MODEL_TYPE> \
+  --tokenizer <TOKENIZER_PATH> \
+  --use-ray \
+  --num_workers 1
+```
+
+Or for fine-tuning:
+
+```bash
+python scripts/ray_fine_tune.py \
+  --config <CONFIG_JSON_PATH> \
+  --num_workers 1
+```
+
+- The `--use-ray` and `--num_workers 1` flags ensure Ray is used, but only a single worker/process is launched.
+- No Ray cluster or YAML config is needed for this mode; Ray will run locally.
+
+---
+
+## Ray Cluster YAML Template
+
+Below is a template for a Ray cluster configuration YAML file for AWS, based on a real working example. Replace all placeholder values (in angle brackets) with your actual configuration. **Do not use real secrets or tokens in your config.**
+
+```yaml
+# ray_cluster_template.yaml
+cluster_name: <your-cluster-name>
+
+provider:
+  type: aws
+  region: <aws-region>
+  aws_profile: <aws-profile-name>
+  use_internal_ips: true
+
+auth:
+  ssh_user: <ssh-username>
+  ssh_proxy_command: |
+    aws ssm start-session --target `aws ec2 describe-instances --filters 'Name=tag:Name,Values=<head-node-tag>' 'Name=instance-state-name,Values=running' --query 'Reservations[*].Instances[*].InstanceId' --output text | head -n1` --document-name AWS-StartSSHSession --parameters 'portNumber=22'
+
+available_node_types:
+  ray.head.default:
+    node_config:
+      InstanceType: <head-instance-type>
+      ImageId: <ami-id>
+      SubnetId: <subnet-id>
+      KeyName: <key-name>
+      IamInstanceProfile:
+        Arn: <iam-instance-profile-arn>
+      InstanceMarketOptions:
+        MarketType: spot
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            DeleteOnTermination: true
+  ray.worker.default:
+    min_workers: <min-workers>
+    max_workers: <max-workers>
+    node_config:
+      InstanceType: <worker-instance-type>
+      ImageId: <ami-id>
+      SubnetId: <subnet-id>
+      KeyName: <key-name>
+      IamInstanceProfile:
+        Arn: <iam-instance-profile-arn>
+      InstanceMarketOptions:
+        MarketType: spot
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            DeleteOnTermination: true
+
+head_node_type: ray.head.default
+max_workers: <max-workers>
+
+setup_commands:
+  - |
+    if ! command -v python &> /dev/null; then
+      sudo ln -s $(which python3) /usr/bin/python
+    fi
+  # Format and mount NVMe to /scratch if not already formatted
+  - |
+    sudo chown <ssh-username>:<ssh-username> /opt/dlami/nvme
+    export HF_CACHE=/opt/dlami/nvme/hf_cache
+    export PATH=/home/<ssh-username>/.local/bin:$PATH
+  # Install git if needed
+  - |
+    if ! command -v git &> /dev/null; then
+      sudo apt update
+      sudo apt install -y git
+    fi
+  # Clone your repo if not already present
+  - |
+    if [ ! -d "/home/<ssh-username>/<repo-name>" ]; then
+      git clone <your-repo-url> /home/<ssh-username>/<repo-name>
+    fi
+  - |
+    cd /home/<ssh-username>/<repo-name>
+    ln -s /opt/dlami/nvme data
+  # Install AWS CLI if needed
+  - |
+    if ! command -v aws &> /dev/null; then
+      sudo apt update
+      sudo apt install -y awscli
+    fi
+  # Copy data from S3 to /scratch (optional)
+  # - aws s3 cp --recursive <s3-bucket-path> /home/<ssh-username>/<repo-name>/data/<dataset-dir> --quiet
+  - pip install -q --upgrade pip
+  - pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+  - pip install -q transformers datasets accelerate wandb evaluate tqdm scikit-learn s3fs tokenizers "ray[data,train,tune,serve]" peft
+  # wandb login (optional)
+  # - wandb login <your-wandb-api-key>
+
+file_mounts: {}
+initialization_commands: []
+```
+
+---
+
+## Fine-tuning Config JSON Template
+
+Below is a template for the fine-tuning configuration JSON file used by `ray_fine_tune.py`. Replace all placeholder values (in angle brackets) with your actual configuration.
+
+```json
+{
+  "model_key": "protbert",
+  "dataset_path": "<path-to-hf-dataset>",
+  "checkpoint_path": "<output-checkpoint-dir>",
+  "num_epochs": 3,
+  "batch_size": 32,
+  "learning_rate": 0.0001,
+  "mlm_prob": 0.15,
+  "wandb_project": "<wandb-project-name>",
+  "tokenizer_path": "<path-to-tokenizer>",
+  "gradient_checkpointing": true,
+  "use_lora": false,
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lora_target_modules": ["query", "value"],
+  "lora_dropout": 0.05,
+  "early_stop": true,
+  "early_stopping_patience": 3,
+  "s3_output_path": "<s3-bucket-path>"
+}
+```
+
+--- 
