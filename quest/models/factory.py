@@ -2,7 +2,16 @@
 
 from quest.models.lstm import LSTMGenerator, BiLSTMGenerator
 from quest.models.transformer import DecoderOnlyTransformerGenerator
-def get_model(model_type, vocab_size, embed_size, hidden_size, num_layers, nhead=0, dropout=0):
+# If this factory is not used elsewhere, consider removing it to avoid redundancy.
+def get_model(
+    model_type: str,
+    vocab_size: int,
+    embed_size: int,
+    hidden_size: int,
+    num_layers: int,
+    nhead: int = 0,
+    dropout: float = 0.0
+):
     if model_type == "lstm":
         return LSTMGenerator(vocab_size, embed_size, hidden_size, num_layers)
     elif model_type == "bilstm":
