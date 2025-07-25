@@ -172,6 +172,74 @@ python scripts/ray_train.py \
 - `--use-ray`: Enable Ray distributed training.
 - `--num_workers`: Number of Ray workers (GPUs).
 
+### 4. Ray-based Data Processing (`ray_datawriter.py`)
+
+This script processes raw Parquet files and creates tokenized datasets for training. It supports both HuggingFace models (BERT, ProtBERT, ESM, LLaMA) and custom models (LSTM, Transformer).
+
+**Example usage (local):**
+
+```bash
+# Process data for HuggingFace models (BERT, ProtBERT, ESM, LLaMA)
+python scripts/ray_datawriter.py \
+  --path "data/*.parquet" \
+  --model-name protbert \
+  --output-raw "processed_data" \
+  --max-len 1024 \
+  --use-ray \
+  --num-workers 4
+
+# Process data for custom models (LSTM, Transformer)
+python scripts/ray_datawriter.py \
+  --path "data/*.parquet" \
+  --model-name lstm \
+  --output-raw "processed_data" \
+  --max-len 1024 \
+  --bpe-vocab 200 \
+  --truncate-long \
+  --use-ray \
+  --num-workers 4
+```
+
+**Example usage (AWS with Ray cluster):**
+
+```bash
+# Submit to Ray cluster
+ray submit <path-to-ray-cluster-yaml> scripts/ray_datawriter.py -- \
+  --path "s3://your-bucket/data/*.parquet" \
+  --model-name protbert \
+  --output-raw "s3://your-bucket/processed_data" \
+  --max-len 1024 \
+  --use-ray \
+  --num-workers 8 \
+  --s3-key <your-aws-key> \
+  --s3-secret <your-aws-secret>
+
+# Or using ray job submit
+ray job submit --address='ray://<head-node-ip>:10001' -- \
+  python scripts/ray_datawriter.py \
+  --path "s3://your-bucket/data/*.parquet" \
+  --model-name lstm \
+  --output-raw "s3://your-bucket/processed_data" \
+  --max-len 1024 \
+  --bpe-vocab 200 \
+  --truncate-long \
+  --use-ray \
+  --num-workers 8 \
+  --s3-key <your-aws-key> \
+  --s3-secret <your-aws-secret>
+```
+
+**Key parameters:**
+- `--path`: Path to Parquet files (supports glob patterns and S3 paths)
+- `--model-name`: Model type ('bert', 'protbert', 'esm', 'llama', 'lstm', 'transformer')
+- `--output-raw`: Output directory for processed dataset
+- `--max-len`: Maximum sequence length (default: 1024)
+- `--bpe-vocab`: Vocabulary size for BPE tokenizer (custom models only, default: 200)
+- `--truncate-long`: Truncate long sequences instead of padding
+- `--use-ray`: Enable Ray distributed processing
+- `--num-workers`: Number of Ray workers
+- `--s3-key`, `--s3-secret`: AWS credentials for S3 access
+
 ### 5. Running Locally with Ray (Non-Distributed)
 
 You can use Ray for orchestration on a single machine without launching a distributed cluster. This is useful for debugging or running on a single GPU/CPU, but still benefits from Ray's job management and logging.
@@ -193,6 +261,18 @@ Or for fine-tuning:
 python scripts/ray_fine_tune.py \
   --config <CONFIG_JSON_PATH> \
   --num_workers 1
+```
+
+Or for data processing:
+
+```bash
+python scripts/ray_datawriter.py \
+  --path "data/*.parquet" \
+  --model-name protbert \
+  --output-raw "processed_data" \
+  --max-len 1024 \
+  --use-ray \
+  --num-workers 1
 ```
 
 - The `--use-ray` and `--num_workers 1` flags ensure Ray is used, but only a single worker/process is launched.
