@@ -45,12 +45,15 @@ def cli() -> argparse.Namespace:
     """Define the command-line arguments for the script."""
     p = argparse.ArgumentParser(description="Evaluate a pre-trained MLM using Ray.")
     p.add_argument("--raw_dataset_dir", required=True, help="Path to the RAW dataset")
-    p.add_argument("--model_name", required=True)
+    p.add_argument("--model_name", required=True, help="Path to model (local .pt/.pth file or HuggingFace model name)")
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--mlm_prob", type=float, default=0.15)
     p.add_argument("--schema_path", type=str, default=None, help="Optional: Path to a JSON file defining the dataset schema.")
     p.add_argument("--wandb_project", type=str, default=None, help="W&B project name to log metrics.")
     p.add_argument("--test", action="store_true", help="Run on a smaller subset of the validation data.")
+    p.add_argument("--checkpoint_dir", type=str, default="/home/ubuntu/quest/checkpoints", help="Directory for checkpoints")
+    p.add_argument("--resume_from_checkpoint", action="store_true", help="Resume from existing checkpoint")
+    p.add_argument("--max_length", type=int, default=256, help="Maximum sequence length")
     return p.parse_args()
 
 # ---------------------------------------------------------------------
@@ -173,8 +176,92 @@ def evaluate_func(config: dict[str, Any]) -> None:
     
     # --- 1. Load Model, Tokenizer, and Data ---
     print(f"Loading model and tokenizer '{config['model_name']}'...")
-    model = AutoModelForMaskedLM.from_pretrained(config["model_name"])  # type: ignore
-    tokenizer = AutoTokenizer.from_pretrained(config["model_name"])  # type: ignore
+    
+    # Determine if this is a local custom model or HuggingFace model
+    if os.path.exists(config["model_name"]) and (config["model_name"].endswith('.pt') or config["model_name"].endswith('.pth')):
+        # Local custom model - load using torch.load and custom model architecture
+        print(f"Loading custom local model from {config['model_name']}")
+        checkpoint = torch.load(config["model_name"], map_location='cpu')
+        
+        # Extract model config and create model using factory
+        from quest.models.factory import get_model  # type: ignore
+        model_config = checkpoint.get('model_config', {})
+        model_type = model_config.get('model_type', 'lstm')  # default to lstm
+        vocab_size = model_config.get('vocab_size', 1000)
+        embed_size = model_config.get('embed_size', 128)
+        hidden_size = model_config.get('hidden_size', 256)
+        num_layers = model_config.get('num_layers', 2)
+        nhead = model_config.get('nhead', 8)
+        dropout = model_config.get('dropout', 0.1)
+        
+        if model_type == "transformer":
+            model = get_model(model_type, vocab_size, embed_size, hidden_size, num_layers, nhead, dropout)
+        else:
+            model = get_model(model_type, vocab_size, embed_size, hidden_size, num_layers)
+        
+        # Load state dict
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        
+        # Wrap custom model to provide HuggingFace-compatible interface
+        class CustomModelWrapper:
+            def __init__(self, model):
+                self.model = model
+                self.device = next(model.parameters()).device
+            
+            def __call__(self, input_ids, attention_mask=None, labels=None):
+                logits = self.model(input_ids, attention_mask)
+                
+                # Create outputs similar to HuggingFace format
+                class Outputs:
+                    def __init__(self, logits, loss=None):
+                        self.logits = logits
+                        self.loss = loss
+                
+                # Compute loss if labels provided
+                loss = None
+                if labels is not None:
+                    # Flatten for CrossEntropyLoss: (batch*seq, vocab) and (batch*seq,)
+                    flat_logits = logits.view(-1, logits.size(-1))
+                    flat_labels = labels.view(-1)
+                    # Ignore padded positions (label = -100)
+                    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+                    loss = loss_fn(flat_logits, flat_labels)
+                
+                return Outputs(logits, loss)
+            
+            def eval(self):
+                self.model.eval()
+                return self
+            
+            def to(self, device):
+                self.model = self.model.to(device)
+                self.device = device
+                return self
+                
+            def half(self):
+                self.model = self.model.half()
+                return self
+        
+        # Wrap the model
+        model = CustomModelWrapper(model)
+        
+        # For custom models, we need a compatible tokenizer
+        # This assumes the tokenizer info is also saved in the checkpoint
+        tokenizer_path = model_config.get('tokenizer_path', config["model_name"].replace('.pt', '_tokenizer').replace('.pth', '_tokenizer'))
+        if os.path.exists(tokenizer_path):
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)  # type: ignore
+        else:
+            # Fallback to a default tokenizer - this might need adjustment based on your setup
+            print(f"Warning: No tokenizer found at {tokenizer_path}, using bert-base-cased as fallback")
+            tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")  # type: ignore
+    else:
+        # HuggingFace model
+        print(f"Loading HuggingFace model: {config['model_name']}")
+        model = AutoModelForMaskedLM.from_pretrained(config["model_name"])  # type: ignore
+        tokenizer = AutoTokenizer.from_pretrained(config["model_name"])  # type: ignore
     
     print(f"Loading RAW dataset from {config['raw_dataset_dir']} (validation split)")
     ds = load_from_disk(config["raw_dataset_dir"]) 
