@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 # type: ignore
 """
-datawriter.py  *map-only version*
+datawriter.py  *Ray Data version*
 ──────────────────────────────────────────────
-• Reads Parquet shards (local or s3://)
+• Reads Parquet shards from local filesystem
+• Handles datasets larger than RAM via disk spilling
 • Splits 80/10/10 → train / val / test
 • Two branches controlled by --model-name
 
@@ -17,7 +18,11 @@ datawriter.py  *map-only version*
         ▸ encode via AminoAcidDataset **inside datasets.map**
         ▸ returns DatasetDict with {input_ids,target_ids}
 
-No manual pyarrow writing — all handled by hf dataset `map`.
+Usage:
+    python scripts/ray_datawriter.py \
+        --path "./data/**/*.parquet" \
+        --model-name bert \
+        --output-raw ./output
 """
 
 import os
@@ -27,7 +32,6 @@ from itertools import combinations, permutations
 from pathlib import Path
 from typing import List, Dict, Any
 import numpy
-import s3fs
 from datasets import Dataset, DatasetDict  # Only keep what's needed for final output
 from transformers import AutoTokenizer
 from tqdm.auto import tqdm
@@ -416,7 +420,12 @@ def safe_get(row: Dict[str, Any], key: str) -> str:
     v=row.get(key,"")
     return "" if v in (None,"NA") or (isinstance(v,float) and pd.isna(v)) else v
 
-def deduplicate_ray_data(ds: ray.data.Dataset, mode: str) -> ray.data.Dataset:
+def print_progress(stage: str, message: str, indent: int = 1):
+    """Helper function for consistent progress reporting."""
+    prefix = "   " * indent
+    print(f"{prefix}{stage} {message}", flush=True)
+
+def deduplicate_ray_data(ds: ray.data.Dataset, mode: str) -> tuple:
     """
     Ray Data deduplication - simple and memory-efficient.
 
@@ -425,24 +434,25 @@ def deduplicate_ray_data(ds: ray.data.Dataset, mode: str) -> ray.data.Dataset:
         mode: Analysis mode
 
     Returns:
-        Deduplicated Ray Dataset
+        tuple: (deduplicated_dataset, stats_dict)
     """
-    print(f"🔄 Applying deduplication for mode: {mode}")
+    print(f"\n🔄 DEDUPLICATION PIPELINE (Mode: {mode})")
+    print("=" * 80)
+    stats = {}
+    import time
 
     # Define validation and dedup key function based on mode
     def add_dedup_key(row):
-        """Add validation and dedup key to each row."""
+        """Add validation and dedup key to each row. Returns NEW dict (thread-safe)."""
         if mode == "tra":
             tra = row.get('tra', '')
             valid = bool(tra) and tra != 'NA' and _valid_aa.issuperset(tra)
-            row['_dedup_key'] = tra if valid else ''
-            row['_valid'] = valid
+            return {**row, '_dedup_key': tra if valid else '', '_valid': valid}
 
         elif mode == "trb":
             trb = row.get('trb', '')
             valid = bool(trb) and trb != 'NA' and _valid_aa.issuperset(trb)
-            row['_dedup_key'] = trb if valid else ''
-            row['_valid'] = valid
+            return {**row, '_dedup_key': trb if valid else '', '_valid': valid}
 
         elif mode == "tcr_pairing":
             tra = row.get('tra', '')
@@ -450,8 +460,7 @@ def deduplicate_ray_data(ds: ray.data.Dataset, mode: str) -> ray.data.Dataset:
             tra_valid = bool(tra) and tra != 'NA' and _valid_aa.issuperset(tra)
             trb_valid = bool(trb) and trb != 'NA' and _valid_aa.issuperset(trb)
             valid = tra_valid and trb_valid
-            row['_dedup_key'] = f"{tra}|{trb}" if valid else ''
-            row['_valid'] = valid
+            return {**row, '_dedup_key': f"{tra}|{trb}" if valid else '', '_valid': valid}
 
         elif mode == "mhc_binding":
             pep = row.get('peptide', '')
@@ -461,8 +470,7 @@ def deduplicate_ray_data(ds: ray.data.Dataset, mode: str) -> ray.data.Dataset:
             mho_valid = bool(mho) and mho != 'NA' and _valid_aa.issuperset(mho)
             mht_valid = bool(mht) and mht != 'NA' and _valid_aa.issuperset(mht)
             valid = pep_valid and mho_valid
-            row['_dedup_key'] = f"{pep}|{mho}|{mht if mht_valid else ''}" if valid else ''
-            row['_valid'] = valid
+            return {**row, '_dedup_key': f"{pep}|{mho}|{mht if mht_valid else ''}" if valid else '', '_valid': valid}
 
         elif mode == "specificity":
             tra = row.get('tra', '')
@@ -487,10 +495,11 @@ def deduplicate_ray_data(ds: ray.data.Dataset, mode: str) -> ray.data.Dataset:
                 if tra_valid: parts.append(f"tra:{tra}")
                 if trb_valid: parts.append(f"trb:{trb}")
                 parts.sort()
-                row['_dedup_key'] = '|'.join(parts)
+                dedup_key = '|'.join(parts)
             else:
-                row['_dedup_key'] = ''
-            row['_valid'] = valid
+                dedup_key = ''
+
+            return {**row, '_dedup_key': dedup_key, '_valid': valid}
 
         else:  # default mode
             tra = row.get('tra', '')
@@ -515,39 +524,176 @@ def deduplicate_ray_data(ds: ray.data.Dataset, mode: str) -> ray.data.Dataset:
             valid = len(parts) > 0
             if valid:
                 parts.sort()
-                row['_dedup_key'] = '|'.join(parts)
+                dedup_key = '|'.join(parts)
             else:
-                row['_dedup_key'] = ''
-            row['_valid'] = valid
+                dedup_key = ''
 
-        return row
+            return {**row, '_dedup_key': dedup_key, '_valid': valid}
 
-    # Add dedup keys
-    print("   ⏳ Computing dedup keys...")
-    ds = ds.map(add_dedup_key)
+    # Add dedup keys, filter, and collect ALL sequences for duplicate analysis
+    step_start = time.time()
+    print_progress("⏳", "Step 1/5: Computing deduplication keys and validating sequences...")
+    ds_with_keys = ds.map(add_dedup_key)
+    ds_filtered = ds_with_keys.filter(lambda row: row['_valid'])
 
-    # Filter invalid rows
-    print("   ⏳ Filtering valid sequences...")
-    ds = ds.filter(lambda row: row['_valid'])
+    # Count total input rows BEFORE deduplication (force execution)
+    print_progress("⏳", "Step 2/5: Counting total valid rows (this triggers data loading)...")
+    count_start = time.time()
+    total_before_dedup = ds_filtered.count()
+    count_time = time.time() - count_start
+    print_progress("✓", f"Found {total_before_dedup:,} valid rows (took {count_time:.1f}s)")
 
-    # Drop duplicates using Ray's built-in method (memory-efficient, uses sorting)
-    print("   ⏳ Removing duplicates (streaming sort-based dedup)...")
-    ds = ds.unique(column='_dedup_key')
+    # Collect duplicate statistics by counting occurrences of each key
+    print_progress("⏳", "Step 3/5: Analyzing duplicate patterns...")
+    dup_analysis_start = time.time()
 
-    # Clean up temp columns - use map to remove columns instead of drop_columns
-    print("   ⏳ Cleaning up temp columns...")
-    def remove_temp_cols(row):
-        """Remove temporary dedup columns."""
-        if '_dedup_key' in row:
-            del row['_dedup_key']
-        if '_valid' in row:
-            del row['_valid']
-        return row
+    # Group by dedup_key and count occurrences - need to use Ray Data aggregation
+    # We'll collect the counts from each batch and merge them
+    def count_keys_in_batch(batch):
+        """Count occurrences of each dedup key in this batch. Returns augmented batch with counts."""
+        import pandas as pd
+        df = pd.DataFrame(batch)
+        if len(df) == 0:
+            return df
 
-    ds = ds.map(remove_temp_cols)
+        # Count each key in this batch and store in a new column
+        key_counts = df['_dedup_key'].value_counts().to_dict()
 
-    print("   ✓ Deduplication complete")
-    return ds
+        # Add count column to each row
+        df['_key_count'] = df['_dedup_key'].map(key_counts)
+
+        return df
+
+    # Process all batches to count duplicates within each batch
+    print_progress("   ", "→ Grouping sequences by deduplication key...", indent=2)
+    ds_with_counts = ds_filtered.map_batches(count_keys_in_batch, batch_format="pandas")
+
+    # Now aggregate counts across ALL batches using groupby
+    print_progress("   ", "→ Computing global duplicate counts (this may take several minutes)...", indent=2)
+
+    # Use Ray Data's groupby to get global counts
+    # This is the proper way to collect statistics in distributed Ray Data
+    grouped = ds_with_counts.groupby('_dedup_key').count()
+
+    # Materialize to get the aggregated counts
+    count_results = grouped.materialize()
+
+    # Convert to dictionary for reporting
+    from collections import Counter
+    duplicate_counter = Counter()
+
+    for row in count_results.iter_rows():
+        key = row['_dedup_key']
+        count = row['count()']  # Ray Data's count aggregation column name
+        if key and key != '':
+            duplicate_counter[key] = count
+
+    dup_analysis_time = time.time() - dup_analysis_start
+    print_progress("✓", f"Analyzed {len(duplicate_counter):,} unique sequences (took {dup_analysis_time:.1f}s)")
+
+    # Now do the actual deduplication with sorting
+    print_progress("⏳", "Step 4/5: Sorting dataset by deduplication key (external merge sort)...")
+    sort_start = time.time()
+    ds_sorted = ds_filtered.sort(key='_dedup_key')
+    sort_time = time.time() - sort_start
+    print_progress("✓", f"Sorting complete (took {sort_time:.1f}s)")
+
+    # Final dedup to remove consecutive duplicates
+    print_progress("⏳", "Step 5/5: Removing duplicate rows...")
+    dedup_start = time.time()
+
+    def drop_consecutive_duplicates(batch):
+        """Keep only first occurrence of consecutive duplicate keys."""
+        import pandas as pd
+        df = pd.DataFrame(batch)
+        if len(df) == 0:
+            return df
+
+        # Mark first occurrence of each unique _dedup_key
+        df['_keep'] = df['_dedup_key'].ne(df['_dedup_key'].shift())
+
+        # Filter and drop temp columns
+        df_filtered = df[df['_keep']].drop(columns=['_dedup_key', '_valid', '_keep'])
+
+        return df_filtered
+
+    ds_deduped = ds_sorted.map_batches(drop_consecutive_duplicates, batch_format="pandas")
+
+    # Materialize to get final count (single execution)
+    print_progress("   ", "→ Materializing deduplicated dataset to disk...", indent=2)
+    ds_deduped = ds_deduped.materialize()
+
+    # Get final count (fast after materialization)
+    final_count = ds_deduped.count()
+    dedup_time = time.time() - dedup_start
+    print_progress("✓", f"Removed duplicates (took {dedup_time:.1f}s)")
+
+    # Analyze and report duplicate statistics
+    print("\n" + "="*80)
+    print("📊 DUPLICATE ANALYSIS")
+    print("="*80)
+
+    if duplicate_counter:
+        # Sort by duplicate count (descending)
+        sorted_duplicates = duplicate_counter.most_common()
+
+        # Find sequences with actual duplicates (count > 1)
+        duplicated_sequences = [(k, v) for k, v in sorted_duplicates if v > 1]
+
+        if duplicated_sequences:
+            print(f"Total unique sequences: {len(duplicate_counter):,}")
+            print(f"Sequences with duplicates: {len(duplicated_sequences):,}")
+            print(f"Total duplicate instances removed: {sum(v - 1 for k, v in duplicated_sequences):,}")
+            print(f"\nTop 20 most duplicated sequences:")
+            print("-" * 80)
+
+            for i, (key, count) in enumerate(duplicated_sequences[:20], 1):
+                # Truncate sequence if too long for display
+                display_key = key if len(key) <= 50 else f"{key[:47]}..."
+                print(f"{i:2d}. Count: {count:>10,} | Sequence: {display_key}")
+
+            # Distribution analysis
+            dup_counts = [v for k, v in duplicated_sequences]
+            print(f"\nDuplicate count distribution:")
+            print(f"  Min occurrences: {min(dup_counts):,}")
+            print(f"  Max occurrences: {max(dup_counts):,}")
+            print(f"  Avg occurrences: {sum(dup_counts)/len(dup_counts):.1f}")
+
+            # Save detailed report to file
+            import json
+            report_path = "/tmp/duplicate_report.json"
+            report_data = {
+                'total_unique_sequences': len(duplicate_counter),
+                'sequences_with_duplicates': len(duplicated_sequences),
+                'total_rows_before_dedup': total_before_dedup,
+                'total_rows_after_dedup': final_count,
+                'total_duplicate_instances_removed': sum(v - 1 for k, v in duplicated_sequences),
+                'top_100_duplicates': [
+                    {
+                        'sequence': k,
+                        'count': v,
+                        'duplicates_removed': v - 1
+                    }
+                    for k, v in duplicated_sequences[:100]
+                ]
+            }
+            with open(report_path, 'w') as f:
+                json.dump(report_data, f, indent=2)
+            print(f"\n💾 Detailed duplicate report saved to: {report_path}")
+        else:
+            print("No duplicates found!")
+    else:
+        print("No sequences to analyze!")
+
+    print("="*80 + "\n")
+
+    # Correct stats
+    stats['rows_after_deduplication'] = final_count
+    stats['rows_before_deduplication'] = total_before_dedup
+    stats['duplicate_sequences'] = len([k for k, v in duplicate_counter.items() if v > 1])
+
+    print(f"   ✓ Deduplication complete: {total_before_dedup:,} → {final_count:,} rows")
+    return ds_deduped, stats
 
 # Old HF Datasets dedup function - keep for reference but not used
 def deduplicate_by_mode(ds: Dataset, mode: str, num_proc: int = 10, batch_size: int = 10000) -> Dataset:
@@ -982,9 +1128,6 @@ def cli():
     p.add_argument("--truncate-long",action="store_true")
     p.add_argument("--mlm-prob",type=float,default=0.15,
                    help="Probability of masking tokens in MLM. Default is 0.15.")
-    p.add_argument("--s3-key",default=os.getenv("AWS_ACCESS_KEY_ID"))
-    p.add_argument("--s3-secret",default=os.getenv("AWS_SECRET_ACCESS_KEY"))
-    p.add_argument("--s3-token",default=os.getenv("AWS_SESSION_TOKEN"))
     p.add_argument("--num-proc", type=int, default=None, help="Number of processes for data processing (default: auto-detect)")
     p.add_argument("--batch-size", type=int, default=100000, help="Batch size for dataset processing operations (default: 100000, recommended: 100000-200000 for x2gd.16xlarge with 1TB RAM)")
     p.add_argument("--tmp-dir", type=str, default="tmp_processed", help="Directory for temporary/intermediate files during processing.")
@@ -994,38 +1137,65 @@ def cli():
 
 # Multi-node task distribution helper
 def main():
-    """Ray Data version for large-scale processing."""
+    """
+    Ray Data version for large-scale processing.
+
+    Multi-node best practices implemented:
+    1. Thread-safe: All map functions return NEW dicts (no in-place mutations)
+    2. Fault tolerance: Materialize after major operations to break lineage
+    3. Memory efficient: Disk spilling enabled, streaming operations
+    4. Scalable: Works on single node or distributed Ray cluster
+    """
     args = cli()
 
     # Initialize Ray with disk spilling for datasets larger than RAM
     spill_dir = os.path.join(args.tmp_dir, "ray_spill")
     os.makedirs(spill_dir, exist_ok=True)
 
-    # Configure Ray logging to reduce noise
-    os.environ["RAY_DEDUP_LOGS"] = "1"  # Enable log deduplication (already default, but explicit)
+    # Configure Ray logging to reduce noise - MUST be set before ray.init()
+    os.environ["RAY_DEDUP_LOGS"] = "1"  # Enable log deduplication
     os.environ["RAY_object_spilling_config"] = json.dumps({
         "type": "filesystem",
         "params": {"directory_path": spill_dir}
     })
 
-    # Suppress Ray's verbose logging
+    # Disable Ray Data progress reporting (the verbose logs you're seeing)
+    os.environ["RAY_DATA_DISABLE_PROGRESS_BARS"] = "1"
+    os.environ["RAY_DATA_TRACE_SCHEDULING"] = "0"  # Disable scheduling traces
+    os.environ["RAY_LOG_TO_STDERR"] = "0"  # Disable stderr logging
+
+    # Suppress Ray's verbose logging completely
     import logging
-    logging.getLogger("ray").setLevel(logging.WARNING)
-    logging.getLogger("ray.data").setLevel(logging.WARNING)
+    import warnings
+
+    # Suppress all warnings
+    warnings.filterwarnings("ignore")
+
+    # Set Ray logging to CRITICAL (only fatal errors)
+    logging.getLogger("ray").setLevel(logging.CRITICAL)
+    logging.getLogger("ray.data").setLevel(logging.CRITICAL)
+    logging.getLogger("ray.data._internal").setLevel(logging.CRITICAL)
+    logging.getLogger("ray.data._internal.execution").setLevel(logging.CRITICAL)
+    logging.getLogger("ray.tune").setLevel(logging.CRITICAL)
+    logging.getLogger("ray.rllib").setLevel(logging.CRITICAL)
+    logging.getLogger("ray._private").setLevel(logging.CRITICAL)
 
     ray.init(
         _temp_dir=args.tmp_dir,
         object_store_memory=int(psutil.virtual_memory().available * 0.7),  # Use 70% of RAM for object store
-        logging_level=logging.WARNING,  # Reduce Ray internal logs
-        log_to_driver=False  # Don't log worker outputs to driver (reduces noise)
+        logging_level=logging.CRITICAL,  # Only show critical errors
+        log_to_driver=False,  # Don't log worker outputs to driver
+        configure_logging=True,
+        include_dashboard=False  # Disable dashboard to reduce overhead
     )
 
     # Setup cache directories
     os.makedirs(args.tmp_dir, exist_ok=True)
     os.makedirs(os.path.join(args.tmp_dir, "ray_spill"), exist_ok=True)
 
-    # Ray Data will show progress bars by default
-    # No need to disable logging like we did for HF Datasets
+    # Disable Ray Data progress bars (programmatic way)
+    # Note: ray is already imported at the top of the file
+    ray.data.DataContext.get_current().execution_options.verbose_progress = False
 
     num_proc = args.num_proc or get_num_workers()
     mem = psutil.virtual_memory()
@@ -1056,32 +1226,26 @@ def main():
     # Prepare file paths and resolve globs
     file_paths = args.path if isinstance(args.path, list) else [args.path]
 
-    # Setup filesystem for S3 or local
-    if args.s3_key or any(p.startswith('s3://') for p in file_paths):
-        print("📂 Setting up S3 filesystem...")
-        filesystem = s3fs.S3FileSystem(
-            key=args.s3_key,
-            secret=args.s3_secret,
-            token=args.s3_token
-        )
-        # Resolve S3 globs
-        print(f"🔍 Resolving S3 paths...")
-        all_files = []
-        for pattern in file_paths:
-            # Remove s3:// prefix for s3fs.glob
-            s3_pattern = pattern.replace('s3://', '')
-            matched = filesystem.glob(s3_pattern)
-            # Add s3:// back for Ray Data
-            all_files.extend([f's3://{f}' for f in matched])
-        print(f"Found {len(all_files)} files")
-    else:
-        # Local filesystem glob
-        import glob
-        all_files = []
-        for pattern in file_paths:
-            all_files.extend(glob.glob(pattern, recursive=True))
-        print(f"Found {len(all_files)} files")
-        filesystem = None
+    # Local filesystem glob
+    import glob
+    print(f"🔍 Resolving local paths (including partitioned parquet directories)...")
+    all_files = []
+    for pattern in file_paths:
+        matched = glob.glob(pattern, recursive=True)
+        for match in matched:
+            if os.path.isdir(match):
+                # It's a partitioned parquet directory
+                part_files = glob.glob(os.path.join(match, "*.parquet"))
+                if part_files:
+                    all_files.extend(part_files)
+                else:
+                    # Add directory itself (Ray Data can handle it)
+                    all_files.append(match)
+            else:
+                # It's a single file
+                all_files.append(match)
+
+    print(f"Found {len(all_files)} parquet files/partitions")
 
     # Apply sampling if requested
     if args.sample is not None and args.sample < len(all_files):
@@ -1094,10 +1258,7 @@ def main():
 
     # Load with Ray Data - streaming, never loads full dataset into memory
     print("📂 Loading parquet files with Ray Data (streaming)...")
-    if filesystem:
-        ds = ray.data.read_parquet(all_files, filesystem=filesystem)
-    else:
-        ds = ray.data.read_parquet(all_files)
+    ds = ray.data.read_parquet(all_files)
 
     print(f"✓ Dataset loaded in streaming mode")
 
@@ -1107,12 +1268,21 @@ def main():
     print("="*80)
     import time
     start_time = time.time()
-    ds = deduplicate_ray_data(ds, args.mode)
+    ds, dedup_stats = deduplicate_ray_data(ds, args.mode)
+
+    # Materialize to checkpoint (break lineage for fault tolerance)
+    print("   ⏳ Materializing deduplicated dataset...")
+    ds = ds.materialize()
+
     dedup_time = time.time() - start_time
 
-    # Get count to show results
-    row_count = ds.count()
-    print(f"✅ Deduplication complete: {row_count:,} unique rows in {dedup_time/60:.1f} minutes")
+    # Detailed deduplication summary
+    print("\n" + "="*80)
+    print("📊 DEDUPLICATION SUMMARY")
+    print("="*80)
+    print(f"⏱️  Time: {dedup_time/60:.1f} minutes ({dedup_time:.0f} seconds)")
+    print(f"📤 Final unique rows: {dedup_stats['rows_after_deduplication']:,}")
+    print(f"⚡ Processing speed: {dedup_stats['rows_after_deduplication']/dedup_time:,.0f} rows/sec")
     print("="*80 + "\n")
 
     # Explode sequences for modes that need it
@@ -1133,17 +1303,43 @@ def main():
         ds = ds.flat_map(explode_and_unnest)
         print("   ✓ Explosion complete")
 
+        # Materialize after explosion to break lineage
+        print("   ⏳ Materializing exploded dataset...")
+        ds = ds.materialize()
+
         # Deduplicate exact sequences
         if args.mode in ["mhc_binding", "specificity", "default"]:
             print("🔄 Deduplicating exact sequences...")
 
             def add_seq_dedup_key(row):
-                row['_seq_key'] = '|'.join(str(x) for x in sorted(row['sequence_tuple']))
-                return row
+                """Add sequence dedup key. Returns NEW dict (thread-safe)."""
+                return {**row, '_seq_key': '|'.join(str(x) for x in sorted(row['sequence_tuple']))}
 
             ds = ds.map(add_seq_dedup_key)
-            ds = ds.unique(column='_seq_key')
-            ds = ds.drop_columns(['_seq_key'])
+
+            # Sort and remove consecutive duplicates
+            print("   ⏳ Sorting by sequence key...")
+            ds = ds.sort(key='_seq_key')
+
+            print("   ⏳ Removing duplicate sequences...")
+            def drop_consecutive_seq_duplicates(batch):
+                """Keep only first occurrence of consecutive duplicate sequences."""
+                import pandas as pd
+                df = pd.DataFrame(batch)
+
+                if len(df) == 0:
+                    return df
+
+                # Mark first occurrence
+                df['_keep'] = df['_seq_key'].ne(df['_seq_key'].shift())
+
+                # Filter and drop temp column
+                df_filtered = df[df['_keep']].drop(columns=['_seq_key', '_keep'])
+
+                return df_filtered
+
+            ds = ds.map_batches(drop_consecutive_seq_duplicates, batch_format="pandas")
+
             print("   ✓ Sequence dedup complete\n")
 
     # Split 80/10/10 with Ray Data
@@ -1158,39 +1354,89 @@ def main():
 
     if model_type in ["bert", "protbert", "esm", "llama"]:
         def format_row(row):
-            """Format a single row for transformer models."""
+            """Format a single row for transformer models. Returns NEW dict (thread-safe)."""
             if 'sequence_tuple' in row:
-                # Already exploded
-                row['combo_id'] = format_sequence_for_model(row['sequence_tuple'], model_type)
-                row['combo_feats'] = row['feat_names']
-                # Remove temp columns
-                if 'sequence_tuple' in row:
-                    del row['sequence_tuple']
-                if 'feat_names' in row:
-                    del row['feat_names']
+                # Already exploded - return new dict without temp columns
+                return {
+                    **{k: v for k, v in row.items() if k not in ('sequence_tuple', 'feat_names')},
+                    'combo_id': format_sequence_for_model(row['sequence_tuple'], model_type),
+                    'combo_feats': row['feat_names']
+                }
             else:
                 # Need to explode for tra/trb modes
                 result = explode_example(row, args.mode)
                 if result['sequences']:
                     # Just take first sequence for tra/trb (they're single-molecule)
-                    row['combo_id'] = format_sequence_for_model(result['sequences'][0], model_type)
-                    row['combo_feats'] = result['feat_names'][0]
-            return row
+                    return {
+                        **row,
+                        'combo_id': format_sequence_for_model(result['sequences'][0], model_type),
+                        'combo_feats': result['feat_names'][0]
+                    }
+                return row
 
         print("📝 Formatting train split...")
         train_ds = train_ds.map(format_row)
+        train_count = train_ds.count()
+
         print("📝 Formatting validation split...")
         val_ds = val_ds.map(format_row)
+        val_count = val_ds.count()
+
         print("📝 Formatting test split...")
         test_ds = test_ds.map(format_row)
+        test_count = test_ds.count()
+
+        # Calculate token statistics (sample first 1000 rows)
+        print("\n📊 Computing token statistics...")
+        def count_tokens_in_row(row):
+            """Count tokens in combo_id (space-separated for ProtBERT)."""
+            seq = row.get('combo_id', '')
+            if model_type == "protbert":
+                # ProtBERT uses space-separated amino acids
+                tokens = seq.split()
+            else:
+                # For other models, rough estimate
+                tokens = seq.split()
+            return {'token_count': len(tokens), **row}
+
+        # Sample and compute token stats
+        train_sample = train_ds.limit(1000).map(count_tokens_in_row)
+        token_counts = [row['token_count'] for row in train_sample.take_all()]
+
+        if token_counts:
+            avg_tokens = sum(token_counts) / len(token_counts)
+            min_tokens = min(token_counts)
+            max_tokens = max(token_counts)
+            total_tokens_est = int(avg_tokens * train_count)
+        else:
+            avg_tokens = min_tokens = max_tokens = total_tokens_est = 0
 
         # Save as HF Datasets format (materialize Ray Data to disk)
-        print("💾 Saving to disk...")
+        print("\n💾 Saving to disk...")
         os.makedirs(args.output_raw, exist_ok=True)
         train_ds.write_parquet(os.path.join(args.output_raw, "train"))
         val_ds.write_parquet(os.path.join(args.output_raw, "validation"))
         test_ds.write_parquet(os.path.join(args.output_raw, "test"))
-        print(f"✅ Saved to {args.output_raw}")
+
+        # Final summary
+        print("\n" + "="*80)
+        print(f"📊 FINAL DATASET SUMMARY ({model_type.upper()})")
+        print("="*80)
+        print(f"📁 Output directory: {args.output_raw}")
+        print(f"🧬 Analysis mode: {args.mode}")
+        print(f"\n📦 Split Statistics:")
+        print(f"   Train:      {train_count:>12,} examples ({train_count/(train_count+val_count+test_count)*100:.1f}%)")
+        print(f"   Validation: {val_count:>12,} examples ({val_count/(train_count+val_count+test_count)*100:.1f}%)")
+        print(f"   Test:       {test_count:>12,} examples ({test_count/(train_count+val_count+test_count)*100:.1f}%)")
+        print(f"   Total:      {train_count+val_count+test_count:>12,} examples")
+        print(f"\n🔤 Token Statistics (train split):")
+        print(f"   Average tokens/sequence: {avg_tokens:.1f}")
+        print(f"   Min tokens:              {min_tokens:,}")
+        print(f"   Max tokens:              {max_tokens:,}")
+        print(f"   Estimated total tokens:  {total_tokens_est:,}")
+        print("="*80)
+        print(f"✅ Dataset saved to {args.output_raw}")
+        print("="*80 + "\n")
         
     elif model_type in ["lstm", "transformer"]:
         # Custom BPE path - need to materialize train split for tokenizer training
