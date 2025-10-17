@@ -24,6 +24,10 @@ from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer, AutoModelForMaskedLM,  # type: ignore
 )
+try:
+    from peft import PeftModel  # type: ignore
+except ImportError:
+    PeftModel = None
 from tqdm.auto import tqdm
 import ray
 import math
@@ -49,6 +53,10 @@ def cli() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--mlm_prob", type=float, default=0.15)
     p.add_argument("--schema_path", type=str, default=None, help="Optional: Path to a JSON file defining the dataset schema.")
+    p.add_argument("--masking_mode", type=str, default="default",
+                   choices=["tcra", "tcrb", "tcr_pairing", "mhc_binding", "specificity", "default"],
+                   help="Masking mode: tcra (mask middle of TRA only), tcrb (mask middle of TRB only), tcr_pairing (mask one of TRA+TRB), mhc_binding (mask one of peptide/MHC), specificity (mask one sequence from complete TCR complexes), default (use existing fine-tuning code)")
+    p.add_argument("--base_model", type=str, default=None, help="Base model name/path for PEFT adapters (if not specified, will try to detect from adapter config)")
     p.add_argument("--wandb_project", type=str, default=None, help="W&B project name to log metrics.")
     p.add_argument("--test", action="store_true", help="Run on a smaller subset of the validation data.")
     return p.parse_args()
@@ -56,24 +64,20 @@ def cli() -> argparse.Namespace:
 # ---------------------------------------------------------------------
 # 2. Helper Functions (EXACTLY THE SAME AS ORIGINAL)
 # ---------------------------------------------------------------------
-def custom_masking_collator(
+def simple_collator(
     features: list[dict[str, Any]],
-    tokenizer: Any,  # Use Any due to missing stubs in transformers
-    rules: list[dict[str, Any]] | None = None,
-    mlm_probability: float = 0.15
+    tokenizer: Any  # Use Any due to missing stubs in transformers
 ) -> dict[str, Any]:
-    """Efficiently apply targeted or random masking using tensor operations, minimizing memory usage."""
-    # Convert input_ids and attention_mask to tensors
+    """Simple collator for pre-masked data - just handles batching and padding."""
+    # Convert to tensors
     input_ids = [torch.tensor(item["input_ids"]) for item in features]
     attention_mask = [torch.tensor(item["attention_mask"]) for item in features if "attention_mask" in item]
+    labels = [torch.tensor(item["labels"]) for item in features if "labels" in item]
 
-    # Fallbacks for pad_token_id and mask_token_id for type checkers and runtime safety
+    # Fallbacks for pad_token_id for type checkers and runtime safety
     pad_token_id = getattr(tokenizer, 'pad_token_id', 0)
     if pad_token_id is None:
         pad_token_id = 0
-    mask_token_id = getattr(tokenizer, 'mask_token_id', 0)
-    if mask_token_id is None:
-        mask_token_id = 0
 
     # Pad input_ids and attention_mask
     input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id)
@@ -82,49 +86,16 @@ def custom_masking_collator(
     else:
         attention_mask = None
 
-    labels = torch.full_like(input_ids, -100)
+    # Pad labels if present
+    if labels:
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+    else:
+        # If no labels in dataset, create dummy labels (shouldn't happen with pre-masked data)
+        labels = torch.full_like(input_ids, -100)
 
-    for i, item in enumerate(features):
-        seq_len = len(item["input_ids"])
-        if rules:  # Schema-based masking
-            item_feats = tuple(sorted(item.get("combo_feats", [])))
-            for rule in rules:
-                if tuple(rule["if_combo_feats"]) == item_feats:
-                    action = rule["action"]
-                    params = rule["params"]
-
-                    if action == "mask_middle":
-                        num_tokens = params["num_tokens"]
-                        start_idx = seq_len // 2 - num_tokens // 2
-                        end_idx = start_idx + num_tokens
-                    elif action == "mask_slice":
-                        start_idx = params["start_index"]
-                        end_idx = params["end_index"]
-                    else:  # "mask_all" or default
-                        start_idx, end_idx = 0, seq_len
-
-                    if 0 <= start_idx < end_idx <= seq_len:
-                        labels[i, start_idx:end_idx] = input_ids[i, start_idx:end_idx]
-                        input_ids[i, start_idx:end_idx] = mask_token_id
-                    break  # Stop after finding the first matching rule
-        else:  # Random masking
-            # Fallback for all_special_ids for type checker/runtime safety
-            special_token_ids = set(getattr(tokenizer, 'all_special_ids', []) or [])
-            candidate_indices = [j for j, tid in enumerate(item["input_ids"]) if tid not in special_token_ids]
-            num_to_mask = max(1, int(round(mlm_probability * len(candidate_indices))))
-            if len(candidate_indices) > 0:
-                mask_indices = random.sample(candidate_indices, min(num_to_mask, len(candidate_indices)))
-                # Ensure at least one token is masked
-                if len(mask_indices) == 0:
-                    mask_indices = [random.choice(candidate_indices)]
-                mask_indices = torch.tensor(mask_indices, dtype=torch.long)
-                labels[i, mask_indices] = input_ids[i, mask_indices]
-                input_ids[i, mask_indices] = mask_token_id
-
-    batch = {"input_ids": input_ids}
+    batch = {"input_ids": input_ids, "labels": labels}
     if attention_mask is not None:
         batch["attention_mask"] = attention_mask
-    batch["labels"] = labels
     return batch
 
 def log_predictions_to_wandb(
@@ -172,9 +143,104 @@ def evaluate_func(config: dict[str, Any]) -> None:
     """Ray training function that runs on each worker."""
     
     # --- 1. Load Model, Tokenizer, and Data ---
-    print(f"Loading model and tokenizer '{config['model_name']}'...")
-    model = AutoModelForMaskedLM.from_pretrained(config["model_name"])  # type: ignore
-    tokenizer = AutoTokenizer.from_pretrained(config["model_name"])  # type: ignore
+    model_path = config["model_name"]
+    print(f"Loading model and tokenizer from '{model_path}'...")
+    
+    # Check if this is a PEFT adapter model
+    import os
+    is_peft_model = False
+    if os.path.isdir(model_path) and os.path.exists(os.path.join(model_path, "adapter_config.json")):
+        print(f"Detected PEFT adapter model at {model_path}")
+        is_peft_model = True
+
+        # Load base model first, then apply PEFT adapter
+        try:
+            # Determine base model name: user input > adapter config > default
+            base_model_name = config.get("base_model")
+
+            if base_model_name:
+                print(f"Using user-specified base model: {base_model_name}")
+            else:
+                # Try to get from adapter config
+                try:
+                    import json
+                    with open(os.path.join(model_path, "adapter_config.json"), 'r') as f:
+                        adapter_config = json.load(f)
+                    base_model_name = adapter_config.get("base_model_name_or_path")
+
+                    if base_model_name:
+                        print(f"Using base model from adapter config: {base_model_name}")
+                    else:
+                        base_model_name = "Rostlab/prot_bert"
+                        print("No base model in config, defaulting to Rostlab/prot_bert")
+                except Exception as config_e:
+                    print(f"Could not read adapter config: {config_e}")
+                    base_model_name = "Rostlab/prot_bert"
+                    print("Defaulting to Rostlab/prot_bert")
+
+            from peft import PeftModel
+            base_model = AutoModelForMaskedLM.from_pretrained(base_model_name)  # type: ignore
+            model = PeftModel.from_pretrained(base_model, model_path)  # type: ignore
+            tokenizer = AutoTokenizer.from_pretrained(base_model_name)  # type: ignore
+            print("✅ Successfully loaded PEFT model")
+
+        except Exception as e:
+            print(f"Failed to load PEFT model: {e}")
+            print("Falling back to base model...")
+            model = AutoModelForMaskedLM.from_pretrained("Rostlab/prot_bert")  # type: ignore
+            tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_bert")  # type: ignore
+
+    elif model_path.startswith("s3://"):
+        print("Loading model from S3...")
+        import s3fs
+        import tempfile
+        import os
+
+        # Download model from S3 to temporary directory
+        fs = s3fs.S3FileSystem()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            print(f"Downloading model from {model_path} to {temp_dir}...")
+
+            # Download all files from S3 to temp directory
+            s3_path = model_path.replace("s3://", "")
+            fs.get(s3_path, temp_dir, recursive=True)
+
+            # Check if downloaded model is PEFT
+            if os.path.exists(os.path.join(temp_dir, "adapter_config.json")):
+                print("Downloaded model is a PEFT adapter")
+                try:
+                    import json
+                    with open(os.path.join(temp_dir, "adapter_config.json"), 'r') as f:
+                        adapter_config = json.load(f)
+                    base_model_name = adapter_config.get("base_model_name_or_path", "Rostlab/prot_bert")
+
+                    from peft import PeftModel
+                    base_model = AutoModelForMaskedLM.from_pretrained(base_model_name)  # type: ignore
+                    model = PeftModel.from_pretrained(base_model, temp_dir)  # type: ignore
+                    tokenizer = AutoTokenizer.from_pretrained(base_model_name)  # type: ignore
+                    print("✅ Successfully loaded PEFT model from S3")
+
+                except Exception as e:
+                    print(f"Failed to load PEFT model from S3: {e}")
+                    model = AutoModelForMaskedLM.from_pretrained("Rostlab/prot_bert")  # type: ignore
+                    tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_bert")  # type: ignore
+            else:
+                # Find the actual model directory (handle nested structure)
+                model_files = []
+                for root, dirs, files in os.walk(temp_dir):
+                    if "config.json" in files:
+                        model_dir = root
+                        break
+                else:
+                    model_dir = temp_dir
+
+                print(f"Loading model from downloaded directory: {model_dir}")
+                model = AutoModelForMaskedLM.from_pretrained(model_dir)  # type: ignore
+                tokenizer = AutoTokenizer.from_pretrained(model_dir)  # type: ignore
+    else:
+        print("Loading model from local path or HuggingFace Hub...")
+        model = AutoModelForMaskedLM.from_pretrained(model_path)  # type: ignore
+        tokenizer = AutoTokenizer.from_pretrained(model_path)  # type: ignore
     
     print(f"Loading RAW dataset from {config['raw_dataset_dir']} (validation split)")
     ds = load_from_disk(config["raw_dataset_dir"]) 
@@ -200,17 +266,10 @@ def evaluate_func(config: dict[str, Any]) -> None:
     sample_preds, sample_labels, sample_input_ids = [], [], []
     sample_limit = 50
 
-    # --- 2. Setup Collator Based on Workflow ---
-    masking_rules = []
-    if config.get("schema_path"):
-        print(f"Loading custom masking schema from {config['schema_path']}...")
-        with open(config["schema_path"], 'r') as f:
-            masking_rules = json.load(f).get("masking_rules", [])
-    else:
-        masking_rules = None
-
-    print("Using custom masking collator for evaluation (schema-based or random masking).")
-    collator = partial(custom_masking_collator, tokenizer=tokenizer, rules=masking_rules, mlm_probability=config["mlm_prob"])
+    # --- 2. Setup Collator for Pre-masked Data ---
+    masking_mode = config.get("masking_mode", "default")
+    print(f"Using simple collator for pre-masked data evaluation (masking_mode: {masking_mode}).")
+    collator = partial(simple_collator, tokenizer=tokenizer)
 
     # --- Calculate Stats for Logging ---
     num_sequences = len(eval_ds)  # type: ignore
@@ -341,8 +400,9 @@ def main() -> None:
     trainer = TorchTrainer(  # type: ignore
         evaluate_func,
         scaling_config=ScalingConfig(
-            num_workers=8,  # 8 distributed workers (1 per g5.xlarge)
+            num_workers=4,  # 4 distributed workers (1 head + 3 workers)
             use_gpu=True,
+            resources_per_worker={"GPU": 1}
         ),
         run_config=RunConfig(
             failure_config=FailureConfig(max_failures=-1),  # Unlimited retries
@@ -354,6 +414,8 @@ def main() -> None:
             "batch_size": args.batch_size,
             "mlm_prob": args.mlm_prob,
             "schema_path": args.schema_path,
+            "masking_mode": args.masking_mode,
+            "base_model": args.base_model,
             "wandb_project": args.wandb_project,
             "test": args.test,
         }

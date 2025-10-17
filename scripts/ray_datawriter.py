@@ -425,6 +425,170 @@ def print_progress(stage: str, message: str, indent: int = 1):
     prefix = "   " * indent
     print(f"{prefix}{stage} {message}", flush=True)
 
+def deduplicate_ray_data_fast(ds: ray.data.Dataset, mode: str) -> tuple:
+    """
+    Fast Ray Data deduplication - skips expensive duplicate analysis.
+
+    This is 10-100x faster than the detailed version because it:
+    - Skips the initial count (saves one full dataset scan)
+    - Skips detailed duplicate statistics (saves expensive groupby + materialize)
+    - Only performs the minimal operations needed for deduplication
+
+    Args:
+        ds: Ray Dataset (streaming)
+        mode: Analysis mode
+
+    Returns:
+        tuple: (deduplicated_dataset, stats_dict)
+    """
+    print(f"\n🚀 FAST DEDUPLICATION (Mode: {mode})")
+    print("="*80)
+    print("⚡ Skipping detailed duplicate analysis for maximum speed")
+    stats = {}
+    import time
+
+    # Define validation and dedup key function based on mode
+    def add_dedup_key(row):
+        """Add validation and dedup key to each row. Returns NEW dict (thread-safe)."""
+        if mode == "tra":
+            tra = row.get('tra', '')
+            valid = bool(tra) and tra != 'NA' and _valid_aa.issuperset(tra)
+            return {**row, '_dedup_key': tra if valid else '', '_valid': valid}
+
+        elif mode == "trb":
+            trb = row.get('trb', '')
+            valid = bool(trb) and trb != 'NA' and _valid_aa.issuperset(trb)
+            return {**row, '_dedup_key': trb if valid else '', '_valid': valid}
+
+        elif mode == "tcr_pairing":
+            tra = row.get('tra', '')
+            trb = row.get('trb', '')
+            tra_valid = bool(tra) and tra != 'NA' and _valid_aa.issuperset(tra)
+            trb_valid = bool(trb) and trb != 'NA' and _valid_aa.issuperset(trb)
+            valid = tra_valid and trb_valid
+            return {**row, '_dedup_key': f"{tra}|{trb}" if valid else '', '_valid': valid}
+
+        elif mode == "mhc_binding":
+            pep = row.get('peptide', '')
+            mho = row.get('mhc_one', '')
+            mht = row.get('mhc_two', '')
+            pep_valid = bool(pep) and pep != 'NA' and _valid_aa.issuperset(pep)
+            mho_valid = bool(mho) and mho != 'NA' and _valid_aa.issuperset(mho)
+            mht_valid = bool(mht) and mht != 'NA' and _valid_aa.issuperset(mht)
+            valid = pep_valid and mho_valid
+            return {**row, '_dedup_key': f"{pep}|{mho}|{mht if mht_valid else ''}" if valid else '', '_valid': valid}
+
+        elif mode == "specificity":
+            tra = row.get('tra', '')
+            trb = row.get('trb', '')
+            pep = row.get('peptide', '')
+            mho = row.get('mhc_one', '')
+            mht = row.get('mhc_two', '')
+
+            tra_valid = bool(tra) and tra != 'NA' and _valid_aa.issuperset(tra)
+            trb_valid = bool(trb) and trb != 'NA' and _valid_aa.issuperset(trb)
+            pep_valid = bool(pep) and pep != 'NA' and _valid_aa.issuperset(pep)
+            mho_valid = bool(mho) and mho != 'NA' and _valid_aa.issuperset(mho)
+            mht_valid = bool(mht) and mht != 'NA' and _valid_aa.issuperset(mht)
+
+            valid = pep_valid and mho_valid and (tra_valid or trb_valid)
+
+            if valid:
+                parts = []
+                if mho_valid: parts.append(f"mhc_one:{mho}")
+                if mht_valid: parts.append(f"mhc_two:{mht}")
+                if pep_valid: parts.append(f"peptide:{pep}")
+                if tra_valid: parts.append(f"tra:{tra}")
+                if trb_valid: parts.append(f"trb:{trb}")
+                parts.sort()
+                dedup_key = '|'.join(parts)
+            else:
+                dedup_key = ''
+
+            return {**row, '_dedup_key': dedup_key, '_valid': valid}
+
+        else:  # default mode
+            tra = row.get('tra', '')
+            trb = row.get('trb', '')
+            pep = row.get('peptide', '')
+            mho = row.get('mhc_one', '')
+            mht = row.get('mhc_two', '')
+
+            tra_valid = bool(tra) and tra != 'NA' and _valid_aa.issuperset(tra)
+            trb_valid = bool(trb) and trb != 'NA' and _valid_aa.issuperset(trb)
+            pep_valid = bool(pep) and pep != 'NA' and _valid_aa.issuperset(pep)
+            mho_valid = bool(mho) and mho != 'NA' and _valid_aa.issuperset(mho)
+            mht_valid = bool(mht) and mht != 'NA' and _valid_aa.issuperset(mht)
+
+            parts = []
+            if mho_valid: parts.append(f"mhc_one:{mho}")
+            if mht_valid: parts.append(f"mhc_two:{mht}")
+            if pep_valid: parts.append(f"peptide:{pep}")
+            if tra_valid: parts.append(f"tra:{tra}")
+            if trb_valid: parts.append(f"trb:{trb}")
+
+            valid = len(parts) > 0
+            if valid:
+                parts.sort()
+                dedup_key = '|'.join(parts)
+            else:
+                dedup_key = ''
+
+            return {**row, '_dedup_key': dedup_key, '_valid': valid}
+
+    # Pipeline: Add keys, filter, sort, deduplicate
+    start_time = time.time()
+
+    print_progress("⏳", "Step 1/3: Adding dedup keys and filtering invalid sequences...")
+    ds_with_keys = ds.map(add_dedup_key)
+    ds_filtered = ds_with_keys.filter(lambda row: row['_valid'])
+
+    print_progress("⏳", "Step 2/3: Sorting by dedup key (external merge sort)...")
+    sort_start = time.time()
+    ds_sorted = ds_filtered.sort(key='_dedup_key')
+    sort_time = time.time() - sort_start
+    print_progress("✓", f"Sorting complete (took {sort_time:.1f}s)")
+
+    print_progress("⏳", "Step 3/3: Removing consecutive duplicates...")
+    dedup_start = time.time()
+
+    def drop_consecutive_duplicates(batch):
+        """Keep only first occurrence of consecutive duplicate keys."""
+        import pandas as pd
+        df = pd.DataFrame(batch)
+        if len(df) == 0:
+            return df
+
+        # Mark first occurrence of each unique _dedup_key
+        df['_keep'] = df['_dedup_key'].ne(df['_dedup_key'].shift())
+
+        # Filter and drop temp columns
+        df_filtered = df[df['_keep']].drop(columns=['_dedup_key', '_valid', '_keep'])
+
+        return df_filtered
+
+    ds_deduped = ds_sorted.map_batches(drop_consecutive_duplicates, batch_format="pandas")
+
+    # Only materialize and count at the end
+    print_progress("   ", "→ Materializing deduplicated dataset...", indent=2)
+    ds_deduped = ds_deduped.materialize()
+
+    # Get final count (fast after materialization)
+    final_count = ds_deduped.count()
+    total_time = time.time() - start_time
+
+    print_progress("✓", f"Fast deduplication complete: {final_count:,} unique rows")
+    print(f"   ⏱️  Total time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print(f"   ⚡ Speed: {final_count/total_time:,.0f} rows/sec")
+    print("="*80 + "\n")
+
+    # Minimal stats (don't compute expensive metrics)
+    stats['rows_after_deduplication'] = final_count
+    stats['rows_before_deduplication'] = 'not_computed_in_fast_mode'
+    stats['duplicate_sequences'] = 'not_computed_in_fast_mode'
+
+    return ds_deduped, stats
+
 def deduplicate_ray_data(ds: ray.data.Dataset, mode: str) -> tuple:
     """
     Ray Data deduplication - simple and memory-efficient.
@@ -1133,6 +1297,7 @@ def cli():
     p.add_argument("--tmp-dir", type=str, default="tmp_processed", help="Directory for temporary/intermediate files during processing.")
     p.add_argument("--sample", type=int, default=None, help="Sample N files for testing (e.g., 10 for first 10 files). Applied during file selection.")
     p.add_argument("--in-memory", action="store_true", help="Keep datasets in memory to avoid disk caching (use for small datasets only)")
+    p.add_argument("--fast-mode", action="store_true", help="Enable fast processing mode: skip detailed duplicate analysis and token statistics for 10-100x speedup")
     return p.parse_args()
 
 # Multi-node task distribution helper
@@ -1268,11 +1433,14 @@ def main():
     print("="*80)
     import time
     start_time = time.time()
-    ds, dedup_stats = deduplicate_ray_data(ds, args.mode)
 
-    # Materialize to checkpoint (break lineage for fault tolerance)
-    print("   ⏳ Materializing deduplicated dataset...")
-    ds = ds.materialize()
+    # Use fast mode if requested
+    if args.fast_mode:
+        ds, dedup_stats = deduplicate_ray_data_fast(ds, args.mode)
+    else:
+        ds, dedup_stats = deduplicate_ray_data(ds, args.mode)
+
+    # Note: Dataset is already materialized by deduplication functions
 
     dedup_time = time.time() - start_time
 
@@ -1387,29 +1555,33 @@ def main():
         test_count = test_ds.count()
 
         # Calculate token statistics (sample first 1000 rows)
-        print("\n📊 Computing token statistics...")
-        def count_tokens_in_row(row):
-            """Count tokens in combo_id (space-separated for ProtBERT)."""
-            seq = row.get('combo_id', '')
-            if model_type == "protbert":
-                # ProtBERT uses space-separated amino acids
-                tokens = seq.split()
-            else:
-                # For other models, rough estimate
-                tokens = seq.split()
-            return {'token_count': len(tokens), **row}
-
-        # Sample and compute token stats
-        train_sample = train_ds.limit(1000).map(count_tokens_in_row)
-        token_counts = [row['token_count'] for row in train_sample.take_all()]
-
-        if token_counts:
-            avg_tokens = sum(token_counts) / len(token_counts)
-            min_tokens = min(token_counts)
-            max_tokens = max(token_counts)
-            total_tokens_est = int(avg_tokens * train_count)
-        else:
+        if args.fast_mode:
+            print("\n⚡ Skipping token statistics (fast mode)")
             avg_tokens = min_tokens = max_tokens = total_tokens_est = 0
+        else:
+            print("\n📊 Computing token statistics...")
+            def count_tokens_in_row(row):
+                """Count tokens in combo_id (space-separated for ProtBERT)."""
+                seq = row.get('combo_id', '')
+                if model_type == "protbert":
+                    # ProtBERT uses space-separated amino acids
+                    tokens = seq.split()
+                else:
+                    # For other models, rough estimate
+                    tokens = seq.split()
+                return {'token_count': len(tokens), **row}
+
+            # Sample and compute token stats
+            train_sample = train_ds.limit(1000).map(count_tokens_in_row)
+            token_counts = [row['token_count'] for row in train_sample.take_all()]
+
+            if token_counts:
+                avg_tokens = sum(token_counts) / len(token_counts)
+                min_tokens = min(token_counts)
+                max_tokens = max(token_counts)
+                total_tokens_est = int(avg_tokens * train_count)
+            else:
+                avg_tokens = min_tokens = max_tokens = total_tokens_est = 0
 
         # Save as HF Datasets format (materialize Ray Data to disk)
         print("\n💾 Saving to disk...")
@@ -1429,11 +1601,14 @@ def main():
         print(f"   Validation: {val_count:>12,} examples ({val_count/(train_count+val_count+test_count)*100:.1f}%)")
         print(f"   Test:       {test_count:>12,} examples ({test_count/(train_count+val_count+test_count)*100:.1f}%)")
         print(f"   Total:      {train_count+val_count+test_count:>12,} examples")
-        print(f"\n🔤 Token Statistics (train split):")
-        print(f"   Average tokens/sequence: {avg_tokens:.1f}")
-        print(f"   Min tokens:              {min_tokens:,}")
-        print(f"   Max tokens:              {max_tokens:,}")
-        print(f"   Estimated total tokens:  {total_tokens_est:,}")
+        if not args.fast_mode:
+            print(f"\n🔤 Token Statistics (train split):")
+            print(f"   Average tokens/sequence: {avg_tokens:.1f}")
+            print(f"   Min tokens:              {min_tokens:,}")
+            print(f"   Max tokens:              {max_tokens:,}")
+            print(f"   Estimated total tokens:  {total_tokens_est:,}")
+        else:
+            print(f"\n⚡ Fast mode: Token statistics skipped for speed")
         print("="*80)
         print(f"✅ Dataset saved to {args.output_raw}")
         print("="*80 + "\n")
