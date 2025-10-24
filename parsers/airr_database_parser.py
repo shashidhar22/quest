@@ -53,14 +53,24 @@ class DatabaseParser:
         self,
         out_prefix: Optional[Path] = None,
         compression: str = "snappy",
-    ) -> Tuple[Path, Path]:
+    ) -> dict:
         """
-        Parse each of the individual databases and return two *dask.delayed* objects:
-            - mri_delayed : combined MRI table
-            - seq_delayed : combined sequence table
+        Parse each of the individual databases and write to parquet files.
+        
+        Returns:
+            dict: Statistics including total_mri_rows, total_seq_rows, databases_parsed
         """
         log = logging.getLogger(__name__)
         log.info("⇢ Starting parse()")
+        
+        # Verify config has required keys
+        if 'databases' not in self.config:
+            log.error("  ✗ Config missing 'databases' key")
+            return {'total_mri_rows': 0, 'total_seq_rows': 0, 'databases_parsed': 0}
+        
+        log.info(f"  ↳ Output directory: {self.output_path}")
+        log.info(f"  ↳ MRI directory: {self._mri_dir}")
+        log.info(f"  ↳ Seq directory: {self._seq_dir}")
 
         # name, function pairs in the order you want them run
         parse_fns = [
@@ -71,6 +81,9 @@ class DatabaseParser:
         ]
 
         mri_list, seq_list = [], []
+        total_mri_rows = 0
+        total_seq_rows = 0
+        databases_parsed = 0
 
         for label, fn in parse_fns:
             if os.path.exists(self._mri_dir / f"{label}_mri.parquet"):
@@ -78,14 +91,45 @@ class DatabaseParser:
                 continue
             log.info("  ↳ Parsing %s …", label)
             t0 = time.time()
-            mri_df, seq_df = fn()  # each helper returns *combined* tables
+            
+            try:
+                result = fn()  # each helper returns *combined* tables
+                
+                # Handle case where function returns None
+                if result is None:
+                    log.warning(f"    ✗ {label} returned None - likely missing file")
+                    continue
+                
+                mri_df, seq_df = result
+                
+                # Handle empty dataframes
+                if mri_df is None or seq_df is None:
+                    log.warning(f"    ✗ {label} returned None dataframes - likely missing file")
+                    continue
+                    
+            except Exception as e:
+                log.error(f"    ✗ {label} failed with error: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+            
             dt = time.time() - t0
+            
+            # Count rows before deletion
+            mri_rows = len(mri_df) if not mri_df.empty else 0
+            seq_rows = len(seq_df) if not seq_df.empty else 0
+            total_mri_rows += mri_rows
+            total_seq_rows += seq_rows
+            
+            if mri_rows > 0 or seq_rows > 0:
+                databases_parsed += 1
+            
             log.info(
                 "    ✓ %s done in %.2fs (MRI rows=%s, Seq rows=%s)",
                 label,
                 dt,
-                f"{len(mri_df):,}",
-                f"{len(seq_df):,}",
+                f"{mri_rows:,}",
+                f"{seq_rows:,}",
             )
 
             # Write the aggregated result as well (handy for global analyses)
@@ -104,12 +148,12 @@ class DatabaseParser:
         log.info("  ↳ Parsing iReceptor …")
         self._parse_ireceptor()
 
-        #log.info("⇢ Building delayed concatenations")
-        #mri_delayed = delayed_concat(mri_list)
-        #seq_delayed = delayed_concat(seq_list)
-
-        #log.info("⇢ parse() finished—returning Delayed objects")
-        #return mri_delayed, seq_delayed
+        log.info("⇢ parse() finished")
+        return {
+            'total_mri_rows': total_mri_rows,
+            'total_seq_rows': total_seq_rows,
+            'databases_parsed': len(parse_fns) + 1  # +1 for iReceptor
+        }
 
     # ----------------------------------------------------------------------
     #                           VDJdb
@@ -117,28 +161,37 @@ class DatabaseParser:
     def _parse_vdjdb(self):
         """
         Parse the VDJdb dataset using pandas in memory.
+        VDJdb format: Long format with one row per chain (TRA or TRB).
         Returns:
             (mri_table, sequence_table)
         """
+        log = logging.getLogger(__name__)
         database_path = self.config['databases']['vdjdb']
 
         try:
             df = pd.read_csv(database_path, sep="\t", dtype=str, na_filter=False)
         except FileNotFoundError:
-            print(f"File not found: {database_path}")
+            log.error(f"    ✗ VDJdb file not found: {database_path}")
+            return pd.DataFrame(), pd.DataFrame()
+        except Exception as e:
+            log.error(f"    ✗ VDJdb error reading file: {e}")
             return pd.DataFrame(), pd.DataFrame()
 
         if self.test and not df.empty:
             df = df.sample(frac=0.1, random_state=21)
 
-        relevant_columns = OrderedDict({
-            'cdr3.alpha': 'tra',
-            'v.alpha': 'trav_gene',
-            'j.alpha': 'traj_gene',
-            'cdr3.beta': 'trb',
-            'v.beta': 'trbv_gene',
-            'd.beta': 'trbd_gene',
-            'j.beta': 'trbj_gene',
+        # Filter for HomoSapiens and vdjdb.score != '0'
+        if 'species' in df.columns and 'vdjdb.score' in df.columns:
+            df = df[
+                (df['species'] == 'HomoSapiens') &
+                (df['vdjdb.score'] != '0')
+            ]
+
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        # Parse metadata columns
+        meta_cols = {
             'species': 'host_organism',
             'mhc.a': 'mhc_restriction',
             'mhc.b': 'mhc_restriction_two',
@@ -146,27 +199,96 @@ class DatabaseParser:
             'antigen.epitope': 'peptide',
             'antigen.gene': 'epitope_source_molecule',
             'antigen.species': 'epitope_source_organism',
-            'reference.id': 'study_id',
-            'method.verification': 'assay_method',
-            'meta.epitope.id': 'epitope_reference_name',
-            'meta.tissue': 'source_tissue',
-            'meta.donor.MHC': 'mhc_profile',
+            'reference.id': 'study_id'
+        }
+        
+        # Add optional metadata columns
+        optional_meta = {
+            'method': 'assay_method',
             'vdjdb.score': 'vdjdb_score'
-        })
+        }
+        
+        # Rename columns that exist
+        rename_map = {}
+        for old_col, new_col in {**meta_cols, **optional_meta}.items():
+            if old_col in df.columns:
+                rename_map[old_col] = new_col
+        
+        df.rename(columns=rename_map, inplace=True)
 
-        # Filter for HomoSapiens and 'vdjdb.score' != '0'
-        df = df[
-            (df['species'] == 'HomoSapiens') &
-            (df['vdjdb.score'] != '0')
+        # Separate TRA and TRB rows
+        tra_df = df[df['gene'] == 'TRA'].copy()
+        trb_df = df[df['gene'] == 'TRB'].copy()
+
+        # Rename chain-specific columns
+        tra_df.rename(columns={
+            'cdr3': 'tra',
+            'v.segm': 'trav_gene',
+            'j.segm': 'traj_gene'
+        }, inplace=True)
+
+        trb_df.rename(columns={
+            'cdr3': 'trb',
+            'v.segm': 'trbv_gene',
+            'j.segm': 'trbj_gene'
+        }, inplace=True)
+
+        # Add empty columns for missing chain data
+        for col in ['trb', 'trbv_gene', 'trbj_gene', 'trbd_gene']:
+            if col not in tra_df.columns:
+                tra_df[col] = ""
+        
+        for col in ['tra', 'trav_gene', 'traj_gene', 'trad_gene']:
+            if col not in trb_df.columns:
+                trb_df[col] = ""
+
+        # Merge on complex.id to reconstruct paired chains
+        common_cols = ['complex.id'] + list(rename_map.values())
+        common_cols = [c for c in common_cols if c in tra_df.columns and c in trb_df.columns]
+        
+        # Select relevant columns for merge
+        tra_merge_cols = common_cols + ['tra', 'trav_gene', 'traj_gene']
+        trb_merge_cols = common_cols + ['trb', 'trbv_gene', 'trbj_gene']
+        
+        tra_merge_cols = [c for c in tra_merge_cols if c in tra_df.columns]
+        trb_merge_cols = [c for c in trb_merge_cols if c in trb_df.columns]
+
+        # Merge paired chains
+        if 'complex.id' in df.columns:
+            df = pd.merge(
+                tra_df[tra_merge_cols],
+                trb_df[trb_merge_cols],
+                on='complex.id',
+                how='outer',
+                suffixes=('', '_y')
+            )
+            
+            # Merge metadata columns that got duplicated
+            for col in rename_map.values():
+                if f'{col}_y' in df.columns:
+                    df[col] = df[col].fillna(df[f'{col}_y'])
+                    df.drop(columns=[f'{col}_y'], inplace=True)
+        else:
+            # If no complex.id, concatenate all rows
+            df = pd.concat([tra_df, trb_df], axis=0, ignore_index=True)
+
+        # Ensure all required columns exist
+        required_cols = [
+            'tra', 'trav_gene', 'traj_gene', 
+            'trb', 'trbv_gene', 'trbj_gene', 'trbd_gene',
+            'peptide', 'mhc_restriction', 'mhc_restriction_two',
+            'host_organism', 'study_id', 'mhc_class',
+            'epitope_source_molecule', 'epitope_source_organism'
         ]
-
-        if df.empty:
-            return pd.DataFrame(), pd.DataFrame()
-
-        df = df[list(relevant_columns.keys())].rename(columns=relevant_columns)
+        
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = ""
 
         # MRI table
-        mri_table = df.drop(columns=['vdjdb_score'], errors='ignore').copy()
+        mri_cols = [c for c in df.columns if c not in ['vdjdb_score', 'gene', 'complex.id']]
+        mri_table = df[mri_cols].copy()
+        mri_table['data_source'] = 'vdjdb'
 
         # Sequence table
         seq_cols = [
@@ -174,7 +296,7 @@ class DatabaseParser:
             'trbv_gene', 'trbd_gene', 'trbj_gene', 'trb',
             'peptide', 'mhc_restriction', 'mhc_restriction_two'
         ]
-        sequence_table = mri_table[seq_cols].copy()
+        sequence_table = df[seq_cols].copy()
         # Transform MHC
         try:
             sequence_table['mhc_restriction'] = transform_mhc_restriction(
@@ -216,10 +338,11 @@ class DatabaseParser:
         Returns:
             (mri_table, sequence_table)
         """
+        log = logging.getLogger(__name__)
         database_path = Path(self.config['databases']['tcrdb'])
         tsv_files = list(database_path.rglob("*.tsv"))
         if not tsv_files:
-            print(f"No TSV files found in {database_path}")
+            log.error(f"    ✗ No TSV files found in {database_path}")
             return pd.DataFrame(), pd.DataFrame()
 
         all_mri = []
@@ -270,11 +393,15 @@ class DatabaseParser:
         Returns:
             (mri_table, sequence_table)
         """
+        log = logging.getLogger(__name__)
         database_path = self.config['databases']['mcpas_tcr']
         try:
             df = pd.read_csv(database_path, dtype=str, na_filter=False)
         except FileNotFoundError:
-            print(f"File not found: {database_path}")
+            log.error(f"    ✗ McPAS file not found: {database_path}")
+            return pd.DataFrame(), pd.DataFrame()
+        except Exception as e:
+            log.error(f"    ✗ McPAS error reading file: {e}")
             return pd.DataFrame(), pd.DataFrame()
 
         if df.empty:
@@ -407,7 +534,8 @@ class DatabaseParser:
         try:
             df = pd.read_csv(file_path, sep="\t", names=col_names, header=0, dtype=str, na_filter=False)
         except FileNotFoundError:
-            print(f"File not found: {file_path}")
+            log = logging.getLogger(__name__)
+            log.error(f"    ✗ {source} tcell_assay file not found: {file_path}")
             return pd.DataFrame(), pd.DataFrame()
         if df.empty:
             return pd.DataFrame(), pd.DataFrame()
@@ -508,7 +636,8 @@ class DatabaseParser:
                 na_filter=False
             )
         except FileNotFoundError:
-            print(f"File not found: {file_path}")
+            log = logging.getLogger(__name__)
+            log.error(f"    ✗ {source} mhc_ligand file not found: {file_path}")
             return pd.DataFrame(), pd.DataFrame()
 
         if df.empty:
@@ -610,7 +739,8 @@ class DatabaseParser:
                 na_filter=False
             )
         except FileNotFoundError:
-            print(f"File not found: {file_path}")
+            log = logging.getLogger(__name__)
+            log.error(f"    ✗ {source} receptor file not found: {file_path}")
             return pd.DataFrame(), pd.DataFrame()
         if df.empty:
             return pd.DataFrame(), pd.DataFrame()
@@ -836,15 +966,26 @@ class DatabaseParser:
         if not db_path:
             return dd.from_pandas(pd.DataFrame(), 1), dd.from_pandas(pd.DataFrame(), 1)
 
-        df = dd.read_csv(db_path,
-                        sep="\t",
-                        dtype=str,
-                        na_filter=False,
-                        blocksize="64 MB",
-                        assume_missing=True)
-
+        # For test mode, read only a small portion of the file
+        # This avoids loading massive files (e.g., 112GB paone) into memory
         if self.test:
-            df = df.sample(frac=0.10, random_state=21)
+            # Read first 10% of blocks instead of sampling entire file
+            df = dd.read_csv(db_path,
+                            sep="\t",
+                            dtype=str,
+                            na_filter=False,
+                            blocksize="64 MB",
+                            assume_missing=True)
+            # Only take first few partitions for testing
+            n_partitions = max(1, df.npartitions // 10)
+            df = df.head(n_partitions * 200_000, npartitions=-1, compute=False)
+        else:
+            df = dd.read_csv(db_path,
+                            sep="\t",
+                            dtype=str,
+                            na_filter=False,
+                            blocksize="64 MB",
+                            assume_missing=True)
 
         df  = df[df.productive == "T"]
 
