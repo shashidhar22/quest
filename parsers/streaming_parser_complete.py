@@ -35,6 +35,12 @@ from .utils import (
     format_combined_tcell
 )
 
+try:
+    from .tcr_stitcher import TCRStitcher
+    STITCHER_AVAILABLE = True
+except ImportError:
+    STITCHER_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,13 +62,15 @@ class StreamingParserComplete:
         output_dir: str,
         chunk_size: int = 100_000,
         compression: str = 'snappy',
-        test_mode: bool = False
+        test_mode: bool = False,
+        enable_stitching: bool = False
     ):
         self.format_config = format_config
         self.output_dir = Path(output_dir)
         self.chunk_size = chunk_size
         self.compression = compression
         self.test_mode = test_mode
+        self.enable_stitching = enable_stitching
         
         # Create output directories
         self.mri_dir = self.output_dir / "mri"
@@ -73,6 +81,15 @@ class StreamingParserComplete:
         # Load format definitions
         with open(self.format_config, 'r') as f:
             self.format_dict = yaml.safe_load(f)
+        
+        # Initialize TCR stitcher if enabled
+        if self.enable_stitching and STITCHER_AVAILABLE:
+            self.stitcher = TCRStitcher(species="HUMAN")
+            logger.info("TCR stitching enabled")
+        else:
+            self.stitcher = None
+            if self.enable_stitching and not STITCHER_AVAILABLE:
+                logger.warning("TCR stitching requested but stitcher not available")
     
     def detect_format(self, file_path: str) -> Tuple[str, str, str]:
         """
@@ -128,6 +145,24 @@ class StreamingParserComplete:
                     return format_type, format_name, delimiter
         
         raise ValueError(f"Unknown format for {file_path}. Columns: {columns}")
+    
+    def _apply_stitching(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply TCR stitching to add full-length sequences if enabled.
+        
+        Args:
+            df: DataFrame with TCR data
+        
+        Returns:
+            DataFrame with tra_full and trb_full columns added
+        """
+        if self.stitcher is not None and not df.empty:
+            df = self.stitcher.process_dataframe(df)
+        else:
+            # Add empty columns if stitching disabled
+            df['tra_full'] = ''
+            df['trb_full'] = ''
+        return df
     
     def parse_file_streaming(
         self,
@@ -300,13 +335,16 @@ class StreamingParserComplete:
         chunk['host_organism'] = 'human'
         chunk['source'] = f'bulk_survey_{format_name}'
         
+        # Apply TCR stitching before building tables
+        chunk = self._apply_stitching(chunk)
+        
         # Build MRI table
         mri_table = standardize_mri(chunk)
         
         # Build sequence table (deduplicated)
         seq_cols = ['tra', 'trad_gene', 'traj_gene', 'trav_gene',
                     'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 
-                    'peptide', 'mhc_one', 'mhc_two']
+                    'peptide', 'mhc_one', 'mhc_two', 'tra_full', 'trb_full']
         seq_table = chunk[[c for c in seq_cols if c in chunk.columns]].copy()
         seq_table['source'] = f'bulk_survey_{format_name}'
         seq_table = standardize_sequence(seq_table).drop_duplicates()
@@ -717,6 +755,10 @@ class StreamingParserComplete:
         
         sequence_table['source'] = 'single_cell'
         
+        # Apply TCR stitching
+        mri_table = self._apply_stitching(mri_table)
+        sequence_table = self._apply_stitching(sequence_table)
+        
         # Standardize
         sequence_table = standardize_sequence(sequence_table)
         mri_table = standardize_mri(mri_table)
@@ -766,6 +808,10 @@ class StreamingParserComplete:
         mri_table['source'] = 'single_cell'
         
         sequence_table['source'] = 'single_cell'
+        
+        # Apply TCR stitching
+        mri_table = self._apply_stitching(mri_table)
+        sequence_table = self._apply_stitching(sequence_table)
         
         # Standardize
         sequence_table = standardize_sequence(sequence_table)
@@ -835,6 +881,10 @@ class StreamingParserComplete:
         mri_table['molecule_type'] = molecule_type
         
         sequence_table['source'] = 'single_cell'
+        
+        # Apply TCR stitching
+        mri_table = self._apply_stitching(mri_table)
+        sequence_table = self._apply_stitching(sequence_table)
         
         # Standardize
         sequence_table = standardize_sequence(sequence_table)
@@ -934,6 +984,10 @@ class StreamingParserComplete:
         
         sequence_table['source'] = 'misc_format'
         
+        # Apply TCR stitching
+        mri_table = self._apply_stitching(mri_table)
+        sequence_table = self._apply_stitching(sequence_table)
+        
         sequence_table = standardize_sequence(sequence_table)
         mri_table = standardize_mri(mri_table)
         
@@ -999,6 +1053,10 @@ class StreamingParserComplete:
         mri_table['source'] = 'misc_format'
         
         seq_table['source'] = 'misc_format'
+        
+        # Apply TCR stitching
+        mri_table = self._apply_stitching(mri_table)
+        seq_table = self._apply_stitching(seq_table)
         
         seq_table = standardize_sequence(seq_table)
         mri_table = standardize_mri(mri_table)
