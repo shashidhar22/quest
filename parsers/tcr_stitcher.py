@@ -1,0 +1,407 @@
+"""
+TCR Full-Length Sequence Stitcher
+
+Uses stitchr to generate full-length TCR sequences from CDR3 + gene segments.
+This module processes CDR3 sequences with V/J gene annotations to produce complete TCR alpha
+and beta chain sequences.
+
+Dependencies:
+    - stitchr: Reconstructs full-length TCR sequences from CDR3 + gene segments
+"""
+
+import logging
+import pandas as pd
+import numpy as np
+from typing import Optional, Tuple
+import warnings
+import re
+
+logger = logging.getLogger(__name__)
+
+# Suppress warnings from stitchr
+warnings.filterwarnings('ignore')
+
+try:
+    from Stitchr import stitchrfunctions as fxn
+    from Stitchr import stitchr as st
+    STITCHR_AVAILABLE = True
+except ImportError:
+    STITCHR_AVAILABLE = False
+    logger.warning("stitchr not available. Install with: pip install stitchr")
+
+try:
+    import tcrconvert
+    TCRCONVERT_AVAILABLE = True
+except ImportError:
+    TCRCONVERT_AVAILABLE = False
+    logger.warning("tcrconvert not available. Install with: pip install tcrconvert")
+
+
+class TCRStitcher:
+    """
+    Handles full-length TCR sequence generation from CDR3 + gene segments.
+    
+    Workflow:
+        1. Normalize gene names to be compatible with stitchr
+        2. Generate full-length sequences using stitchr
+        3. Return complete TCR alpha/beta sequences
+    """
+    
+    def __init__(self, species: str = "HUMAN"):
+        """
+        Initialize TCR stitcher.
+        
+        Args:
+            species: Species for stitching (default: "HUMAN")
+        """
+        self.species = species.upper()
+        self.enabled = STITCHR_AVAILABLE
+        
+        if not self.enabled:
+            logger.warning("TCR stitching disabled. Missing: stitchr")
+        else:
+            # Initialize stitchr data for both TRA and TRB chains
+            try:
+                self.tra_data = self._init_chain_data('TRA')
+                self.trb_data = self._init_chain_data('TRB')
+                logger.info("TCR stitcher initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize stitchr data: {e}")
+                self.enabled = False
+    
+    def _init_chain_data(self, chain: str) -> dict:
+        """
+        Initialize reference data for a specific chain.
+        
+        Args:
+            chain: 'TRA' or 'TRB'
+        
+        Returns:
+            Dictionary containing initialized data structures
+        """
+        tcr_dat, functionality, partial = fxn.get_ref_data(chain, st.gene_types, self.species)
+        codons = fxn.get_optimal_codons('', self.species)
+        j_res, low_conf_js = fxn.get_j_motifs(self.species)
+        c_res = fxn.get_c_motifs(self.species)
+        
+        return {
+            'tcr_dat': tcr_dat,
+            'functionality': functionality,
+            'partial': partial,
+            'codons': codons,
+            'j_res': j_res,
+            'low_conf_js': low_conf_js,
+            'c_res': c_res
+        }
+    
+    def convert_to_imgt(self, gene: str, chain: str) -> Optional[str]:
+        """
+        Convert gene name to IMGT format using tcrconvert.
+        
+        Args:
+            gene: Gene name in any format
+            chain: 'TRA' or 'TRB'
+        
+        Returns:
+            Gene name in IMGT format or None if conversion fails
+        """
+        if not TCRCONVERT_AVAILABLE or not gene:
+            return None
+        
+        try:
+            # Determine gene type (V, D, or J)
+            if 'V' in gene.upper():
+                gene_type = 'V'
+            elif 'D' in gene.upper():
+                gene_type = 'D'
+            elif 'J' in gene.upper():
+                gene_type = 'J'
+            else:
+                return None
+            
+            # Convert to IMGT format
+            result = tcrconvert.convert_gene_name(
+                gene_name=gene,
+                species='human',
+                chain_type=chain.lower(),  # 'tra' or 'trb'
+                target_format='imgt',
+                gene_type=gene_type.lower()
+            )
+            
+            return result if result else None
+            
+        except Exception as e:
+            logger.debug(f"tcrconvert failed for {gene}: {e}")
+            return None
+    
+    def normalize_gene_name(self, gene: str, chain: str = None) -> Optional[str]:
+        """
+        Normalize gene name to be compatible with stitchr.
+        First tries tcrconvert to IMGT format, then falls back to manual normalization.
+        
+        Handles variations like:
+        - "TCRBV13-01*01" -> "TRBV13-1*01" (IMGT format via tcrconvert)
+        - "TCRAV1-2" -> "TRAV1-2"
+        - "TRBV06-05" -> "TRBV6-5"
+        - Multiple alleles: "TRAV1-2,TRAV1-3" -> "TRAV1-2"
+        
+        Args:
+            gene: Gene name
+            chain: Chain type ('TRA' or 'TRB') - helps tcrconvert
+        
+        Returns:
+            Normalized gene name or None if invalid
+        """
+        if not gene or pd.isna(gene) or gene == '':
+            return None
+        
+        try:
+            # Clean up gene name
+            gene = str(gene).strip()
+            
+            # Handle multiple alleles (take first)
+            if ',' in gene:
+                gene = gene.split(',')[0].strip()
+            if ';' in gene:
+                gene = gene.split(';')[0].strip()
+            
+            # Try tcrconvert first if chain is specified
+            if chain and TCRCONVERT_AVAILABLE:
+                imgt_gene = self.convert_to_imgt(gene, chain)
+                if imgt_gene:
+                    logger.debug(f"tcrconvert: {gene} -> {imgt_gene}")
+                    return imgt_gene
+            
+            # Fallback to manual normalization
+            # Remove "TCR" prefix if present (e.g., TCRAV -> TRAV)
+            gene = re.sub(r'^TCR([AB][VDJ])', r'\1', gene)
+            
+            # Normalize numbering (remove leading zeros)
+            # TRAV01-02 -> TRAV1-2
+            gene = re.sub(r'([TRAV|TRBV|TRAJ|TRBJ|TRAD|TRBD])0*(\d+)-0*(\d+)', r'\1\2-\3', gene)
+            
+            return gene
+            
+        except Exception as e:
+            logger.debug(f"Gene normalization failed for {gene}: {e}")
+            return None
+    
+    def stitch_tcr(
+        self,
+        cdr3: str,
+        v_gene: str,
+        j_gene: str,
+        chain: str,
+        c_gene: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Generate full-length TCR sequence using stitchr.
+        
+        Args:
+            cdr3: CDR3 amino acid sequence
+            v_gene: V gene name (normalized)
+            j_gene: J gene name (normalized)
+            chain: 'TRA' or 'TRB'
+            c_gene: Optional constant region gene (auto-selected if None)
+        
+        Returns:
+            Full-length TCR amino acid sequence or None if stitching fails
+        """
+        if not STITCHR_AVAILABLE or not all([cdr3, v_gene, j_gene]):
+            return None
+        
+        try:
+            # Clean inputs
+            cdr3 = str(cdr3).strip()
+            v_gene = str(v_gene).strip()
+            j_gene = str(j_gene).strip()
+            
+            # Auto-select constant region if not provided
+            if c_gene is None:
+                if chain == 'TRA':
+                    c_gene = 'TRAC*01'
+                elif chain == 'TRB':
+                    c_gene = 'TRBC1*01'  # Default to TRBC1
+            
+            # Get chain data
+            chain_data = self.tra_data if chain == 'TRA' else self.trb_data
+            
+            # Build tcr_bits dictionary for stitchr
+            tcr_bits = {
+                'v': v_gene,
+                'j': j_gene,
+                'cdr3': cdr3,
+                'l': '',  # Leader sequence (empty - will use default from V gene)
+                'c': c_gene,
+                'mode': '',
+                'skip_c_checks': False,
+                'skip_n_checks': False,
+                'no_leader': True,  # Skip leader sequence (CDR3-based stitching)
+                'species': self.species,
+                'seamless': False,
+                '5_prime_seq': '',
+                '3_prime_seq': '',
+                'name': f'{chain}-{cdr3}'
+            }
+            
+            # Call stitchr
+            stitched = st.stitch(
+                tcr_bits,
+                chain_data['tcr_dat'],
+                chain_data['functionality'],
+                chain_data['partial'],
+                chain_data['codons'],
+                3,  # codon_warning_threshold
+                '',  # aa_file
+                chain_data['c_res'],
+                chain_data['j_res'],
+                chain_data['low_conf_js']
+            )
+            
+            # Extract amino acid sequence from result
+            if stitched and 'seqs' in stitched and 'aa' in stitched['seqs']:
+                aa_seq = stitched['seqs']['aa']
+                if aa_seq and len(aa_seq) > len(cdr3):
+                    return aa_seq
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"TCR stitching failed for {chain} {cdr3}: {e}")
+            return None
+    
+    def process_tcr_pair(
+        self,
+        tra_cdr3: str,
+        tra_v: str,
+        tra_j: str,
+        trb_cdr3: str,
+        trb_v: str,
+        trb_j: str
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Process a TCR alpha/beta pair to generate full-length sequences.
+        
+        Args:
+            tra_cdr3: Alpha chain CDR3
+            tra_v: Alpha V gene
+            tra_j: Alpha J gene
+            trb_cdr3: Beta chain CDR3
+            trb_v: Beta V gene
+            trb_j: Beta J gene
+        
+        Returns:
+            (tra_full_sequence, trb_full_sequence) - either may be None
+        """
+        tra_full = None
+        trb_full = None
+        
+        # Process TRA
+        if tra_cdr3 and tra_v and tra_j:
+            norm_tra_v = self.normalize_gene_name(tra_v, 'TRA')
+            norm_tra_j = self.normalize_gene_name(tra_j, 'TRA')
+            
+            if norm_tra_v and norm_tra_j:
+                tra_full = self.stitch_tcr(
+                    cdr3=tra_cdr3,
+                    v_gene=norm_tra_v,
+                    j_gene=norm_tra_j,
+                    chain='TRA'
+                )
+        
+        # Process TRB
+        if trb_cdr3 and trb_v and trb_j:
+            norm_trb_v = self.normalize_gene_name(trb_v, 'TRB')
+            norm_trb_j = self.normalize_gene_name(trb_j, 'TRB')
+            
+            if norm_trb_v and norm_trb_j:
+                trb_full = self.stitch_tcr(
+                    cdr3=trb_cdr3,
+                    v_gene=norm_trb_v,
+                    j_gene=norm_trb_j,
+                    chain='TRB'
+                )
+        
+        return tra_full, trb_full
+    
+    def process_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add full-length TCR sequences to a DataFrame.
+        
+        Expected columns: tra, trav_gene, traj_gene, trb, trbv_gene, trbj_gene
+        Adds columns: tra_full, trb_full
+        
+        Args:
+            df: DataFrame with TCR data
+        
+        Returns:
+            DataFrame with added tra_full and trb_full columns
+        """
+        if not self.enabled or df.empty:
+            df['tra_full'] = ''
+            df['trb_full'] = ''
+            return df
+        
+        # Initialize columns
+        tra_full_list = []
+        trb_full_list = []
+        
+        # Process each row
+        for _, row in df.iterrows():
+            tra_cdr3 = row.get('tra', '')
+            tra_v = row.get('trav_gene', '')
+            tra_j = row.get('traj_gene', '')
+            trb_cdr3 = row.get('trb', '')
+            trb_v = row.get('trbv_gene', '')
+            trb_j = row.get('trbj_gene', '')
+            
+            tra_full, trb_full = self.process_tcr_pair(
+                tra_cdr3, tra_v, tra_j,
+                trb_cdr3, trb_v, trb_j
+            )
+            
+            tra_full_list.append(tra_full if tra_full else '')
+            trb_full_list.append(trb_full if trb_full else '')
+        
+        df['tra_full'] = tra_full_list
+        df['trb_full'] = trb_full_list
+        
+        # Log statistics
+        tra_success = sum(1 for x in tra_full_list if x)
+        trb_success = sum(1 for x in trb_full_list if x)
+        total_rows = len(df)
+        
+        if total_rows > 0:
+            logger.info(
+                f"TCR stitching: {tra_success}/{total_rows} TRA "
+                f"({100*tra_success/total_rows:.1f}%), "
+                f"{trb_success}/{total_rows} TRB "
+                f"({100*trb_success/total_rows:.1f}%)"
+            )
+        
+        return df
+
+
+def add_full_tcr_sequences(
+    df: pd.DataFrame,
+    species: str = "HUMAN",
+    enabled: bool = True
+) -> pd.DataFrame:
+    """
+    Convenience function to add full-length TCR sequences to a DataFrame.
+    
+    Args:
+        df: DataFrame with CDR3 and gene annotations
+        species: Species for gene conversion
+        enabled: Whether to enable stitching (False = add empty columns)
+    
+    Returns:
+        DataFrame with tra_full and trb_full columns
+    """
+    if not enabled:
+        df['tra_full'] = ''
+        df['trb_full'] = ''
+        return df
+    
+    stitcher = TCRStitcher(species=species)
+    return stitcher.process_dataframe(df)
