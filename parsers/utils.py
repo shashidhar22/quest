@@ -56,10 +56,14 @@ def get_mhc_sequence(value, fasta_dict):
     Given an MHC allele value (e.g. "A*02:01"), return the IMGT sequence from fasta_dict.
     If not found, return None.
     """
+    # Handle pd.NA, None, or empty strings
+    if pd.isna(value) or not value:
+        return None
+    
     try:
-        allele, _ = value.split(';', 1)
+        allele, _ = str(value).split(';', 1)
     except (ValueError, AttributeError):
-        allele = value
+        allele = str(value)
 
     return fasta_dict.get(allele, None)
 
@@ -91,6 +95,7 @@ def process_mhc_restriction(mhc):
 def transform_mhc_restriction(values, fasta_dict):
     """
     Apply a normalization + highest-resolution lookup to each MHC allele in a pandas Series.
+    OPTIMIZED: Pre-builds a lookup cache to avoid repeated linear scans.
     
     Args:
         values (pd.Series): MHC restriction values
@@ -99,6 +104,16 @@ def transform_mhc_restriction(values, fasta_dict):
         pd.Series: resolved or NA
     """
     sorted_fasta_keys = sorted(fasta_dict.keys())
+    
+    # Build prefix lookup cache once (OPTIMIZATION)
+    prefix_cache = {}
+    for key in sorted_fasta_keys:
+        # For each key like "A*02:01", cache prefixes: "A*02:01", "A*02", "A*"
+        parts = key.split(':')
+        for i in range(len(parts), 0, -1):
+            prefix = ':'.join(parts[:i])
+            if prefix not in prefix_cache:
+                prefix_cache[prefix] = key
 
     def extract_annotations(value):
         match = re.search(r'\s+([A-Za-z0-9, ]+)\s+mutant$', value)
@@ -125,11 +140,8 @@ def transform_mhc_restriction(values, fasta_dict):
             return pd.NA, None
 
     def find_highest_resolution(base):
-        # Linear scan for the first matching key that starts with base
-        for key in sorted_fasta_keys:
-            if key.startswith(base):
-                return key
-        return pd.NA
+        # Use cached prefix lookup - O(1) instead of O(n)
+        return prefix_cache.get(base, pd.NA)
 
     def process_value(value):
         if pd.isna(value) or not value.strip():
