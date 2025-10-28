@@ -104,9 +104,10 @@ def main():
     
     # Use high parallelization (leave some CPUs for system)
     # 60 workers out of 64 vCPUs
+    # Note: Parse both TSV and CSV files (contigs use CSV format)
     file_stats = parser.parse_directory(
         input_dir='/mnt/ephemeral/data',
-        pattern='**/*.tsv',
+        pattern='**/*.[tc]sv',  # Matches both .tsv and .csv
         max_workers=60
     )
     
