@@ -346,6 +346,13 @@ class StreamingParserComplete:
                     'trb', 'trbd_gene', 'trbj_gene', 'trbv_gene', 
                     'peptide', 'mhc_one', 'mhc_two', 'tra_full', 'trb_full']
         seq_table = chunk[[c for c in seq_cols if c in chunk.columns]].copy()
+        
+        # Filter out sequences shorter than 4 characters
+        if 'tra' in seq_table.columns:
+            seq_table.loc[seq_table['tra'].str.len() < 4, 'tra'] = ''
+        if 'trb' in seq_table.columns:
+            seq_table.loc[seq_table['trb'].str.len() < 4, 'trb'] = ''
+        
         seq_table['source'] = f'bulk_survey_{format_name}'
         seq_table = standardize_sequence(seq_table).drop_duplicates()
         
@@ -739,6 +746,12 @@ class StreamingParserComplete:
         mri_table = pd.DataFrame(formatted_contigs)
         sequence_table = mri_table.copy().drop_duplicates()
         
+        # Filter out sequences shorter than 4 characters
+        if 'tra' in sequence_table.columns:
+            sequence_table.loc[sequence_table['tra'].str.len() < 4, 'tra'] = ''
+        if 'trb' in sequence_table.columns:
+            sequence_table.loc[sequence_table['trb'].str.len() < 4, 'trb'] = ''
+        
         # Add metadata
         repertoire_id = Path(file_path).stem
         parts = Path(file_path).parts
@@ -792,6 +805,12 @@ class StreamingParserComplete:
         
         mri_table = pd.DataFrame(parsed_rows)
         sequence_table = mri_table.copy().drop_duplicates()
+        
+        # Filter out sequences shorter than 4 characters
+        if 'tra' in sequence_table.columns:
+            sequence_table.loc[sequence_table['tra'].str.len() < 4, 'tra'] = ''
+        if 'trb' in sequence_table.columns:
+            sequence_table.loc[sequence_table['trb'].str.len() < 4, 'trb'] = ''
         
         # Add metadata
         repertoire_id = Path(file_path).stem
@@ -865,6 +884,12 @@ class StreamingParserComplete:
         
         mri_table = pd.DataFrame(formatted_results)
         sequence_table = mri_table.copy().drop_duplicates()
+        
+        # Filter out sequences shorter than 4 characters
+        if 'tra' in sequence_table.columns:
+            sequence_table.loc[sequence_table['tra'].str.len() < 4, 'tra'] = ''
+        if 'trb' in sequence_table.columns:
+            sequence_table.loc[sequence_table['trb'].str.len() < 4, 'trb'] = ''
         
         # Add metadata
         repertoire_id = Path(file_path).stem
@@ -1037,6 +1062,12 @@ class StreamingParserComplete:
             return pd.DataFrame(), pd.DataFrame()
         
         seq_table = mri_table.copy().drop_duplicates()
+        
+        # Filter out sequences shorter than 4 characters
+        if 'tra' in seq_table.columns:
+            seq_table.loc[seq_table['tra'].str.len() < 4, 'tra'] = ''
+        if 'trb' in seq_table.columns:
+            seq_table.loc[seq_table['trb'].str.len() < 4, 'trb'] = ''
         
         # Add metadata
         repertoire_id = Path(file_path).stem
