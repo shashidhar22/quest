@@ -1,0 +1,178 @@
+================================================================================
+TCR DUPLICATION ANALYSIS REPORT (Parallel Streaming)
+================================================================================
+
+📊 DATASET LEVEL SUMMARY
+--------------------------------------------------------------------------------
+Total rows: 2,657,707,031
+
+TCR Single Fields:
+  tra               :   19,936,223 unique /      81,242,642 total ( 75.5% dup)
+  trb               :  741,135,975 unique /   2,576,277,295 total ( 71.2% dup)
+  trav_gene         :          758 unique /      81,368,120 total (100.0% dup)
+  trbv_gene         :        1,624 unique /   2,576,475,412 total (100.0% dup)
+
+Peptide/MHC Single Fields:
+  peptide        :    1,206,582 unique /       2,394,998 total ( 49.6% dup)
+  mhc_one        :          432 unique /       1,234,251 total (100.0% dup)
+  mhc_two        :           76 unique /         207,946 total (100.0% dup)
+
+TCR Combinations:
+  tra_trav                 :   28,196,242 unique /      81,242,031 total ( 65.3% dup)
+  trb_trbv                 : 1,166,984,953 unique /   2,576,138,498 total ( 54.7% dup)
+  tra_trb                  :    1,117,172 unique /       2,326,955 total ( 52.0% dup)
+  tra_trav_trb_trbv        :    1,118,741 unique /       2,326,395 total ( 51.9% dup)
+
+Peptide/MHC Combinations:
+  mhc_one_mhc_two               :          154 unique /         207,943 total ( 99.9% dup)
+  peptide_mhc_one               :      959,897 unique /       1,234,251 total ( 22.2% dup)
+  peptide_mhc_two               :      171,244 unique /         207,946 total ( 17.6% dup)
+  peptide_mhc_one_mhc_two       :      171,690 unique /         207,943 total ( 17.4% dup)
+
+TCR + Peptide/MHC Combinations:
+  tra_peptide_mhc_one                :        4,592 unique /           5,415 total ( 15.2% dup)
+  tra_trav_peptide_mhc_one           :        4,781 unique /           5,415 total ( 11.7% dup)
+  tra_peptide_mhc_two                :          613 unique /             648 total (  5.4% dup)
+  tra_trav_peptide_mhc_two           :          613 unique /             648 total (  5.4% dup)
+  trb_peptide_mhc_one                :       14,727 unique /          15,864 total (  7.2% dup)
+  trb_trbv_peptide_mhc_one           :       15,069 unique /          15,864 total (  5.0% dup)
+  trb_peptide_mhc_two                :          803 unique /             817 total (  1.7% dup)
+  trb_trbv_peptide_mhc_two           :          804 unique /             817 total (  1.6% dup)
+
+Full Combinations:
+  tra_trb_peptide_mhc_one                      :        3,789 unique /           4,036 total (  6.1% dup)
+  tra_trav_trb_trbv_peptide_mhc_one            :        3,965 unique /           4,036 total (  1.8% dup)
+  tra_trb_peptide_mhc_two                      :          426 unique /             426 total (  0.0% dup)
+  tra_trav_trb_trbv_peptide_mhc_two            :          426 unique /             426 total (  0.0% dup)
+  tra_trb_peptide_mhc_one_mhc_two              :          426 unique /             426 total (  0.0% dup)
+  tra_trav_trb_trbv_peptide_mhc_one_mhc_two    :          426 unique /             426 total (  0.0% dup)
+
+================================================================================
+📁 DATABASE/FOLDER LEVEL SUMMARY
+================================================================================
+
+
+IEDB (2,351,753 rows)
+--------------------------------------------------------------------------------
+  TRA                                :        241 unique (100.0% dup)
+  TRB                                :    115,231 unique ( 95.1% dup)
+  TRA + TRAV                         :        244 unique (100.0% dup)
+  TRB + TRBV                         :        263 unique (100.0% dup)
+  TRA + TRB                          :        254 unique (100.0% dup)
+  Peptide                            :  1,205,768 unique ( 48.7% dup)
+  MHC-I                              :        340 unique (100.0% dup)
+  Peptide + MHC-I                    :    959,181 unique ( 59.2% dup)
+
+IRECEPTOR (61,692,865 rows)
+--------------------------------------------------------------------------------
+  TRA                                :     45,634 unique ( 99.9% dup)
+  TRB                                : 32,897,878 unique ( 46.7% dup)
+  TRA + TRAV                         :     48,958 unique ( 99.9% dup)
+  TRB + TRBV                         : 39,293,883 unique ( 36.3% dup)
+  TRA + TRB                          :     52,639 unique ( 99.9% dup)
+
+MCPAS (37,102 rows)
+--------------------------------------------------------------------------------
+  TRA                                :      9,505 unique ( 74.4% dup)
+  TRB                                :     32,181 unique ( 13.3% dup)
+  TRA + TRAV                         :     10,227 unique ( 72.4% dup)
+  TRB + TRBV                         :     32,807 unique ( 11.6% dup)
+  TRA + TRB                          :     10,365 unique ( 72.1% dup)
+  Peptide                            :        381 unique ( 99.0% dup)
+  MHC-I                              :         37 unique ( 99.9% dup)
+  Peptide + MHC-I                    :        340 unique ( 99.1% dup)
+  TRA + TRB + Peptide + MHC-I        :      2,073 unique ( 94.4% dup)
+
+OTHER (2,583,887,669 rows)
+--------------------------------------------------------------------------------
+  TRA                                : 19,878,841 unique ( 99.2% dup)
+  TRB                                : 700,753,718 unique ( 72.9% dup)
+  TRA + TRAV                         : 28,134,777 unique ( 98.9% dup)
+  TRB + TRBV                         : 1,118,476,560 unique ( 56.7% dup)
+  TRA + TRB                          :  1,052,142 unique (100.0% dup)
+
+TCRDB (9,731,499 rows)
+--------------------------------------------------------------------------------
+  TRB                                :  7,332,151 unique ( 24.7% dup)
+  TRB + TRBV                         :  9,176,543 unique (  5.7% dup)
+
+VDJDB (6,143 rows)
+--------------------------------------------------------------------------------
+  TRA                                :      2,002 unique ( 67.4% dup)
+  TRB                                :      4,816 unique ( 21.6% dup)
+  TRA + TRAV                         :      2,036 unique ( 66.9% dup)
+  TRB + TRBV                         :      4,897 unique ( 20.3% dup)
+  TRA + TRB                          :      1,772 unique ( 71.2% dup)
+  Peptide                            :        433 unique ( 93.0% dup)
+  MHC-I                              :         55 unique ( 99.1% dup)
+  Peptide + MHC-I                    :        376 unique ( 93.9% dup)
+  TRA + TRB + Peptide + MHC-I        :      1,716 unique ( 72.1% dup)
+
+================================================================================
+📄 FILE DISTRIBUTION BY DATABASE
+================================================================================
+
+Database             Files       Total Rows
+--------------------------------------------------------------------------------
+iedb                     1        2,351,753
+ireceptor                2       61,692,865
+mcpas                    1           37,102
+other               26,601    2,583,887,669
+tcrdb                    1        9,731,499
+vdjdb                    1            6,143
+
+================================================================================
+📂 'OTHER' CATEGORY BREAKDOWN BY STUDY CATEGORY
+================================================================================
+
+Category                            Files       Total Rows
+--------------------------------------------------------------------------------
+acute_illness                          33          141,014
+adaptive_bulk                      24,033    2,538,942,729
+autoimmune_studies                      4           28,387
+cancer_studies                      2,079       30,598,607
+chronic_illness                       230        5,893,388
+healthy_studies                        65          498,472
+multiple_classifications               37          157,700
+unclassified_data                       5           13,839
+unknown                                 1           87,167
+viral_studies                         114        7,526,366
+
+================================================================================
+📂 'OTHER' CATEGORY BREAKDOWN BY STUDY ID (Top 30)
+================================================================================
+
+Study ID             Category                     Files       Total Rows
+--------------------------------------------------------------------------------
+bulk_data            adaptive_bulk               24,033    2,538,942,729
+kstme                cancer_studies                 738        4,175,205
+lung_va              cancer_studies                 357        4,939,886
+cfar                 chronic_illness                218        5,863,435
+GSE200996            cancer_studies                 163        7,097,736
+acsr_arks_two        cancer_studies                 137        2,077,442
+rcc                  cancer_studies                 110          982,590
+GSE173351            cancer_studies                 107          725,187
+u54                  cancer_studies                 102        1,841,427
+GSE169441            viral_studies                   53           93,343
+ZEN8140861           viral_studies                   53        7,419,275
+radvax               cancer_studies                  50        1,435,367
+bl_uganda            cancer_studies                  50          566,867
+acsr_southafrica     cancer_studies                  40           90,051
+GSE194189            healthy_studies                 36          271,715
+kobs                 cancer_studies                  34        1,594,996
+acsr_texas           cancer_studies                  34          337,132
+GSE79338             cancer_studies                  27        4,090,893
+GSE167118            acute_illness                   23          133,315
+GSE180268            multiple_classifications        19           61,387
+GSE166489            multiple_classifications        18           96,313
+GSE111360            healthy_studies                 17          102,307
+GSE201425            cancer_studies                  16           39,807
+GSE195486            cancer_studies                  16          124,926
+acsr_arks            cancer_studies                  14              114
+GSE145370            cancer_studies                  14           60,458
+GSE231590            healthy_studies                 12          124,450
+aku_breast_pilot     cancer_studies                  12            3,876
+GSE184320            chronic_illness                 12           29,953
+GSE162500            cancer_studies                  12           59,929
+
+================================================================================

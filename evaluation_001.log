@@ -1,0 +1,473 @@
+Some weights of the model checkpoint at Rostlab/prot_bert_bfd were not used when initializing BertForMaskedLM: ['bert.pooler.dense.bias', 'bert.pooler.dense.weight', 'cls.seq_relationship.bias', 'cls.seq_relationship.weight']
+- This IS expected if you are initializing BertForMaskedLM from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
+- This IS NOT expected if you are initializing BertForMaskedLM from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
+/pytorch/third_party/ideep/mkl-dnn/src/cpu/aarch64/xbyak_aarch64/src/util_impl_linux.h, 444: Can't open MIDR_EL1 sysfs entry
+================================================================================
+LOADING MODEL
+================================================================================
+Base model: Rostlab/prot_bert_bfd
+Adapter: /mnt/ephemeral/protbert_01_specifcity
+Device: cpu
+✅ Model loaded!
+
+================================================================================
+LOADING DATASET
+================================================================================
+Dataset path: /mnt/ephemeral/protbert_spec
+Dataset splits: ['train', 'val', 'test']
+Train size: 65080
+Val size: 8126
+Test size: 8134
+
+Dataset columns: ['combo_id', 'combo_feats', 'input_ids', 'labels', 'attention_mask']
+Dataset features: {'combo_id': Value('string'), 'combo_feats': List(Value('string')), 'input_ids': List(Value('int32')), 'labels': List(Value('int64')), 'attention_mask': List(Value('int8'))}
+✅ Dataset loaded!
+
+================================================================================
+EVALUATING PREDICTIONS ON PRE-MASKED SAMPLES
+================================================================================
+
+Detailed evaluation of 5 samples:
+
+────────────────────────────────────────────────────────────────────────────────
+Sample 1
+────────────────────────────────────────────────────────────────────────────────
+Masked sequence: CASGPLLLMTNEQFF[MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK]MAVMAPRTLVL...
+Combo ID: C A S G P L L L M T N E Q F F [SEP] N L V P M V A T V [SEP] M A V M A P R T L V L L L S G A L A L T Q T W A G S H S M R Y F F T S V S R P G R G E P R F I A V G Y V D D T Q F V R F D S D A A S Q R M E P R A P W I E Q E G P E Y W D G E T R K V K A H S Q T H R V D L G T L R G Y Y N Q S E A G S H T V Q R M Y G C D V G S D W R F L R G Y H Q Y A Y D G K D Y I A L K E D L R S W T A A D M A A Q T T K H K W E A A H V A E Q L R A Y L E G T C V E W L R R Y L E N G K E T L Q R T D A P K T H M T H H A V S D H E A T L R C W A L S F Y P A E I T L T W Q R D G E D Q T Q D T E L V E T R P A G D G T F Q K W A A V V V P S G Q E Q R Y T C H V Q H E G L P K P L T L R W E P S S Q P T I P I V G I I A G L V L F G A V I T G A V V A A V M W R R K S S D R K G G S Y S Q A A S S D S A Q G S D V S L T A C K V
+Combo features: ['trb', 'peptide', 'mhc_one']
+
+Loss: 1.7390
+Number of masked positions: 9
+Top-1 accuracy: 5/9 (55.56%)
+Top-5 accuracy: 7/9 (77.78%)
+
+Detailed predictions:
+
+  Position 17 - True: N
+    1. G   - 48.42%  
+    2. C   -  8.29%  
+    3. V   -  6.26%  
+    4. A   -  5.57%  
+    5. T   -  5.45%  
+
+  Position 18 - True: L
+    1. L   - 35.04% ✓
+    2. I   - 11.99%  
+    3. T   -  7.49%  
+    4. C   -  7.34%  
+    5. V   -  7.17%  
+
+  Position 19 - True: V
+    1. C   - 23.70%  
+    2. A   - 15.14%  
+    3. V   - 12.75% ✓
+    4. T   -  7.32%  
+    5. D   -  5.67%  
+
+  Position 20 - True: P
+    1. P   - 24.37% ✓
+    2. T   - 10.99%  
+    3. N   -  7.67%  
+    4. I   -  7.56%  
+    5. S   -  7.33%  
+
+  Position 21 - True: M
+    1. L   - 19.98%  
+    2. F   - 18.86%  
+    3. V   - 11.24%  
+    4. G   -  7.67%  
+    5. R   -  6.61%  
+  ... and 4 more masked positions
+
+────────────────────────────────────────────────────────────────────────────────
+Sample 2
+────────────────────────────────────────────────────────────────────────────────
+Masked sequence: CASSFGISRSF[MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MA...
+Combo ID: C A S S F G I S R S F [SEP] W E D L F C D E S L S S P E P P S S S E [SEP] M V C L K F P G G S C M A A L T V T L M V L S S P L A L A G D T R P R F L E Q V K H E C H F F N G T E R V R F L D R Y F Y H Q E E Y V R F D S D V G E Y R A V T E L G R P D A E Y W N S Q K D L L E Q K R A A V D T Y C R H N Y G V G E S F T V Q R R V Y P E V T V Y P A K T Q P L Q H H N L L V C S V N G F Y P G S I E V R W F R N G Q E E K T G V V S T G L I Q N G D W T F Q T L V M L E T V P R S G E V Y T C Q V E H P S L T S P L T V E W R A R S E S A Q S K M L S G V G G F V L G L L F L G A G L F I Y F R N Q K G H S G L Q P T G F L S
+Combo features: ['trb', 'peptide', 'mhc_one']
+
+Loss: 2.2392
+Number of masked positions: 20
+Top-1 accuracy: 8/20 (40.00%)
+Top-5 accuracy: 15/20 (75.00%)
+
+Detailed predictions:
+
+  Position 13 - True: W
+    1. L   - 16.11%  
+    2. S   - 15.04%  
+    3. F   - 11.77%  
+    4. C   -  7.94%  
+    5. Y   -  6.37%  
+
+  Position 14 - True: E
+    1. S   - 15.59%  
+    2. G   -  9.58%  
+    3. E   -  9.00% ✓
+    4. D   -  8.45%  
+    5. A   -  7.98%  
+
+  Position 15 - True: D
+    1. S   - 22.43%  
+    2. R   - 10.39%  
+    3. G   -  9.86%  
+    4. D   -  8.10% ✓
+    5. A   -  7.39%  
+
+  Position 16 - True: L
+    1. S   - 18.06%  
+    2. G   - 11.09%  
+    3. D   -  9.55%  
+    4. R   -  7.53%  
+    5. A   -  7.42%  
+
+  Position 17 - True: F
+    1. S   - 13.92%  
+    2. D   - 12.53%  
+    3. G   -  9.45%  
+    4. R   -  7.15%  
+    5. A   -  6.62%  
+  ... and 15 more masked positions
+
+────────────────────────────────────────────────────────────────────────────────
+Sample 3
+────────────────────────────────────────────────────────────────────────────────
+Masked sequence: [MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][M...
+Combo ID: C A L S E A G A N S K L T F [SEP] Q L Q P F P Q P E L P Y [SEP] M S W K K A L R I P G G L R A A T V T L M L S M L S T P V A E G R D S P E D F V Y Q F K G M C Y F T N G T E R V R L V S R S I Y N R E E I V R F D S D V G E F R A V T L L G L P A A E Y W N S Q K D I L E R K R A A V D R V C R H N Y Q L E L R T T L Q R R V E P T V T I S P S R T E A L N H H N L L V C S V T D F Y P A Q I K V R W F R N D Q E E T A G V V S T P L I R N G D W T F Q I L V M L E M T P Q R G D V Y T C H V E H P S L Q S P I T V E W R A Q S E S A Q S K M L S G I G G F V L G L I F L G L G L I I H H R S Q K G L L H
+Combo features: ['tra', 'peptide', 'mhc_two']
+
+Loss: 2.0734
+Number of masked positions: 14
+Top-1 accuracy: 6/14 (42.86%)
+Top-5 accuracy: 9/14 (64.29%)
+
+Detailed predictions:
+
+  Position 1 - True: C
+    1. C   - 91.48% ✓
+    2. S   -  1.52%  
+    3. F   -  1.24%  
+    4. Y   -  1.02%  
+    5. L   -  0.70%  
+
+  Position 2 - True: A
+    1. A   - 82.57% ✓
+    2. S   -  6.29%  
+    3. V   -  5.57%  
+    4. T   -  1.26%  
+    5. L   -  0.79%  
+
+  Position 3 - True: L
+    1. S   - 47.21%  
+    2. R   -  8.86%  
+    3. A   -  8.21%  
+    4. L   -  7.77% ✓
+    5. V   -  5.49%  
+
+  Position 4 - True: S
+    1. S   - 40.07% ✓
+    2. R   -  9.98%  
+    3. G   -  7.33%  
+    4. L   -  7.30%  
+    5. A   -  7.21%  
+
+  Position 5 - True: E
+    1. G   - 29.03%  
+    2. D   - 13.98%  
+    3. S   - 13.20%  
+    4. R   -  8.26%  
+    5. T   -  4.41%  
+  ... and 9 more masked positions
+
+────────────────────────────────────────────────────────────────────────────────
+Sample 4
+────────────────────────────────────────────────────────────────────────────────
+Masked sequence: CALYNTDKLIFGLCTLVAML[MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK]...
+Combo ID: C A L Y N T D K L I F [SEP] G L C T L V A M L [SEP] M A V M A P R T L V L L L S G A L A L T Q T W A G S H S M R Y F F T S V S R P G R G E P R F I A V G Y V D D T Q F V R F D S D A A S Q R M E P R A P W I E Q E G P E Y W D G E T R K V K A H S Q T H R V D L G T L R G Y Y N Q S E A G S H T V Q R M Y G C D V G S D W R F L R G Y H Q Y A Y D G K D Y I A L K E D L R S W T A A D M A A Q T T K H K W E A A H V A E Q L R A Y L E G T C V E W L R R Y L E N G K E T L Q R T D A P K T H M T H H A V S D H E A T L R C W A L S F Y P A E I T L T W Q R D G E D Q T Q D T E L V E T R P A G D G T F Q K W A A V V V P S G Q E Q R Y T C H V Q H E G L P K P L T L R W E P S S Q P T I P I V G I I A G L V L F G A V I T G A V V A A V M W R R K S S D R K G G S Y S Q A A S S D S A Q G S D V S L T A C K V
+Combo features: ['tra', 'peptide', 'mhc_one']
+
+Loss: 0.5786
+Number of masked positions: 365
+Top-1 accuracy: 312/365 (85.48%)
+Top-5 accuracy: 363/365 (99.45%)
+
+Detailed predictions:
+
+  Position 23 - True: M
+    1. M   - 64.05% ✓
+    2. L   -  7.91%  
+    3. E   -  7.49%  
+    4. R   -  3.12%  
+    5. A   -  2.95%  
+
+  Position 24 - True: A
+    1. A   - 42.87% ✓
+    2. E   - 20.23%  
+    3. R   -  9.34%  
+    4. D   -  8.42%  
+    5. H   -  5.61%  
+
+  Position 25 - True: V
+    1. V   - 95.97% ✓
+    2. A   -  0.84%  
+    3. R   -  0.61%  
+    4. L   -  0.50%  
+    5. C   -  0.39%  
+
+  Position 26 - True: M
+    1. M   - 43.53% ✓
+    2. T   - 18.37%  
+    3. I   - 11.50%  
+    4. P   -  4.13%  
+    5. L   -  4.00%  
+
+  Position 27 - True: A
+    1. A   - 81.65% ✓
+    2. T   -  5.08%  
+    3. P   -  4.67%  
+    4. G   -  1.94%  
+    5. V   -  1.63%  
+  ... and 360 more masked positions
+
+────────────────────────────────────────────────────────────────────────────────
+Sample 5
+────────────────────────────────────────────────────────────────────────────────
+Masked sequence: CASSLRSRSYEQYF[MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK]...
+Combo ID: C A S S L R S R S Y E Q Y F [SEP] L T D E Q R A A A L E K A A A [SEP] M I L N K A L L L G A L A L T T V M S P C G G E D I V A D H V A S C G V N L Y Q F Y G P S G Q Y T H E F D G D E Q F Y V D L E R K E T A W R W P E F S K F G G F D P Q G A L R N M A V A K H N L N I M I K R Y N S T A A T N E V P E V T V F S K S P V T L G Q P N T L I C L V D N I F P P V V N I T W L S N G Q S V T E G V S E T S F L S K S D H S F F K I S Y L T F L P S A D E I Y D C K V E H W G L D Q P L L K H W E P E I P A P M S E L T E T V V C A L G L S V G L M G I V V G T V F I I Q G L R S V G A S R H Q G P L [SEP] M S W K K A L R I P G D L R V A T V T L M L A M L S S L L A E G R D S P E D F V F Q F K G M C Y F T N G T E R V R L V T R Y I Y N R E E Y A R F D S D V G V Y R A V T P Q G R P D A E Y W N S Q K E V L E G T R A E L D T V C R H N Y E V A F R G I L Q R R V E P T V T I S P S R T E A L N H H N L L V C S V T D F Y P G Q I K V R W F R N D Q E E T A G V V S T P L I R N G D W T F Q I L V M L E M T P Q R G D V Y T C H V E H P S L Q S P I T V E W R A Q S E S A Q S K M L S G V G G F V L G L I F L G L G L I I R Q R S Q K G L L H
+Combo features: ['trb', 'peptide', 'mhc_one', 'mhc_two']
+
+Loss: 2.8162
+Number of masked positions: 15
+Top-1 accuracy: 0/15 (0.00%)
+Top-5 accuracy: 6/15 (40.00%)
+
+Detailed predictions:
+
+  Position 16 - True: L
+    1. S   -  9.63%  
+    2. R   -  9.19%  
+    3. K   -  9.13%  
+    4. L   -  7.63% ✓
+    5. Q   -  6.36%  
+
+  Position 17 - True: T
+    1. R   -  9.57%  
+    2. S   -  8.93%  
+    3. K   -  8.66%  
+    4. L   -  7.82%  
+    5. Q   -  7.52%  
+
+  Position 18 - True: D
+    1. S   -  9.96%  
+    2. L   -  8.53%  
+    3. F   -  6.80%  
+    4. R   -  6.79%  
+    5. N   -  6.67%  
+
+  Position 19 - True: E
+    1. S   -  8.33%  
+    2. R   -  8.31%  
+    3. K   -  7.82%  
+    4. L   -  7.31%  
+    5. N   -  6.91%  
+
+  Position 20 - True: Q
+    1. S   -  8.67%  
+    2. R   -  8.52%  
+    3. K   -  8.15%  
+    4. L   -  7.31%  
+    5. N   -  7.03%  
+  ... and 10 more masked positions
+
+================================================================================
+BATCH EVALUATION STATISTICS
+================================================================================
+
+Evaluating 100 samples from validation set...
+
+  0%|          | 0/100 [00:00<?, ?it/s]  1%|          | 1/100 [00:01<02:05,  1.27s/it]  2%|▏         | 2/100 [00:02<02:02,  1.25s/it]  3%|▎         | 3/100 [00:03<02:00,  1.25s/it]  4%|▍         | 4/100 [00:05<02:04,  1.30s/it]  5%|▌         | 5/100 [00:06<02:01,  1.28s/it]  6%|▌         | 6/100 [00:07<01:58,  1.26s/it]  7%|▋         | 7/100 [00:08<02:00,  1.29s/it]  8%|▊         | 8/100 [00:10<02:01,  1.32s/it]  9%|▉         | 9/100 [00:11<01:57,  1.30s/it] 10%|█         | 10/100 [00:12<01:55,  1.28s/it] 11%|█         | 11/100 [00:14<01:56,  1.30s/it] 12%|█▏        | 12/100 [00:15<01:53,  1.29s/it] 13%|█▎        | 13/100 [00:16<01:51,  1.28s/it] 14%|█▍        | 14/100 [00:17<01:48,  1.26s/it] 15%|█▌        | 15/100 [00:19<01:47,  1.26s/it] 16%|█▌        | 16/100 [00:20<01:46,  1.27s/it] 17%|█▋        | 17/100 [00:21<01:47,  1.30s/it] 18%|█▊        | 18/100 [00:23<01:46,  1.30s/it] 19%|█▉        | 19/100 [00:24<01:46,  1.31s/it] 20%|██        | 20/100 [00:25<01:43,  1.30s/it] 21%|██        | 21/100 [00:27<01:44,  1.32s/it] 22%|██▏       | 22/100 [00:28<01:40,  1.29s/it] 23%|██▎       | 23/100 [00:29<01:37,  1.27s/it] 24%|██▍       | 24/100 [00:30<01:36,  1.27s/it] 25%|██▌       | 25/100 [00:32<01:34,  1.26s/it] 26%|██▌       | 26/100 [00:33<01:32,  1.25s/it] 27%|██▋       | 27/100 [00:34<01:31,  1.26s/it] 28%|██▊       | 28/100 [00:35<01:33,  1.29s/it] 29%|██▉       | 29/100 [00:37<01:32,  1.31s/it] 30%|███       | 30/100 [00:38<01:32,  1.32s/it] 31%|███       | 31/100 [00:39<01:29,  1.30s/it] 32%|███▏      | 32/100 [00:41<01:27,  1.29s/it] 33%|███▎      | 33/100 [00:42<01:25,  1.27s/it] 34%|███▍      | 34/100 [00:43<01:22,  1.25s/it] 35%|███▌      | 35/100 [00:44<01:21,  1.25s/it] 36%|███▌      | 36/100 [00:46<01:20,  1.26s/it] 37%|███▋      | 37/100 [00:47<01:19,  1.26s/it] 38%|███▊      | 38/100 [00:48<01:17,  1.25s/it] 39%|███▉      | 39/100 [00:49<01:15,  1.24s/it] 40%|████      | 40/100 [00:51<01:16,  1.28s/it] 41%|████      | 41/100 [00:52<01:14,  1.27s/it] 42%|████▏     | 42/100 [00:53<01:12,  1.25s/it] 43%|████▎     | 43/100 [00:54<01:11,  1.25s/it] 44%|████▍     | 44/100 [00:56<01:10,  1.27s/it] 45%|████▌     | 45/100 [00:57<01:08,  1.25s/it] 46%|████▌     | 46/100 [00:58<01:08,  1.27s/it] 47%|████▋     | 47/100 [00:59<01:07,  1.27s/it] 48%|████▊     | 48/100 [01:01<01:06,  1.28s/it] 49%|████▉     | 49/100 [01:02<01:04,  1.27s/it] 50%|█████     | 50/100 [01:03<01:03,  1.27s/it] 51%|█████     | 51/100 [01:05<01:03,  1.30s/it] 52%|█████▏    | 52/100 [01:06<01:02,  1.30s/it] 53%|█████▎    | 53/100 [01:07<01:00,  1.29s/it] 54%|█████▍    | 54/100 [01:08<00:58,  1.27s/it] 55%|█████▌    | 55/100 [01:10<00:56,  1.25s/it] 56%|█████▌    | 56/100 [01:11<00:55,  1.26s/it] 57%|█████▋    | 57/100 [01:12<00:53,  1.25s/it] 58%|█████▊    | 58/100 [01:13<00:52,  1.24s/it] 59%|█████▉    | 59/100 [01:15<00:52,  1.27s/it] 60%|██████    | 60/100 [01:16<00:51,  1.28s/it] 61%|██████    | 61/100 [01:17<00:49,  1.26s/it] 62%|██████▏   | 62/100 [01:18<00:47,  1.25s/it] 63%|██████▎   | 63/100 [01:20<00:47,  1.29s/it] 64%|██████▍   | 64/100 [01:21<00:47,  1.33s/it] 65%|██████▌   | 65/100 [01:22<00:45,  1.30s/it] 66%|██████▌   | 66/100 [01:24<00:43,  1.28s/it] 67%|██████▋   | 67/100 [01:25<00:41,  1.27s/it] 68%|██████▊   | 68/100 [01:26<00:40,  1.27s/it] 69%|██████▉   | 69/100 [01:27<00:38,  1.26s/it] 70%|███████   | 70/100 [01:29<00:37,  1.25s/it] 71%|███████   | 71/100 [01:30<00:36,  1.27s/it] 72%|███████▏  | 72/100 [01:31<00:35,  1.27s/it] 73%|███████▎  | 73/100 [01:33<00:34,  1.26s/it] 74%|███████▍  | 74/100 [01:34<00:33,  1.29s/it] 75%|███████▌  | 75/100 [01:35<00:31,  1.28s/it] 76%|███████▌  | 76/100 [01:37<00:31,  1.32s/it] 77%|███████▋  | 77/100 [01:38<00:30,  1.33s/it] 78%|███████▊  | 78/100 [01:39<00:29,  1.34s/it] 79%|███████▉  | 79/100 [01:41<00:27,  1.31s/it] 80%|████████  | 80/100 [01:42<00:26,  1.34s/it] 81%|████████  | 81/100 [01:43<00:25,  1.36s/it] 82%|████████▏ | 82/100 [01:45<00:23,  1.33s/it] 83%|████████▎ | 83/100 [01:46<00:23,  1.35s/it] 84%|████████▍ | 84/100 [01:47<00:21,  1.31s/it] 85%|████████▌ | 85/100 [01:49<00:19,  1.31s/it] 86%|████████▌ | 86/100 [01:50<00:18,  1.31s/it] 87%|████████▋ | 87/100 [01:51<00:17,  1.33s/it] 88%|████████▊ | 88/100 [01:52<00:15,  1.30s/it] 89%|████████▉ | 89/100 [01:54<00:14,  1.28s/it] 90%|█████████ | 90/100 [01:55<00:12,  1.27s/it] 91%|█████████ | 91/100 [01:56<00:11,  1.26s/it] 92%|█████████▏| 92/100 [01:57<00:09,  1.24s/it] 93%|█████████▎| 93/100 [01:59<00:08,  1.23s/it] 94%|█████████▍| 94/100 [02:00<00:07,  1.23s/it] 95%|█████████▌| 95/100 [02:01<00:06,  1.26s/it] 96%|█████████▌| 96/100 [02:02<00:05,  1.28s/it] 97%|█████████▋| 97/100 [02:04<00:03,  1.27s/it] 98%|█████████▊| 98/100 [02:05<00:02,  1.25s/it] 99%|█████████▉| 99/100 [02:06<00:01,  1.25s/it]100%|██████████| 100/100 [02:07<00:00,  1.24s/it]100%|██████████| 100/100 [02:07<00:00,  1.28s/it]
+
+================================================================================
+OVERALL RESULTS
+================================================================================
+Samples evaluated: 100
+Total masked tokens: 10890
+Average loss: 1.8725
+Top-1 accuracy: 63.27%
+Top-5 accuracy: 89.11%
+
+================================================================================
+PER-POSITION ACCURACY ANALYSIS
+================================================================================
+
+Position | Accuracy | Sample Count
+----------------------------------------
+       1 |  100.00% |           35
+       2 |   74.29% |           35
+       3 |   51.43% |           35
+       4 |   60.00% |           35
+       5 |   11.43% |           35
+       6 |   25.71% |           35
+       7 |   25.71% |           35
+       8 |   25.71% |           35
+       9 |   22.86% |           35
+      10 |   25.71% |           35
+      11 |   19.44% |           36
+      12 |   32.35% |           34
+      13 |   42.86% |           35
+      14 |   43.33% |           30
+      15 |   50.00% |           26
+      16 |   36.00% |           25
+      17 |   41.38% |           29
+      18 |   31.03% |           29
+      19 |   27.59% |           29
+      20 |   28.57% |           28
+... and 383 more positions
+
+================================================================================
+BEST AND WORST PREDICTIONS
+================================================================================
+
+🏆 TOP 3 BEST PREDICTIONS (Highest Accuracy)
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+Rank #1 - Accuracy: 86.85% (317/365 correct)
+────────────────────────────────────────────────────────────────────────────────
+Sequence: CAWSRVGGYEQFFGILGFVFTL[MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MAS...
+Combo ID: C A W S R V G G Y E Q F F [SEP] G I L G F V F T L [SEP] M A V M A P R T L V L L L S G A L A L T Q T W A G S H S M R Y F F T S V S R P G R G E P R F I A V G Y V D D T Q F V R F D S D A A S Q R M E P R A P W I E Q E G P E Y W D G E T R K V K A H S Q T H R V D L G T L R G Y Y N Q S E A G S H T V Q R M Y G C D V G S D W R F L R G Y H Q Y A Y D G K D Y I A L K E D L R S W T A A D M A A Q T T K H K W E A A H V A E Q L R A Y L E G T C V E W L R R Y L E N G K E T L Q R T D A P K T H M T H H A V S D H E A T L R C W A L S F Y P A E I T L T W Q R D G E D Q T Q D T E L V E T R P A G D G T F Q K W A A V V V P S G Q E Q R Y T C H V Q H E G L P K P L T L R W E P S S Q P T I P I V G I I A G L V L F G A V I T G A V V A A V M W R R K S S D R K G G S Y S Q A A S S D S A Q G S D V S L T A C K V
+Features: ['trb', 'peptide', 'mhc_one']
+
+Loss: 0.5340
+Masked positions: 365
+
+Sample predictions (first 5):
+  Pos  25: M   -> M   (37.87%) ✓
+  Pos  26: A   -> A   (40.31%) ✓
+  Pos  27: V   -> V   (98.32%) ✓
+  Pos  28: M   -> T   (23.91%) ✗
+  Pos  29: A   -> A   (61.84%) ✓
+  ... and 360 more
+
+────────────────────────────────────────────────────────────────────────────────
+Rank #2 - Accuracy: 86.03% (314/365 correct)
+────────────────────────────────────────────────────────────────────────────────
+Sequence: CASSQVGGSYPREQFFALSPVIPHI[MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][...
+Combo ID: C A S S Q V G G S Y P R E Q F F [SEP] A L S P V I P H I [SEP] M A V M A P R T L V L L L S G A L A L T Q T W A G S H S M R Y F F T S V S R P G R G E P R F I A V G Y V D D T Q F V R F D S D A A S Q R M E P R A P W I E Q E G P E Y W D G E T R K V K A H S Q T H R V D L G T L R G Y Y N Q S E A G S H T V Q R M Y G C D V G S D W R F L R G Y H Q Y A Y D G K D Y I A L K E D L R S W T A A D M A A Q T T K H K W E A A H V A E Q L R A Y L E G T C V E W L R R Y L E N G K E T L Q R T D A P K T H M T H H A V S D H E A T L R C W A L S F Y P A E I T L T W Q R D G E D Q T Q D T E L V E T R P A G D G T F Q K W A A V V V P S G Q E Q R Y T C H V Q H E G L P K P L T L R W E P S S Q P T I P I V G I I A G L V L F G A V I T G A V V A A V M W R R K S S D R K G G S Y S Q A A S S D S A Q G S D V S L T A C K V
+Features: ['trb', 'peptide', 'mhc_one']
+
+Loss: 0.5789
+Masked positions: 365
+
+Sample predictions (first 5):
+  Pos  28: M   -> M   (41.01%) ✓
+  Pos  29: A   -> R   (28.73%) ✗
+  Pos  30: V   -> V   (89.19%) ✓
+  Pos  31: M   -> M   (48.49%) ✓
+  Pos  32: A   -> A   (61.50%) ✓
+  ... and 360 more
+
+────────────────────────────────────────────────────────────────────────────────
+Rank #3 - Accuracy: 85.48% (312/365 correct)
+────────────────────────────────────────────────────────────────────────────────
+Sequence: CALYNTDKLIFGLCTLVAML[MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK]...
+Combo ID: C A L Y N T D K L I F [SEP] G L C T L V A M L [SEP] M A V M A P R T L V L L L S G A L A L T Q T W A G S H S M R Y F F T S V S R P G R G E P R F I A V G Y V D D T Q F V R F D S D A A S Q R M E P R A P W I E Q E G P E Y W D G E T R K V K A H S Q T H R V D L G T L R G Y Y N Q S E A G S H T V Q R M Y G C D V G S D W R F L R G Y H Q Y A Y D G K D Y I A L K E D L R S W T A A D M A A Q T T K H K W E A A H V A E Q L R A Y L E G T C V E W L R R Y L E N G K E T L Q R T D A P K T H M T H H A V S D H E A T L R C W A L S F Y P A E I T L T W Q R D G E D Q T Q D T E L V E T R P A G D G T F Q K W A A V V V P S G Q E Q R Y T C H V Q H E G L P K P L T L R W E P S S Q P T I P I V G I I A G L V L F G A V I T G A V V A A V M W R R K S S D R K G G S Y S Q A A S S D S A Q G S D V S L T A C K V
+Features: ['tra', 'peptide', 'mhc_one']
+
+Loss: 0.5786
+Masked positions: 365
+
+Sample predictions (first 5):
+  Pos  23: M   -> M   (64.05%) ✓
+  Pos  24: A   -> A   (42.87%) ✓
+  Pos  25: V   -> V   (95.97%) ✓
+  Pos  26: M   -> M   (43.53%) ✓
+  Pos  27: A   -> A   (81.65%) ✓
+  ... and 360 more
+
+
+
+⚠️  TOP 3 WORST PREDICTIONS (Lowest Accuracy)
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+Rank #1 (from bottom) - Accuracy: 6.67% (1/15 correct)
+────────────────────────────────────────────────────────────────────────────────
+Sequence: CAVRDPGNTDKLIF[MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK]...
+Combo ID: C A V R D P G N T D K L I F [SEP] A A V V R F Q E A A N K Q K Q [SEP] M A I S G V P V L G F F I I A V L M S A Q E S W A I K E E H V I I Q A E F Y L N P D Q S G E F M F D F D G D E I F H V D M A K K E T V W R L E E F G R F A S F E A Q G A L A N I A V D K A N L E I M T K R S N Y T P I T N V P P E V T V L T N S P V E L R E P N V L I C F I D K F T P P V V N V T W L R N G K P V T T G V S E T V F L P R E D H L F R K F H Y L P F L P S T E D V Y D C R V E H W G L D E P L L K H W E F D A P S P L P E T T E N V V C A L G L T V G L V G I I I G T I F I I K G V R K S N A A E R R G P L [SEP] M V C L K L P G G S Y M A K L T V T L M V L S S P L A L A G D T R P R F L Q Q D K Y E C H F F N G T E R V R F L H R D I Y N Q E E D L R F D S D V G E Y R A V T E L G R P D A E Y W N S Q K D F L E D R R A A V D T Y C R H N Y G V G E S F T V Q R R V E P K V T V Y P A R T Q T L Q H H N L L V C S V N G F Y P G S I E V R W F R N S Q E E K A G V V S T G L I Q N G D W T F Q T L V M L E T V P R S G E V Y T C Q V E H P S V T S P L T V E W R A Q S E S A Q S K M L S G V G G F V L G L L F L G A G L F I Y F K N Q K G H S G L H P T G L V S
+Features: ['tra', 'peptide', 'mhc_one', 'mhc_two']
+
+Loss: 3.0368
+Masked positions: 15
+
+Sample predictions (first 5):
+  Pos  16: A   -> R   (13.75%) ✗
+           (true token 'A' not in top-5)
+  Pos  17: A   -> L   (12.33%) ✗
+           (true token 'A' not in top-5)
+  Pos  18: V   -> L   (12.91%) ✗
+           (true token 'V' not in top-5)
+  Pos  19: V   -> L   (10.82%) ✗
+           (true token 'V' not in top-5)
+  Pos  20: R   -> R   (10.36%) ✓
+  ... and 10 more
+
+────────────────────────────────────────────────────────────────────────────────
+Rank #2 (from bottom) - Accuracy: 0.00% (0/15 correct)
+────────────────────────────────────────────────────────────────────────────────
+Sequence: CASSLRSRSYEQYF[MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK]...
+Combo ID: C A S S L R S R S Y E Q Y F [SEP] L T D E Q R A A A L E K A A A [SEP] M I L N K A L L L G A L A L T T V M S P C G G E D I V A D H V A S C G V N L Y Q F Y G P S G Q Y T H E F D G D E Q F Y V D L E R K E T A W R W P E F S K F G G F D P Q G A L R N M A V A K H N L N I M I K R Y N S T A A T N E V P E V T V F S K S P V T L G Q P N T L I C L V D N I F P P V V N I T W L S N G Q S V T E G V S E T S F L S K S D H S F F K I S Y L T F L P S A D E I Y D C K V E H W G L D Q P L L K H W E P E I P A P M S E L T E T V V C A L G L S V G L M G I V V G T V F I I Q G L R S V G A S R H Q G P L [SEP] M S W K K A L R I P G D L R V A T V T L M L A M L S S L L A E G R D S P E D F V F Q F K G M C Y F T N G T E R V R L V T R Y I Y N R E E Y A R F D S D V G V Y R A V T P Q G R P D A E Y W N S Q K E V L E G T R A E L D T V C R H N Y E V A F R G I L Q R R V E P T V T I S P S R T E A L N H H N L L V C S V T D F Y P G Q I K V R W F R N D Q E E T A G V V S T P L I R N G D W T F Q I L V M L E M T P Q R G D V Y T C H V E H P S L Q S P I T V E W R A Q S E S A Q S K M L S G V G G F V L G L I F L G L G L I I R Q R S Q K G L L H
+Features: ['trb', 'peptide', 'mhc_one', 'mhc_two']
+
+Loss: 2.8162
+Masked positions: 15
+
+Sample predictions (first 5):
+  Pos  16: L   -> S   ( 9.63%) ✗
+           (true token 'L' was rank #4 at 7.63%)
+  Pos  17: T   -> R   ( 9.57%) ✗
+           (true token 'T' not in top-5)
+  Pos  18: D   -> S   ( 9.96%) ✗
+           (true token 'D' not in top-5)
+  Pos  19: E   -> S   ( 8.33%) ✗
+           (true token 'E' not in top-5)
+  Pos  20: Q   -> S   ( 8.67%) ✗
+           (true token 'Q' not in top-5)
+  ... and 10 more
+
+────────────────────────────────────────────────────────────────────────────────
+Rank #3 (from bottom) - Accuracy: 0.00% (0/9 correct)
+────────────────────────────────────────────────────────────────────────────────
+Sequence: CASSIQGALTDTQYF[MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK][MASK]MAVMAPRTLVL...
+Combo ID: C A S S I Q G A L T D T Q Y F [SEP] L M F W A S S S I [SEP] M A V M A P R T L V L L L S G A L A L T Q T W A G S H S M R Y F F T S V S R P G R G E P R F I A V G Y V D D T Q F V R F D S D A A S Q R M E P R A P W I E Q E G P E Y W D G E T R K V K A H S Q T H R V D L G T L R G Y Y N Q S E A G S H T V Q R M Y G C D V G S D W R F L R G Y H Q Y A Y D G K D Y I A L K E D L R S W T A A D M A A Q T T K H K W E A A H V A E Q L R A Y L E G T C V E W L R R Y L E N G K E T L Q R T D A P K T H M T H H A V S D H E A T L R C W A L S F Y P A E I T L T W Q R D G E D Q T Q D T E L V E T R P A G D G T F Q K W A A V V V P S G Q E Q R Y T C H V Q H E G L P K P L T L R W E P S S Q P T I P I V G I I A G L V L F G A V I T G A V V A A V M W R R K S S D R K G G S Y S Q A A S S D S A Q G S D V S L T A C K V
+Features: ['trb', 'peptide', 'mhc_one']
+
+Loss: 4.1013
+Masked positions: 9
+
+Sample predictions (first 5):
+  Pos  17: L   -> G   (29.62%) ✗
+           (true token 'L' not in top-5)
+  Pos  18: M   -> L   (48.16%) ✗
+           (true token 'M' not in top-5)
+  Pos  19: F   -> C   (24.73%) ✗
+           (true token 'F' not in top-5)
+  Pos  20: W   -> P   (27.79%) ✗
+           (true token 'W' not in top-5)
+  Pos  21: A   -> L   (28.18%) ✗
+           (true token 'A' not in top-5)
+  ... and 4 more
+
+================================================================================
+EVALUATION COMPLETE!
+================================================================================
+
+Summary:
+  - Evaluated 100 samples
+  - Top-1 Accuracy: 63.27%
+  - Top-5 Accuracy: 89.11%
+  - Average Loss: 1.8725
+  
+This evaluation uses the pre-masked sequences from your dataset where
+tokens are already masked and labels are provided.
+

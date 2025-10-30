@@ -1,0 +1,18 @@
+# Minimal requirements for streaming parser only
+# Use this if you want a lighter installation without Dask
+
+# Core data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Parquet support
+pyarrow>=12.0.0
+
+# YAML configuration
+PyYAML>=6.0
+
+# Compression
+python-snappy>=0.6.1
+
+# Progress bars (optional but recommended)
+tqdm>=4.65.0
