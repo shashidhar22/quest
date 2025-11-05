@@ -15,6 +15,17 @@ import numpy as np
 from typing import Optional, Tuple
 import warnings
 import re
+import os
+import sys
+
+# Add parent directory to path to import format_to_imgt
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from format_to_imgt import standardize_to_imgt
+    IMGT_FORMATTER_AVAILABLE = True
+except ImportError:
+    IMGT_FORMATTER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +67,7 @@ class TCRStitcher:
         """
         self.species = species.upper()
         self.enabled = STITCHR_AVAILABLE
+        self.use_imgt_formatter = IMGT_FORMATTER_AVAILABLE
         
         if not self.enabled:
             logger.warning("TCR stitching disabled. Missing: stitchr")
@@ -136,18 +148,19 @@ class TCRStitcher:
     
     def normalize_gene_name(self, gene: str, chain: str = None) -> Optional[str]:
         """
-        Normalize gene name to be compatible with stitchr.
-        First tries tcrconvert to IMGT format, then falls back to manual normalization.
+        Normalize gene name to IMGT format using format_to_imgt.py.
+        Falls back to tcrconvert, then manual normalization if needed.
         
         Handles variations like:
-        - "TCRBV13-01*01" -> "TRBV13-1*01" (IMGT format via tcrconvert)
+        - "TCRBV13-01*01" -> "TRBV13-1*01" (IMGT format)
         - "TCRAV1-2" -> "TRAV1-2"
         - "TRBV06-05" -> "TRBV6-5"
+        - "TRAJ10 56 0" -> "TRAJ10" (removes trailing text)
         - Multiple alleles: "TRAV1-2,TRAV1-3" -> "TRAV1-2"
         
         Args:
             gene: Gene name
-            chain: Chain type ('TRA' or 'TRB') - helps tcrconvert
+            chain: Chain type ('TRA' or 'TRB') - for logging/fallback
         
         Returns:
             Normalized gene name or None if invalid
@@ -165,21 +178,30 @@ class TCRStitcher:
             if ';' in gene:
                 gene = gene.split(';')[0].strip()
             
-            # Try tcrconvert first if chain is specified
+            # Try format_to_imgt first (most robust)
+            if self.use_imgt_formatter:
+                imgt_gene = standardize_to_imgt(gene)
+                if imgt_gene:
+                    if gene != imgt_gene:
+                        logger.debug(f"IMGT format: {gene} -> {imgt_gene}")
+                    return imgt_gene
+            
+            # Fallback to tcrconvert if available and chain is specified
             if chain and TCRCONVERT_AVAILABLE:
                 imgt_gene = self.convert_to_imgt(gene, chain)
                 if imgt_gene:
                     logger.debug(f"tcrconvert: {gene} -> {imgt_gene}")
                     return imgt_gene
             
-            # Fallback to manual normalization
+            # Last resort: manual normalization
             # Remove "TCR" prefix if present (e.g., TCRAV -> TRAV)
-            gene = re.sub(r'^TCR([AB][VDJ])', r'\1', gene)
+            gene = re.sub(r'^TCR([AB][VDJ])', r'TR\1', gene)
             
             # Normalize numbering (remove leading zeros)
             # TRAV01-02 -> TRAV1-2
             gene = re.sub(r'([TRAV|TRBV|TRAJ|TRBJ|TRAD|TRBD])0*(\d+)-0*(\d+)', r'\1\2-\3', gene)
             
+            logger.debug(f"Manual normalization: {gene}")
             return gene
             
         except Exception as e:
@@ -324,29 +346,91 @@ class TCRStitcher:
         
         return tra_full, trb_full
     
+    def _translate_dna(self, dna_seq: str) -> str:
+        """
+        Translate DNA sequence to amino acid sequence.
+        
+        Args:
+            dna_seq: DNA sequence string
+            
+        Returns:
+            Amino acid sequence string
+        """
+        if not dna_seq:
+            return ''
+        
+        try:
+            # Simple translation table (standard genetic code)
+            codon_table = {
+                'TTT': 'F', 'TTC': 'F', 'TTA': 'L', 'TTG': 'L',
+                'TCT': 'S', 'TCC': 'S', 'TCA': 'S', 'TCG': 'S',
+                'TAT': 'Y', 'TAC': 'Y', 'TAA': '*', 'TAG': '*',
+                'TGT': 'C', 'TGC': 'C', 'TGA': '*', 'TGG': 'W',
+                'CTT': 'L', 'CTC': 'L', 'CTA': 'L', 'CTG': 'L',
+                'CCT': 'P', 'CCC': 'P', 'CCA': 'P', 'CCG': 'P',
+                'CAT': 'H', 'CAC': 'H', 'CAA': 'Q', 'CAG': 'Q',
+                'CGT': 'R', 'CGC': 'R', 'CGA': 'R', 'CGG': 'R',
+                'ATT': 'I', 'ATC': 'I', 'ATA': 'I', 'ATG': 'M',
+                'ACT': 'T', 'ACC': 'T', 'ACA': 'T', 'ACG': 'T',
+                'AAT': 'N', 'AAC': 'N', 'AAA': 'K', 'AAG': 'K',
+                'AGT': 'S', 'AGC': 'S', 'AGA': 'R', 'AGG': 'R',
+                'GTT': 'V', 'GTC': 'V', 'GTA': 'V', 'GTG': 'V',
+                'GCT': 'A', 'GCC': 'A', 'GCA': 'A', 'GCG': 'A',
+                'GAT': 'D', 'GAC': 'D', 'GAA': 'E', 'GAG': 'E',
+                'GGT': 'G', 'GGC': 'G', 'GGA': 'G', 'GGG': 'G',
+            }
+            
+            dna_seq = dna_seq.upper()
+            protein = []
+            
+            # Translate in triplets
+            for i in range(0, len(dna_seq) - 2, 3):
+                codon = dna_seq[i:i+3]
+                aa = codon_table.get(codon, 'X')  # X for unknown
+                if aa == '*':  # Stop codon
+                    break
+                protein.append(aa)
+            
+            return ''.join(protein)
+            
+        except Exception as e:
+            logger.debug(f"Translation failed: {e}")
+            return ''
+    
     def process_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Add full-length TCR sequences to a DataFrame.
         
         Expected columns: tra, trav_gene, traj_gene, trb, trbv_gene, trbj_gene
-        Adds columns: tra_full, trb_full
+        Updates gene columns with IMGT-formatted names
+        Adds columns: tra_full, trb_full (amino acid sequences)
         
         Args:
             df: DataFrame with TCR data
         
         Returns:
-            DataFrame with added tra_full and trb_full columns
+            DataFrame with formatted gene names and full-length amino acid sequences
         """
         if not self.enabled or df.empty:
+            # Just format gene names if stitching is disabled
             df['tra_full'] = ''
             df['trb_full'] = ''
+            # Still format gene names
+            df['trav_gene'] = df.get('trav_gene', '').apply(lambda x: self.normalize_gene_name(x, 'TRA') if x else '')
+            df['traj_gene'] = df.get('traj_gene', '').apply(lambda x: self.normalize_gene_name(x, 'TRA') if x else '')
+            df['trbv_gene'] = df.get('trbv_gene', '').apply(lambda x: self.normalize_gene_name(x, 'TRB') if x else '')
+            df['trbj_gene'] = df.get('trbj_gene', '').apply(lambda x: self.normalize_gene_name(x, 'TRB') if x else '')
             return df
         
         # Initialize columns
         tra_full_list = []
         trb_full_list = []
+        tra_v_fmt_list = []
+        tra_j_fmt_list = []
+        trb_v_fmt_list = []
+        trb_j_fmt_list = []
         
-        # Process each row
+        # Process dataframe
         for _, row in df.iterrows():
             tra_cdr3 = row.get('tra', '')
             tra_v = row.get('trav_gene', '')
@@ -355,14 +439,115 @@ class TCRStitcher:
             trb_v = row.get('trbv_gene', '')
             trb_j = row.get('trbj_gene', '')
             
-            tra_full, trb_full = self.process_tcr_pair(
-                tra_cdr3, tra_v, tra_j,
-                trb_cdr3, trb_v, trb_j
-            )
+            # Normalize gene names using IMGT formatter
+            norm_tra_v = self.normalize_gene_name(tra_v, 'TRA') if tra_v else ''
+            norm_tra_j = self.normalize_gene_name(tra_j, 'TRA') if tra_j else ''
+            norm_trb_v = self.normalize_gene_name(trb_v, 'TRB') if trb_v else ''
+            norm_trb_j = self.normalize_gene_name(trb_j, 'TRB') if trb_j else ''
             
-            tra_full_list.append(tra_full if tra_full else '')
-            trb_full_list.append(trb_full if trb_full else '')
+            # Store formatted gene names
+            tra_v_fmt_list.append(norm_tra_v if norm_tra_v else '')
+            tra_j_fmt_list.append(norm_tra_j if norm_tra_j else '')
+            trb_v_fmt_list.append(norm_trb_v if norm_trb_v else '')
+            trb_j_fmt_list.append(norm_trb_j if norm_trb_j else '')
+            
+            # Process TRA
+            tra_aa = ''
+            if tra_cdr3 and norm_tra_v and norm_tra_j:
+                try:
+                    # Build tcr_bits for TRA
+                    tcr_bits = {
+                        'v': norm_tra_v,
+                        'j': norm_tra_j,
+                        'cdr3': tra_cdr3,
+                        'l': norm_tra_v,  # Use V gene for leader
+                        'c': 'TRAC*01',
+                        'mode': '',
+                        'skip_c_checks': False,
+                        'skip_n_checks': False,
+                        'no_leader': False,  # Include leader sequence
+                        'species': self.species,
+                        'seamless': False,
+                        '5_prime_seq': '',
+                        '3_prime_seq': '',
+                        'name': f'TRA-{tra_cdr3}'
+                    }
+                    
+                    # Stitch TRA
+                    stitched = st.stitch(
+                        tcr_bits,
+                        self.tra_data['tcr_dat'],
+                        self.tra_data['functionality'],
+                        self.tra_data['partial'],
+                        self.tra_data['codons'],
+                        3,  # codon_warning_threshold
+                        '',  # aa_file
+                        self.tra_data['c_res'],
+                        self.tra_data['j_res'],
+                        self.tra_data['low_conf_js']
+                    )
+                    
+                    if stitched and 'stitched_nt' in stitched:
+                        # Translate the full nucleotide sequence to amino acid
+                        tra_aa = self._translate_dna(stitched['stitched_nt'])
+                            
+                except Exception as e:
+                    logger.debug(f"TRA stitching failed for {tra_cdr3}: {e}")
+            
+            tra_full_list.append(tra_aa)
+            
+            # Process TRB
+            trb_aa = ''
+            if trb_cdr3 and norm_trb_v and norm_trb_j:
+                try:
+                    # Build tcr_bits for TRB
+                    tcr_bits = {
+                        'v': norm_trb_v,
+                        'j': norm_trb_j,
+                        'cdr3': trb_cdr3,
+                        'l': norm_trb_v,  # Use V gene for leader
+                        'c': 'TRBC1*01',  # Default to TRBC1
+                        'mode': '',
+                        'skip_c_checks': False,
+                        'skip_n_checks': False,
+                        'no_leader': False,  # Include leader sequence
+                        'species': self.species,
+                        'seamless': False,
+                        '5_prime_seq': '',
+                        '3_prime_seq': '',
+                        'name': f'TRB-{trb_cdr3}'
+                    }
+                    
+                    # Stitch TRB
+                    stitched = st.stitch(
+                        tcr_bits,
+                        self.trb_data['tcr_dat'],
+                        self.trb_data['functionality'],
+                        self.trb_data['partial'],
+                        self.trb_data['codons'],
+                        3,  # codon_warning_threshold
+                        '',  # aa_file
+                        self.trb_data['c_res'],
+                        self.trb_data['j_res'],
+                        self.trb_data['low_conf_js']
+                    )
+                    
+                    if stitched and 'stitched_nt' in stitched:
+                        # Translate the full nucleotide sequence to amino acid
+                        trb_aa = self._translate_dna(stitched['stitched_nt'])
+                            
+                except Exception as e:
+                    logger.debug(f"TRB stitching failed for {trb_cdr3}: {e}")
+            
+            trb_full_list.append(trb_aa)
         
+        # Update gene columns with formatted names
+        df['trav_gene'] = tra_v_fmt_list
+        df['traj_gene'] = tra_j_fmt_list
+        df['trbv_gene'] = trb_v_fmt_list
+        df['trbj_gene'] = trb_j_fmt_list
+        
+        # Add full-length amino acid sequences
         df['tra_full'] = tra_full_list
         df['trb_full'] = trb_full_list
         
@@ -392,11 +577,15 @@ def add_full_tcr_sequences(
     
     Args:
         df: DataFrame with CDR3 and gene annotations
-        species: Species for gene conversion
-        enabled: Whether to enable stitching (False = add empty columns)
+            Expected columns: tra, trav_gene, traj_gene, trb, trbv_gene, trbj_gene
+        species: Species for gene conversion (default: "HUMAN")
+        enabled: Whether to enable stitching (False = only format gene names)
     
     Returns:
-        DataFrame with tra_full and trb_full columns
+        DataFrame with:
+            - Gene columns (trav_gene, traj_gene, trbv_gene, trbj_gene) updated with IMGT format
+            - tra_full: Full-length TRA amino acid sequence
+            - trb_full: Full-length TRB amino acid sequence
     """
     if not enabled:
         df['tra_full'] = ''
