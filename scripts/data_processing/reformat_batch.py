@@ -245,9 +245,15 @@ Examples:
         'output_dir',
         help='Output directory for Parquet files'
     )
+    
+    # Get default config path relative to project root
+    script_dir = Path(__file__).parent
+    project_root = script_dir.parent.parent
+    default_config = str(project_root / 'config' / 'header_config.yaml')
+    
     parser.add_argument(
         '--config',
-        default='/home/ubuntu/quest/config/header_config.yaml',
+        default=default_config,
         help='Path to header_config.yaml (default: %(default)s)'
     )
     parser.add_argument(

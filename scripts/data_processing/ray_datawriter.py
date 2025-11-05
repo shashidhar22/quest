@@ -80,7 +80,8 @@ MODE = {"tra": set(["tra"]),
         "tcr_pairing": set(["tra", "trb"]),
         "mhc_binding": set(["peptide", "mhc_one", "mhc_two"]),
         "specificity": set(["tra", "trb", "peptide", "mhc_one", "mhc_two"]),
-        "default": set(["tra", "trb", "peptide", "mhc_one", "mhc_two"])}
+        "default": set(["tra", "trb", "peptide", "mhc_one", "mhc_two"]),
+        "balanced": set(["tra", "trb", "peptide", "mhc_one", "mhc_two"])}
 
 # ── helper: ProtBERT‑style explode ─────────────────────────────────────-
         
@@ -425,6 +426,171 @@ def print_progress(stage: str, message: str, indent: int = 1):
     prefix = "   " * indent
     print(f"{prefix}{stage} {message}", flush=True)
 
+def balanced_sample_by_molecules(ds: ray.data.Dataset, samples_per_combo: int = None) -> ray.data.Dataset:
+    """
+    Apply balanced sampling across all molecule permutations.
+    
+    For the 5 molecules (tra, trb, peptide, mhc_one, mhc_two), there are:
+    - Single molecules: 5 combinations (tra, trb, peptide, mhc_one, mhc_two)
+    - Pairs: C(5,2) = 10 combinations
+    - Triplets: C(5,3) = 10 combinations  
+    - Quadruplets: C(5,4) = 5 combinations
+    - All five: 1 combination
+    Total: 31 unique combinations (excluding empty set)
+    
+    But we actually care about PERMUTATIONS (order matters), so:
+    - For k molecules chosen from 5: P(5,k) = 5!/(5-k)!
+    - Total permutations: sum(P(5,k) for k=1..5) = 325 permutations
+    
+    This function ensures each permutation gets equal representation in the dataset.
+    
+    Args:
+        ds: Ray Dataset with 'combo_feats' column (tuple of molecule names)
+        samples_per_combo: Number of samples per combination. If None, uses minimum count.
+    
+    Returns:
+        Balanced dataset with equal samples per molecule combination
+    """
+    print("\n🎯 BALANCED SAMPLING BY MOLECULE PERMUTATIONS")
+    print("="*80)
+    
+    import time
+    start_time = time.time()
+    
+    # Step 1: Add permutation key to each row
+    def add_perm_key(row):
+        """Add permutation key based on combo_feats ordering."""
+        combo = row.get('combo_feats', ())
+        if isinstance(combo, tuple):
+            # Use tuple as-is (order matters for permutations)
+            perm_key = '|'.join(sorted(combo))  # Sort for grouping, not for identity
+            return {**row, '_perm_key': perm_key}
+        return {**row, '_perm_key': ''}
+    
+    print_progress("⏳", "Step 1/4: Tagging rows with permutation keys...")
+    ds_with_keys = ds.map(add_perm_key)
+    
+    # Step 2: Count samples per permutation
+    print_progress("⏳", "Step 2/4: Counting samples per permutation...")
+    
+    # Use Ray Data's groupby to count
+    grouped = ds_with_keys.groupby('_perm_key').count()
+    count_results = grouped.materialize()
+    
+    # Build dictionary of counts
+    perm_counts = {}
+    for row in count_results.iter_rows():
+        key = row['_perm_key']
+        count = row['count()']
+        if key and key != '':
+            perm_counts[key] = count
+    
+    if not perm_counts:
+        print("   ⚠️  No permutations found!")
+        return ds
+    
+    # Print statistics
+    total_perms = len(perm_counts)
+    total_samples = sum(perm_counts.values())
+    min_count = min(perm_counts.values())
+    max_count = max(perm_counts.values())
+    avg_count = total_samples / total_perms
+    
+    print(f"\n   📊 Permutation Statistics:")
+    print(f"      Total unique permutations: {total_perms}")
+    print(f"      Total samples: {total_samples:,}")
+    print(f"      Min samples per permutation: {min_count:,}")
+    print(f"      Max samples per permutation: {max_count:,}")
+    print(f"      Avg samples per permutation: {avg_count:,.1f}")
+    print(f"      Imbalance ratio: {max_count/min_count:.1f}x")
+    
+    # Determine target samples per permutation
+    if samples_per_combo is None:
+        target_samples = min_count
+        print(f"\n   🎯 Using minimum count as target: {target_samples:,} samples per permutation")
+    else:
+        target_samples = samples_per_combo
+        print(f"\n   🎯 Using specified target: {target_samples:,} samples per permutation")
+    
+    # Show top 10 most and least represented permutations
+    sorted_perms = sorted(perm_counts.items(), key=lambda x: x[1], reverse=True)
+    
+    print(f"\n   📈 Top 10 most represented permutations:")
+    for i, (perm, count) in enumerate(sorted_perms[:10], 1):
+        print(f"      {i:2d}. {perm:40s} : {count:>8,} samples")
+    
+    print(f"\n   📉 Top 10 least represented permutations:")
+    for i, (perm, count) in enumerate(sorted_perms[-10:][::-1], 1):
+        print(f"      {i:2d}. {perm:40s} : {count:>8,} samples")
+    
+    # Step 3: Sample from each permutation
+    print_progress("⏳", "Step 3/4: Sampling from each permutation...")
+    
+    def sample_within_group(batch):
+        """Sample target_samples from each permutation group."""
+        import pandas as pd
+        import random
+        
+        df = pd.DataFrame(batch)
+        if len(df) == 0:
+            return df
+        
+        # Group by permutation key
+        sampled_dfs = []
+        for perm_key, group in df.groupby('_perm_key'):
+            if perm_key and perm_key != '':
+                # Sample with replacement if needed, without replacement otherwise
+                n_samples = min(target_samples, len(group))
+                if n_samples == len(group):
+                    # Take all samples
+                    sampled = group
+                elif n_samples > len(group):
+                    # Sample with replacement
+                    sampled = group.sample(n=target_samples, replace=True, random_state=42)
+                else:
+                    # Sample without replacement
+                    sampled = group.sample(n=n_samples, random_state=42)
+                
+                sampled_dfs.append(sampled)
+        
+        if sampled_dfs:
+            result = pd.concat(sampled_dfs, ignore_index=True)
+            # Drop temp column
+            result = result.drop(columns=['_perm_key'])
+            return result
+        return pd.DataFrame()
+    
+    # Sort by permutation key first to group consecutive rows
+    print_progress("   ", "→ Sorting by permutation key...", indent=2)
+    ds_sorted = ds_with_keys.sort(key='_perm_key')
+    
+    print_progress("   ", "→ Sampling within each group...", indent=2)
+    ds_sampled = ds_sorted.map_batches(sample_within_group, batch_format="pandas")
+    
+    # Step 4: Materialize and shuffle
+    print_progress("⏳", "Step 4/4: Materializing and shuffling...")
+    ds_sampled = ds_sampled.materialize()
+    
+    # Shuffle to mix permutations
+    print_progress("   ", "→ Shuffling to mix permutations...", indent=2)
+    ds_sampled = ds_sampled.random_shuffle(seed=42)
+    
+    # Get final count
+    final_count = ds_sampled.count()
+    expected_count = total_perms * target_samples
+    
+    elapsed = time.time() - start_time
+    
+    print(f"\n   ✓ Balanced sampling complete!")
+    print(f"      Original samples: {total_samples:,}")
+    print(f"      Target samples: {expected_count:,} ({total_perms} perms × {target_samples:,})")
+    print(f"      Final samples: {final_count:,}")
+    print(f"      Time: {elapsed:.1f}s")
+    print(f"      Retention rate: {final_count/total_samples*100:.1f}%")
+    print("="*80 + "\n")
+    
+    return ds_sampled
+
 def deduplicate_ray_data_fast(ds: ray.data.Dataset, mode: str) -> tuple:
     """
     Fast Ray Data deduplication - skips expensive duplicate analysis.
@@ -436,7 +602,7 @@ def deduplicate_ray_data_fast(ds: ray.data.Dataset, mode: str) -> tuple:
 
     Args:
         ds: Ray Dataset (streaming)
-        mode: Analysis mode
+        mode: Analysis mode (tra, trb, tcr_pairing, mhc_binding, specificity, default, balanced)
 
     Returns:
         tuple: (deduplicated_dataset, stats_dict)
@@ -507,7 +673,7 @@ def deduplicate_ray_data_fast(ds: ray.data.Dataset, mode: str) -> tuple:
 
             return {**row, '_dedup_key': dedup_key, '_valid': valid}
 
-        else:  # default mode
+        else:  # default or balanced mode (both treat data the same way during deduplication)
             tra = row.get('tra', '')
             trb = row.get('trb', '')
             pep = row.get('peptide', '')
@@ -595,7 +761,7 @@ def deduplicate_ray_data(ds: ray.data.Dataset, mode: str) -> tuple:
 
     Args:
         ds: Ray Dataset (streaming)
-        mode: Analysis mode
+        mode: Analysis mode (tra, trb, tcr_pairing, mhc_binding, specificity, default, balanced)
 
     Returns:
         tuple: (deduplicated_dataset, stats_dict)
@@ -665,7 +831,7 @@ def deduplicate_ray_data(ds: ray.data.Dataset, mode: str) -> tuple:
 
             return {**row, '_dedup_key': dedup_key, '_valid': valid}
 
-        else:  # default mode
+        else:  # default or balanced mode (both treat data the same way during deduplication)
             tra = row.get('tra', '')
             trb = row.get('trb', '')
             pep = row.get('peptide', '')
@@ -1283,8 +1449,8 @@ def cli():
     p.add_argument("--model-name",required=True,
                    choices=["bert","protbert","esm","llama","lstm","transformer"])
     p.add_argument("--mode", required=False, default="specificity",
-                   choices=["tra", "trb", "tcr_pairing", "mhc_binding", "specificity", "default"],
-                   help="Analysis mode: tra (TRA only), trb (TRB only), tcr_pairing (TRA+TRB), mhc_binding (MHC+peptide), specificity (complete TCR complexes), default (all combinations except peptide-only)")
+                   choices=["tra", "trb", "tcr_pairing", "mhc_binding", "specificity", "default", "balanced"],
+                   help="Analysis mode: tra (TRA only), trb (TRB only), tcr_pairing (TRA+TRB), mhc_binding (MHC+peptide), specificity (complete TCR complexes), default (all combinations except peptide-only), balanced (all combinations with equal sampling per permutation)")
     p.add_argument("--input_raw_dir", default=None, help="Optional: Path to an existing 'raw' dataset to start masking from.")
     p.add_argument("--output-raw", required=True, help="Path to save the tokenized dataset with text columns.")
     p.add_argument("--max-len",type=int,default=1024)
@@ -1298,6 +1464,7 @@ def cli():
     p.add_argument("--sample", type=int, default=None, help="Sample N files for testing (e.g., 10 for first 10 files). Applied during file selection.")
     p.add_argument("--in-memory", action="store_true", help="Keep datasets in memory to avoid disk caching (use for small datasets only)")
     p.add_argument("--fast-mode", action="store_true", help="Enable fast processing mode: skip detailed duplicate analysis and token statistics for 10-100x speedup")
+    p.add_argument("--samples-per-combo", type=int, default=None, help="Number of samples per molecule combination (only used with --mode balanced). If None, uses min count across all combinations.")
     return p.parse_args()
 
 # Multi-node task distribution helper
@@ -1553,6 +1720,28 @@ def main():
         print("📝 Formatting test split...")
         test_ds = test_ds.map(format_row)
         test_count = test_ds.count()
+
+        # Apply balanced sampling if mode is "balanced"
+        if args.mode == "balanced":
+            print("\n🎯 APPLYING BALANCED SAMPLING (Mode: balanced)")
+            print("="*80)
+            print("This mode ensures equal representation across all molecule permutations.")
+            print("Balancing across molecule permutations...")
+            
+            # Apply to each split
+            print("\n📝 Balancing train split...")
+            train_ds = balanced_sample_by_molecules(train_ds, args.samples_per_combo)
+            train_count = train_ds.count()
+            
+            print("\n📝 Balancing validation split...")
+            val_ds = balanced_sample_by_molecules(val_ds, args.samples_per_combo)
+            val_count = val_ds.count()
+            
+            print("\n📝 Balancing test split...")
+            test_ds = balanced_sample_by_molecules(test_ds, args.samples_per_combo)
+            test_count = test_ds.count()
+            
+            print("="*80 + "\n")
 
         # Calculate token statistics (sample first 1000 rows)
         if args.fast_mode:
