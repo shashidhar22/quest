@@ -13,27 +13,50 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from parsers.streaming_parser import StreamingParser
 
 
+def get_test_data_dir():
+    """Get test data directory from user input or environment variable."""
+    import os
+    
+    default_dir = os.environ.get('TEST_DATA_DIR', '')
+    
+    if len(sys.argv) > 1:
+        return Path(sys.argv[1])
+    elif default_dir:
+        return Path(default_dir)
+    else:
+        test_dir_input = input("\nEnter path to test data directory: ").strip()
+        if not test_dir_input:
+            print("❌ No test directory provided")
+            return None
+        return Path(test_dir_input)
+
+
 def test_format_detection():
     """Test format detection on sample files"""
     print("="*80)
     print("Testing Format Detection")
     print("="*80)
     
-    config_path = '/home/ubuntu/quest/config/header_config.yaml'
+    # Get test data directory
+    test_dir = get_test_data_dir()
+    if test_dir is None:
+        return False
+    
+    if not test_dir.exists():
+        print(f"❌ Test directory not found: {test_dir}")
+        print("Please provide a valid directory path")
+        return False
+    
+    # Get config path relative to project root
+    project_root = Path(__file__).parent.parent
+    config_path = project_root / 'config' / 'header_config.yaml'
+    
     parser = StreamingParser(
-        format_config=config_path,
+        format_config=str(config_path),
         output_dir='/tmp/test_output',
         chunk_size=1000,
         test_mode=True
     )
-    
-    # Test with sample data directory
-    test_dir = Path('/mnt/ephemeral/data')
-    
-    if not test_dir.exists():
-        print(f"❌ Test directory not found: {test_dir}")
-        print("Please update test_dir in this script to point to your data")
-        return False
     
     # Find first few files
     sample_files = list(test_dir.rglob('*.tsv'))[:5]
@@ -72,23 +95,35 @@ def test_parsing():
     print("Testing File Parsing")
     print("="*80)
     
-    config_path = '/home/ubuntu/quest/config/header_config.yaml'
+    # Get test data directory
+    test_dir = get_test_data_dir()
+    if test_dir is None:
+        return False
+    
+    if not test_dir.exists():
+        print(f"❌ Test directory not found: {test_dir}")
+        return False
+    
+    # Get config path relative to project root
+    project_root = Path(__file__).parent.parent
+    config_path = project_root / 'config' / 'header_config.yaml'
+    
     output_dir = Path('/tmp/test_reformat_output')
     output_dir.mkdir(exist_ok=True, parents=True)
     
     parser = StreamingParser(
-        format_config=config_path,
+        format_config=str(config_path),
         output_dir=str(output_dir),
         chunk_size=1000,
         test_mode=True  # Only process 10% of each file
     )
     
     # Find a sample file
-    test_dir = Path('/mnt/ephemeral/data')
     sample_files = list(test_dir.rglob('*.tsv'))[:2]
     
     if not sample_files:
-        print("❌ No sample files found")
+        print("❌ No sample files found in test directory")
+        print(f"Please add sample .tsv files to: {test_dir}")
         return False
     
     print(f"\nParsing {len(sample_files)} sample file(s) (10% each)...\n")
@@ -200,6 +235,9 @@ def test_output_schema():
 def main():
     """Run all tests"""
     print("\n" + "🧬 TCR Reformatter Test Suite 🧬\n")
+    print("Usage: python test_reformatter_scripts.py [test_data_directory]")
+    print("   Or: Set TEST_DATA_DIR environment variable")
+    print()
     
     tests = [
         ("Format Detection", test_format_detection),

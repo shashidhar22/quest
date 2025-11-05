@@ -71,9 +71,13 @@ def test_duplication_stats():
         
         test_data.to_csv(test_file, sep='\t', index=False)
         
+        # Get config path relative to project root
+        project_root = Path(__file__).parent.parent
+        config_path = project_root / 'config' / 'header_config.yaml'
+        
         # Initialize parser
         parser = StreamingParserComplete(
-            format_config='/home/ubuntu/quest/config/header_config.yaml',
+            format_config=str(config_path),
             output_dir=output_dir,
             chunk_size=100,
             test_mode=False
