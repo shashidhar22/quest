@@ -5,6 +5,7 @@ Three-stage pipeline: molecule dedup → permutation generation → permutation 
 """
 
 import argparse
+import heapq
 import json
 import os
 import subprocess
@@ -129,10 +130,245 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
     
     return valid_count
 
+def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, mode: str,
+                                     chunk_size: int, num_workers: int = None) -> tuple[List[Path], int]:
+    """
+    Stream-extract parquet rows and directly build sorted chunk files without creating
+    a giant intermediate extract file. Returns (chunk_files, valid_count).
+    """
+    if num_workers is None:
+        num_workers = max(1, cpu_count() - 2)
+
+    print(f"   ℹ️  Using {num_workers} parallel workers (streaming extract)")
+
+    chunk_files: List[Path] = []
+    current_chunk: List[str] = []
+    chunk_idx = 0
+    valid_count = 0
+
+    args_list = [(pf, mode) for pf in parquet_files]
+    with Pool(num_workers) as pool:
+        with tqdm(desc="Extracting + chunking", unit=" files", total=len(parquet_files)) as pbar:
+            for lines, count in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
+                valid_count += count
+                # Append lines and spill when needed
+                if lines:
+                    current_chunk.extend(lines)
+                    while len(current_chunk) >= chunk_size:
+                        # Sort and spill a full chunk
+                        to_write = current_chunk[:chunk_size]
+                        del current_chunk[:chunk_size]
+                        to_write.sort()
+                        out_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
+                        with open(out_path, 'w') as cf:
+                            cf.writelines(to_write)
+                        chunk_files.append(out_path)
+                        chunk_idx += 1
+                pbar.update(1)
+
+    # Flush remainder
+    if current_chunk:
+        current_chunk.sort()
+        out_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
+        with open(out_path, 'w') as cf:
+            cf.writelines(current_chunk)
+        chunk_files.append(out_path)
+        chunk_idx += 1
+
+    print(f"   ℹ️  Created {len(chunk_files)} sorted chunk files (streamed)")
+    return chunk_files, valid_count
+
+def merge_sorted_files(chunk_files: List[Path], output_file: Path, temp_dir: Path, max_open_files: int = 256) -> None:
+    """
+    Multi-pass k-way merge of sorted chunk files into a single sorted output.
+    Deletes intermediate chunk files progressively to control disk usage.
+    """
+    if not chunk_files:
+        # Create empty output
+        open(output_file, 'w').close()
+        return
+
+    if len(chunk_files) == 1:
+        os.replace(chunk_files[0], output_file)
+        return
+
+    def merge_group(files: List[Path], out_path: Path):
+        file_iters = []
+        for p in files:
+            f = open(p, 'r')
+            file_iters.append((f, iter(f)))
+        try:
+            heap = []
+            for idx, (fh, it) in enumerate(file_iters):
+                try:
+                    line = next(it)
+                    heapq.heappush(heap, (line, idx))
+                except StopIteration:
+                    pass
+            with open(out_path, 'w') as out:
+                while heap:
+                    line, idx = heapq.heappop(heap)
+                    out.write(line)
+                    try:
+                        nxt = next(file_iters[idx][1])
+                        heapq.heappush(heap, (nxt, idx))
+                    except StopIteration:
+                        pass
+        finally:
+            for fh, _ in file_iters:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
+    pass_num = 0
+    while len(chunk_files) > 1:
+        pass_num += 1
+        new_chunk_files: List[Path] = []
+        print(f"   ℹ️  Merge pass {pass_num}: {len(chunk_files)} files → batches of ≤{max_open_files}")
+        with tqdm(total=len(chunk_files), desc=f"   Merging (pass {pass_num})", unit=" files") as pbar:
+            for i in range(0, len(chunk_files), max_open_files):
+                group = chunk_files[i:i+max_open_files]
+                out_path = temp_dir / f"merge_p{pass_num}_{i//max_open_files:06d}.txt"
+                merge_group(group, out_path)
+                new_chunk_files.append(out_path)
+                for p in group:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+                pbar.update(len(group))
+        chunk_files = new_chunk_files
+
+    os.replace(chunk_files[0], output_file)
+
+def extract_and_sort_streaming(parquet_files: List[str], sorted_file: Path, temp_dir: Path, mode: str,
+                               num_workers: int, chunk_size: int, max_open_files: int) -> tuple[int, float]:
+    """
+    End-to-end streaming extract + chunked sort + multi-pass merge into sorted_file.
+    Returns (valid_count, elapsed_seconds).
+    """
+    start = time.time()
+    chunk_files, valid_count = extract_and_create_sorted_chunks(
+        parquet_files, temp_dir, mode, chunk_size, num_workers
+    )
+    merge_sorted_files(chunk_files, sorted_file, temp_dir, max_open_files=max_open_files)
+    return valid_count, time.time() - start
+
+def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size: int = 50_000_000, max_open_files: int = 256) -> float:
+    """
+    External merge sort implemented in Python:
+    - Read input in chunks of `chunk_size` lines
+    - Sort each chunk in-memory and spill to temp files
+    - K-way merge the chunk files in batches (<= max_open_files open at once)
+    Returns time taken in seconds.
+    """
+    start_time = time.time()
+
+    print(f"   ℹ️  Using PyArrow-style chunked sort (chunk_size={chunk_size:,} lines, max_open_files={max_open_files})")
+
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    chunk_files: List[Path] = []
+
+    # Phase 1: create sorted chunk files
+    current_chunk: List[str] = []
+    chunk_idx = 0
+    with open(input_file, 'r') as f:
+        for line in tqdm(f, desc="   Reading and sorting chunks", unit=" lines", unit_scale=True):
+            if not line:
+                continue
+            current_chunk.append(line)
+            if len(current_chunk) >= chunk_size:
+                current_chunk.sort()
+                chunk_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
+                with open(chunk_path, 'w') as cf:
+                    cf.writelines(current_chunk)
+                chunk_files.append(chunk_path)
+                current_chunk = []
+                chunk_idx += 1
+
+        # Flush last chunk
+        if current_chunk:
+            current_chunk.sort()
+            chunk_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
+            with open(chunk_path, 'w') as cf:
+                cf.writelines(current_chunk)
+            chunk_files.append(chunk_path)
+            current_chunk = []
+            chunk_idx += 1
+
+    print(f"   ℹ️  Created {len(chunk_files)} sorted chunk files")
+
+    # Early exit: single chunk
+    if len(chunk_files) == 1:
+        os.replace(chunk_files[0], output_file)
+        return time.time() - start_time
+
+    # Helper: merge a group of sorted files into one output file
+    def merge_group(files: List[Path], out_path: Path):
+        file_iters = []
+        for p in files:
+            f = open(p, 'r')
+            file_iters.append((f, iter(f)))
+
+        try:
+            heap = []
+            # Prime heap
+            for idx, (fh, it) in enumerate(file_iters):
+                try:
+                    line = next(it)
+                    heapq.heappush(heap, (line, idx))
+                except StopIteration:
+                    pass
+
+            with open(out_path, 'w') as out:
+                while heap:
+                    line, idx = heapq.heappop(heap)
+                    out.write(line)
+                    try:
+                        nxt = next(file_iters[idx][1])
+                        heapq.heappush(heap, (nxt, idx))
+                    except StopIteration:
+                        pass
+        finally:
+            for fh, _ in file_iters:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
+    # Phase 2: multi-pass k-way merge in batches
+    pass_num = 0
+    while len(chunk_files) > 1:
+        pass_num += 1
+        new_chunk_files: List[Path] = []
+        print(f"   ℹ️  Merge pass {pass_num}: {len(chunk_files)} files → batches of ≤{max_open_files}")
+        with tqdm(total=len(chunk_files), desc=f"   Merging (pass {pass_num})", unit=" files") as pbar:
+            for i in range(0, len(chunk_files), max_open_files):
+                group = chunk_files[i:i+max_open_files]
+                out_path = temp_dir / f"merge_p{pass_num}_{i//max_open_files:06d}.txt"
+                merge_group(group, out_path)
+                new_chunk_files.append(out_path)
+                # Remove merged inputs to free disk
+                for p in group:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+                pbar.update(len(group))
+        chunk_files = new_chunk_files
+
+    # Final file
+    os.replace(chunk_files[0], output_file)
+    return time.time() - start_time
+
+
 def external_sort(input_file: Path, output_file: Path, temp_dir: Path, buffer_size: str = "50G", num_threads: int = None) -> float:
     """
     Use Unix sort with large buffer for external merge sort.
     Returns time taken in seconds.
+    
+    NOTE: This function is kept for compatibility but PyArrow sort is now preferred.
     """
     if num_threads is None:
         num_threads = max(4, cpu_count() - 2)  # Use most cores, leave 2 free
@@ -308,7 +544,10 @@ def generate_permutations(input_file: Path, output_file: Path, mode: str, max_pe
     
     return perm_count
 
-def deduplicate_permutations(input_file: Path, output_file: Path, temp_dir: Path, buffer_size: str = "50G", num_threads: int = None) -> int:
+def deduplicate_permutations(input_file: Path, output_file: Path, temp_dir: Path, 
+                           buffer_size: str = "50G", num_threads: int = None, 
+                           use_unix_sort: bool = False, sort_chunk_size: int = 50_000_000,
+                           sort_max_open_files: int = 256) -> int:
     """
     Deduplicate permutations (remove exact duplicate orderings).
     Returns number of unique permutations.
@@ -317,8 +556,12 @@ def deduplicate_permutations(input_file: Path, output_file: Path, temp_dir: Path
     
     # Sort by permutation key
     sorted_file = temp_dir / "permutations_sorted.txt"
-    print("   ℹ️  Sorting permutations...")
-    sort_time = external_sort(input_file, sorted_file, temp_dir, buffer_size, num_threads)
+    if use_unix_sort:
+        print("   ℹ️  Sorting permutations with Unix sort...")
+        sort_time = external_sort(input_file, sorted_file, temp_dir, buffer_size, num_threads)
+    else:
+        print("   ℹ️  Sorting permutations with PyArrow...")
+        sort_time = pyarrow_sort(input_file, sorted_file, temp_dir, chunk_size=sort_chunk_size, max_open_files=sort_max_open_files)
     print(f"   ✓ Sorted in {sort_time:.1f}s")
     
     # Remove consecutive duplicates
@@ -522,26 +765,39 @@ def main():
     parser.add_argument("--output-deduplicated-full", help="Output directory for full-length sequences (default: <output-deduplicated>_full)")
     parser.add_argument("--mode", required=True, choices=list(MODE_CONFIGS.keys()), help="Processing mode")
     parser.add_argument("--sample", type=int, help="Sample N files for testing")
-    parser.add_argument("--tmp-dir", default="/mnt/ephemeral/temp", help="Temp directory for sort")
+    parser.add_argument("--tmp-dir", default="/mnt/ephemeral/temp", help="Temp directory for small intermediate files")
+    parser.add_argument("--work-dir", help="Working directory for large sorted chunks and merge outputs (default: same as tmp-dir, use EBS for large datasets)")
     parser.add_argument("--max-permutations", type=int, help="Max permutations per molecule")
     parser.add_argument("--no-permutations", action="store_true", help="Skip permutation generation entirely")
     parser.add_argument("--keep-all-permutations", action="store_true", help="Generate permutations but skip permutation deduplication")
-    parser.add_argument("--buffer-size", default="50G", help="Sort buffer size (e.g., 50G)")
+    parser.add_argument("--buffer-size", default="50G", help="Sort buffer size (e.g., 50G) - only used with --use-unix-sort")
     parser.add_argument("--num-workers", type=int, default=None, help="Number of parallel workers (default: CPU count - 2)")
+    parser.add_argument("--sort-chunk-size", type=int, default=50_000_000, help="Chunk size for PyArrow sort (default: 50M lines)")
+    parser.add_argument("--sort-max-open-files", type=int, default=256, help="Max files to open per merge pass (default: 256)")
+    parser.add_argument("--use-unix-sort", action="store_true", help="Use Unix sort instead of PyArrow sort (not recommended for large datasets)")
     
     args = parser.parse_args()
     
-    # Setup temp directory
+    # Setup temp directory (for small ops)
     temp_dir = Path(args.tmp_dir)
     temp_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Setup work directory (for large chunks/merge - can be on EBS)
+    work_dir = Path(args.work_dir) if args.work_dir else temp_dir
+    work_dir.mkdir(exist_ok=True, parents=True)
     
     # Set Unix sort temp dir
     os.environ['TMPDIR'] = str(temp_dir)
     
     # Check available space
-    stat = os.statvfs(temp_dir)
-    free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
-    print(f"💾 Available space in temp dir: {free_gb:.1f} GB")
+    temp_stat = os.statvfs(temp_dir)
+    temp_free_gb = (temp_stat.f_bavail * temp_stat.f_frsize) / (1024**3)
+    print(f"💾 Available space in temp dir ({temp_dir}): {temp_free_gb:.1f} GB")
+    
+    if work_dir != temp_dir:
+        work_stat = os.statvfs(work_dir)
+        work_free_gb = (work_stat.f_bavail * work_stat.f_frsize) / (1024**3)
+        print(f"💾 Available space in work dir ({work_dir}): {work_free_gb:.1f} GB")
     
     # Find all parquet files
     all_files = []
@@ -560,20 +816,30 @@ def main():
     print(f"STAGE 1: MOLECULE DEDUPLICATION (mode={args.mode})")
     print(f"{'='*60}")
     
-    extract_file = temp_dir / "extract.txt"
-    sorted_file = temp_dir / "sorted.txt"
-    deduped_file = temp_dir / "deduped.txt"
+    sorted_file = work_dir / "sorted.txt"
+    deduped_file = work_dir / "deduped.txt"
     
-    # Extract
-    print("\n📊 Step 1/3: Extracting and tagging molecules...")
-    valid_count = extract_parquet_to_temp(all_files, extract_file, args.mode, args.num_workers)
-    print(f"✓ Extracted {valid_count:,} valid molecules ({extract_file.stat().st_size / (1024**3):.2f} GB)")
-    
-    # Sort
-    print("\n📊 Step 2/3: External Unix sort...")
-    sort_time = external_sort(extract_file, sorted_file, temp_dir, args.buffer_size, args.num_workers)
-    print(f"✓ Sorted in {sort_time:.1f}s ({sort_time/60:.1f} min)")
-    extract_file.unlink()
+    if args.use_unix_sort:
+        # Traditional: extract → external sort
+        extract_file = work_dir / "extract.txt"
+        print("\n📊 Step 1/3: Extracting and tagging molecules...")
+        valid_count = extract_parquet_to_temp(all_files, extract_file, args.mode, args.num_workers)
+        size_gb = extract_file.stat().st_size / (1024**3)
+        print(f"✓ Extracted {valid_count:,} valid molecules ({size_gb:.2f} GB)")
+
+        print("\n📊 Step 2/3: External Unix sort...")
+        sort_time = external_sort(extract_file, sorted_file, work_dir, args.buffer_size, args.num_workers)
+        print(f"✓ Sorted in {sort_time:.1f}s ({sort_time/60:.1f} min)")
+        extract_file.unlink()
+    else:
+        # Streaming: extract directly into sorted chunks → merge, no giant extract file
+        print("\n📊 Step 1/2: Extracting + building sorted chunks (streaming)...")
+        valid_count, sort_time = extract_and_sort_streaming(
+            all_files, sorted_file, work_dir, args.mode,
+            args.num_workers if args.num_workers else max(1, cpu_count()-2),
+            args.sort_chunk_size, args.sort_max_open_files
+        )
+        print(f"✓ Streamed extract+sort in {sort_time:.1f}s ({sort_time/60:.1f} min)")
     
     # Deduplicate
     print("\n📊 Step 3/3: Streaming deduplication...")
@@ -587,7 +853,7 @@ def main():
         print(f"STAGE 2: PERMUTATION GENERATION")
         print(f"{'='*60}")
         
-        perm_file = temp_dir / "permutations.txt"
+        perm_file = work_dir / "permutations.txt"
         perm_count = generate_permutations(deduped_file, perm_file, args.mode, args.max_permutations, args.num_workers)
         print(f"✓ Generated {perm_count:,} permutations ({perm_count/unique_count:.1f}x expansion)")
         deduped_file.unlink()
@@ -602,8 +868,13 @@ def main():
             print(f"STAGE 3: PERMUTATION DEDUPLICATION")
             print(f"{'='*60}")
             
-            final_file = temp_dir / "final.txt"
-            final_count = deduplicate_permutations(perm_file, final_file, temp_dir, args.buffer_size, args.num_workers)
+            final_file = work_dir / "final.txt"
+            final_count = deduplicate_permutations(
+                perm_file, final_file, work_dir, 
+                args.buffer_size, args.num_workers,
+                args.use_unix_sort, args.sort_chunk_size,
+                args.sort_max_open_files
+            )
             print(f"✓ Kept {final_count:,} unique permutations")
             perm_file.unlink()
     else:
@@ -640,9 +911,18 @@ def main():
     print(f"Output (Full): {output_dir_full}")
     
     # Cleanup
+    print(f"\n📊 Cleaning up temporary files...")
     try:
+        # Only try to remove work_dir if it's empty and different from output dirs
+        if work_dir != temp_dir:
+            # Don't remove if it contains output
+            output_dir = Path(args.output_deduplicated)
+            output_dir_full = Path(args.output_deduplicated_full) if args.output_deduplicated_full else Path(str(output_dir) + "_full")
+            if not (output_dir.is_relative_to(work_dir) or output_dir_full.is_relative_to(work_dir)):
+                work_dir.rmdir()
         temp_dir.rmdir()
-    except:
+    except Exception as e:
+        print(f"   ℹ️  Could not remove temp directories (may not be empty): {e}")
         pass
 
 if __name__ == "__main__":
