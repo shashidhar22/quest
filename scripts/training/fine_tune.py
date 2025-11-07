@@ -514,7 +514,86 @@ def compute_metrics(eval_pred: Any) -> Dict[str, float]:
     }
 
 
-def log_dataset_statistics(dataset: Any, split_name: str) -> Dict[str, Any]:
+def log_prediction_examples(
+    model: Any,
+    tokenizer: Any,
+    dataset: Any,
+    num_examples: int = 50,
+    device: str = "cuda"
+) -> None:
+    """
+    Log prediction examples to W&B as a table.
+    
+    Args:
+        model: Trained model
+        tokenizer: Tokenizer
+        dataset: Dataset to sample from
+        num_examples: Number of examples to log
+        device: Device to run inference on
+    """
+    if wandb.run is None:
+        return
+    
+    model.eval()
+    model.to(device)
+    
+    # Sample random examples
+    indices = random.sample(range(len(dataset)), min(num_examples, len(dataset)))
+    
+    examples_data = []
+    
+    with torch.no_grad():
+        for idx in tqdm(indices, desc="Generating prediction examples"):
+            example = dataset[idx]
+            
+            # Get input_ids and labels
+            input_ids = torch.tensor([example["input_ids"]], dtype=torch.long).to(device)
+            labels = torch.tensor([example["labels"]], dtype=torch.long).to(device)
+            attention_mask = torch.tensor([example["attention_mask"]], dtype=torch.long).to(device)
+            
+            # Get predictions
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            predictions = torch.argmax(outputs.logits, dim=-1)
+            
+            # Decode masked input (showing [MASK] tokens)
+            masked_input = tokenizer.decode(input_ids[0], skip_special_tokens=False)
+            
+            # Create predicted output by replacing masked positions
+            output_ids = input_ids[0].clone()
+            mask_positions = labels[0] != -100
+            output_ids[mask_positions] = predictions[0][mask_positions]
+            predicted_output = tokenizer.decode(output_ids, skip_special_tokens=False)
+            
+            # Get ground truth
+            ground_truth_ids = input_ids[0].clone()
+            ground_truth_ids[mask_positions] = labels[0][mask_positions]
+            ground_truth = tokenizer.decode(ground_truth_ids, skip_special_tokens=False)
+            
+            # Calculate accuracy for this example
+            correct = (predictions[0][mask_positions] == labels[0][mask_positions]).sum().item()
+            total = mask_positions.sum().item()
+            accuracy = correct / total if total > 0 else 0.0
+            
+            examples_data.append([
+                masked_input,
+                predicted_output,
+                ground_truth,
+                f"{accuracy:.2%}"
+            ])
+    
+    # Create W&B table
+    table = wandb.Table(
+        data=examples_data,
+        columns=["Masked Input", "Predicted Output", "Ground Truth", "Accuracy"]
+    )
+    
+    wandb.log({"prediction_examples": table})
+    print(f"✅ Logged {len(examples_data)} prediction examples to W&B")
+    
+    model.train()
+
+
+def log_dataset_statistics(dataset: Any, split_name: str, log_to_wandb: bool = False) -> Dict[str, Any]:
     """Log dataset statistics to W&B and console."""
     num_examples = len(dataset)
     
@@ -527,7 +606,6 @@ def log_dataset_statistics(dataset: Any, split_name: str) -> Dict[str, Any]:
     
     stats = {
         f"{split_name}_num_examples": num_examples,
-        f"{split_name}_permutation_keys": pkey_counts_str,
     }
     
     print(f"\n{split_name.upper()} Dataset Statistics:")
@@ -536,6 +614,22 @@ def log_dataset_statistics(dataset: Any, split_name: str) -> Dict[str, Any]:
         print(f"  Permutation key distribution:")
         for key, count in sorted(pkey_counts_str.items(), key=lambda x: x[1], reverse=True):
             print(f"    {key}: {count:,} ({count/num_examples*100:.1f}%)")
+        
+        # Create bar chart for W&B
+        if log_to_wandb and wandb.run is not None:
+            # Sort by count for better visualization
+            sorted_keys = sorted(pkey_counts_str.items(), key=lambda x: x[1], reverse=True)
+            
+            # Create bar chart data
+            data = [[key, count] for key, count in sorted_keys]
+            table = wandb.Table(data=data, columns=["Permutation Key", "Count"])
+            
+            stats[f"{split_name}_permutation_distribution"] = wandb.plot.bar(
+                table, 
+                "Permutation Key", 
+                "Count",
+                title=f"{split_name.title()} Dataset: Examples per Permutation Key"
+            )
     
     return stats
 
@@ -690,6 +784,10 @@ def main():
                         help="Evaluate every N steps (default: once per epoch)")
     parser.add_argument("--save_steps", type=int, default=None,
                         help="Save checkpoint every N steps (default: once per epoch)")
+    parser.add_argument("--max_eval_samples", type=int, default=None,
+                        help="Maximum number of evaluation samples to use (useful for large validation sets)")
+    parser.add_argument("--log_prediction_examples", action="store_true",
+                        help="Log prediction examples to W&B (can be slow for large datasets)")
     
     # Other arguments
     parser.add_argument("--test", action="store_true",
@@ -724,7 +822,12 @@ def main():
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
-            config=vars(args)
+            config=vars(args),
+            settings=wandb.Settings(
+                # Disable system metrics to reduce clutter
+                _disable_stats=True,
+                _disable_meta=True,
+            )
         )
     
     # ─────────────────────────────────────────────────────────────────────────────
@@ -747,9 +850,29 @@ def main():
         train_dataset = train_dataset.shuffle(seed=args.seed).select(range(min(1000, len(train_dataset))))
         val_dataset = val_dataset.shuffle(seed=args.seed).select(range(min(200, len(val_dataset))))
     
+    # Limit validation set size if specified
+    if args.max_eval_samples is not None and len(val_dataset) > args.max_eval_samples:
+        print(f"\n⚠️  Limiting validation set from {len(val_dataset):,} to {args.max_eval_samples:,} examples")
+        val_dataset = val_dataset.shuffle(seed=args.seed).select(range(args.max_eval_samples))
+    
+    # Auto-adjust eval batch size AND limit eval set for very large validation sets to prevent OOM
+    if len(val_dataset) > 50000:
+        if args.max_eval_samples is None:
+            # Automatically limit to 50k examples for very large validation sets
+            old_val_size = len(val_dataset)
+            args.max_eval_samples = 50000
+            val_dataset = val_dataset.shuffle(seed=args.seed).select(range(args.max_eval_samples))
+            print(f"\n⚠️  Very large validation set detected ({old_val_size:,} examples)")
+            print(f"   Automatically limiting to {args.max_eval_samples:,} examples to prevent OOM during evaluation")
+        
+        if args.eval_batch_size > 4:
+            old_eval_batch = args.eval_batch_size
+            args.eval_batch_size = 4
+            print(f"   Also reducing eval batch size from {old_eval_batch} to {args.eval_batch_size}")
+    
     # Log dataset statistics
-    train_stats = log_dataset_statistics(train_dataset, "train")
-    val_stats = log_dataset_statistics(val_dataset, "validation")
+    train_stats = log_dataset_statistics(train_dataset, "train", log_to_wandb=args.wandb_project is not None)
+    val_stats = log_dataset_statistics(val_dataset, "validation", log_to_wandb=args.wandb_project is not None)
     
     if args.wandb_project:
         wandb.log(train_stats)
@@ -845,6 +968,11 @@ def main():
         remove_unused_columns=True,  # Remove extra columns like permutation_key
         label_names=["labels"],
         include_num_input_tokens_seen=False,
+        
+        # Disable unnecessary logging
+        log_level="warning",
+        disable_tqdm=False,
+        skip_memory_metrics=True,
     )
     
     # ─────────────────────────────────────────────────────────────────────────────
@@ -898,6 +1026,22 @@ def main():
     
     if args.wandb_project:
         wandb.log({"final_eval": eval_results})
+        
+        # Log prediction examples only if requested
+        if args.log_prediction_examples:
+            print("\nGenerating prediction examples for W&B...")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            try:
+                log_prediction_examples(
+                    model=trainer.model,
+                    tokenizer=tokenizer,
+                    dataset=val_dataset,
+                    num_examples=50,
+                    device=device
+                )
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to log prediction examples: {e}")
+        
         wandb.finish()
     
     print("\n✅ Fine-tuning complete!")
