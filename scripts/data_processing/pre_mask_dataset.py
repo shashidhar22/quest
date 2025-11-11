@@ -21,6 +21,13 @@ from datasets import load_from_disk, DatasetDict
 from transformers import AutoTokenizer
 from tqdm.auto import tqdm
 
+# Try to import ESM3
+try:
+    from esm.tokenization import get_esm3_model_tokenizers
+    HAS_ESM3 = True
+except ImportError:
+    HAS_ESM3 = False
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Pre-mask dataset for fine-tuning")
@@ -54,12 +61,22 @@ class MaskingFunction:
         self.cdr3_mask_length = cdr3_mask_length
         self.seed = seed
         
-        # Token IDs
-        self.mask_token_id = tokenizer.mask_token_id
-        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        self.cls_token_id = tokenizer.cls_token_id if hasattr(tokenizer, 'cls_token_id') else None
-        self.sep_token_id = tokenizer.sep_token_id if hasattr(tokenizer, 'sep_token_id') else None
-        self.vocab_size = len(tokenizer)
+        # Token IDs - handle both HuggingFace and ESM3 tokenizers
+        self.mask_token_id = getattr(tokenizer, 'mask_token_id', None)
+        self.pad_token_id = getattr(tokenizer, 'pad_token_id', None)
+        if self.pad_token_id is None:
+            self.pad_token_id = 0
+        
+        self.cls_token_id = getattr(tokenizer, 'cls_token_id', None)
+        self.sep_token_id = getattr(tokenizer, 'sep_token_id', None)
+        
+        # Vocab size - handle both dict-like and len() tokenizers
+        if hasattr(tokenizer, '__len__'):
+            self.vocab_size = len(tokenizer)
+        elif hasattr(tokenizer, 'vocab_size'):
+            self.vocab_size = tokenizer.vocab_size
+        else:
+            self.vocab_size = 1000  # Fallback
     
     def __call__(self, examples: Dict[str, List]) -> Dict[str, List]:
         """Apply masking to a batch of examples."""
@@ -107,10 +124,19 @@ class MaskingFunction:
         if self.sep_token_id is not None and token_id == self.sep_token_id:
             return True
         
-        token = self.tokenizer.decode([token_id])
+        # Try to decode token (handle both HuggingFace and ESM3 tokenizers)
+        try:
+            if hasattr(self.tokenizer, 'decode'):
+                token = self.tokenizer.decode([token_id])
+            else:
+                # Fallback for tokenizers without decode
+                return False
+        except:
+            return False
+        
         if token.startswith('[') and token.endswith(']'):
             return True
-        if token in ['<s>', '</s>', '<pad>', '<unk>']:
+        if token in ['<s>', '</s>', '<pad>', '<unk>', '<mask>', '<cls>', '<sep>']:
             return True
         
         return False
@@ -279,6 +305,46 @@ class MaskingFunction:
         return input_ids, label_ids
 
 
+def load_tokenizer(tokenizer_path: str):
+    """
+    Load tokenizer with special handling for ESM3.
+    
+    Args:
+        tokenizer_path: Path or name of tokenizer. Special values:
+            - "esm3" or "esm3_sm_open_v1": Load ESM3 tokenizer
+            - Otherwise: Load via AutoTokenizer
+    
+    Returns:
+        tokenizer object
+    """
+    # Check if ESM3 is requested
+    if tokenizer_path.lower() in ["esm3", "esm3_sm_open_v1"]:
+        if not HAS_ESM3:
+            print("⚠️  ESM-3 package not available. Install with: pip install esm")
+            print("   Falling back to ESM-2 tokenizer")
+            tokenizer_path = "facebook/esm2_t6_8M_UR50D"
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            print(f"✓ Loaded ESM-2 tokenizer as fallback")
+        else:
+            try:
+                print(f"Loading ESM-3 tokenizer...")
+                tokenizers = get_esm3_model_tokenizers("esm3_sm_open_v1")
+                tokenizer = tokenizers.sequence
+                print(f"✓ Loaded ESM-3 sequence tokenizer")
+            except Exception as e:
+                print(f"⚠️  Failed to load ESM-3 tokenizer: {e}")
+                print("   Falling back to ESM-2 tokenizer")
+                tokenizer_path = "facebook/esm2_t6_8M_UR50D"
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+                print(f"✓ Loaded ESM-2 tokenizer as fallback")
+    else:
+        # Standard HuggingFace tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        print(f"✓ Loaded tokenizer: {tokenizer_path}")
+    
+    return tokenizer
+
+
 def main():
     args = parse_args()
     
@@ -301,7 +367,7 @@ def main():
     
     # Load tokenizer
     print(f"\nLoading tokenizer: {args.tokenizer_path}")
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    tokenizer = load_tokenizer(args.tokenizer_path)
     
     # Create masking function
     mask_fn = MaskingFunction(

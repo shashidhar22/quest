@@ -32,7 +32,7 @@ except ImportError:
 # Try to import ESM3 from evolutionaryscale/esm
 try:
     from esm.models.esm3 import ESM3
-    from esm.tokenization import get_model_tokenizers
+    from esm.tokenization import get_esm3_model_tokenizers
     HAS_ESM3 = True
 except ImportError:
     HAS_ESM3 = False
@@ -180,7 +180,7 @@ class ESM3Tokenizer(SequenceTokenizerBase):
             try:
                 # Get the tokenizers for ESM3
                 # ESM3 uses sequence tokenizer and structure tokenizer
-                self.tokenizers = get_model_tokenizers(model_name)
+                self.tokenizers = get_esm3_model_tokenizers(model_name)
                 self.tokenizer = self.tokenizers.sequence  # Use sequence tokenizer
                 self.is_esm3 = True
                 print(f"✓ Loaded ESM-3 tokenizer from {model_name}")
@@ -268,7 +268,7 @@ class ESM3Tokenizer(SequenceTokenizerBase):
                 print("ESM3 tokenizer - reinitializing from model")
                 # Reinitialize ESM3
                 if HAS_ESM3:
-                    self.tokenizers = get_model_tokenizers("esm3_sm_open_v1")
+                    self.tokenizers = get_esm3_model_tokenizers("esm3_sm_open_v1")
                     self.tokenizer = self.tokenizers.sequence
                     self.is_esm3 = True
                 else:

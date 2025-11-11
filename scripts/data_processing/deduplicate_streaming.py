@@ -714,9 +714,20 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
                     if not val or str(val) == 'nan' or str(val) == '' or isinstance(val, float):
                         val = row_dict.get(field, "")
                     
+                    # If we have a valid sequence, add it
                     if val and str(val) != 'nan' and str(val) != '' and not (isinstance(val, float)):
                         seq_parts_full.append(str(val))
                         actual_fields_full.append(field)
+                    # If this field was in the original permutation, we need to keep it in the key
+                    # even if we don't have a sequence (to maintain permutation structure)
+                    elif field in field_order:
+                        # Check if the original CDR3 data had a valid sequence for this field
+                        # If yes, but we just don't have the full version, still include in key
+                        cdr3_val = row_dict.get(field, "") if field in ['tra', 'trb'] else row_dict.get(field, "")
+                        if cdr3_val and str(cdr3_val) != 'nan' and str(cdr3_val) != '' and not (isinstance(cdr3_val, float)):
+                            # We have CDR3 but no full - use CDR3 as fallback
+                            seq_parts_full.append(str(cdr3_val))
+                            actual_fields_full.append(field)
                 
                 seq_full = " ".join(seq_parts_full)
                 perm_key_full = "_".join(actual_fields_full) if actual_fields_full else "empty"
