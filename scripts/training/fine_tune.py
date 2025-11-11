@@ -496,15 +496,21 @@ def compute_metrics(eval_pred: Any) -> Dict[str, float]:
         references=labels[mask]
     )["accuracy"]
     
-    # Calculate loss and perplexity
-    loss_fct = torch.nn.CrossEntropyLoss()
-    logits_tensor = torch.tensor(logits, dtype=torch.float32)
-    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    # Calculate loss and perplexity using numpy to avoid OOM issues
+    # Convert to float64 for numerical stability
+    logits_masked = logits[mask].astype(np.float64)
+    labels_masked = labels[mask].astype(np.int64)
     
-    loss = loss_fct(
-        logits_tensor.view(-1, logits_tensor.size(-1)),
-        labels_tensor.view(-1)
-    ).item()
+    # Compute cross-entropy loss manually using numpy (more memory efficient)
+    # Apply log-softmax
+    logits_max = np.max(logits_masked, axis=-1, keepdims=True)
+    logits_shifted = logits_masked - logits_max
+    log_sum_exp = np.log(np.sum(np.exp(logits_shifted), axis=-1, keepdims=True))
+    log_probs = logits_shifted - log_sum_exp
+    
+    # Get log probability of correct class
+    nll = -log_probs[np.arange(len(labels_masked)), labels_masked]
+    loss = np.mean(nll)
     
     perplexity = math.exp(loss) if loss < 100 else float('inf')
     
@@ -1018,15 +1024,25 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────────
     
     print("\nRunning final evaluation...")
-    eval_results = trainer.evaluate()
+    print(f"  Evaluating on {len(val_dataset):,} validation examples")
     
-    print("\nFinal Evaluation Results:")
-    for key, value in eval_results.items():
-        print(f"  {key}: {value:.4f}")
+    try:
+        eval_results = trainer.evaluate()
+        
+        print("\nFinal Evaluation Results:")
+        for key, value in eval_results.items():
+            print(f"  {key}: {value:.4f}")
+        
+        if args.wandb_project:
+            wandb.log({"final_eval": eval_results})
+    except Exception as e:
+        print(f"\n⚠️  Warning: Final evaluation failed with error: {e}")
+        print("This is likely due to memory constraints with large validation sets.")
+        print("Training has completed successfully - the best model has been saved.")
+        import traceback
+        traceback.print_exc()
     
     if args.wandb_project:
-        wandb.log({"final_eval": eval_results})
-        
         # Log prediction examples only if requested
         if args.log_prediction_examples:
             print("\nGenerating prediction examples for W&B...")
