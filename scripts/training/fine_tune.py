@@ -39,7 +39,134 @@ from accelerate import Accelerator
 from typing import Any, Dict, List, Optional, Tuple
 from tqdm.auto import tqdm
 
+# Try to import ESM3 package
+try:
+    from esm.pretrained import (
+        ESM3_sm_open_v0,
+        ESM3_structure_encoder_v0,
+        ESM3_structure_decoder_v0,
+    )
+    from esm.sdk.api import ESMProtein, ESM3InferenceClient
+    ESM3_AVAILABLE = True
+except ImportError:
+    ESM3_AVAILABLE = False
+    print("⚠️  ESM3 package not available. Install with: pip install esm")
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ESM3 MODEL WRAPPER FOR HUGGINGFACE TRAINER COMPATIBILITY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ESM3ForMaskedLM(nn.Module):
+    """
+    Wrapper around ESM3 model to make it compatible with HuggingFace Trainer.
+    
+    ESM3's forward() doesn't accept 'labels' argument, but Trainer expects it.
+    This wrapper handles the labels and computes the MLM loss.
+    """
+    
+    def __init__(self, esm3_model):
+        super().__init__()
+        self.esm3 = esm3_model
+        
+        # Create a proper config object compatible with PEFT
+        class ESM3Config:
+            """Config object for ESM3 model compatible with PEFT"""
+            def __init__(self):
+                self.vocab_size = 64
+                self.hidden_size = 1536
+                self.num_hidden_layers = 48
+                self.num_attention_heads = 24
+                self.intermediate_size = 8192
+                self.tie_word_embeddings = False
+                self.model_type = "esm3"
+                
+            def get(self, key, default=None):
+                """Dict-like get method for PEFT compatibility"""
+                return getattr(self, key, default)
+            
+            def __getitem__(self, key):
+                """Dict-like indexing for PEFT compatibility"""
+                return getattr(self, key)
+            
+            def to_dict(self):
+                """Convert config to dictionary for W&B and other integrations"""
+                return {
+                    'vocab_size': self.vocab_size,
+                    'hidden_size': self.hidden_size,
+                    'num_hidden_layers': self.num_hidden_layers,
+                    'num_attention_heads': self.num_attention_heads,
+                    'intermediate_size': self.intermediate_size,
+                    'tie_word_embeddings': self.tie_word_embeddings,
+                    'model_type': self.model_type,
+                }
+        
+        self.config = ESM3Config()
+        
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        **kwargs
+    ):
+        """
+        Forward pass compatible with HuggingFace Trainer.
+        
+        Args:
+            input_ids: Input token IDs
+            attention_mask: Attention mask
+            labels: Target labels for MLM (-100 for non-masked positions)
+            **kwargs: Other arguments (ignored)
+        
+        Returns:
+            Dictionary with 'loss' and 'logits'
+        """
+        # Prepare inputs for ESM3
+        # ESM3 expects sequence_tokens as input
+        from esm.sdk.api import ESMProteinTensor
+        
+        # Convert input_ids to ESM3 format
+        batch_size, seq_len = input_ids.shape
+        
+        # ESM3 forward expects ESMProteinTensor with sequence field
+        # For simplicity, we'll call the model directly with sequence tokens
+        outputs = self.esm3(
+            sequence_tokens=input_ids,
+        )
+        
+        # Get sequence logits from outputs
+        logits = outputs.sequence_logits
+        
+        # Compute loss if labels are provided
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            # Flatten for loss computation
+            loss = loss_fct(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1)
+            )
+        
+        # Return in HuggingFace format
+        return type('Output', (), {
+            'loss': loss,
+            'logits': logits,
+        })()
+    
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing if supported"""
+        if hasattr(self.esm3, 'gradient_checkpointing_enable'):
+            self.esm3.gradient_checkpointing_enable()
+    
+    def __getattr__(self, name):
+        """Delegate attribute access to wrapped ESM3 model"""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.esm3, name)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -648,74 +775,238 @@ def load_model_and_tokenizer(
     model_path: str,
     use_lora: bool = False,
     lora_config: Optional[Dict[str, Any]] = None,
+    enable_gradient_checkpointing: bool = False,
 ) -> Tuple[Any, Any]:
     """
     Load model and tokenizer, optionally applying LoRA.
     
+    Supports both HuggingFace models and ESM3 models via the esm package.
+    
     Args:
-        model_path: Path to model (local or HuggingFace Hub)
+        model_path: Path to model (local or HuggingFace Hub) or ESM3 model name (e.g., 'esm3-small', 'esm3-medium', 'esm3-large')
         use_lora: Whether to apply LoRA
         lora_config: LoRA configuration dict
+        enable_gradient_checkpointing: Whether to enable gradient checkpointing
     
     Returns:
         (model, tokenizer)
     """
     print(f"Loading model and tokenizer from: {model_path}")
     
-    # Check if this is a PEFT adapter model
-    is_peft_model = False
-    if os.path.isdir(model_path) and os.path.exists(os.path.join(model_path, "adapter_config.json")):
-        print(f"Detected existing PEFT adapter at {model_path}")
-        is_peft_model = True
+    # Check if this is an ESM3 model
+    is_esm3 = False
+    if ESM3_AVAILABLE and (model_path.startswith('esm3') or 'esm3' in model_path.lower()):
+        is_esm3 = True
+        print(f"Detected ESM3 model: {model_path}")
+    
+    if is_esm3:
+        # Load ESM3 model using the esm package
+        print("Loading ESM3 model using esm package...")
         
-        # Load base model name from adapter config
-        with open(os.path.join(model_path, "adapter_config.json"), 'r') as f:
-            adapter_config = json.load(f)
-        base_model_name = adapter_config.get("base_model_name_or_path", "Rostlab/prot_bert")
+        # Map common ESM3 model names to loading functions
+        esm3_model_loaders = {
+            'esm3-small': ESM3_sm_open_v0,
+            'esm3-sm': ESM3_sm_open_v0,
+            'esm3_sm_open_v0': ESM3_sm_open_v0,
+        }
         
-        print(f"Loading base model: {base_model_name}")
-        base_model = AutoModelForMaskedLM.from_pretrained(base_model_name)
+        model_loader = esm3_model_loaders.get(model_path.lower())
+        if model_loader is None:
+            # Try to find a matching loader
+            for key, loader in esm3_model_loaders.items():
+                if key in model_path.lower():
+                    model_loader = loader
+                    break
         
-        # Load PEFT model and merge weights
-        peft_model = PeftModel.from_pretrained(base_model, model_path)
-        print("Merging PEFT weights into base model...")
-        model = peft_model.merge_and_unload()
+        if model_loader is None:
+            raise ValueError(
+                f"Unknown ESM3 model: {model_path}. "
+                f"Available models: {list(esm3_model_loaders.keys())}"
+            )
         
-        tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+        # Load ESM3 model with device placement
+        print(f"Loading ESM3 model with {model_loader.__name__}...")
+        print("⚠️  Loading large model - this may take a moment and use significant memory...")
+        
+        # Clear CUDA cache before loading
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"🔧 Cleared CUDA cache")
+        
+        # Load model directly to GPU
+        esm3_model = model_loader()
+        
+        print(f"✅ Model loaded successfully")
+        
+        # Clear cache again after loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Wrap ESM3 model for HuggingFace Trainer compatibility
+        model = ESM3ForMaskedLM(esm3_model)
+        print("✅ Wrapped ESM3 model for HuggingFace Trainer compatibility")
+        
+        # ESM3 uses its own tokenization - we need to wrap it for HuggingFace Trainer compatibility
+        # For now, we'll use a simple wrapper that delegates to the model's internal tokenizer
+        class ESM3TokenizerWrapper:
+            """Wrapper to make ESM3 tokenization compatible with HuggingFace Trainer"""
+            def __init__(self, esm3_model):
+                self.model = esm3_model
+                # Set required attributes for Trainer compatibility
+                self.pad_token = "<pad>"
+                self.pad_token_id = 0  # ESM3 uses 0 for padding
+                self.mask_token = "<mask>"
+                self.mask_token_id = 32  # ESM3 mask token
+                self.vocab_size = 64  # ESM3 vocabulary size
+                
+            def __call__(self, text, **kwargs):
+                # This won't be used since we're using pre-tokenized data
+                raise NotImplementedError("ESM3 tokenization should be done during dataset preparation")
+            
+            def decode(self, token_ids, **kwargs):
+                # Placeholder for decode - needed for logging
+                if isinstance(token_ids, list):
+                    return " ".join([str(t) for t in token_ids])
+                else:
+                    return str(token_ids)
+        
+        tokenizer = ESM3TokenizerWrapper(model)
+        
+        print(f"✅ Loaded ESM3 model: {model_loader.__name__}")
+        
     else:
-        # Load regular model
-        model = AutoModelForMaskedLM.from_pretrained(model_path)
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        # Check if this is a PEFT adapter model
+        is_peft_model = False
+        if os.path.isdir(model_path) and os.path.exists(os.path.join(model_path, "adapter_config.json")):
+            print(f"Detected existing PEFT adapter at {model_path}")
+            is_peft_model = True
+            
+            # Load base model name from adapter config
+            with open(os.path.join(model_path, "adapter_config.json"), 'r') as f:
+                adapter_config = json.load(f)
+            base_model_name = adapter_config.get("base_model_name_or_path", "Rostlab/prot_bert")
+            
+            print(f"Loading base model: {base_model_name}")
+            base_model = AutoModelForMaskedLM.from_pretrained(base_model_name)
+            
+            # Load PEFT model and merge weights
+            peft_model = PeftModel.from_pretrained(base_model, model_path)
+            print("Merging PEFT weights into base model...")
+            model = peft_model.merge_and_unload()
+            
+            tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+        else:
+            # Load regular HuggingFace model
+            model = AutoModelForMaskedLM.from_pretrained(model_path)
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
     
     # Set pad token if not present
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        if hasattr(tokenizer, 'eos_token') and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            # For ESM3 or other models without eos_token
+            print("⚠️  No pad token found, using mask token as pad token")
+            tokenizer.pad_token = tokenizer.mask_token if hasattr(tokenizer, 'mask_token') else None
     
     # Apply LoRA if requested
     if use_lora:
         print("Applying LoRA configuration...")
         
+        # Determine target modules based on model type
+        target_modules = lora_config.get("target_modules", ["query", "value"])
+        
+        # For ESM3, use different target modules
+        if is_esm3:
+            print("Detected ESM3 model - using ESM3-specific LoRA target modules")
+            # ESM3 uses MultiHeadAttention with layernorm_qkv containing the QKV projection
+            # and ffn layers. We target the Linear layers inside these modules.
+            # Note: ESM3 is wrapped, so we need to prefix with 'esm3.'
+            target_modules = lora_config.get("target_modules", [
+                "esm3.transformer.blocks.0.attn.layernorm_qkv.1",  # Example path to Linear layer
+                "esm3.transformer.blocks.0.attn.out_proj",
+                "esm3.transformer.blocks.0.ffn.1",
+                "esm3.transformer.blocks.0.ffn.3"
+            ])
+            print(f"  Target modules: {target_modules}")
+        
         lora_cfg = LoraConfig(
             r=lora_config.get("r", 16),
             lora_alpha=lora_config.get("alpha", 32),
-            target_modules=lora_config.get("target_modules", ["query", "value"]),
+            target_modules=target_modules,
             lora_dropout=lora_config.get("dropout", 0.05),
             bias="none",
         )
         
-        model = get_peft_model(model, lora_cfg)
-        
-        # Ensure MLM head is trainable
-        for name, param in model.named_parameters():
-            if "cls" in name or "lm_head" in name:
-                param.requires_grad = True
-        
-        model.print_trainable_parameters()
+        try:
+            model = get_peft_model(model, lora_cfg)
+            
+            # Ensure MLM head is trainable
+            for name, param in model.named_parameters():
+                if "cls" in name or "lm_head" in name or "output" in name.lower():
+                    param.requires_grad = True
+            
+            model.print_trainable_parameters()
+        except ValueError as e:
+            error_msg = str(e)
+            print(f"\n⚠️  LoRA application failed: {error_msg}")
+            
+            # If the error is about unsupported module types, try to find Linear layers
+            if "not supported" in error_msg or "not found" in error_msg:
+                print("Attempting to find correct target modules by scanning Linear layers...")
+                
+                # Try to auto-detect target modules
+                import torch
+                linear_layers = []
+                for name, module in model.named_modules():
+                    if isinstance(module, torch.nn.Linear):
+                        linear_layers.append(name)
+                
+                print(f"Found {len(linear_layers)} Linear layers in model")
+                
+                # For ESM3, look for specific patterns in the layer names
+                # Priority: attention layers, then FFN layers
+                attn_layers = [name for name in linear_layers if 'attn' in name.lower()]
+                ffn_layers = [name for name in linear_layers if 'ffn' in name.lower()]
+                
+                # Select a subset of layers to target (from first transformer block)
+                found_modules = []
+                if attn_layers:
+                    # Take first 2-3 attention-related layers
+                    found_modules.extend(attn_layers[:3])
+                    print(f"  Selected attention layers: {attn_layers[:3]}")
+                
+                if ffn_layers and len(found_modules) < 4:
+                    # Add some FFN layers
+                    found_modules.extend(ffn_layers[:2])
+                    print(f"  Selected FFN layers: {ffn_layers[:2]}")
+                
+                if not found_modules:
+                    # Fall back to first few linear layers
+                    found_modules = [name for name in linear_layers[:4]]
+                    print(f"  Using first linear layers: {found_modules}")
+                
+                if found_modules:
+                    print(f"\nRetrying LoRA with target modules: {found_modules}")
+                    lora_cfg.target_modules = found_modules
+                    model = get_peft_model(model, lora_cfg)
+                    model.print_trainable_parameters()
+                else:
+                    print(f"\n❌ Available linear layers (first 20):")
+                    for i, layer in enumerate(linear_layers[:20]):
+                        print(f"  {i+1}. {layer}")
+                    raise ValueError(
+                        f"Could not automatically detect LoRA target modules. "
+                        f"Please specify --lora_target_modules manually from the list above."
+                    )
+            else:
+                raise
     
     # Enable gradient checkpointing for memory savings
     # Note: Can slow down training but essential for large models on limited GPU memory
-    if hasattr(model, "gradient_checkpointing_enable"):
-        print("Enabling gradient checkpointing for memory efficiency...")
+    if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        print("✅ Enabling gradient checkpointing for memory efficiency...")
         model.gradient_checkpointing_enable()
     
     return model, tokenizer
@@ -739,7 +1030,10 @@ def main():
     
     # Model arguments
     parser.add_argument("--model_path", type=str, required=True,
-                        help="Path to pre-trained model (local or HuggingFace Hub)")
+                        help="Path to pre-trained model. Supports: "
+                             "(1) HuggingFace model names (e.g., 'facebook/esm2_t12_35M_UR50D'), "
+                             "(2) Local model directories, "
+                             "(3) ESM3 model names (e.g., 'esm3-small', 'esm3-medium', 'esm3-large')")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Directory to save checkpoints and final model")
     
@@ -771,7 +1065,9 @@ def main():
     parser.add_argument("--lora_dropout", type=float, default=0.05,
                         help="LoRA dropout")
     parser.add_argument("--lora_target_modules", type=str, nargs="+", default=["query", "value"],
-                        help="Target modules for LoRA")
+                        help="Target modules for LoRA. Default ['query', 'value'] for HuggingFace models. "
+                             "For ESM3, auto-detects attention/FFN Linear layers or use specific paths like "
+                             "'attn.layernorm_qkv.1', 'attn.out_proj', 'ffn.1', 'ffn.3'")
     
     # Masking arguments
     parser.add_argument("--mlm_probability", type=float, default=0.15,
@@ -806,6 +1102,12 @@ def main():
                         help="Use FP16 mixed precision")
     parser.add_argument("--bf16", action="store_true",
                         help="Use BF16 mixed precision")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to save memory (slower but reduces memory)")
+    parser.add_argument("--optim", type=str, default="adamw_torch",
+                        help="Optimizer to use. Use 'adamw_8bit' for 8-bit Adam (requires bitsandbytes) to save memory")
+    parser.add_argument("--max_seq_length", type=int, default=None,
+                        help="Maximum sequence length. Sequences longer than this will be truncated to save memory")
     
     args = parser.parse_args()
     
@@ -819,6 +1121,34 @@ def main():
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+    
+    # Memory optimization warnings and recommendations
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"\n🔍 GPU Memory: {gpu_memory:.1f} GB")
+        
+        if gpu_memory < 25:  # Less than 25GB (e.g., g5.xlarge has 24GB)
+            print("\n⚠️  MEMORY OPTIMIZATION RECOMMENDATIONS:")
+            print("   Your GPU has limited memory. Consider these options:")
+            print(f"   1. Current batch size: {args.batch_size}")
+            if args.batch_size > 2:
+                print(f"      → Try reducing to 1-2")
+            print(f"   2. Gradient accumulation: {args.gradient_accumulation_steps}")
+            if args.gradient_accumulation_steps < 4:
+                print(f"      → Increase to 4-8 to maintain effective batch size")
+            if not args.gradient_checkpointing:
+                print(f"   3. Gradient checkpointing: OFF")
+                print(f"      → Add --gradient_checkpointing (slower but saves ~30% memory)")
+            if args.optim == "adamw_torch":
+                print(f"   4. Optimizer: {args.optim}")
+                print(f"      → Try --optim adamw_8bit (requires: pip install bitsandbytes)")
+            if not args.use_lora:
+                print(f"   5. LoRA: OFF")
+                print(f"      → Add --use_lora --lora_r 8 (reduces trainable params by 99%)")
+            if args.max_seq_length is None:
+                print(f"   6. Max sequence length: unlimited")
+                print(f"      → Try --max_seq_length 512 or 256")
+            print()
     
     # ─────────────────────────────────────────────────────────────────────────────
     # Initialize W&B
@@ -855,6 +1185,22 @@ def main():
         print("\n⚠️  Running in TEST mode with reduced dataset size")
         train_dataset = train_dataset.shuffle(seed=args.seed).select(range(min(1000, len(train_dataset))))
         val_dataset = val_dataset.shuffle(seed=args.seed).select(range(min(200, len(val_dataset))))
+    
+    # Truncate sequences if max_seq_length is specified (saves memory)
+    if args.max_seq_length is not None:
+        print(f"\n✂️  Truncating sequences to max length: {args.max_seq_length}")
+        
+        def truncate_sequence(example):
+            if len(example['input_ids']) > args.max_seq_length:
+                example['input_ids'] = example['input_ids'][:args.max_seq_length]
+                if 'attention_mask' in example:
+                    example['attention_mask'] = example['attention_mask'][:args.max_seq_length]
+                if 'labels' in example:
+                    example['labels'] = example['labels'][:args.max_seq_length]
+            return example
+        
+        train_dataset = train_dataset.map(truncate_sequence, desc="Truncating training sequences")
+        val_dataset = val_dataset.map(truncate_sequence, desc="Truncating validation sequences")
     
     # Limit validation set size if specified
     if args.max_eval_samples is not None and len(val_dataset) > args.max_eval_samples:
@@ -898,7 +1244,8 @@ def main():
     model, tokenizer = load_model_and_tokenizer(
         args.model_path,
         use_lora=args.use_lora,
-        lora_config=lora_config
+        lora_config=lora_config,
+        enable_gradient_checkpointing=args.gradient_checkpointing,
     )
     
     # ─────────────────────────────────────────────────────────────────────────────
@@ -965,12 +1312,17 @@ def main():
         fp16=args.fp16,
         bf16=args.bf16,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        gradient_checkpointing=False,  # Disabled for LoRA compatibility
+        gradient_checkpointing=args.gradient_checkpointing,
         lr_scheduler_type="cosine",
+        optim=args.optim,  # Can be adamw_8bit for memory savings
+        
+        # Memory optimization
+        dataloader_pin_memory=False,  # Disable pin_memory to save GPU memory
+        auto_find_batch_size=False,  # Don't auto-adjust, use user's settings
         
         # Other
         seed=args.seed,
-        dataloader_num_workers=4,
+        dataloader_num_workers=2,  # Reduced from 4 to save memory
         remove_unused_columns=True,  # Remove extra columns like permutation_key
         label_names=["labels"],
         include_num_input_tokens_seen=False,
