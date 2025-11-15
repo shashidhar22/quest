@@ -21,6 +21,17 @@ from itertools import permutations as iter_permutations
 from multiprocessing import Pool, cpu_count
 from functools import partial
 
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+# Import TCR stitcher
+try:
+    from parsers.tcr_stitcher import TCRStitcher
+    STITCHER_AVAILABLE = True
+except ImportError:
+    STITCHER_AVAILABLE = False
+    print("⚠️  WARNING: TCRStitcher not available. Full-length sequences will not be generated.")
+
 # Valid amino acids
 _valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
 
@@ -73,10 +84,24 @@ def process_single_parquet(args: tuple) -> tuple:
     """
     Process a single parquet file and return (lines, count).
     This runs in a separate process for parallelization.
+    
+    If --stitch-tcr flag is enabled, will attempt to generate full-length
+    TCR sequences from CDR3 + gene segments using stitchr.
     """
-    pf, mode = args
+    pf, mode, stitch_tcr = args
     lines = []
     valid_count = 0
+    stitch_success_count = 0
+    stitch_attempt_count = 0
+    
+    # Initialize stitcher if needed (once per process)
+    stitcher = None
+    if stitch_tcr and STITCHER_AVAILABLE:
+        try:
+            stitcher = TCRStitcher(species="HUMAN")
+        except Exception as e:
+            print(f"Warning: Failed to initialize TCRStitcher in process: {e}")
+            stitcher = None
     
     try:
         table = pq.read_table(pf)
@@ -96,14 +121,56 @@ def process_single_parquet(args: tuple) -> tuple:
                             'trav_gene', 'traj_gene', 'trad_gene',  # TRA gene segments
                             'trbv_gene', 'trbj_gene', 'trbd_gene']  # TRB gene segments
                 }
+                
+                # Stitch full-length sequences if requested and not already present
+                if stitcher is not None:
+                    try:
+                        # Stitch TRA if we have CDR3 + genes but no full-length sequence
+                        if ('tra' in molecule_data and molecule_data.get('tra') and 
+                            ('tra_full' not in molecule_data or not molecule_data.get('tra_full'))):
+                            stitch_attempt_count += 1
+                            tra_full = stitcher.stitch_tcr(
+                                cdr3=molecule_data.get('tra'),
+                                v_gene=molecule_data.get('trav_gene'),
+                                j_gene=molecule_data.get('traj_gene'),
+                                chain='TRA'
+                            )
+                            if tra_full:
+                                molecule_data['tra_full'] = tra_full
+                                stitch_success_count += 1
+                        
+                        # Stitch TRB if we have CDR3 + genes but no full-length sequence
+                        if ('trb' in molecule_data and molecule_data.get('trb') and 
+                            ('trb_full' not in molecule_data or not molecule_data.get('trb_full'))):
+                            stitch_attempt_count += 1
+                            trb_full = stitcher.stitch_tcr(
+                                cdr3=molecule_data.get('trb'),
+                                v_gene=molecule_data.get('trbv_gene'),
+                                j_gene=molecule_data.get('trbj_gene'),
+                                chain='TRB'
+                            )
+                            if trb_full:
+                                molecule_data['trb_full'] = trb_full
+                                stitch_success_count += 1
+                    except Exception as e:
+                        # Don't fail the whole file for stitching errors
+                        pass
+                
                 lines.append(f"{dedup_key}\t{json.dumps(molecule_data)}\n")
                 valid_count += 1
     except Exception as e:
         print(f"Warning: Failed to read {pf}: {e}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+    
+    # Print stitching stats for this file (only if we tried stitching)
+    if stitch_tcr and stitch_attempt_count > 0:
+        success_rate = (stitch_success_count / stitch_attempt_count * 100) if stitch_attempt_count > 0 else 0
+        print(f"Stitching stats for {pf}: {stitch_success_count}/{stitch_attempt_count} ({success_rate:.1f}%)")
     
     return lines, valid_count
 
-def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str, num_workers: int = None) -> int:
+def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str, num_workers: int = None, stitch_tcr: bool = False) -> int:
     """
     Extract parquet files to temp file with dedup keys (parallelized).
     Returns number of valid rows extracted.
@@ -114,12 +181,13 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
     valid_count = 0
     
     print(f"   ℹ️  Using {num_workers} parallel workers")
+    if stitch_tcr:
+        print(f"   ℹ️  TCR stitching ENABLED - will generate full-length sequences from CDR3 + gene segments")
     
     with open(temp_file, 'w') as out:
         with Pool(num_workers) as pool:
             # Process files in parallel
-            process_func = partial(process_single_parquet, mode=mode)
-            args_list = [(pf, mode) for pf in parquet_files]
+            args_list = [(pf, mode, stitch_tcr) for pf in parquet_files]
             
             with tqdm(desc="Extracting parquet files", unit=" files", total=len(parquet_files)) as pbar:
                 for lines, count in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
@@ -131,7 +199,7 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
     return valid_count
 
 def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, mode: str,
-                                     chunk_size: int, num_workers: int = None) -> tuple[List[Path], int]:
+                                     chunk_size: int, num_workers: int = None, stitch_tcr: bool = False) -> tuple[List[Path], int]:
     """
     Stream-extract parquet rows and directly build sorted chunk files without creating
     a giant intermediate extract file. Returns (chunk_files, valid_count).
@@ -140,13 +208,15 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
         num_workers = max(1, cpu_count() - 2)
 
     print(f"   ℹ️  Using {num_workers} parallel workers (streaming extract)")
+    if stitch_tcr:
+        print(f"   ℹ️  TCR stitching ENABLED - will generate full-length sequences from CDR3 + gene segments")
 
     chunk_files: List[Path] = []
     current_chunk: List[str] = []
     chunk_idx = 0
     valid_count = 0
 
-    args_list = [(pf, mode) for pf in parquet_files]
+    args_list = [(pf, mode, stitch_tcr) for pf in parquet_files]
     with Pool(num_workers) as pool:
         with tqdm(desc="Extracting + chunking", unit=" files", total=len(parquet_files)) as pbar:
             for lines, count in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
@@ -243,14 +313,14 @@ def merge_sorted_files(chunk_files: List[Path], output_file: Path, temp_dir: Pat
     os.replace(chunk_files[0], output_file)
 
 def extract_and_sort_streaming(parquet_files: List[str], sorted_file: Path, temp_dir: Path, mode: str,
-                               num_workers: int, chunk_size: int, max_open_files: int) -> tuple[int, float]:
+                               num_workers: int, chunk_size: int, max_open_files: int, stitch_tcr: bool = False) -> tuple[int, float]:
     """
     End-to-end streaming extract + chunked sort + multi-pass merge into sorted_file.
     Returns (valid_count, elapsed_seconds).
     """
     start = time.time()
     chunk_files, valid_count = extract_and_create_sorted_chunks(
-        parquet_files, temp_dir, mode, chunk_size, num_workers
+        parquet_files, temp_dir, mode, chunk_size, num_workers, stitch_tcr
     )
     merge_sorted_files(chunk_files, sorted_file, temp_dir, max_open_files=max_open_files)
     return valid_count, time.time() - start
@@ -636,8 +706,19 @@ def concatenate_sequences(row_dict: Dict, field_order: List[str], sequences_dict
 def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Path, batch_size: int = 1000000):
     """
     Convert deduplicated text file to two parquet outputs:
-    1. CDR3 version (tra/trb) - permutation_key, concatenated_sequence
+    1. CDR3 version (tra/trb) - permutation_key, concatenated_sequence (all rows)
     2. Full-length version (tra_full/trb_full) - permutation_key, concatenated_sequence
+    
+    FILTERING: The full-length output only includes rows where at least one full-length
+    TCR sequence (tra_full or trb_full) exists. Rows with only CDR3 data are excluded.
+    
+    IMPORTANT: Permutation keys in the full-length output only include fields where
+    the full-length version actually exists:
+    - permutation_key='tra' means tra_full exists
+    - permutation_key='tra_trb' means both tra_full and trb_full exist
+    - permutation_key='peptide' means only peptide (no TCR full-length)
+    
+    This allows users to filter for rows with specific full-length molecules.
     """
     print(f"\n📊 Writing parquet outputs...")
     
@@ -698,10 +779,12 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
                 })
                 
                 # Create full-length version (tra_full/trb_full)
+                # IMPORTANT: Only include fields in permutation key if full-length version exists
+                # This distinguishes rows with actual full-length sequences from CDR3 fallbacks
                 seq_parts_full = []
                 actual_fields_full = []
                 for field in field_order:
-                    # Try full-length version first (tra_full/trb_full)
+                    # Determine which field to look up
                     lookup_field = field
                     if field == 'tra':
                         lookup_field = 'tra_full'
@@ -710,64 +793,76 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
                     
                     val = row_dict.get(lookup_field, "")
                     
-                    # If full-length version doesn't exist, fall back to regular field
-                    if not val or str(val) == 'nan' or str(val) == '' or isinstance(val, float):
-                        val = row_dict.get(field, "")
+                    # Check if we have a valid full-length sequence
+                    has_full = val and str(val) != 'nan' and str(val) != '' and not isinstance(val, float)
                     
-                    # If we have a valid sequence, add it
-                    if val and str(val) != 'nan' and str(val) != '' and not (isinstance(val, float)):
+                    if has_full:
+                        # We have the full-length version - use it and include in permutation key
                         seq_parts_full.append(str(val))
                         actual_fields_full.append(field)
-                    # If this field was in the original permutation, we need to keep it in the key
-                    # even if we don't have a sequence (to maintain permutation structure)
-                    elif field in field_order:
-                        # Check if the original CDR3 data had a valid sequence for this field
-                        # If yes, but we just don't have the full version, still include in key
-                        cdr3_val = row_dict.get(field, "") if field in ['tra', 'trb'] else row_dict.get(field, "")
-                        if cdr3_val and str(cdr3_val) != 'nan' and str(cdr3_val) != '' and not (isinstance(cdr3_val, float)):
-                            # We have CDR3 but no full - use CDR3 as fallback
-                            seq_parts_full.append(str(cdr3_val))
+                    elif lookup_field == field:
+                        # This field doesn't have a full version (peptide, mhc_one, mhc_two)
+                        # Use the regular field value
+                        val = row_dict.get(field, "")
+                        if val and str(val) != 'nan' and str(val) != '' and not isinstance(val, float):
+                            seq_parts_full.append(str(val))
                             actual_fields_full.append(field)
+                    # else: field is tra/trb but no full-length version exists - skip entirely
+                    # This ensures permutation_key only includes fields with actual full-length data
                 
                 seq_full = " ".join(seq_parts_full)
                 perm_key_full = "_".join(actual_fields_full) if actual_fields_full else "empty"
                 
-                batch_data_full.append({
-                    'permutation_key': perm_key_full,
-                    'sequence': seq_full
-                })
+                # Filter: Only include in full output if we have at least one full-length TCR sequence
+                # Check if tra_full or trb_full actually exists in the row
+                has_full_tcr = ('tra_full' in row_dict and row_dict.get('tra_full') and 
+                               str(row_dict['tra_full']) != 'nan' and str(row_dict['tra_full']) != '' and 
+                               not isinstance(row_dict['tra_full'], float)) or \
+                              ('trb_full' in row_dict and row_dict.get('trb_full') and 
+                               str(row_dict['trb_full']) != 'nan' and str(row_dict['trb_full']) != '' and 
+                               not isinstance(row_dict['trb_full'], float))
                 
+                # Only add to full output if we have at least one full-length TCR sequence
+                if has_full_tcr:
+                    batch_data_full.append({
+                        'permutation_key': perm_key_full,
+                        'sequence': seq_full
+                    })
+                
+                # Write CDR3 batch if ready
                 if len(batch_data_cdr3) >= batch_size:
-                    # Write CDR3 batch
                     table_cdr3 = pa.Table.from_pylist(batch_data_cdr3)
                     output_file_cdr3 = output_dir / f"batch_{batch_num:06d}.parquet"
                     pq.write_table(table_cdr3, output_file_cdr3)
-                    
-                    # Write full-length batch
-                    table_full = pa.Table.from_pylist(batch_data_full)
-                    output_file_full = output_dir_full / f"batch_{batch_num:06d}.parquet"
-                    pq.write_table(table_full, output_file_full)
-                    
                     pbar.update(len(batch_data_cdr3))
                     batch_num += 1
                     batch_data_cdr3 = []
+                
+                # Write full-length batch if ready (independent counter)
+                if len(batch_data_full) >= batch_size:
+                    table_full = pa.Table.from_pylist(batch_data_full)
+                    output_file_full = output_dir_full / f"batch_{len(list(output_dir_full.glob('*.parquet'))):06d}.parquet"
+                    pq.write_table(table_full, output_file_full)
                     batch_data_full = []
             
-            # Write remaining
+            # Write remaining CDR3 data
             if batch_data_cdr3:
                 table_cdr3 = pa.Table.from_pylist(batch_data_cdr3)
                 output_file_cdr3 = output_dir / f"batch_{batch_num:06d}.parquet"
                 pq.write_table(table_cdr3, output_file_cdr3)
-                
-                table_full = pa.Table.from_pylist(batch_data_full)
-                output_file_full = output_dir_full / f"batch_{batch_num:06d}.parquet"
-                pq.write_table(table_full, output_file_full)
-                
                 pbar.update(len(batch_data_cdr3))
+            
+            # Write remaining full-length data
+            if batch_data_full:
+                table_full = pa.Table.from_pylist(batch_data_full)
+                output_file_full = output_dir_full / f"batch_{len(list(output_dir_full.glob('*.parquet'))):06d}.parquet"
+                pq.write_table(table_full, output_file_full)
     
-    print(f"✓ Wrote {batch_num + 1} parquet files to:")
-    print(f"   CDR3: {output_dir}")
-    print(f"   Full: {output_dir_full}")
+    cdr3_files = len(list(output_dir.glob('*.parquet')))
+    full_files = len(list(output_dir_full.glob('*.parquet')))
+    print(f"✓ Wrote parquet files:")
+    print(f"   CDR3: {output_dir} ({cdr3_files} files)")
+    print(f"   Full: {output_dir_full} ({full_files} files, filtered for full-length TCR sequences)")
 
 def main():
     parser = argparse.ArgumentParser(description="Streaming deduplication with external sort")
@@ -786,6 +881,7 @@ def main():
     parser.add_argument("--sort-chunk-size", type=int, default=50_000_000, help="Chunk size for PyArrow sort (default: 50M lines)")
     parser.add_argument("--sort-max-open-files", type=int, default=256, help="Max files to open per merge pass (default: 256)")
     parser.add_argument("--use-unix-sort", action="store_true", help="Use Unix sort instead of PyArrow sort (not recommended for large datasets)")
+    parser.add_argument("--stitch-tcr", action="store_true", help="Generate full-length TCR sequences from CDR3 + gene segments using stitchr")
     
     args = parser.parse_args()
     
@@ -834,7 +930,7 @@ def main():
         # Traditional: extract → external sort
         extract_file = work_dir / "extract.txt"
         print("\n📊 Step 1/3: Extracting and tagging molecules...")
-        valid_count = extract_parquet_to_temp(all_files, extract_file, args.mode, args.num_workers)
+        valid_count = extract_parquet_to_temp(all_files, extract_file, args.mode, args.num_workers, args.stitch_tcr)
         size_gb = extract_file.stat().st_size / (1024**3)
         print(f"✓ Extracted {valid_count:,} valid molecules ({size_gb:.2f} GB)")
 
@@ -848,7 +944,7 @@ def main():
         valid_count, sort_time = extract_and_sort_streaming(
             all_files, sorted_file, work_dir, args.mode,
             args.num_workers if args.num_workers else max(1, cpu_count()-2),
-            args.sort_chunk_size, args.sort_max_open_files
+            args.sort_chunk_size, args.sort_max_open_files, args.stitch_tcr
         )
         print(f"✓ Streamed extract+sort in {sort_time:.1f}s ({sort_time/60:.1f} min)")
     

@@ -221,8 +221,8 @@ class TCRStitcher:
         
         Args:
             cdr3: CDR3 amino acid sequence
-            v_gene: V gene name (normalized)
-            j_gene: J gene name (normalized)
+            v_gene: V gene name (will be normalized to IMGT format)
+            j_gene: J gene name (will be normalized to IMGT format)
             chain: 'TRA' or 'TRB'
             c_gene: Optional constant region gene (auto-selected if None)
         
@@ -238,6 +238,13 @@ class TCRStitcher:
             v_gene = str(v_gene).strip()
             j_gene = str(j_gene).strip()
             
+            # Normalize gene names to IMGT format
+            norm_v_gene = self.normalize_gene_name(v_gene, chain)
+            norm_j_gene = self.normalize_gene_name(j_gene, chain)
+            
+            if not norm_v_gene or not norm_j_gene:
+                return None
+            
             # Auto-select constant region if not provided
             if c_gene is None:
                 if chain == 'TRA':
@@ -250,15 +257,15 @@ class TCRStitcher:
             
             # Build tcr_bits dictionary for stitchr
             tcr_bits = {
-                'v': v_gene,
-                'j': j_gene,
+                'v': norm_v_gene,
+                'j': norm_j_gene,
                 'cdr3': cdr3,
-                'l': '',  # Leader sequence (empty - will use default from V gene)
+                'l': norm_v_gene,  # Use V gene for leader
                 'c': c_gene,
                 'mode': '',
                 'skip_c_checks': False,
                 'skip_n_checks': False,
-                'no_leader': True,  # Skip leader sequence (CDR3-based stitching)
+                'no_leader': False,  # Include leader sequence
                 'species': self.species,
                 'seamless': False,
                 '5_prime_seq': '',
@@ -280,9 +287,10 @@ class TCRStitcher:
                 chain_data['low_conf_js']
             )
             
-            # Extract amino acid sequence from result
-            if stitched and 'seqs' in stitched and 'aa' in stitched['seqs']:
-                aa_seq = stitched['seqs']['aa']
+            # Extract and translate nucleotide sequence to amino acid
+            if stitched and 'stitched_nt' in stitched:
+                # Translate the full nucleotide sequence to amino acid
+                aa_seq = self._translate_dna(stitched['stitched_nt'])
                 if aa_seq and len(aa_seq) > len(cdr3):
                     return aa_seq
             
