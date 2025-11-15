@@ -1127,28 +1127,77 @@ def main():
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"\n🔍 GPU Memory: {gpu_memory:.1f} GB")
         
-        if gpu_memory < 25:  # Less than 25GB (e.g., g5.xlarge has 24GB)
+        # Calculate estimated memory usage for BERT
+        estimated_model_memory = 0.5  # BERT base ~0.5GB
+        estimated_batch_memory = args.batch_size * 0.5  # ~0.5GB per batch for 512 seq len
+        estimated_total = estimated_model_memory + estimated_batch_memory
+        
+        print(f"   Estimated memory usage: ~{estimated_total:.1f} GB")
+        print(f"   Model: ~{estimated_model_memory:.1f} GB, Batch: ~{estimated_batch_memory:.1f} GB")
+        
+        # Auto-apply optimizations if memory is tight
+        memory_is_tight = estimated_total > gpu_memory * 0.7
+        
+        if memory_is_tight or gpu_memory < 25:
             print("\n⚠️  MEMORY OPTIMIZATION RECOMMENDATIONS:")
             print("   Your GPU has limited memory. Consider these options:")
-            print(f"   1. Current batch size: {args.batch_size}")
-            if args.batch_size > 2:
-                print(f"      → Try reducing to 1-2")
+            
+            # Auto-reduce batch size if critically low on memory
+            if estimated_total > gpu_memory * 0.9 and args.batch_size > 1:
+                suggested_batch_size = max(1, args.batch_size // 2)
+                print(f"\n   🚨 CRITICAL: Likely to OOM with current settings!")
+                print(f"   1. Current batch size: {args.batch_size}")
+                print(f"      → STRONGLY RECOMMEND reducing to {suggested_batch_size}")
+                if args.gradient_accumulation_steps < 4:
+                    suggested_grad_accum = args.gradient_accumulation_steps * (args.batch_size // suggested_batch_size)
+                    print(f"      → AND increase gradient_accumulation_steps to {suggested_grad_accum}")
+                    print(f"      → This maintains effective batch size of {suggested_batch_size * suggested_grad_accum}")
+            else:
+                print(f"   1. Current batch size: {args.batch_size}")
+                if args.batch_size > 4:
+                    print(f"      → Try reducing to 2-4")
+                elif args.batch_size > 2:
+                    print(f"      → Try reducing to 1-2")
+            
             print(f"   2. Gradient accumulation: {args.gradient_accumulation_steps}")
             if args.gradient_accumulation_steps < 4:
                 print(f"      → Increase to 4-8 to maintain effective batch size")
+            
             if not args.gradient_checkpointing:
                 print(f"   3. Gradient checkpointing: OFF")
-                print(f"      → Add --gradient_checkpointing (slower but saves ~30% memory)")
+                print(f"      → Add --gradient_checkpointing (saves ~30-40% memory)")
+            
             if args.optim == "adamw_torch":
                 print(f"   4. Optimizer: {args.optim}")
-                print(f"      → Try --optim adamw_8bit (requires: pip install bitsandbytes)")
+                print(f"      → Try --optim adamw_8bit (saves ~50% optimizer memory)")
+                print(f"      → Install: pip install bitsandbytes")
+            
             if not args.use_lora:
                 print(f"   5. LoRA: OFF")
                 print(f"      → Add --use_lora --lora_r 8 (reduces trainable params by 99%)")
-            if args.max_seq_length is None:
-                print(f"   6. Max sequence length: unlimited")
-                print(f"      → Try --max_seq_length 512 or 256")
+            
+            if args.max_seq_length is None or args.max_seq_length > 512:
+                print(f"   6. Max sequence length: {args.max_seq_length if args.max_seq_length else 'unlimited'}")
+                print(f"      → Try --max_seq_length 384 or 256 (saves significant memory)")
+            
+            if not args.fp16 and not args.bf16:
+                print(f"   7. Mixed precision: OFF")
+                print(f"      → Add --fp16 (saves ~50% memory, faster training)")
+            
+            print(f"\n   💡 RECOMMENDED COMMAND:")
+            print(f"   python scripts/training/fine_tune.py \\")
+            print(f"       --batch_size {max(1, args.batch_size // 2)} \\")
+            print(f"       --gradient_accumulation_steps {args.gradient_accumulation_steps * 2} \\")
+            print(f"       --gradient_checkpointing \\")
+            print(f"       --fp16 \\")
+            print(f"       --max_seq_length 384 \\")
+            print(f"       --use_lora --lora_r 8 \\")
+            print(f"       ... (other args)")
             print()
+    
+    # Set PYTORCH_CUDA_ALLOC_CONF for better memory management
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    print("✅ Enabled expandable_segments for better CUDA memory management")
     
     # ─────────────────────────────────────────────────────────────────────────────
     # Initialize W&B
@@ -1186,6 +1235,15 @@ def main():
         train_dataset = train_dataset.shuffle(seed=args.seed).select(range(min(1000, len(train_dataset))))
         val_dataset = val_dataset.shuffle(seed=args.seed).select(range(min(200, len(val_dataset))))
     
+    # Check maximum sequence length in dataset
+    print("\n📏 Checking dataset sequence lengths...")
+    max_train_len = max(len(x['input_ids']) for x in train_dataset.select(range(min(1000, len(train_dataset)))))
+    max_val_len = max(len(x['input_ids']) for x in val_dataset.select(range(min(1000, len(val_dataset)))))
+    dataset_max_len = max(max_train_len, max_val_len)
+    print(f"   Max length in sample (train): {max_train_len}")
+    print(f"   Max length in sample (val): {max_val_len}")
+    print(f"   Dataset max length: {dataset_max_len}")
+    
     # Truncate sequences if max_seq_length is specified (saves memory)
     if args.max_seq_length is not None:
         print(f"\n✂️  Truncating sequences to max length: {args.max_seq_length}")
@@ -1201,6 +1259,7 @@ def main():
         
         train_dataset = train_dataset.map(truncate_sequence, desc="Truncating training sequences")
         val_dataset = val_dataset.map(truncate_sequence, desc="Truncating validation sequences")
+        dataset_max_len = args.max_seq_length
     
     # Limit validation set size if specified
     if args.max_eval_samples is not None and len(val_dataset) > args.max_eval_samples:
@@ -1247,6 +1306,45 @@ def main():
         lora_config=lora_config,
         enable_gradient_checkpointing=args.gradient_checkpointing,
     )
+    
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Check model's max position embeddings vs dataset max length
+    # ─────────────────────────────────────────────────────────────────────────────
+    
+    model_max_length = None
+    if hasattr(model.config, 'max_position_embeddings'):
+        model_max_length = model.config.max_position_embeddings
+        print(f"\n📐 Model max position embeddings: {model_max_length}")
+    elif hasattr(model, 'esm3'):  # ESM3 model
+        model_max_length = 1024  # ESM3 supports up to 1024
+        print(f"\n📐 ESM3 model max length: {model_max_length}")
+    
+    if model_max_length is not None and dataset_max_len > model_max_length:
+        error_msg = (
+            f"\n{'='*80}\n"
+            f"❌ FATAL ERROR: Dataset sequences exceed model's maximum length!\n"
+            f"{'='*80}\n"
+            f"   Dataset max length: {dataset_max_len} tokens\n"
+            f"   Model max length:   {model_max_length} tokens\n"
+            f"   Difference:         {dataset_max_len - model_max_length} tokens over limit\n\n"
+            f"This will cause a RuntimeError during training/evaluation.\n\n"
+            f"💡 SOLUTIONS (choose one):\n"
+            f"   1. Add --max_seq_length {model_max_length} to truncate sequences\n"
+            f"   2. Use a model with longer context:\n"
+            f"      - ESM2 models support up to 1024 tokens\n"
+            f"      - ESM3 models support up to 1024 tokens\n"
+            f"      Example: --model_path facebook/esm2_t12_35M_UR50D\n\n"
+            f"{'='*80}\n"
+        )
+        print(error_msg)
+        raise RuntimeError(f"Dataset sequences ({dataset_max_len}) exceed model max length ({model_max_length})")
+    elif model_max_length is not None and dataset_max_len > model_max_length * 0.9:
+        print(f"\n⚠️  WARNING: Dataset sequences are close to model's maximum!")
+        print(f"   Dataset max: {dataset_max_len} / Model max: {model_max_length}")
+        print(f"   Recommend using --max_seq_length {int(model_max_length * 0.95)} for safety")
+    else:
+        print(f"\n✅ Dataset sequence lengths are compatible with model")
+        print(f"   Dataset max: {dataset_max_len} / Model max: {model_max_length}")
     
     # ─────────────────────────────────────────────────────────────────────────────
     # Create data collator with task-specific masking
@@ -1355,7 +1453,33 @@ def main():
     print("Starting training...")
     print("="*80 + "\n")
     
-    trainer.train()
+    # Clear CUDA cache before training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print("🔧 Cleared CUDA cache before training")
+    
+    try:
+        trainer.train()
+    except torch.cuda.OutOfMemoryError as e:
+        print("\n" + "="*80)
+        print("❌ CUDA OUT OF MEMORY ERROR")
+        print("="*80)
+        print(f"\nError: {e}\n")
+        print("💡 IMMEDIATE SOLUTIONS:")
+        print("   1. Reduce batch size further (current: {})".format(args.batch_size))
+        print("   2. Add --gradient_checkpointing if not already enabled")
+        print("   3. Add --fp16 for half precision training")
+        print("   4. Reduce --max_seq_length to 256 or 128")
+        print("   5. Use LoRA: --use_lora --lora_r 8")
+        print("\n   Try restarting with smaller batch size:")
+        print(f"   --batch_size 1 --gradient_accumulation_steps 16 --gradient_checkpointing --fp16")
+        print("="*80 + "\n")
+        raise
+    
+    # Clear cache after training before evaluation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print("\n🔧 Cleared CUDA cache after training")
     
     # ─────────────────────────────────────────────────────────────────────────────
     # Save best model
@@ -1375,6 +1499,11 @@ def main():
     # Final evaluation and logging
     # ─────────────────────────────────────────────────────────────────────────────
     
+    # Clear cache before evaluation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print("\n🔧 Cleared CUDA cache before final evaluation")
+    
     print("\nRunning final evaluation...")
     print(f"  Evaluating on {len(val_dataset):,} validation examples")
     
@@ -1387,6 +1516,15 @@ def main():
         
         if args.wandb_project:
             wandb.log({"final_eval": eval_results})
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"\n⚠️  Warning: Final evaluation failed with OOM error")
+        print(f"   This is common with large validation sets.")
+        print(f"   Training has completed successfully - the best model has been saved.")
+        print(f"\n   To evaluate separately, use:")
+        print(f"   python scripts/inference/evaluate_mlm.py \\")
+        print(f"       --model_path {best_model_dir} \\")
+        print(f"       --dataset_path {args.dataset_path} \\")
+        print(f"       --batch_size 4")
     except Exception as e:
         print(f"\n⚠️  Warning: Final evaluation failed with error: {e}")
         print("This is likely due to memory constraints with large validation sets.")
