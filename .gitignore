@@ -10,8 +10,8 @@ missed_files.txt
 missing_data.txt
 # Folders
 config
-./data
-./results
+data
+results
 keys
 logs
 misc
@@ -64,7 +64,7 @@ data/raw/*
 data/processed/*
 !data/.gitkeep
 !data/source_file_mapping.json
-
+!scripts/mil/data
 # Logs and temporary files
 logs/
 *.log
