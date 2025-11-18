@@ -27,8 +27,47 @@ The MIL framework treats each repertoire as a "bag" of TCR sequences (instances)
 The easiest way to get started is to use the pipeline script:
 
 ```bash
-cd /home/ubuntu/quest
-bash scripts/inference/run_mil_pipeline.sh
+# Set required environment variables
+export DATA_BASE=/path/to/mil/data          # Directory containing train_datasets/
+export MODEL_PATH=/path/to/esm2/model       # Fine-tuned ESM2 model checkpoint
+
+# Run the pipeline
+bash scripts/mil/run_full_pipeline.sh
+```
+
+#### Required Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `DATA_BASE` | Base directory containing `train_datasets/` subdirectory with your data |
+| `MODEL_PATH` | Path to the fine-tuned ESM2 model checkpoint |
+
+#### Optional Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROCESSED_BASE` | `${DATA_BASE}/processed_mil` | Output directory for processed data |
+| `RESULTS_BASE` | `${DATA_BASE}/../results/mil` | Output directory for results |
+| `TRAIN_DATASETS_STR` | `train_dataset_1` through `train_dataset_8` | Space-separated list of dataset names |
+| `N_CLUSTERS` | `100` | Number of clusters for k-means |
+| `CLUSTERING_METHOD` | `kmeans` | Clustering method |
+| `NUM_EPOCHS` | `100` | Training epochs |
+| `BATCH_SIZE` | `16` | Training batch size |
+| `LR` | `1e-3` | Learning rate |
+| `PATIENCE` | `15` | Early stopping patience |
+| `HIDDEN_DIM` | `256` | Hidden layer dimension |
+| `TOP_K` | `50000` | Number of top TCRs to extract |
+
+#### Example with Custom Configuration
+
+```bash
+export DATA_BASE=/data/tcr_repertoires
+export MODEL_PATH=/models/esm2_finetuned/best_model
+export N_CLUSTERS=200
+export NUM_EPOCHS=50
+export TRAIN_DATASETS_STR="dataset_a dataset_b dataset_c"
+
+bash scripts/mil/run_full_pipeline.sh all
 ```
 
 This will:
