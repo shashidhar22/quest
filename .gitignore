@@ -10,8 +10,8 @@ missed_files.txt
 missing_data.txt
 # Folders
 config
-data
-results
+./data
+./results
 keys
 logs
 misc
