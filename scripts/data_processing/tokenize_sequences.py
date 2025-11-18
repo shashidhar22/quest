@@ -84,20 +84,60 @@ class ProtBERTTokenizer(SequenceTokenizerBase):
     
     def tokenize_batch(self, sequences: List[str]) -> Dict[str, List[List[int]]]:
         """Tokenize sequences with spaces between amino acids."""
-        # Check if sequences already have [CLS] token (already spaced)
-        # If so, don't add spaces again
-        spaced_seqs = []
-        for seq in sequences:
-            if seq.startswith('[CLS]'):
-                # Already formatted with [CLS] and [SEP] tokens and spaces
-                spaced_seqs.append(seq)
-            else:
-                # Add spaces between amino acids
-                spaced_seqs.append(self._add_spaces(seq))
         
-        # Tokenize
+        
+        # Tokenize - BertTokenizer automatically adds [CLS] and [SEP]
         encoded = self.tokenizer(
-            spaced_seqs,
+            sequences,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors=None
+        )
+        
+        return {
+            'input_ids': encoded['input_ids'],
+            'attention_mask': encoded['attention_mask']
+        }
+    
+    def save(self, output_dir: Path):
+        """Save tokenizer."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.tokenizer.save_pretrained(str(output_dir))
+    
+    def load(self, output_dir: Path):
+        """Load tokenizer."""
+        self.tokenizer = BertTokenizer.from_pretrained(str(output_dir))
+
+
+class StandardBERTTokenizer(SequenceTokenizerBase):
+    """
+    Standard BERT tokenizer (e.g., google-bert/bert-base-uncased) for protein sequences.
+    Uses character-level tokenization with spaces between amino acids.
+    """
+    
+    def __init__(self, max_length: int = 512, model_name: str = "google-bert/bert-base-uncased"):
+        super().__init__(max_length)
+        if not HAS_TRANSFORMERS:
+            raise ImportError("transformers required for BERT")
+        
+        # Use standard BERT tokenizer
+        self.tokenizer = BertTokenizer.from_pretrained(
+            model_name,
+            do_lower_case=False  # Keep amino acids case-sensitive
+        )
+        print(f"✓ Loaded Standard BERT tokenizer from {model_name} (vocab size: {len(self.tokenizer)})")
+    
+    def _add_spaces(self, seq: str) -> str:
+        """Add spaces between amino acids."""
+        return " ".join(list(seq))
+    
+    def tokenize_batch(self, sequences: List[str]) -> Dict[str, List[List[int]]]:
+        """Tokenize sequences with spaces between amino acids."""
+        
+        # Tokenize - BertTokenizer automatically adds [CLS] and [SEP]
+        encoded = self.tokenizer(
+            sequences,
             padding='max_length',
             truncation=True,
             max_length=self.max_length,
@@ -616,35 +656,45 @@ def concatenate_molecule_sequences(row: Dict, model_type: str = None) -> str:
             # Split by space to get individual molecules
             # Each molecule is a contiguous amino acid string (e.g., "CASSLGQAYEQYF")
             molecules = sequence_str.split()
+            # Filter out NA and na values
+            molecules = [mol for mol in molecules if mol.upper() != 'NA']
             
             if model_type in ['protbert', 'bert']:
-                # ProtBERT/BERT: [CLS] at start, [SEP] between molecules
-                # Add spaces between amino acids for each molecule
-                spaced_molecules = [" ".join(list(mol)) for mol in molecules]
-                # Join with [SEP] token
-                return "[CLS] " + " [SEP] ".join(spaced_molecules)
+                # ProtBERT/BERT: Add spaces between amino acids for each molecule
+                # Add [SEP] after each molecule
+                # BertTokenizer will add [CLS] at start
+                spaced_molecules_with_sep = []
+                for mol in molecules:
+                    # Add spaces between amino acids
+                    spaced = " ".join(list(mol)).lstrip().rstrip()
+                    # Add [SEP] after the molecule
+                    spaced_molecules_with_sep.append(spaced)
+                # Join all molecules
+                return " [SEP] ".join(spaced_molecules_with_sep)
             else:
                 # Other models: keep molecules without internal spacing
                 # Just join with spaces
                 return " ".join(molecules)
     
     # Old format: individual molecule columns
-    sequences = []
-    for field in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']:
-        val = row.get(field, '')
-        if val and str(val) != 'nan' and str(val) != '':
-            sequences.append(str(val))
-    
-    # Concatenate based on model type
-    if model_type in ['protbert', 'bert']:
-        # ProtBERT/BERT: [CLS] at start, [SEP] between molecules
-        # Add spaces between amino acids for each molecule
-        spaced_molecules = [" ".join(list(seq)) for seq in sequences]
-        # Join with [SEP] token
-        return "[CLS] " + " [SEP] ".join(spaced_molecules)
     else:
-        # Other models: simple space separator
-        return " ".join(sequences)
+        sequences = []
+        for field in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']:
+            val = row.get(field, '')
+            # Filter out empty, nan, NA, and na values
+            if val and str(val) != 'nan' and str(val) != '' and str(val).upper() != 'NA':
+                sequences.append(str(val))
+    
+        # Concatenate based on model type
+        if model_type in ['protbert', 'bert']:
+            # ProtBERT/BERT: Add spaces between amino acids for each molecule
+            # Join molecules with space (BertTokenizer will add [CLS] and [SEP] automatically)
+            spaced_molecules = [" ".join(list(seq)) for seq in sequences]
+            # Join with space - tokenizer will handle special tokens
+            return " ".join(spaced_molecules)
+        else:
+            # Other models: simple space separator
+            return " ".join(sequences)
 
 
 def create_tokenize_function(tokenizer, model_type: str):
@@ -729,7 +779,7 @@ def tokenize_dataset(
     if model_type == "protbert":
         tokenizer = ProtBERTTokenizer(max_length)
     elif model_type == "bert":
-        tokenizer = ProtBERTTokenizer(max_length)
+        tokenizer = StandardBERTTokenizer(max_length, model_name="google-bert/bert-base-cased")
     elif model_type == "esm2":
         tokenizer = ESM2Tokenizer(max_length)
     elif model_type == "esm3":
