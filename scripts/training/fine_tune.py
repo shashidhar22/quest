@@ -34,6 +34,7 @@ from transformers import (
     EarlyStoppingCallback,
     DataCollatorWithPadding,
 )
+from transformers.modeling_outputs import MaskedLMOutput
 from peft import get_peft_model, LoraConfig, PeftModel
 from accelerate import Accelerator
 from typing import Any, Dict, List, Optional, Tuple
@@ -150,11 +151,8 @@ class ESM3ForMaskedLM(nn.Module):
                 labels.view(-1)
             )
         
-        # Return in HuggingFace format
-        return type('Output', (), {
-            'loss': loss,
-            'logits': logits,
-        })()
+        # Return a proper MaskedLMOutput which is both dict-like and indexable (Trainer expects outputs[0] for loss)
+        return MaskedLMOutput(loss=loss, logits=logits)
     
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing if supported"""
