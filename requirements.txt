@@ -58,6 +58,16 @@ cramjam>=2.11.0
 # Monitoring and logging
 wandb>=0.22.3
 
+# Machine learning utilities
+scikit-learn>=1.6.0
+
+# HDF5 support
+h5py>=3.13.0
+
+# Visualization
+matplotlib>=3.10.0
+seaborn>=0.13.0
+
 # Testing (optional)
 # pytest>=7.3.0
 # pytest-cov>=4.1.0
