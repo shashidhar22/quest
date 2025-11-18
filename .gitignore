@@ -11,6 +11,7 @@ missing_data.txt
 # Folders
 config
 data
+results
 keys
 logs
 misc
