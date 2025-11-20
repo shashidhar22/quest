@@ -40,6 +40,15 @@ from transformers import (
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# Try to import Accelerate for distributed evaluation
+try:
+    from accelerate import Accelerator
+    ACCELERATE_AVAILABLE = True
+except ImportError:
+    ACCELERATE_AVAILABLE = False
+    print("⚠️  Accelerate not available. Multi-GPU evaluation will not be supported.")
+    print("   Install with: pip install accelerate")
+
 # Try to import PEFT for LoRA model support
 try:
     from peft import PeftModel
@@ -58,21 +67,23 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def load_model_and_tokenizer(
     model_path: str,
-    device: str = "cuda"
+    device: str = "cuda",
+    use_accelerate: bool = False
 ) -> Tuple[Any, Any]:
     """
     Load model and tokenizer from HuggingFace or local path.
     Supports regular models and PEFT/LoRA adapters.
-    
+
     Args:
         model_path: Path to model (local or HuggingFace Hub)
-        device: Device to load model on
-    
+        device: Device to load model on (ignored if use_accelerate=True)
+        use_accelerate: Whether to use Accelerate for distributed inference
+
     Returns:
         (model, tokenizer)
     """
     print(f"Loading model from: {model_path}")
-    
+
     # Check if this is a PEFT adapter model
     is_peft_model = False
     if os.path.isdir(model_path) and os.path.exists(os.path.join(model_path, "adapter_config.json")):
@@ -81,29 +92,29 @@ def load_model_and_tokenizer(
                 "This appears to be a PEFT/LoRA model but peft is not installed. "
                 "Install with: pip install peft"
             )
-        
+
         print(f"Detected PEFT adapter model at {model_path}")
         is_peft_model = True
-        
+
         # Load base model name from adapter config
         with open(os.path.join(model_path, "adapter_config.json"), 'r') as f:
             adapter_config = json.load(f)
         base_model_name = adapter_config.get("base_model_name_or_path", "Rostlab/prot_bert")
-        
+
         print(f"Loading base model: {base_model_name}")
         base_model = AutoModelForMaskedLM.from_pretrained(base_model_name)
-        
+
         # Load PEFT model and merge weights for faster inference
         peft_model = PeftModel.from_pretrained(base_model, model_path)
         print("Merging PEFT weights into base model for faster inference...")
         model = peft_model.merge_and_unload()
-        
+
         tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     else:
         # Load regular HuggingFace model
         model = AutoModelForMaskedLM.from_pretrained(model_path)
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-    
+
     # Set pad token if not present
     if tokenizer.pad_token is None:
         if hasattr(tokenizer, 'eos_token') and tokenizer.eos_token is not None:
@@ -111,15 +122,20 @@ def load_model_and_tokenizer(
         else:
             print("⚠️  No pad token found, using mask token as pad token")
             tokenizer.pad_token = tokenizer.mask_token
-    
-    # Move model to device and set to eval mode
-    model = model.to(device)
+
+    # Move model to device and set to eval mode (if not using Accelerate)
+    if not use_accelerate:
+        model = model.to(device)
+
     model.eval()
-    
-    print(f"✅ Model loaded successfully on {device}")
+
+    if not use_accelerate:
+        print(f"✅ Model loaded successfully on {device}")
+    else:
+        print(f"✅ Model loaded successfully (will be distributed by Accelerate)")
     print(f"   Model type: {model.config.model_type}")
     print(f"   Vocab size: {len(tokenizer)}")
-    
+
     return model, tokenizer
 
 
@@ -183,37 +199,45 @@ def run_inference(
     dataloader: DataLoader,
     device: str = "cuda",
     return_attentions: bool = False,
+    accelerator: Any = None,
 ) -> Dict[str, Any]:
     """
     Run inference on entire dataset and compute metrics.
-    
+
     Args:
         model: Trained model
         dataloader: DataLoader with validation data
-        device: Device to run inference on
+        device: Device to run inference on (ignored if accelerator is provided)
         return_attentions: Whether to return attention weights
-    
+        accelerator: Optional Accelerator instance for distributed inference
+
     Returns:
         Dictionary with metrics and optionally attention weights
     """
     model.eval()
-    
+
     all_logits = []
     all_labels = []
+    all_input_ids = []
     all_attentions = [] if return_attentions else None
     all_permutation_keys = []
-    
+
     total_loss = 0.0
     total_correct = 0
     total_masked = 0
-    
+
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Running inference"):
-            # Move batch to device
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            
+        for batch in tqdm(dataloader, desc="Running inference", disable=not accelerator.is_local_main_process if accelerator else False):
+            # Move batch to device (unless using accelerator which handles this)
+            if accelerator is None:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+            else:
+                input_ids = batch["input_ids"]
+                attention_mask = batch["attention_mask"]
+                labels = batch["labels"]
+
             # Forward pass
             outputs = model(
                 input_ids=input_ids,
@@ -221,51 +245,73 @@ def run_inference(
                 labels=labels,
                 output_attentions=return_attentions,
             )
-            
-            # Store results
-            all_logits.append(outputs.logits.cpu())
-            all_labels.append(labels.cpu())
-            
-            if return_attentions and outputs.attentions is not None:
-                # Store attention from last layer
-                all_attentions.append(outputs.attentions[-1].cpu())
-            
-            # Store permutation keys if available
-            if "permutation_key" in batch:
-                all_permutation_keys.extend(batch["permutation_key"])
-            
-            # Accumulate metrics
-            batch_metrics = compute_mlm_metrics(outputs.logits.cpu(), labels.cpu())
-            total_correct += batch_metrics["num_correct"]
-            total_masked += batch_metrics["num_masked"]
-            total_loss += batch_metrics["loss"] * batch_metrics["num_masked"]
-    
-    # Concatenate all results
-    all_logits = torch.cat(all_logits, dim=0)
-    all_labels = torch.cat(all_labels, dim=0)
-    
-    # Compute overall metrics
-    overall_accuracy = total_correct / total_masked if total_masked > 0 else 0.0
-    overall_loss = total_loss / total_masked if total_masked > 0 else 0.0
-    overall_perplexity = math.exp(overall_loss) if overall_loss < 100 else float('inf')
-    
-    results = {
-        "overall": {
-            "accuracy": overall_accuracy,
-            "loss": overall_loss,
-            "perplexity": overall_perplexity,
-            "total_masked_tokens": total_masked,
-            "total_correct": total_correct,
-        },
-        "logits": all_logits,
-        "labels": all_labels,
-        "permutation_keys": all_permutation_keys if all_permutation_keys else None,
-    }
-    
-    if return_attentions and all_attentions:
-        results["attentions"] = torch.cat(all_attentions, dim=0)
-    
-    return results
+
+            # Gather results from all processes if using distributed inference
+            if accelerator is not None:
+                logits = accelerator.gather_for_metrics(outputs.logits)
+                labels_gathered = accelerator.gather_for_metrics(labels)
+                input_ids_gathered = accelerator.gather_for_metrics(input_ids)
+
+                if return_attentions and outputs.attentions is not None:
+                    attentions_gathered = accelerator.gather_for_metrics(outputs.attentions[-1])
+            else:
+                logits = outputs.logits
+                labels_gathered = labels
+                input_ids_gathered = input_ids
+                attentions_gathered = outputs.attentions[-1] if (return_attentions and outputs.attentions is not None) else None
+
+            # Store results (only on main process or if not using accelerator)
+            if accelerator is None or accelerator.is_local_main_process:
+                all_logits.append(logits.cpu())
+                all_labels.append(labels_gathered.cpu())
+                all_input_ids.append(input_ids_gathered.cpu())
+
+                if return_attentions and attentions_gathered is not None:
+                    all_attentions.append(attentions_gathered.cpu())
+
+                # Store permutation keys if available
+                if "permutation_key" in batch:
+                    all_permutation_keys.extend(batch["permutation_key"])
+
+                # Accumulate metrics
+                batch_metrics = compute_mlm_metrics(logits.cpu(), labels_gathered.cpu())
+                total_correct += batch_metrics["num_correct"]
+                total_masked += batch_metrics["num_masked"]
+                total_loss += batch_metrics["loss"] * batch_metrics["num_masked"]
+
+    # Only process results on main process (or if not using accelerator)
+    if accelerator is None or accelerator.is_local_main_process:
+        # Concatenate all results
+        all_logits = torch.cat(all_logits, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+        all_input_ids = torch.cat(all_input_ids, dim=0)
+
+        # Compute overall metrics
+        overall_accuracy = total_correct / total_masked if total_masked > 0 else 0.0
+        overall_loss = total_loss / total_masked if total_masked > 0 else 0.0
+        overall_perplexity = math.exp(overall_loss) if overall_loss < 100 else float('inf')
+
+        results = {
+            "overall": {
+                "accuracy": overall_accuracy,
+                "loss": overall_loss,
+                "perplexity": overall_perplexity,
+                "total_masked_tokens": total_masked,
+                "total_correct": total_correct,
+            },
+            "logits": all_logits,
+            "labels": all_labels,
+            "input_ids": all_input_ids,
+            "permutation_keys": all_permutation_keys if all_permutation_keys else None,
+        }
+
+        if return_attentions and all_attentions:
+            results["attentions"] = torch.cat(all_attentions, dim=0)
+
+        return results
+    else:
+        # Return empty results for non-main processes
+        return None
 
 
 def compute_per_permutation_metrics(
@@ -603,45 +649,77 @@ def main():
         default=42,
         help="Random seed"
     )
-    
+    parser.add_argument(
+        "--use_multi_gpu",
+        action="store_true",
+        help="Use Accelerate for multi-GPU inference"
+    )
+
     args = parser.parse_args()
-    
+
     # Set random seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    
-    # Initialize W&B
-    wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_run_name,
-        config=vars(args),
-    )
-    
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Initialize Accelerator if requested
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    accelerator = None
+    if args.use_multi_gpu:
+        if not ACCELERATE_AVAILABLE:
+            raise ImportError(
+                "Multi-GPU inference requires accelerate. Install with: pip install accelerate"
+            )
+        print("\n🚀 Initializing Accelerate for multi-GPU inference...")
+        accelerator = Accelerator()
+        args.device = accelerator.device
+        print(f"   Number of processes: {accelerator.num_processes}")
+        print(f"   Main process: {accelerator.is_main_process}")
+        print(f"   Local main process: {accelerator.is_local_main_process}")
+
+    # Initialize W&B (only on main process)
+    if accelerator is None or accelerator.is_main_process:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+        )
+
     # ─────────────────────────────────────────────────────────────────────────────
     # Load model and tokenizer
     # ─────────────────────────────────────────────────────────────────────────────
-    
-    model, tokenizer = load_model_and_tokenizer(args.model_path, args.device)
+
+    model, tokenizer = load_model_and_tokenizer(
+        args.model_path,
+        args.device,
+        use_accelerate=args.use_multi_gpu
+    )
     
     # ─────────────────────────────────────────────────────────────────────────────
     # Load dataset
     # ─────────────────────────────────────────────────────────────────────────────
-    
-    print(f"\nLoading dataset from: {args.dataset_path}")
+
+    if accelerator is None or accelerator.is_main_process:
+        print(f"\nLoading dataset from: {args.dataset_path}")
+
     dataset = load_from_disk(args.dataset_path)
-    
+
     # Get validation split
     if "validation" not in dataset:
         raise ValueError(f"Dataset must have 'validation' split. Available: {list(dataset.keys())}")
-    
+
     val_dataset = dataset["validation"]
-    print(f"Validation dataset size: {len(val_dataset):,} examples")
-    
+
+    if accelerator is None or accelerator.is_main_process:
+        print(f"Validation dataset size: {len(val_dataset):,} examples")
+
     # Limit samples if specified
     if args.max_samples is not None and len(val_dataset) > args.max_samples:
-        print(f"Limiting evaluation to {args.max_samples:,} samples")
+        if accelerator is None or accelerator.is_main_process:
+            print(f"Limiting evaluation to {args.max_samples:,} samples")
         val_dataset = val_dataset.shuffle(seed=args.seed).select(range(args.max_samples))
-    
+
     # Check required columns
     required_columns = ["input_ids", "attention_mask", "labels"]
     missing_columns = [col for col in required_columns if col not in val_dataset.column_names]
@@ -651,15 +729,17 @@ def main():
             f"Available columns: {val_dataset.column_names}\n"
             f"Make sure the dataset has pre-computed masked labels."
         )
-    
-    print(f"Dataset columns: {val_dataset.column_names}")
-    
+
+    if accelerator is None or accelerator.is_main_process:
+        print(f"Dataset columns: {val_dataset.column_names}")
+
     # Check if permutation_key is available
     has_permutation_keys = "permutation_key" in val_dataset.column_names
-    if has_permutation_keys:
-        print("✅ Permutation keys available - will compute per-permutation metrics")
-    else:
-        print("⚠️  No permutation keys found - skipping per-permutation analysis")
+    if accelerator is None or accelerator.is_main_process:
+        if has_permutation_keys:
+            print("✅ Permutation keys available - will compute per-permutation metrics")
+        else:
+            print("⚠️  No permutation keys found - skipping per-permutation analysis")
     
     # ─────────────────────────────────────────────────────────────────────────────
     # Create DataLoader
@@ -685,85 +765,97 @@ def main():
         collate_fn=collate_fn,
         num_workers=2,
     )
-    
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Prepare model and dataloader with Accelerator if using multi-GPU
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    if accelerator is not None:
+        model, dataloader = accelerator.prepare(model, dataloader)
+
     # ─────────────────────────────────────────────────────────────────────────────
     # Run inference
     # ─────────────────────────────────────────────────────────────────────────────
-    
-    print("\n" + "="*80)
-    print("RUNNING INFERENCE")
-    print("="*80 + "\n")
-    
+
+    if accelerator is None or accelerator.is_main_process:
+        print("\n" + "="*80)
+        print("RUNNING INFERENCE")
+        print("="*80 + "\n")
+
     results = run_inference(
         model=model,
         dataloader=dataloader,
         device=args.device,
         return_attentions=args.visualize_attention,
+        accelerator=accelerator,
     )
     
     # ─────────────────────────────────────────────────────────────────────────────
-    # Compute per-permutation metrics
+    # Compute per-permutation metrics (only on main process)
     # ─────────────────────────────────────────────────────────────────────────────
-    
-    per_pkey_metrics = {}
-    if results["permutation_keys"]:
-        print("\nComputing per-permutation metrics...")
-        per_pkey_metrics = compute_per_permutation_metrics(
-            logits=results["logits"],
-            labels=results["labels"],
-            permutation_keys=results["permutation_keys"],
+
+    if results is not None:  # Only main process has results when using multi-GPU
+        per_pkey_metrics = {}
+        if results["permutation_keys"]:
+            print("\nComputing per-permutation metrics...")
+            per_pkey_metrics = compute_per_permutation_metrics(
+                logits=results["logits"],
+                labels=results["labels"],
+                permutation_keys=results["permutation_keys"],
+            )
+
+        # ─────────────────────────────────────────────────────────────────────────────
+        # Generate attention visualizations
+        # ─────────────────────────────────────────────────────────────────────────────
+
+        attention_figures = {}
+        if args.visualize_attention and "attentions" in results:
+            print("\nGenerating attention visualizations...")
+
+            attention_figures = visualize_attention_maps(
+                attentions=results["attentions"],
+                permutation_keys=results["permutation_keys"],
+                tokenizer=tokenizer,
+                input_ids=results["input_ids"],
+                num_examples_per_pkey=args.num_attention_examples,
+                max_pkeys=args.max_attention_pkeys,
+            )
+
+        # ─────────────────────────────────────────────────────────────────────────────
+        # Log to W&B
+        # ─────────────────────────────────────────────────────────────────────────────
+
+        log_to_wandb(
+            overall_metrics=results["overall"],
+            per_pkey_metrics=per_pkey_metrics,
+            attention_figures=attention_figures,
+            config=vars(args),
         )
-    
-    # ─────────────────────────────────────────────────────────────────────────────
-    # Generate attention visualizations
-    # ─────────────────────────────────────────────────────────────────────────────
-    
-    attention_figures = {}
-    if args.visualize_attention and "attentions" in results:
-        print("\nGenerating attention visualizations...")
-        
-        # Get input_ids for visualization
-        input_ids = results["logits"].argmax(dim=-1)  # Use predictions for visualization
-        
-        attention_figures = visualize_attention_maps(
-            attentions=results["attentions"],
-            permutation_keys=results["permutation_keys"],
-            tokenizer=tokenizer,
-            input_ids=input_ids,
-            num_examples_per_pkey=args.num_attention_examples,
-            max_pkeys=args.max_attention_pkeys,
-        )
-    
-    # ─────────────────────────────────────────────────────────────────────────────
-    # Log to W&B
-    # ─────────────────────────────────────────────────────────────────────────────
-    
-    log_to_wandb(
-        overall_metrics=results["overall"],
-        per_pkey_metrics=per_pkey_metrics,
-        attention_figures=attention_figures,
-        config=vars(args),
-    )
-    
-    # ─────────────────────────────────────────────────────────────────────────────
-    # Save results to file
-    # ─────────────────────────────────────────────────────────────────────────────
-    
-    output_dir = f"evaluation_results/{wandb.run.name}"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    results_file = os.path.join(output_dir, "metrics.json")
-    with open(results_file, 'w') as f:
-        json.dump({
-            "overall": results["overall"],
-            "per_permutation": per_pkey_metrics,
-            "config": vars(args),
-        }, f, indent=2)
-    
-    print(f"\n✅ Results saved to: {results_file}")
-    
-    wandb.finish()
-    print("\n✅ Evaluation complete!")
+
+        # ─────────────────────────────────────────────────────────────────────────────
+        # Save results to file
+        # ─────────────────────────────────────────────────────────────────────────────
+
+        output_dir = f"evaluation_results/{wandb.run.name}"
+        os.makedirs(output_dir, exist_ok=True)
+
+        results_file = os.path.join(output_dir, "metrics.json")
+        with open(results_file, 'w') as f:
+            json.dump({
+                "overall": results["overall"],
+                "per_permutation": per_pkey_metrics,
+                "config": vars(args),
+            }, f, indent=2)
+
+        print(f"\n✅ Results saved to: {results_file}")
+
+        wandb.finish()
+        print("\n✅ Evaluation complete!")
+    else:
+        # Non-main processes just wait
+        if accelerator is not None:
+            accelerator.wait_for_everyone()
+            print("✅ Evaluation complete (worker process)")
 
 
 if __name__ == "__main__":
