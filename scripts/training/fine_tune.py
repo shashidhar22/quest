@@ -1086,6 +1086,10 @@ def main():
                         help="Save checkpoint every N steps (default: once per epoch)")
     parser.add_argument("--max_eval_samples", type=int, default=None,
                         help="Maximum number of evaluation samples to use (useful for large validation sets)")
+    parser.add_argument("--eval_accumulation_steps", type=int, default=10,
+                        help="Number of batches to accumulate before moving predictions to CPU. "
+                             "Prevents OOM during evaluation with large vocab models (e.g., BERT). "
+                             "Lower = less memory but slower. Default: 10")
     parser.add_argument("--log_prediction_examples", action="store_true",
                         help="Log prediction examples to W&B (can be slow for large datasets)")
     
@@ -1181,7 +1185,13 @@ def main():
             if not args.fp16 and not args.bf16:
                 print(f"   7. Mixed precision: OFF")
                 print(f"      → Add --fp16 (saves ~50% memory, faster training)")
-            
+
+            print(f"   8. Eval accumulation steps: {args.eval_accumulation_steps}")
+            if args.eval_accumulation_steps > 10:
+                print(f"      → Try --eval_accumulation_steps 5 (helps with BERT/large vocab models)")
+            else:
+                print(f"      → Current setting is optimal for large vocab models")
+
             print(f"\n   💡 RECOMMENDED COMMAND:")
             print(f"   python scripts/training/fine_tune.py \\")
             print(f"       --batch_size {max(1, args.batch_size // 2)} \\")
@@ -1413,12 +1423,14 @@ def main():
         optim=args.optim,  # Can be adamw_8bit for memory savings
         
         # Memory optimization
-        dataloader_pin_memory=False,  # Disable pin_memory to save GPU memory
+        dataloader_pin_memory=True,  # Enable for faster CPU->GPU transfer (disable if OOM)
         auto_find_batch_size=False,  # Don't auto-adjust, use user's settings
-        
+        eval_accumulation_steps=args.eval_accumulation_steps,  # CRITICAL: Prevents OOM with large vocab models like BERT
+
         # Other
         seed=args.seed,
-        dataloader_num_workers=2,  # Reduced from 4 to save memory
+        dataloader_num_workers=4,  # Increased for faster data loading with pre-masked data
+        dataloader_prefetch_factor=2,  # Prefetch 2 batches per worker for better throughput
         remove_unused_columns=True,  # Remove extra columns like permutation_key
         label_names=["labels"],
         include_num_input_tokens_seen=False,
