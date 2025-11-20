@@ -1389,7 +1389,20 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────────
     # Setup training arguments
     # ─────────────────────────────────────────────────────────────────────────────
-    
+
+    # Disable compute_metrics for BERT to save memory during evaluation
+    # (BERT's 29k vocab creates huge prediction tensors)
+    use_metrics = "bert" not in args.model_path.lower()
+
+    if not use_metrics:
+        print("\n⚠️  Disabling accuracy/perplexity metrics for BERT to save memory")
+        print("   Will use validation loss as best model metric instead")
+        print("   (BERT's 29k vocabulary creates huge prediction tensors)\n")
+
+    # Use loss for BERT (no metrics), accuracy for others
+    best_metric = "loss" if not use_metrics else "accuracy"
+    metric_greater_is_better = False if not use_metrics else True
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
@@ -1399,15 +1412,15 @@ def main():
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
         max_grad_norm=args.max_grad_norm,
-        
+
         # Evaluation and saving
         eval_strategy="epoch" if args.eval_steps is None else "steps",
         eval_steps=args.eval_steps,
         save_strategy="epoch" if args.save_steps is None else "steps",
         save_steps=args.save_steps,
         load_best_model_at_end=True,
-        metric_for_best_model="accuracy",
-        greater_is_better=True,
+        metric_for_best_model=best_metric,
+        greater_is_better=metric_greater_is_better,
         
         # Logging
         logging_dir=f"{args.output_dir}/logs",
@@ -1444,14 +1457,14 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────────
     # Create Trainer
     # ─────────────────────────────────────────────────────────────────────────────
-    
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics if use_metrics else None,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
     
