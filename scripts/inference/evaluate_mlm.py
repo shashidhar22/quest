@@ -43,9 +43,11 @@ import seaborn as sns
 # Try to import Accelerate for distributed evaluation
 try:
     from accelerate import Accelerator
+    from accelerate.utils import gather_object
     ACCELERATE_AVAILABLE = True
 except ImportError:
     ACCELERATE_AVAILABLE = False
+    gather_object = None
     print("⚠️  Accelerate not available. Multi-GPU evaluation will not be supported.")
     print("   Install with: pip install accelerate")
 
@@ -200,31 +202,51 @@ def run_inference(
     device: str = "cuda",
     return_attentions: bool = False,
     accelerator: Any = None,
+    attention_sample_config: Dict[str, int] = None,
 ) -> Dict[str, Any]:
     """
     Run inference on entire dataset and compute metrics.
+    Memory-efficient version that computes metrics on-the-fly.
 
     Args:
         model: Trained model
         dataloader: DataLoader with validation data
         device: Device to run inference on (ignored if accelerator is provided)
-        return_attentions: Whether to return attention weights
+        return_attentions: Whether to return attention weights for sampled examples
         accelerator: Optional Accelerator instance for distributed inference
+        attention_sample_config: Dict with 'examples_per_key' and 'max_keys' for sampling
 
     Returns:
-        Dictionary with metrics and optionally attention weights
+        Dictionary with aggregated metrics and sampled attention data
     """
     model.eval()
 
-    all_logits = []
-    all_labels = []
-    all_input_ids = []
-    all_attentions = [] if return_attentions else None
-    all_permutation_keys = []
-
+    # Overall metrics accumulators
     total_loss = 0.0
     total_correct = 0
     total_masked = 0
+
+    # Per-permutation metrics accumulators
+    per_pkey_stats = defaultdict(lambda: {
+        "loss_sum": 0.0,
+        "correct": 0,
+        "masked": 0,
+        "num_examples": 0,
+    })
+
+    # For attention visualization: sample a few examples per permutation key
+    # Only sample specific permutations of interest
+    PERMUTATIONS_OF_INTEREST = {
+        "tra", "trb", "peptide", "mhc_one", "mhc_two", "tra_trb",
+        "peptide_mhc_one", "peptide_mhc_one_mhc_two", "tra_peptide_mhc_one",
+        "trb_peptide_mhc_one", "tra_trb_peptide_mhc_one"
+    }
+    attention_samples = defaultdict(list) if return_attentions else None
+    attention_sample_limit = attention_sample_config or {"examples_per_key": 3, "max_keys": 10}
+    sampled_pkeys = set()
+
+    example_idx = 0  # Track global example index
+    layer_info_printed = False  # Flag to print layer info only once
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Running inference", disable=not accelerator.is_local_main_process if accelerator else False):
@@ -253,43 +275,138 @@ def run_inference(
                 input_ids_gathered = accelerator.gather_for_metrics(input_ids)
 
                 if return_attentions and outputs.attentions is not None:
-                    attentions_gathered = accelerator.gather_for_metrics(outputs.attentions[-1])
+                    # Get middle 10 layers
+                    num_layers = len(outputs.attentions)
+                    middle_start = max(0, (num_layers - 10) // 2)
+                    middle_end = min(num_layers, middle_start + 10)
+                    middle_layer_indices = list(range(middle_start, middle_end))
+
+                    # Print layer info once
+                    if not layer_info_printed and (accelerator is None or accelerator.is_local_main_process):
+                        print(f"\n📊 Capturing attention from middle 10 layers: {middle_layer_indices}")
+                        print(f"   (Total layers in model: {num_layers})\n")
+                        layer_info_printed = True
+
+                    attentions_gathered = {
+                        layer_idx: accelerator.gather_for_metrics(outputs.attentions[layer_idx])
+                        for layer_idx in middle_layer_indices
+                    }
+                else:
+                    attentions_gathered = None
+
+                # Gather permutation keys if available (collective operation - all processes must call)
+                if "permutation_key" in batch:
+                    batch_pkeys = gather_object(batch["permutation_key"])
+                else:
+                    batch_pkeys = None
             else:
                 logits = outputs.logits
                 labels_gathered = labels
                 input_ids_gathered = input_ids
-                attentions_gathered = outputs.attentions[-1] if (return_attentions and outputs.attentions is not None) else None
 
-            # Store results (only on main process or if not using accelerator)
+                if return_attentions and outputs.attentions is not None:
+                    # Get middle 10 layers
+                    num_layers = len(outputs.attentions)
+                    middle_start = max(0, (num_layers - 10) // 2)
+                    middle_end = min(num_layers, middle_start + 10)
+                    middle_layer_indices = list(range(middle_start, middle_end))
+
+                    # Print layer info once
+                    if not layer_info_printed:
+                        print(f"\n📊 Capturing attention from middle 10 layers: {middle_layer_indices}")
+                        print(f"   (Total layers in model: {num_layers})\n")
+                        layer_info_printed = True
+
+                    attentions_gathered = {
+                        layer_idx: outputs.attentions[layer_idx]
+                        for layer_idx in middle_layer_indices
+                    }
+                else:
+                    attentions_gathered = None
+
+                # No gathering needed for single process
+                batch_pkeys = batch.get("permutation_key", None)
+
+            # Process results (only on main process or if not using accelerator)
             if accelerator is None or accelerator.is_local_main_process:
-                all_logits.append(logits.cpu())
-                all_labels.append(labels_gathered.cpu())
-                all_input_ids.append(input_ids_gathered.cpu())
+                # Move to CPU for processing
+                logits_cpu = logits.cpu()
+                labels_cpu = labels_gathered.cpu()
+                input_ids_cpu = input_ids_gathered.cpu()
 
-                if return_attentions and attentions_gathered is not None:
-                    all_attentions.append(attentions_gathered.cpu())
+                # Set batch_pkeys to None list if not available
+                if batch_pkeys is None:
+                    batch_pkeys = [None] * logits_cpu.size(0)
 
-                # Store permutation keys if available
-                if "permutation_key" in batch:
-                    all_permutation_keys.extend(batch["permutation_key"])
+                # Process each example in the batch
+                for i in range(logits_cpu.size(0)):
+                    example_logits = logits_cpu[i:i+1]
+                    example_labels = labels_cpu[i:i+1]
+                    example_input_ids = input_ids_cpu[i:i+1]
+                    pkey = batch_pkeys[i]
 
-                # Accumulate metrics
-                batch_metrics = compute_mlm_metrics(logits.cpu(), labels_gathered.cpu())
-                total_correct += batch_metrics["num_correct"]
-                total_masked += batch_metrics["num_masked"]
-                total_loss += batch_metrics["loss"] * batch_metrics["num_masked"]
+                    # Compute metrics for this example
+                    metrics = compute_mlm_metrics(example_logits, example_labels)
+
+                    # Skip if no masked tokens
+                    if metrics["num_masked"] == 0:
+                        example_idx += 1
+                        continue
+
+                    # Accumulate overall metrics
+                    total_correct += metrics["num_correct"]
+                    total_masked += metrics["num_masked"]
+                    total_loss += metrics["loss"] * metrics["num_masked"]
+
+                    # Accumulate per-permutation metrics
+                    if pkey is not None:
+                        per_pkey_stats[pkey]["loss_sum"] += metrics["loss"] * metrics["num_masked"]
+                        per_pkey_stats[pkey]["correct"] += metrics["num_correct"]
+                        per_pkey_stats[pkey]["masked"] += metrics["num_masked"]
+                        per_pkey_stats[pkey]["num_examples"] += 1
+
+                        # Sample attention weights for visualization (only for permutations of interest)
+                        if (return_attentions and attentions_gathered is not None and
+                            pkey in PERMUTATIONS_OF_INTEREST):
+
+                            if len(attention_samples[pkey]) < attention_sample_limit["examples_per_key"]:
+                                sampled_pkeys.add(pkey)
+                                # Store attention from all middle layers
+                                layer_attentions = {
+                                    layer_idx: attn_tensor[i].cpu()
+                                    for layer_idx, attn_tensor in attentions_gathered.items()
+                                }
+                                attention_samples[pkey].append({
+                                    "attention": layer_attentions,
+                                    "input_ids": example_input_ids[0],
+                                    "example_idx": example_idx,
+                                })
+
+                    example_idx += 1
+
+                # Free memory
+                del logits_cpu, labels_cpu, input_ids_cpu
+                if attentions_gathered is not None:
+                    del attentions_gathered
 
     # Only process results on main process (or if not using accelerator)
     if accelerator is None or accelerator.is_local_main_process:
-        # Concatenate all results
-        all_logits = torch.cat(all_logits, dim=0)
-        all_labels = torch.cat(all_labels, dim=0)
-        all_input_ids = torch.cat(all_input_ids, dim=0)
-
         # Compute overall metrics
         overall_accuracy = total_correct / total_masked if total_masked > 0 else 0.0
         overall_loss = total_loss / total_masked if total_masked > 0 else 0.0
         overall_perplexity = math.exp(overall_loss) if overall_loss < 100 else float('inf')
+
+        # Compute per-permutation metrics from accumulated stats
+        per_pkey_metrics = {}
+        for pkey, stats in per_pkey_stats.items():
+            if stats["masked"] > 0:
+                per_pkey_metrics[pkey] = {
+                    "accuracy": stats["correct"] / stats["masked"],
+                    "loss": stats["loss_sum"] / stats["masked"],
+                    "perplexity": math.exp(stats["loss_sum"] / stats["masked"]) if stats["loss_sum"] / stats["masked"] < 100 else float('inf'),
+                    "num_examples": stats["num_examples"],
+                    "num_masked_tokens": stats["masked"],
+                }
 
         results = {
             "overall": {
@@ -299,14 +416,9 @@ def run_inference(
                 "total_masked_tokens": total_masked,
                 "total_correct": total_correct,
             },
-            "logits": all_logits,
-            "labels": all_labels,
-            "input_ids": all_input_ids,
-            "permutation_keys": all_permutation_keys if all_permutation_keys else None,
+            "per_permutation": per_pkey_metrics,
+            "attention_samples": dict(attention_samples) if attention_samples else None,
         }
-
-        if return_attentions and all_attentions:
-            results["attentions"] = torch.cat(all_attentions, dim=0)
 
         return results
     else:
@@ -314,49 +426,8 @@ def run_inference(
         return None
 
 
-def compute_per_permutation_metrics(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    permutation_keys: List[str],
-) -> Dict[str, Dict[str, float]]:
-    """
-    Compute metrics separately for each permutation key.
-    
-    Args:
-        logits: Model predictions [num_examples, seq_len, vocab_size]
-        labels: Ground truth labels [num_examples, seq_len]
-        permutation_keys: List of permutation keys for each example
-    
-    Returns:
-        Dictionary mapping permutation_key -> metrics
-    """
-    if not permutation_keys:
-        return {}
-    
-    # Group examples by permutation key
-    pkey_to_indices = defaultdict(list)
-    for idx, pkey in enumerate(permutation_keys):
-        pkey_to_indices[pkey].append(idx)
-    
-    per_pkey_metrics = {}
-    
-    for pkey, indices in pkey_to_indices.items():
-        # Get logits and labels for this permutation key
-        pkey_logits = logits[indices]
-        pkey_labels = labels[indices]
-        
-        # Compute metrics
-        metrics = compute_mlm_metrics(pkey_logits, pkey_labels)
-        
-        per_pkey_metrics[pkey] = {
-            "accuracy": metrics["accuracy"],
-            "loss": metrics["loss"],
-            "perplexity": metrics["perplexity"],
-            "num_examples": len(indices),
-            "num_masked_tokens": metrics["num_masked"],
-        }
-    
-    return per_pkey_metrics
+# NOTE: compute_per_permutation_metrics has been removed.
+# Metrics are now computed on-the-fly in run_inference() to save memory.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -364,96 +435,87 @@ def compute_per_permutation_metrics(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def visualize_attention_maps(
-    attentions: torch.Tensor,
-    permutation_keys: List[str],
+    attention_samples: Dict[str, List[Dict[str, Any]]],
     tokenizer: Any,
-    input_ids: torch.Tensor,
-    num_examples_per_pkey: int = 3,
-    max_pkeys: int = 10,
 ) -> Dict[str, plt.Figure]:
     """
-    Create attention map visualizations for each permutation key.
-    
+    Create attention map visualizations from sampled attention data.
+    Averages attention across all sampled examples for each permutation and layer.
+
     Args:
-        attentions: Attention weights [num_examples, num_heads, seq_len, seq_len]
-        permutation_keys: List of permutation keys for each example
+        attention_samples: Dict mapping pkey -> list of {attention: {layer_idx: tensor}, input_ids, example_idx}
         tokenizer: Tokenizer for decoding sequences
-        input_ids: Input token IDs for visualization
-        num_examples_per_pkey: Number of examples to visualize per permutation key
-        max_pkeys: Maximum number of permutation keys to visualize
-    
+
     Returns:
-        Dictionary mapping permutation_key -> matplotlib Figure
+        Dictionary mapping (permutation_key, layer_idx) -> matplotlib Figure
     """
-    if not permutation_keys or attentions is None:
+    if not attention_samples:
         return {}
-    
-    # Group examples by permutation key
-    pkey_to_indices = defaultdict(list)
-    for idx, pkey in enumerate(permutation_keys):
-        pkey_to_indices[pkey].append(idx)
-    
-    # Sort by frequency (most common first)
-    sorted_pkeys = sorted(
-        pkey_to_indices.items(),
-        key=lambda x: len(x[1]),
-        reverse=True
-    )[:max_pkeys]
-    
+
     attention_figures = {}
-    
-    for pkey, indices in sorted_pkeys:
-        # Sample a few examples
-        sample_indices = indices[:num_examples_per_pkey]
-        
-        # Create figure with subplots
-        fig, axes = plt.subplots(
-            len(sample_indices), 1,
-            figsize=(12, 4 * len(sample_indices))
+
+    for pkey, samples in attention_samples.items():
+        if not samples:
+            continue
+
+        # Find the minimum sequence length across all samples (for proper averaging)
+        min_seq_len = min(
+            (sample["input_ids"] != tokenizer.pad_token_id).sum().item()
+            for sample in samples
         )
-        
-        if len(sample_indices) == 1:
-            axes = [axes]
-        
-        fig.suptitle(f"Attention Maps: {pkey}", fontsize=16, y=0.995)
-        
-        for plot_idx, example_idx in enumerate(sample_indices):
-            # Get attention weights (average across heads)
-            attn = attentions[example_idx].mean(dim=0)  # [seq_len, seq_len]
-            
-            # Get tokens for this example
-            tokens = input_ids[example_idx]
-            
-            # Decode tokens
+
+        # Get all layer indices from the first sample
+        layer_indices = sorted(samples[0]["attention"].keys())
+
+        # Create visualizations for each layer
+        for layer_idx in layer_indices:
+            # Average attention across all samples for this layer
+            # First, collect all attention matrices (averaged across heads and truncated)
+            attention_matrices = []
+            for sample in samples:
+                # Get attention weights for this layer (average across heads)
+                attn = sample["attention"][layer_idx].mean(dim=0)  # [seq_len, seq_len]
+                # Truncate to minimum length for consistent averaging
+                attn = attn[:min_seq_len, :min_seq_len]
+                attention_matrices.append(attn)
+
+            # Average across all samples
+            avg_attention = torch.stack(attention_matrices).mean(dim=0).numpy()
+
+            # Get tokens from the first sample (truncated to min length)
+            tokens = samples[0]["input_ids"][:min_seq_len]
             token_strs = [tokenizer.decode([t]) for t in tokens]
-            
-            # Truncate to non-padding tokens
-            seq_len = (tokens != tokenizer.pad_token_id).sum().item()
-            attn = attn[:seq_len, :seq_len].numpy()
-            token_strs = token_strs[:seq_len]
-            
-            # Plot attention heatmap
-            ax = axes[plot_idx]
+
+            # Create figure with single subplot
+            fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+
+            # Plot averaged attention heatmap
             sns.heatmap(
-                attn,
+                avg_attention,
                 cmap="viridis",
                 xticklabels=token_strs,
                 yticklabels=token_strs,
                 ax=ax,
-                cbar_kws={"label": "Attention Weight"},
+                cbar_kws={"label": "Average Attention Weight"},
                 square=True,
             )
-            ax.set_title(f"Example {plot_idx + 1}", fontsize=12)
+
+            # Title with number of examples averaged and layer info
+            ax.set_title(
+                f"Average Attention Map: {pkey} - Layer {layer_idx}\n(Averaged across {len(samples)} examples)",
+                fontsize=14
+            )
             ax.set_xlabel("Key Position")
             ax.set_ylabel("Query Position")
-            
+
             # Rotate labels for readability
             ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=8)
             ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=8)
-        
-        plt.tight_layout()
-        attention_figures[pkey] = fig
-    
+
+            plt.tight_layout()
+            # Use tuple key to store both pkey and layer
+            attention_figures[f"{pkey}_layer_{layer_idx}"] = fig
+
     return attention_figures
 
 
@@ -554,11 +616,11 @@ def log_to_wandb(
     print("\n" + "="*80)
     print("ATTENTION VISUALIZATIONS")
     print("="*80)
-    
+
     if attention_figures:
-        for pkey, fig in attention_figures.items():
-            print(f"  Logging attention map for: {pkey}")
-            wandb.log({f"attention_maps/{pkey}": wandb.Image(fig)})
+        for fig_key, fig in attention_figures.items():
+            print(f"  Logging attention map for: {fig_key}")
+            wandb.log({f"attention_maps/{fig_key}": wandb.Image(fig)})
             plt.close(fig)  # Close to free memory
     else:
         print("  No attention visualizations generated")
@@ -680,10 +742,14 @@ def main():
 
     # Initialize W&B (only on main process)
     if accelerator is None or accelerator.is_main_process:
+        # Prepare config for W&B (convert device to string)
+        wandb_config = vars(args).copy()
+        wandb_config["device"] = str(wandb_config["device"])
+
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
-            config=vars(args),
+            config=wandb_config,
         )
 
     # ─────────────────────────────────────────────────────────────────────────────
@@ -782,43 +848,54 @@ def main():
         print("RUNNING INFERENCE")
         print("="*80 + "\n")
 
+    # Configure attention sampling
+    attention_sample_config = {
+        "examples_per_key": args.num_attention_examples,
+        "max_keys": args.max_attention_pkeys,
+    }
+
     results = run_inference(
         model=model,
         dataloader=dataloader,
         device=args.device,
         return_attentions=args.visualize_attention,
         accelerator=accelerator,
+        attention_sample_config=attention_sample_config,
     )
-    
+
     # ─────────────────────────────────────────────────────────────────────────────
-    # Compute per-permutation metrics (only on main process)
+    # Process results (only on main process)
     # ─────────────────────────────────────────────────────────────────────────────
 
     if results is not None:  # Only main process has results when using multi-GPU
-        per_pkey_metrics = {}
-        if results["permutation_keys"]:
-            print("\nComputing per-permutation metrics...")
-            per_pkey_metrics = compute_per_permutation_metrics(
-                logits=results["logits"],
-                labels=results["labels"],
-                permutation_keys=results["permutation_keys"],
-            )
+        # Prepare config for logging (convert device to string for JSON serialization)
+        config_dict = vars(args).copy()
+        config_dict["device"] = str(config_dict["device"])
+
+        # Per-permutation metrics are already computed in run_inference()
+        # Filter to only the permutations of interest for logging/visualization
+        PERMUTATIONS_OF_INTEREST = {
+            "tra", "trb", "peptide", "mhc_one", "mhc_two", "tra_trb",
+            "peptide_mhc_one", "peptide_mhc_one_mhc_two", "tra_peptide_mhc_one",
+            "trb_peptide_mhc_one", "tra_trb_peptide_mhc_one"
+        }
+        all_per_pkey_metrics = results.get("per_permutation", {})
+        per_pkey_metrics = {
+            k: v for k, v in all_per_pkey_metrics.items()
+            if k in PERMUTATIONS_OF_INTEREST
+        }
 
         # ─────────────────────────────────────────────────────────────────────────────
         # Generate attention visualizations
         # ─────────────────────────────────────────────────────────────────────────────
 
         attention_figures = {}
-        if args.visualize_attention and "attentions" in results:
+        if args.visualize_attention and results.get("attention_samples"):
             print("\nGenerating attention visualizations...")
 
             attention_figures = visualize_attention_maps(
-                attentions=results["attentions"],
-                permutation_keys=results["permutation_keys"],
+                attention_samples=results["attention_samples"],
                 tokenizer=tokenizer,
-                input_ids=results["input_ids"],
-                num_examples_per_pkey=args.num_attention_examples,
-                max_pkeys=args.max_attention_pkeys,
             )
 
         # ─────────────────────────────────────────────────────────────────────────────
@@ -829,33 +906,23 @@ def main():
             overall_metrics=results["overall"],
             per_pkey_metrics=per_pkey_metrics,
             attention_figures=attention_figures,
-            config=vars(args),
+            config=config_dict,
         )
 
         # ─────────────────────────────────────────────────────────────────────────────
-        # Save results to file
+        # Finish W&B
         # ─────────────────────────────────────────────────────────────────────────────
-
-        output_dir = f"evaluation_results/{wandb.run.name}"
-        os.makedirs(output_dir, exist_ok=True)
-
-        results_file = os.path.join(output_dir, "metrics.json")
-        with open(results_file, 'w') as f:
-            json.dump({
-                "overall": results["overall"],
-                "per_permutation": per_pkey_metrics,
-                "config": vars(args),
-            }, f, indent=2)
-
-        print(f"\n✅ Results saved to: {results_file}")
 
         wandb.finish()
         print("\n✅ Evaluation complete!")
     else:
-        # Non-main processes just wait
+        # Non-main processes
         if accelerator is not None:
-            accelerator.wait_for_everyone()
             print("✅ Evaluation complete (worker process)")
+
+    # Final synchronization - all processes must wait before exit
+    if accelerator is not None:
+        accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":
