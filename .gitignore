@@ -60,6 +60,9 @@ model_output/
 model_config/
 
 # Data directories
+tokenized/
+HUMAN/
+evaluation_results/
 data/raw/*
 data/processed/*
 !data/.gitkeep
