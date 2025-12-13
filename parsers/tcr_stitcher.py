@@ -18,14 +18,17 @@ import re
 import os
 import sys
 
-# Add parent directory to path to import format_to_imgt
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+# Import format_to_imgt from same package
 try:
-    from format_to_imgt import standardize_to_imgt
+    from parsers.format_to_imgt import standardize_to_imgt
     IMGT_FORMATTER_AVAILABLE = True
 except ImportError:
-    IMGT_FORMATTER_AVAILABLE = False
+    try:
+        # Fallback for when running from parsers directory
+        from format_to_imgt import standardize_to_imgt
+        IMGT_FORMATTER_AVAILABLE = True
+    except ImportError:
+        IMGT_FORMATTER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
