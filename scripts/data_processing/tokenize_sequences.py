@@ -174,7 +174,15 @@ class ESM2Tokenizer(SequenceTokenizerBase):
         print(f"✓ Loaded ESM-2 tokenizer from {model_name} (vocab size: {len(self.tokenizer)})")
     
     def tokenize_batch(self, sequences: List[str]) -> Dict[str, List[List[int]]]:
-        """Tokenize sequences directly (no spaces)."""
+        """
+        Tokenize sequences using standard ESM tokenization.
+        
+        Molecules are separated by dash (-) which is a native ESM token (ID 30).
+        The ESM tokenizer's encode() method preserves dashes correctly.
+        
+        Format: "CASSLG-GILGFVFTL" -> [<cls>, C, A, S, S, L, G, -, G, I, L, G, F, V, F, T, L, <eos>]
+        """
+        # ESM tokenizer correctly handles dash as a native token
         encoded = self.tokenizer(
             sequences,
             padding='max_length',
@@ -266,7 +274,8 @@ class ESM3Tokenizer(SequenceTokenizerBase):
                 'attention_mask': attention_mask
             }
         else:
-            # Use ESM-2 tokenizer (HuggingFace format)
+            # Use ESM-2 tokenizer - dash is handled natively
+            # Molecules are separated by dash (-) which is token ID 30
             encoded = self.tokenizer(
                 sequences,
                 padding='max_length',
@@ -455,11 +464,147 @@ def get_permutation_signature(row: Dict) -> str:
     return "_".join(present) if present else "empty"
 
 
-def _count_permutations_in_file(file_path: Path) -> tuple[Dict[str, int], int]:
+def matches_mode(pkey: str, mode: Optional[str]) -> bool:
+    """
+    Check if permutation key matches the specified mode for filtering.
+    
+    Filtering logic (same as pre_mask_dataset.py):
+    - None/mlm: keep all keys
+    - tra: keep only keys that are exactly "tra"
+    - trb: keep only keys that are exactly "trb"
+    - tra_trb_pairing: keep only keys "tra_trb" or "trb_tra"
+    - tcr_mhc: keys with at least one TCR chain AND at least one MHC chain, but NO peptide
+    - peptide_mhc: keys with peptide AND at least one MHC chain, but NO TCR chains
+    - specificity: keys with at least one TCR chain, peptide, AND at least one MHC chain
+    
+    Args:
+        pkey: Permutation key string (e.g., 'tra', 'trb_peptide_mhc_one')
+        mode: Filtering mode (None means keep all)
+        
+    Returns:
+        True if the key matches the mode, False otherwise
+    """
+    if mode is None or mode == "mlm":
+        return True
+    
+    if not pkey:
+        return False
+    
+    pkey_lower = pkey.lower()
+    
+    # Check for presence of each molecule type using word matching
+    has_tra = 'tra' in pkey_lower.replace('_', ' ').split()
+    has_trb = 'trb' in pkey_lower.replace('_', ' ').split()
+    has_tcr = has_tra or has_trb
+    has_peptide = 'peptide' in pkey_lower
+    has_mhc = 'mhc_one' in pkey_lower or 'mhc_two' in pkey_lower or 'mhcone' in pkey_lower or 'mhctwo' in pkey_lower
+    
+    if mode == "tra":
+        return pkey_lower == "tra"
+    
+    elif mode == "trb":
+        return pkey_lower == "trb"
+    
+    elif mode == "tra_trb_pairing":
+        return pkey_lower in ["tra_trb", "trb_tra"]
+    
+    elif mode == "tcr_mhc":
+        return has_tcr and has_mhc and not has_peptide
+    
+    elif mode == "peptide_mhc":
+        return has_peptide and has_mhc and not has_tcr
+    
+    elif mode == "specificity":
+        return has_tcr and has_peptide and has_mhc
+    
+    else:
+        # Unknown mode - keep all
+        return True
+
+
+def stratified_split_rows(
+    chunk_rows: List[Dict],
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    seed: int = 42
+) -> np.ndarray:
+    """
+    Perform stratified split on chunk rows to preserve class balance.
+    
+    Groups rows by permutation_key (or computes it from molecule fields),
+    then splits each class proportionally into train/val/test.
+    
+    Args:
+        chunk_rows: List of row dictionaries
+        train_ratio: Fraction for training set (default 0.8)
+        val_ratio: Fraction for validation set (default 0.1)
+        test_ratio: Fraction for test set (default 0.1)
+        seed: Random seed for reproducibility
+        
+    Returns:
+        numpy array of split assignments ('train', 'validation', 'test')
+    """
+    np.random.seed(seed)
+    
+    # Group indices by permutation key
+    pkey_to_indices: Dict[str, List[int]] = {}
+    for i, row in enumerate(chunk_rows):
+        # Get permutation key - either from column or compute it
+        if 'permutation_key' in row:
+            pkey = row['permutation_key']
+        else:
+            pkey = get_permutation_signature(row)
+        
+        if pkey not in pkey_to_indices:
+            pkey_to_indices[pkey] = []
+        pkey_to_indices[pkey].append(i)
+    
+    # Initialize split assignments
+    split_assignments = np.empty(len(chunk_rows), dtype=object)
+    
+    # Split each class proportionally
+    for pkey, indices in pkey_to_indices.items():
+        n = len(indices)
+        
+        # Shuffle indices for this class
+        shuffled_indices = np.array(indices)
+        np.random.shuffle(shuffled_indices)
+        
+        # Calculate split boundaries
+        n_train = max(1, int(round(n * train_ratio))) if n >= 3 else n
+        n_val = max(1, int(round(n * val_ratio))) if n >= 3 else 0
+        n_test = n - n_train - n_val
+        
+        # Handle edge cases for very small classes
+        if n == 1:
+            # Single sample goes to train
+            n_train, n_val, n_test = 1, 0, 0
+        elif n == 2:
+            # Two samples: one train, one val
+            n_train, n_val, n_test = 1, 1, 0
+        elif n_test < 0:
+            # Adjust if we overallocated
+            n_test = 0
+            n_val = n - n_train
+        
+        # Assign splits
+        split_assignments[shuffled_indices[:n_train]] = 'train'
+        split_assignments[shuffled_indices[n_train:n_train + n_val]] = 'validation'
+        split_assignments[shuffled_indices[n_train + n_val:]] = 'test'
+    
+    return split_assignments
+
+
+def _count_permutations_in_file(args) -> tuple[Dict[str, int], int]:
     """
     Count permutations in a single parquet file.
     Used for parallel processing.
+    
+    Args:
+        args: Tuple of (file_path, mode) where mode can be None
     """
+    file_path, mode = args
     permutation_counts = {}
     total_rows = 0
     
@@ -470,29 +615,42 @@ def _count_permutations_in_file(file_path: Path) -> tuple[Dict[str, int], int]:
     
     for row in rows:
         perm = get_permutation_signature(row)
+        # Filter by mode if specified
+        if not matches_mode(perm, mode):
+            continue
         permutation_counts[perm] = permutation_counts.get(perm, 0) + 1
         total_rows += 1
     
     return permutation_counts, total_rows
 
 
-def analyze_dataset_distribution(input_dir: Path, chunk_size: int = 10_000_000, num_workers: int = 16):
+def analyze_dataset_distribution(input_dir: Path, chunk_size: int = 10_000_000, num_workers: int = 16, mode: Optional[str] = None):
     """
     Analyze the distribution of permutations in the dataset by streaming through ALL data.
     Uses parallel processing to speed up analysis.
     Returns dict of permutation -> count and total rows.
+    
+    Args:
+        input_dir: Directory containing parquet files
+        chunk_size: Not used (kept for API compatibility)
+        num_workers: Number of parallel workers
+        mode: Optional mode to filter permutation keys
     """
-    print(f"\n📊 Analyzing full dataset distribution (parallel processing with {num_workers} workers)...")
+    mode_str = f" (filtering for mode: {mode})" if mode else ""
+    print(f"\n📊 Analyzing full dataset distribution{mode_str} (parallel processing with {num_workers} workers)...")
     
     parquet_files = sorted(input_dir.glob("*.parquet"))
     print(f"   Found {len(parquet_files)} parquet files to analyze")
     
-    # Process files in parallel
+    # Process files in parallel - pass mode to each worker
     from multiprocessing import Pool
+    
+    # Create args tuples for each file
+    worker_args = [(pf, mode) for pf in parquet_files]
     
     with Pool(num_workers) as pool:
         results = list(tqdm(
-            pool.imap(_count_permutations_in_file, parquet_files),
+            pool.imap(_count_permutations_in_file, worker_args),
             total=len(parquet_files),
             desc="Scanning files"
         ))
@@ -517,7 +675,8 @@ def analyze_dataset_distribution(input_dir: Path, chunk_size: int = 10_000_000, 
 
 
 def stream_parquet_files(input_dir: Path, sample: Optional[int] = None, chunk_size: int = 10_000_000, 
-                         sample_mode: Optional[str] = None, num_workers: int = 16):
+                         sample_mode: Optional[str] = None, num_workers: int = 16, oversample: bool = False,
+                         mode: Optional[str] = None):
     """
     Stream parquet files in chunks to avoid loading everything into memory.
     
@@ -527,6 +686,8 @@ def stream_parquet_files(input_dir: Path, sample: Optional[int] = None, chunk_si
         chunk_size: Number of rows per chunk (default 10M = ~15GB RAM per chunk)
         sample_mode: Sampling strategy - 'proportional' or 'balanced' or None
         num_workers: Number of parallel workers for distribution analysis (default: 16)
+        oversample: If True and sample_mode='balanced', duplicate underrepresented samples to reach target
+        mode: Filter mode - only include permutation keys matching this mode (mlm, tra, trb, etc.)
     
     Yields:
         (chunk_rows, total_rows_seen) tuples
@@ -545,9 +706,11 @@ def stream_parquet_files(input_dir: Path, sample: Optional[int] = None, chunk_si
     
     if sample and sample_mode:
         print(f"\n🎯 Sampling mode: {sample_mode}")
+        if mode:
+            print(f"🔍 Filtering for mode: {mode}")
         # Use same num_workers for distribution analysis (passed from outer scope)
         dist_counts, total_analyzed = analyze_dataset_distribution(
-            input_dir, chunk_size, num_workers=min(num_workers, len(list(input_dir.glob("*.parquet"))))
+            input_dir, chunk_size, num_workers=min(num_workers, len(list(input_dir.glob("*.parquet")))), mode=mode
         )
         
         if sample_mode == 'proportional':
@@ -558,16 +721,44 @@ def stream_parquet_files(input_dir: Path, sample: Optional[int] = None, chunk_si
                 for perm, count in dist_counts.items()
             }
         elif sample_mode == 'balanced':
-            # Equal samples per permutation
-            print(f"\n⚖️  Balanced sampling: equal samples per permutation")
+            # Equal samples per permutation, but capped by available data
+            print(f"\n⚖️  Balanced sampling: target equal samples per permutation")
             n_permutations = len(dist_counts)
-            per_perm = sample // n_permutations
-            permutation_targets = {perm: per_perm for perm in dist_counts.keys()}
-            print(f"   Target: {per_perm:,} samples per permutation")
+            ideal_per_perm = sample // n_permutations
+            print(f"   Ideal target: {ideal_per_perm:,} samples per permutation ({n_permutations} classes)")
+            
+            # Calculate targets: min(ideal, available) for each class
+            # This ensures we sample all available from small classes
+            permutation_targets = {}
+            total_expected = 0
+            capped_classes = []
+            
+            for perm, available in dist_counts.items():
+                if available >= ideal_per_perm:
+                    permutation_targets[perm] = ideal_per_perm
+                    total_expected += ideal_per_perm
+                else:
+                    # Cap at available amount
+                    permutation_targets[perm] = available
+                    total_expected += available
+                    capped_classes.append((perm, available, ideal_per_perm))
+            
+            print(f"   Expected total samples: {total_expected:,}")
+            if capped_classes:
+                print(f"   ⚠️  {len(capped_classes)} classes have fewer than ideal ({ideal_per_perm:,}):")
+                for perm, avail, ideal in sorted(capped_classes, key=lambda x: x[1]):
+                    print(f"      {perm:30s}: {avail:,} available (capped)")
+            
+            if oversample:
+                print(f"   🔄 Oversampling enabled: capped classes will be duplicated to reach {ideal_per_perm:,}")
+                # With oversampling, set targets back to ideal
+                permutation_targets = {perm: ideal_per_perm for perm in dist_counts.keys()}
         
         print(f"\n🎯 Sampling targets:")
         for perm, target in sorted(permutation_targets.items(), key=lambda x: -x[1]):
-            print(f"   {perm:30s}: {target:10,}")
+            available = dist_counts.get(perm, 0)
+            status = "" if available >= target else f" (⚠️ only {available:,} available)"
+            print(f"   {perm:30s}: {target:10,}{status}")
         
         # Initialize counters
         permutation_counts = {perm: 0 for perm in permutation_targets.keys()}
@@ -575,22 +766,37 @@ def stream_parquet_files(input_dir: Path, sample: Optional[int] = None, chunk_si
     total_rows = 0
     chunk_buffer = []
     
+    # For oversampling: store samples by permutation for later duplication
+    oversample_pool = {} if (oversample and sample_mode == 'balanced') else None
+    
     for pf in tqdm(parquet_files, desc="Processing parquet files"):
         table = pq.read_table(pf)
         df = table.to_pandas()
         rows = df.to_dict('records')
         
         for row in rows:
+            # Check if we should include this row based on mode filter
+            perm = get_permutation_signature(row)
+            
+            # Filter by mode if specified
+            if mode and not matches_mode(perm, mode):
+                continue
+            
             # Check if we should include this row based on sampling mode
             should_include = True
             
             if sample and sample_mode and permutation_targets:
-                perm = get_permutation_signature(row)
+                # perm already computed above for mode filtering
                 if perm in permutation_counts:
                     if permutation_counts[perm] >= permutation_targets[perm]:
                         should_include = False
                     else:
                         permutation_counts[perm] += 1
+                        # Store sample for potential oversampling
+                        if oversample_pool is not None:
+                            if perm not in oversample_pool:
+                                oversample_pool[perm] = []
+                            oversample_pool[perm].append(row)
                 else:
                     # Unknown permutation, skip it
                     should_include = False
@@ -621,15 +827,60 @@ def stream_parquet_files(input_dir: Path, sample: Optional[int] = None, chunk_si
     # Yield remaining rows
     if chunk_buffer:
         yield chunk_buffer, total_rows
+        chunk_buffer = []
+    
+    # Oversampling: duplicate underrepresented samples to reach target
+    if oversample_pool is not None and permutation_targets:
+        print(f"\n🔄 Oversampling underrepresented permutations...")
+        oversampled_rows = []
+        
+        for perm in sorted(permutation_counts.keys()):
+            achieved = permutation_counts[perm]
+            target = permutation_targets[perm]
+            
+            if achieved < target and perm in oversample_pool and len(oversample_pool[perm]) > 0:
+                needed = target - achieved
+                available_samples = oversample_pool[perm]
+                
+                # Duplicate samples cyclically to reach target
+                duplicates_needed = needed
+                idx = 0
+                while duplicates_needed > 0:
+                    oversampled_rows.append(available_samples[idx % len(available_samples)].copy())
+                    idx += 1
+                    duplicates_needed -= 1
+                    permutation_counts[perm] += 1
+                
+                print(f"   {perm:30s}: duplicated {needed:,} samples ({len(available_samples):,} unique → {target:,} total)")
+        
+        # Yield oversampled rows in chunks
+        if oversampled_rows:
+            total_rows += len(oversampled_rows)
+            print(f"   Total oversampled: {len(oversampled_rows):,} rows")
+            
+            # Shuffle oversampled rows to mix duplicates
+            np.random.shuffle(oversampled_rows)
+            
+            for i in range(0, len(oversampled_rows), chunk_size):
+                chunk = oversampled_rows[i:i + chunk_size]
+                yield chunk, total_rows
     
     # Print final sampling stats
     if sample and sample_mode and permutation_targets:
         print(f"\n📊 Final sampling statistics:")
+        under_target = []
         for perm in sorted(permutation_counts.keys()):
             achieved = permutation_counts[perm]
             target = permutation_targets[perm]
             pct = 100 * achieved / target if target > 0 else 0
-            print(f"   {perm:30s}: {achieved:10,} / {target:10,} ({pct:5.1f}%)")
+            status = "✓" if achieved >= target else "⚠️"
+            print(f"   {perm:30s}: {achieved:10,} / {target:10,} ({pct:5.1f}%) {status}")
+            if achieved < target:
+                under_target.append((perm, achieved, target))
+        
+        if under_target and not oversample_pool:
+            print(f"\n⚠️  {len(under_target)} permutations could not reach target!")
+            print(f"   Consider using --oversample to duplicate underrepresented samples.")
 
 
 def concatenate_molecule_sequences(row: Dict, model_type: str = None) -> str:
@@ -646,8 +897,14 @@ def concatenate_molecule_sequences(row: Dict, model_type: str = None) -> str:
         - Reads from tra, trb, peptide, mhc_one, mhc_two columns
         - Concatenates based on model_type
     
-    For ProtBERT/BERT: adds [CLS] at start and [SEP] between molecules
-    For other models: uses space separator between molecules
+    Tokenization formats by model type:
+        - ProtBERT/BERT: Space between each amino acid, [SEP] between molecules
+          Example: "C A S S L G Q A Y E Q Y F [SEP] G I L G F V F T L"
+        - ESM2/ESM3: Contiguous amino acids within molecules, dash (-) between molecules
+          Example: "CASSLGQAYEQYF-GILGFVFTL" 
+          Note: Dash is a native ESM token (ID 30) used for gaps, serves as molecule boundary
+        - BPE/LSTM/Transformer: Contiguous amino acids, dash between molecules
+          Example: "CASSLGQAYEQYF-GILGFVFTL"
     """
     # New format: has 'sequence' column with molecules separated by single space
     if 'sequence' in row and row.get('sequence'):
@@ -661,20 +918,23 @@ def concatenate_molecule_sequences(row: Dict, model_type: str = None) -> str:
             
             if model_type in ['protbert', 'bert']:
                 # ProtBERT/BERT: Add spaces between amino acids for each molecule
-                # Add [SEP] after each molecule
+                # Add [SEP] between molecules
                 # BertTokenizer will add [CLS] at start
                 spaced_molecules_with_sep = []
                 for mol in molecules:
                     # Add spaces between amino acids
-                    spaced = " ".join(list(mol)).lstrip().rstrip()
-                    # Add [SEP] after the molecule
+                    spaced = " ".join(list(mol)).strip()
                     spaced_molecules_with_sep.append(spaced)
-                # Join all molecules
+                # Join all molecules with [SEP]
                 return " [SEP] ".join(spaced_molecules_with_sep)
+            elif model_type in ['esm2', 'esm3']:
+                # ESM2/ESM3: Contiguous amino acids within molecules, dash between molecules
+                # Dash is a native ESM token (ID 30) used for gaps in alignments
+                # Example: "CASSLGQAYEQYF-GILGFVFTL" -> [<cls>, C, A, S, ..., F, -, G, I, L, ..., L, <eos>]
+                return "-".join(molecules)
             else:
-                # Other models: keep molecules without internal spacing
-                # Just join with spaces
-                return " ".join(molecules)
+                # BPE/LSTM/Transformer: Contiguous amino acids, dash between molecules
+                return "-".join(molecules)
     
     # Old format: individual molecule columns
     else:
@@ -688,13 +948,16 @@ def concatenate_molecule_sequences(row: Dict, model_type: str = None) -> str:
         # Concatenate based on model type
         if model_type in ['protbert', 'bert']:
             # ProtBERT/BERT: Add spaces between amino acids for each molecule
-            # Join molecules with space (BertTokenizer will add [CLS] and [SEP] automatically)
+            # Join molecules with [SEP]
             spaced_molecules = [" ".join(list(seq)) for seq in sequences]
-            # Join with space - tokenizer will handle special tokens
-            return " ".join(spaced_molecules)
+            return " [SEP] ".join(spaced_molecules)
+        elif model_type in ['esm2', 'esm3']:
+            # ESM2/ESM3: Contiguous amino acids within molecules, dash between molecules
+            # Dash is a native ESM token (ID 30) used for gaps in alignments
+            return "-".join(sequences)
         else:
-            # Other models: simple space separator
-            return " ".join(sequences)
+            # BPE/LSTM/Transformer: Contiguous amino acids, dash between molecules
+            return "-".join(sequences)
 
 
 def create_tokenize_function(tokenizer, model_type: str):
@@ -754,6 +1017,8 @@ def tokenize_dataset(
     val_split: float = 0.1,
     chunk_size: int = 10_000_000,
     num_workers: int = 50,
+    oversample: bool = False,
+    mode: Optional[str] = None,
 ):
     """
     Main tokenization function with streaming support.
@@ -763,6 +1028,8 @@ def tokenize_dataset(
         num_workers: Parallel workers for Dataset.map()
         sample: Number of sequences to sample (optional)
         sample_mode: Sampling strategy - 'proportional' (maintain distribution) or 'balanced' (equal per permutation)
+        oversample: If True and sample_mode='balanced', duplicate underrepresented samples to reach target
+        mode: Filter mode - only include permutation keys matching this mode (mlm, tra, trb, tra_trb_pairing, tcr_mhc, peptide_mhc, specificity)
     """
     print(f"\n{'='*60}")
     print(f"TOKENIZATION: {model_type.upper()}")
@@ -772,7 +1039,8 @@ def tokenize_dataset(
     print(f"⚙️  Workers: {num_workers}")
     print(f"⚙️  Max RAM usage: ~{chunk_size * 150 / 1e9:.0f}GB per chunk")
     if sample:
-        print(f"⚙️  Sampling: {sample:,} sequences (mode: {sample_mode or 'first-N'})")
+        oversample_str = ", with oversampling" if oversample else ""
+        print(f"⚙️  Sampling: {sample:,} sequences (mode: {sample_mode or 'first-N'}{oversample_str})")
     print()
     
     # Create tokenizer
@@ -794,7 +1062,7 @@ def tokenize_dataset(
             sequence_count = 0
             max_training_sequences = 1_000_000  # Limit for BPE training
             
-            for chunk_rows, _ in stream_parquet_files(input_dir, sample, chunk_size, sample_mode, num_workers):
+            for chunk_rows, _ in stream_parquet_files(input_dir, sample, chunk_size, sample_mode, num_workers, mode=mode):
                 for row in chunk_rows:
                     for field in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']:
                         val = row.get(field, '')
@@ -829,21 +1097,47 @@ def tokenize_dataset(
     }
     split_counts = {'train': 0, 'validation': 0, 'test': 0}
     
+    # Track per-permutation split distribution for validation
+    pkey_split_totals: Dict[str, Dict[str, int]] = {}
+    
     # Process in streaming chunks
     print(f"\n📦 Processing dataset in chunks...")
     np.random.seed(42)
     
     chunk_num = 0
-    for chunk_rows, total_rows in stream_parquet_files(input_dir, sample, chunk_size, sample_mode, num_workers):
+    for chunk_rows, total_rows in stream_parquet_files(input_dir, sample, chunk_size, sample_mode, num_workers, oversample, mode):
         chunk_num += 1
         print(f"\n📦 Processing chunk {chunk_num} ({len(chunk_rows):,} rows, total: {total_rows:,})")
         
-        # Random split assignment for this chunk
-        chunk_splits = np.random.choice(
-            ['train', 'validation', 'test'],
-            size=len(chunk_rows),
-            p=[1 - test_split - val_split, val_split, test_split]
+        # Stratified split assignment for this chunk (preserves class balance)
+        train_ratio = 1 - test_split - val_split
+        chunk_splits = stratified_split_rows(
+            chunk_rows,
+            train_ratio=train_ratio,
+            val_ratio=val_split,
+            test_ratio=test_split,
+            seed=42 + chunk_num  # Vary seed per chunk for variety
         )
+        
+        # Log split distribution for first chunk to validate stratification
+        if chunk_num == 1:
+            from collections import Counter
+            split_counts_preview = Counter(chunk_splits)
+            print(f"   📊 Chunk 1 split preview: {dict(split_counts_preview)}")
+            
+            # Show per-class distribution for validation
+            pkey_split_counts: Dict[str, Dict[str, int]] = {}
+            for i, row in enumerate(chunk_rows):
+                pkey = row.get('permutation_key', get_permutation_signature(row))
+                if pkey not in pkey_split_counts:
+                    pkey_split_counts[pkey] = {'train': 0, 'validation': 0, 'test': 0}
+                pkey_split_counts[pkey][chunk_splits[i]] += 1
+            
+            print(f"   📊 Stratified split by class (first 5):")
+            for pkey in list(pkey_split_counts.keys())[:5]:
+                counts = pkey_split_counts[pkey]
+                total = sum(counts.values())
+                print(f"      {pkey}: {counts} (total: {total})")
         
         # Convert to HuggingFace Dataset for parallel tokenization
         print(f"   ⚡ Creating Dataset...")
@@ -874,6 +1168,13 @@ def tokenize_dataset(
         # Convert to list for splitting
         tokenized_rows = tokenized_dataset.to_pandas().to_dict('records')
         
+        # Track per-permutation split distribution
+        for i, row in enumerate(chunk_rows):
+            pkey = row.get('permutation_key', get_permutation_signature(row))
+            if pkey not in pkey_split_totals:
+                pkey_split_totals[pkey] = {'train': 0, 'validation': 0, 'test': 0}
+            pkey_split_totals[pkey][chunk_splits[i]] += 1
+        
         # Split and write
         for split_name in ['train', 'validation', 'test']:
             split_mask = chunk_splits == split_name
@@ -891,6 +1192,32 @@ def tokenize_dataset(
         print(f"   ✓ Chunk {chunk_num} complete")
         print(f"   📊 Cumulative: Train={split_counts['train']:,}, "
               f"Val={split_counts['validation']:,}, Test={split_counts['test']:,}")
+    
+    # Print stratified split validation summary
+    print(f"\n{'='*60}")
+    print(f"📊 STRATIFIED SPLIT VALIDATION")
+    print(f"{'='*60}")
+    print(f"\nPer-permutation split distribution:")
+    
+    # Sort by total count to show smallest classes first (most important for balanced sampling)
+    sorted_pkeys = sorted(pkey_split_totals.keys(), key=lambda k: sum(pkey_split_totals[k].values()))
+    
+    for pkey in sorted_pkeys:
+        counts = pkey_split_totals[pkey]
+        total = sum(counts.values())
+        train_pct = counts['train'] / total * 100 if total > 0 else 0
+        val_pct = counts['validation'] / total * 100 if total > 0 else 0
+        test_pct = counts['test'] / total * 100 if total > 0 else 0
+        print(f"  {pkey:40s}: train={counts['train']:6,} ({train_pct:5.1f}%), "
+              f"val={counts['validation']:6,} ({val_pct:5.1f}%), "
+              f"test={counts['test']:6,} ({test_pct:5.1f}%) [total: {total:,}]")
+    
+    # Show summary for smallest class
+    if sorted_pkeys:
+        smallest_pkey = sorted_pkeys[0]
+        smallest_counts = pkey_split_totals[smallest_pkey]
+        print(f"\n✓ Smallest class '{smallest_pkey}' preserved with stratified split:")
+        print(f"  Train: {smallest_counts['train']:,}, Val: {smallest_counts['validation']:,}, Test: {smallest_counts['test']:,}")
     
     # Create HuggingFace datasets from parquet chunks
     print(f"\n💾 Creating HuggingFace DatasetDict...")
@@ -933,6 +1260,11 @@ def main():
     parser.add_argument("--sample", type=int, help="Sample N rows (optional)")
     parser.add_argument("--sample-mode", type=str, choices=['proportional', 'balanced'], 
                        help="Sampling mode: 'proportional' (maintain distribution) or 'balanced' (equal per permutation)")
+    parser.add_argument("--oversample", action="store_true", 
+                       help="When using balanced sampling, duplicate underrepresented samples to reach target count")
+    parser.add_argument("--mode", type=str, 
+                       choices=['mlm', 'tra', 'trb', 'tra_trb_pairing', 'tcr_mhc', 'peptide_mhc', 'specificity'],
+                       help="Filter mode: only include permutation keys matching this mode")
     parser.add_argument("--train-bpe", action="store_true", help="Train BPE tokenizer (required for first run)")
     parser.add_argument("--test-split", type=float, default=0.1, help="Test split fraction")
     parser.add_argument("--val-split", type=float, default=0.1, help="Validation split fraction")
@@ -961,6 +1293,8 @@ def main():
         val_split=args.val_split,
         chunk_size=args.chunk_size,
         num_workers=args.num_workers,
+        oversample=args.oversample,
+        mode=args.mode,
     )
 
 

@@ -69,6 +69,10 @@ class MaskingFunction:
         
         self.cls_token_id = getattr(tokenizer, 'cls_token_id', None)
         self.sep_token_id = getattr(tokenizer, 'sep_token_id', None)
+        self.unk_token_id = getattr(tokenizer, 'unk_token_id', None)
+        
+        # Dash token ID (30 in ESM) - used as molecule separator
+        self.dash_token_id = tokenizer.convert_tokens_to_ids('-') if hasattr(tokenizer, 'convert_tokens_to_ids') else None
         
         # Vocab size - handle both dict-like and len() tokenizers
         if hasattr(tokenizer, '__len__'):
@@ -90,6 +94,14 @@ class MaskingFunction:
         labels = []
         
         for input_ids, pkey in zip(input_ids_list, permutation_keys):
+            # Check if this example matches the mode's filtering criteria
+            if not self._matches_mode(pkey):
+                # Skip masking - keep original input with all -100 labels (no loss)
+                input_ids_copy = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
+                masked_inputs.append(input_ids_copy)
+                labels.append([-100] * len(input_ids_copy))
+                continue
+            
             if self.mode == "mlm":
                 masked, lab = self._mask_mlm(input_ids)
             elif self.mode in ["tra", "trb"]:
@@ -115,13 +127,84 @@ class MaskingFunction:
             "permutation_key": permutation_keys,
         }
     
+    def _matches_mode(self, pkey: str) -> bool:
+        """Check if permutation key matches the current masking mode.
+        
+        Filtering logic:
+        - mlm: keep all keys
+        - tra: keep only keys that are exactly "tra"
+        - trb: keep only keys that are exactly "trb"
+        - tra_trb_pairing: keep only keys "tra_trb" or "trb_tra"
+        - tcr_mhc: keys with at least one TCR chain AND at least one MHC chain, but NO peptide
+        - peptide_mhc: keys with peptide AND at least one MHC chain, but NO TCR chains
+        - specificity: keys with at least one TCR chain, peptide, AND at least one MHC chain
+        
+        Args:
+            pkey: Permutation key string (e.g., 'tra', 'trb_peptide_mhc_one')
+            
+        Returns:
+            True if the key matches the mode, False otherwise
+        """
+        if not pkey:
+            return False
+        
+        pkey_lower = pkey.lower()
+        
+        # Check for presence of each molecule type using substring matching
+        has_tra = 'tra' in pkey_lower.replace('_', ' ').split()
+        has_trb = 'trb' in pkey_lower.replace('_', ' ').split()
+        has_tcr = has_tra or has_trb
+        has_peptide = 'peptide' in pkey_lower
+        has_mhc = 'mhc_one' in pkey_lower or 'mhc_two' in pkey_lower or 'mhcone' in pkey_lower or 'mhctwo' in pkey_lower
+        
+        if self.mode == "mlm":
+            # Keep all keys
+            return True
+        
+        elif self.mode == "tra":
+            # Keep only keys that are exactly "tra"
+            return pkey_lower == "tra"
+        
+        elif self.mode == "trb":
+            # Keep only keys that are exactly "trb"
+            return pkey_lower == "trb"
+        
+        elif self.mode == "tra_trb_pairing":
+            # Keep only keys "tra_trb" or "trb_tra"
+            return pkey_lower in ["tra_trb", "trb_tra"]
+        
+        elif self.mode == "tcr_mhc":
+            # Keys with at least one TCR chain AND at least one MHC chain, but NO peptide
+            return has_tcr and has_mhc and not has_peptide
+        
+        elif self.mode == "peptide_mhc":
+            # Keys with peptide AND at least one MHC chain, but NO TCR chains
+            return has_peptide and has_mhc and not has_tcr
+        
+        elif self.mode == "specificity":
+            # Keys with at least one TCR chain, peptide, AND at least one MHC chain
+            return has_tcr and has_peptide and has_mhc
+        
+        else:
+            # Unknown mode - keep all
+            return True
+    
     def _is_special_token(self, token_id: int) -> bool:
-        """Check if token is a special token."""
+        """Check if token is a special token (should not be masked).
+        
+        For ESM models, dash (-) tokens are used as molecule separators
+        and should not be masked. Dash is token ID 30 in ESM vocabulary.
+        """
         if token_id == self.pad_token_id:
             return True
         if self.cls_token_id is not None and token_id == self.cls_token_id:
             return True
         if self.sep_token_id is not None and token_id == self.sep_token_id:
+            return True
+        if self.unk_token_id is not None and token_id == self.unk_token_id:
+            return True
+        if self.dash_token_id is not None and token_id == self.dash_token_id:
+            # Dash (-) is used as molecule separator in ESM models
             return True
         
         # Try to decode token (handle both HuggingFace and ESM3 tokenizers)
@@ -188,7 +271,11 @@ class MaskingFunction:
         return input_ids, label_ids
     
     def _mask_cdr3_middle(self, input_ids: List[int], pkey: str) -> tuple:
-        """Mask middle portion of CDR3."""
+        """Mask 15% of middle portion of CDR3 region.
+        
+        Instead of masking all tokens in the middle region, we mask 15% of them
+        randomly (similar to standard MLM but restricted to the middle region).
+        """
         input_ids = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
         label_ids = [-100] * len(input_ids)
         
@@ -199,15 +286,24 @@ class MaskingFunction:
             middle_start = seq_start + (seq_length - self.cdr3_mask_length) // 2
             middle_end = middle_start + self.cdr3_mask_length
             
+            # Mask 15% of tokens in the middle region (like MLM but restricted to middle)
             for i in range(middle_start, middle_end):
                 if i < seq_end and not self._is_special_token(input_ids[i]):
-                    label_ids[i] = input_ids[i]
-                    input_ids[i] = self.mask_token_id
+                    if random.random() < self.mlm_probability:  # 15% probability
+                        label_ids[i] = input_ids[i]
+                        
+                        # Standard MLM: 80% mask, 10% random, 10% keep
+                        prob = random.random()
+                        if prob < 0.8:
+                            input_ids[i] = self.mask_token_id
+                        elif prob < 0.9:
+                            input_ids[i] = random.randint(0, self.vocab_size - 1)
+                        # else: keep original (10%)
         
         return input_ids, label_ids
     
     def _mask_first_chain(self, input_ids: List[int]) -> tuple:
-        """Mask entire first chain."""
+        """Mask mlm_probability% of first chain with 80/10/10 strategy."""
         input_ids = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
         label_ids = [-100] * len(input_ids)
         
@@ -221,8 +317,16 @@ class MaskingFunction:
         
         for i in range(seq_start, mask_end):
             if not self._is_special_token(input_ids[i]):
-                label_ids[i] = input_ids[i]
-                input_ids[i] = self.mask_token_id
+                if random.random() < self.mlm_probability:
+                    label_ids[i] = input_ids[i]
+                    
+                    # Standard MLM: 80% mask, 10% random, 10% keep
+                    prob = random.random()
+                    if prob < 0.8:
+                        input_ids[i] = self.mask_token_id
+                    elif prob < 0.9:
+                        input_ids[i] = random.randint(0, self.vocab_size - 1)
+                    # else: keep original (10%)
         
         return input_ids, label_ids
     
@@ -250,8 +354,16 @@ class MaskingFunction:
             
             for i in range(seq_start, mask_end):
                 if not self._is_special_token(input_ids[i]):
-                    label_ids[i] = input_ids[i]
-                    input_ids[i] = self.mask_token_id
+                    if random.random() < self.mlm_probability:
+                        label_ids[i] = input_ids[i]
+                        
+                        # Standard MLM: 80% mask, 10% random, 10% keep
+                        prob = random.random()
+                        if prob < 0.8:
+                            input_ids[i] = self.mask_token_id
+                        elif prob < 0.9:
+                            input_ids[i] = random.randint(0, self.vocab_size - 1)
+                        # else: keep original (10%)
         
         return input_ids, label_ids
     
@@ -278,8 +390,16 @@ class MaskingFunction:
             
             for i in range(seq_start, mask_end):
                 if not self._is_special_token(input_ids[i]):
-                    label_ids[i] = input_ids[i]
-                    input_ids[i] = self.mask_token_id
+                    if random.random() < self.mlm_probability:
+                        label_ids[i] = input_ids[i]
+                        
+                        # Standard MLM: 80% mask, 10% random, 10% keep
+                        prob = random.random()
+                        if prob < 0.8:
+                            input_ids[i] = self.mask_token_id
+                        elif prob < 0.9:
+                            input_ids[i] = random.randint(0, self.vocab_size - 1)
+                        # else: keep original (10%)
         
         return input_ids, label_ids
     
@@ -299,8 +419,16 @@ class MaskingFunction:
         
         for i in range(seq_start, mask_end):
             if not self._is_special_token(input_ids[i]):
-                label_ids[i] = input_ids[i]
-                input_ids[i] = self.mask_token_id
+                if random.random() < self.mlm_probability:
+                    label_ids[i] = input_ids[i]
+                    
+                    # Standard MLM: 80% mask, 10% random, 10% keep
+                    prob = random.random()
+                    if prob < 0.8:
+                        input_ids[i] = self.mask_token_id
+                    elif prob < 0.9:
+                        input_ids[i] = random.randint(0, self.vocab_size - 1)
+                    # else: keep original (10%)
         
         return input_ids, label_ids
 
@@ -382,16 +510,36 @@ def main():
     print(f"\nApplying {args.mode} masking with {args.num_proc} processes...")
     masked_dataset = DatasetDict()
     
+    # Create a filter function based on mode
+    def filter_by_mode(example):
+        """Filter examples that don't match the masking mode."""
+        return mask_fn._matches_mode(example.get("permutation_key", ""))
+    
     for split_name in dataset.keys():
-        print(f"\nProcessing {split_name} split ({len(dataset[split_name]):,} examples)...")
+        original_count = len(dataset[split_name])
+        print(f"\nProcessing {split_name} split ({original_count:,} examples)...")
         
-        masked_split = dataset[split_name].map(
+        # Filter to only keep examples that match the mode
+        if args.mode != "mlm":
+            print(f"   Filtering for {args.mode} mode...")
+            filtered_split = dataset[split_name].filter(
+                filter_by_mode,
+                num_proc=args.num_proc,
+                desc=f"Filtering {split_name}"
+            )
+            filtered_count = len(filtered_split)
+            print(f"   Kept {filtered_count:,} / {original_count:,} examples ({100*filtered_count/original_count:.1f}%)")
+        else:
+            filtered_split = dataset[split_name]
+        
+        # Apply masking
+        masked_split = filtered_split.map(
             mask_fn,
             batched=True,
             batch_size=1000,
             num_proc=args.num_proc,
             desc=f"Masking {split_name}",
-            remove_columns=["sequence"] if "sequence" in dataset[split_name].column_names else []
+            remove_columns=["sequence"] if "sequence" in filtered_split.column_names else []
         )
         
         masked_dataset[split_name] = masked_split
