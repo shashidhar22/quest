@@ -244,6 +244,7 @@ def run_inference(
     attention_samples = defaultdict(list) if return_attentions else None
     attention_sample_limit = attention_sample_config or {"examples_per_key": 3, "max_keys": 10}
     sampled_pkeys = set()
+    attention_collection_complete = False  # Flag to stop collecting attention once we have enough
 
     example_idx = 0  # Track global example index
     layer_info_printed = False  # Flag to print layer info only once
@@ -260,12 +261,15 @@ def run_inference(
                 attention_mask = batch["attention_mask"]
                 labels = batch["labels"]
 
+            # Only request attention if we still need samples (saves massive GPU memory)
+            need_attention = return_attentions and not attention_collection_complete
+
             # Forward pass
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
-                output_attentions=return_attentions,
+                output_attentions=need_attention,
             )
 
             # Gather results from all processes if using distributed inference
@@ -274,7 +278,7 @@ def run_inference(
                 labels_gathered = accelerator.gather_for_metrics(labels)
                 input_ids_gathered = accelerator.gather_for_metrics(input_ids)
 
-                if return_attentions and outputs.attentions is not None:
+                if need_attention and outputs.attentions is not None:
                     # Get middle 10 layers
                     num_layers = len(outputs.attentions)
                     middle_start = max(0, (num_layers - 10) // 2)
@@ -304,7 +308,7 @@ def run_inference(
                 labels_gathered = labels
                 input_ids_gathered = input_ids
 
-                if return_attentions and outputs.attentions is not None:
+                if need_attention and outputs.attentions is not None:
                     # Get middle 10 layers
                     num_layers = len(outputs.attentions)
                     middle_start = max(0, (num_layers - 10) // 2)
@@ -383,6 +387,22 @@ def run_inference(
                                 })
 
                     example_idx += 1
+
+                # Check if we have collected enough attention samples
+                if return_attentions and attention_samples and not attention_collection_complete:
+                    # Check if all permutations of interest have enough samples
+                    all_complete = all(
+                        len(attention_samples.get(pkey, [])) >= attention_sample_limit["examples_per_key"]
+                        for pkey in PERMUTATIONS_OF_INTEREST
+                        if pkey in sampled_pkeys  # Only check permutations we've seen
+                    )
+                    # Also complete if we've sampled enough unique permutations
+                    if all_complete or len(sampled_pkeys) >= min(len(PERMUTATIONS_OF_INTEREST), attention_sample_limit["max_keys"]):
+                        total_samples = sum(len(v) for v in attention_samples.values())
+                        if total_samples >= attention_sample_limit["examples_per_key"] * min(3, len(sampled_pkeys)):
+                            attention_collection_complete = True
+                            print(f"\n✅ Attention collection complete: {total_samples} samples from {len(sampled_pkeys)} permutations")
+                            print("   (Disabling attention output for remaining batches to save memory)\n")
 
                 # Free memory
                 del logits_cpu, labels_cpu, input_ids_cpu
