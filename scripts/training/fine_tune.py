@@ -377,8 +377,9 @@ class TaskSpecificMaskingCollator:
         permutation_keys: List[str]
     ) -> Tuple[List[List[int]], List[List[int]]]:
         """
-        Mask the middle portion of CDR3 region.
-        For simplicity, we mask the middle 5 amino acids of the sequence.
+        Mask a percentage (mlm_probability) of the middle portion of CDR3 region.
+        Instead of masking all tokens in the middle region, we mask mlm_probability% of them
+        randomly (similar to standard MLM but restricted to the middle region).
         """
         masked_inputs = []
         labels = []
@@ -395,11 +396,19 @@ class TaskSpecificMaskingCollator:
                 middle_start = seq_start + (seq_length - self.cdr3_mask_length) // 2
                 middle_end = middle_start + self.cdr3_mask_length
                 
-                # Mask the middle region
+                # Mask mlm_probability% of tokens in the middle region (like MLM but restricted to middle)
                 for i in range(middle_start, middle_end):
                     if i < seq_end and not self._is_special_token(input_ids[i]):
-                        label_ids[i] = input_ids[i]
-                        input_ids[i] = self.mask_token_id
+                        if random.random() < self.mlm_probability:
+                            label_ids[i] = input_ids[i]
+                            
+                            # Standard MLM: 80% mask, 10% random, 10% keep
+                            prob = random.random()
+                            if prob < 0.8:
+                                input_ids[i] = self.mask_token_id
+                            elif prob < 0.9:
+                                input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
+                            # else: keep original (10%)
             
             masked_inputs.append(input_ids)
             labels.append(label_ids)
@@ -411,7 +420,7 @@ class TaskSpecificMaskingCollator:
     # ────────────────────────────────────────────────��────────────────────────────
     
     def _mask_first_chain(self, input_ids_list: List[List[int]]) -> Tuple[List[List[int]], List[List[int]]]:
-        """Mask the entire first chain (before first separator)."""
+        """Mask mlm_probability% of first chain (before first separator) with 80/10/10 strategy."""
         masked_inputs = []
         labels = []
         
@@ -431,8 +440,16 @@ class TaskSpecificMaskingCollator:
             
             for i in range(seq_start, mask_end):
                 if not self._is_special_token(input_ids[i]):
-                    label_ids[i] = input_ids[i]
-                    input_ids[i] = self.mask_token_id
+                    if random.random() < self.mlm_probability:
+                        label_ids[i] = input_ids[i]
+                        
+                        # Standard MLM: 80% mask, 10% random, 10% keep
+                        prob = random.random()
+                        if prob < 0.8:
+                            input_ids[i] = self.mask_token_id
+                        elif prob < 0.9:
+                            input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
+                        # else: keep original (10%)
             
             masked_inputs.append(input_ids)
             labels.append(label_ids)
@@ -483,8 +500,16 @@ class TaskSpecificMaskingCollator:
                 
                 for i in range(seq_start, mask_end):
                     if not self._is_special_token(input_ids[i]):
-                        label_ids[i] = input_ids[i]
-                        input_ids[i] = self.mask_token_id
+                        if random.random() < self.mlm_probability:
+                            label_ids[i] = input_ids[i]
+                            
+                            # Standard MLM: 80% mask, 10% random, 10% keep
+                            prob = random.random()
+                            if prob < 0.8:
+                                input_ids[i] = self.mask_token_id
+                            elif prob < 0.9:
+                                input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
+                            # else: keep original (10%)
             
             masked_inputs.append(input_ids)
             labels.append(label_ids)
@@ -528,8 +553,16 @@ class TaskSpecificMaskingCollator:
                 
                 for i in range(seq_start, mask_end):
                     if not self._is_special_token(input_ids[i]):
-                        label_ids[i] = input_ids[i]
-                        input_ids[i] = self.mask_token_id
+                        if random.random() < self.mlm_probability:
+                            label_ids[i] = input_ids[i]
+                            
+                            # Standard MLM: 80% mask, 10% random, 10% keep
+                            prob = random.random()
+                            if prob < 0.8:
+                                input_ids[i] = self.mask_token_id
+                            elif prob < 0.9:
+                                input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
+                            # else: keep original (10%)
             
             masked_inputs.append(input_ids)
             labels.append(label_ids)
@@ -561,8 +594,16 @@ class TaskSpecificMaskingCollator:
             
             for i in range(seq_start, mask_end):
                 if not self._is_special_token(input_ids[i]):
-                    label_ids[i] = input_ids[i]
-                    input_ids[i] = self.mask_token_id
+                    if random.random() < self.mlm_probability:
+                        label_ids[i] = input_ids[i]
+                        
+                        # Standard MLM: 80% mask, 10% random, 10% keep
+                        prob = random.random()
+                        if prob < 0.8:
+                            input_ids[i] = self.mask_token_id
+                        elif prob < 0.9:
+                            input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
+                        # else: keep original (10%)
             
             masked_inputs.append(input_ids)
             labels.append(label_ids)
@@ -1208,10 +1249,17 @@ def main():
     print("✅ Enabled expandable_segments for better CUDA memory management")
     
     # ─────────────────────────────────────────────────────────────────────────────
-    # Initialize W&B
+    # Initialize Accelerator (for distributed training awareness)
     # ─────────────────────────────────────────────────────────────────────────────
     
-    if args.wandb_project:
+    accelerator = Accelerator()
+    is_main_process = accelerator.is_main_process
+    
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Initialize W&B (only on main process to avoid duplicate logging)
+    # ─────────────────────────────────────────────────────────────────────────────
+    
+    if args.wandb_project and is_main_process:
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
@@ -1275,25 +1323,41 @@ def main():
         val_dataset = val_dataset.shuffle(seed=args.seed).select(range(args.max_eval_samples))
     
     # Auto-adjust eval batch size AND limit eval set for very large validation sets to prevent OOM
-    if len(val_dataset) > 50000:
+    # Scale thresholds based on sequence length (shorter sequences = less memory)
+    # Reference: 512 tokens is the "standard" length; scale accordingly
+    seq_length_factor = max(1, dataset_max_len / 512)  # e.g., 32/512 = 0.0625 -> factor = 1 (min)
+    
+    # For short sequences, we can handle much larger batches and val sets
+    # A 32-token sequence uses ~16x less memory than a 512-token sequence
+    memory_scale = 512 / max(32, dataset_max_len)  # e.g., 512/32 = 16x
+    
+    adjusted_val_threshold = int(50000 * memory_scale)  # e.g., 800k for 32-token seqs
+    adjusted_min_batch = max(4, int(4 * memory_scale))  # e.g., 64 for 32-token seqs
+    
+    if len(val_dataset) > adjusted_val_threshold:
         if args.max_eval_samples is None:
-            # Automatically limit to 50k examples for very large validation sets
+            # Automatically limit validation set size
             old_val_size = len(val_dataset)
-            args.max_eval_samples = 50000
+            args.max_eval_samples = adjusted_val_threshold
             val_dataset = val_dataset.shuffle(seed=args.seed).select(range(args.max_eval_samples))
             print(f"\n⚠️  Very large validation set detected ({old_val_size:,} examples)")
             print(f"   Automatically limiting to {args.max_eval_samples:,} examples to prevent OOM during evaluation")
+            print(f"   (threshold adjusted for {dataset_max_len}-token sequences)")
         
-        if args.eval_batch_size > 4:
+        if args.eval_batch_size > adjusted_min_batch:
             old_eval_batch = args.eval_batch_size
-            args.eval_batch_size = 4
+            args.eval_batch_size = adjusted_min_batch
             print(f"   Also reducing eval batch size from {old_eval_batch} to {args.eval_batch_size}")
     
-    # Log dataset statistics
-    train_stats = log_dataset_statistics(train_dataset, "train", log_to_wandb=args.wandb_project is not None)
-    val_stats = log_dataset_statistics(val_dataset, "validation", log_to_wandb=args.wandb_project is not None)
+    print(f"\n📊 Eval settings (adjusted for {dataset_max_len}-token sequences):")
+    print(f"   Validation set size: {len(val_dataset):,}")
+    print(f"   Eval batch size: {args.eval_batch_size}")
     
-    if args.wandb_project:
+    # Log dataset statistics (only on main process)
+    train_stats = log_dataset_statistics(train_dataset, "train", log_to_wandb=args.wandb_project is not None and is_main_process)
+    val_stats = log_dataset_statistics(val_dataset, "validation", log_to_wandb=args.wandb_project is not None and is_main_process)
+    
+    if args.wandb_project and is_main_process:
         wandb.log(train_stats)
         wandb.log(val_stats)
     
@@ -1390,9 +1454,12 @@ def main():
     # Setup training arguments
     # ─────────────────────────────────────────────────────────────────────────────
 
-    # Disable compute_metrics for BERT to save memory during evaluation
+    # Disable compute_metrics for BERT (but not ProtBERT) to save memory during evaluation
     # (BERT's 29k vocab creates huge prediction tensors)
-    use_metrics = "bert" not in args.model_path.lower()
+    model_path_lower = args.model_path.lower()
+    is_bert = "bert" in model_path_lower
+    is_protbert = "prot_bert" in model_path_lower or "protbert" in model_path_lower
+    use_metrics = not is_bert or is_protbert  # Disable for BERT, but keep for ProtBERT
 
     if not use_metrics:
         print("\n⚠️  Disabling accuracy/perplexity metrics for BERT to save memory")
@@ -1537,7 +1604,7 @@ def main():
         for key, value in eval_results.items():
             print(f"  {key}: {value:.4f}")
         
-        if args.wandb_project:
+        if args.wandb_project and is_main_process:
             wandb.log({"final_eval": eval_results})
     except torch.cuda.OutOfMemoryError as e:
         print(f"\n⚠️  Warning: Final evaluation failed with OOM error")
@@ -1555,7 +1622,7 @@ def main():
         import traceback
         traceback.print_exc()
     
-    if args.wandb_project:
+    if args.wandb_project and is_main_process:
         # Log prediction examples only if requested
         if args.log_prediction_examples:
             print("\nGenerating prediction examples for W&B...")
