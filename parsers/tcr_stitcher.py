@@ -50,6 +50,13 @@ except ImportError:
     TCRCONVERT_AVAILABLE = False
     logger.warning("tcrconvert not available. Install with: pip install tcrconvert")
 
+try:
+    import tidytcells.tr as tr
+    TIDYTCELLS_AVAILABLE = True
+except ImportError:
+    TIDYTCELLS_AVAILABLE = False
+    logger.warning("tidytcells not available. Install with: pip install tidytcells")
+
 
 class TCRStitcher:
     """
@@ -151,62 +158,93 @@ class TCRStitcher:
     
     def normalize_gene_name(self, gene: str, chain: str = None) -> Optional[str]:
         """
-        Normalize gene name to IMGT format using format_to_imgt.py.
-        Falls back to tcrconvert, then manual normalization if needed.
-        
+        Normalize gene name to IMGT format.
+
+        Priority order:
+        1. tidytcells.tr.standardize() (NEW - highest priority)
+        2. format_to_imgt.standardize_to_imgt()
+        3. tcrconvert.convert_gene_name()
+        4. Manual regex normalization
+
+        This ensures backward compatibility while preferring tidytcells.
+
         Handles variations like:
         - "TCRBV13-01*01" -> "TRBV13-1*01" (IMGT format)
         - "TCRAV1-2" -> "TRAV1-2"
         - "TRBV06-05" -> "TRBV6-5"
         - "TRAJ10 56 0" -> "TRAJ10" (removes trailing text)
         - Multiple alleles: "TRAV1-2,TRAV1-3" -> "TRAV1-2"
-        
+
         Args:
             gene: Gene name
             chain: Chain type ('TRA' or 'TRB') - for logging/fallback
-        
+
         Returns:
             Normalized gene name or None if invalid
         """
         if not gene or pd.isna(gene) or gene == '':
             return None
-        
+
         try:
             # Clean up gene name
             gene = str(gene).strip()
-            
+
             # Handle multiple alleles (take first)
             if ',' in gene:
                 gene = gene.split(',')[0].strip()
             if ';' in gene:
                 gene = gene.split(';')[0].strip()
-            
-            # Try format_to_imgt first (most robust)
+
+            # PRIORITY 1: Try tidytcells (NEW)
+            if TIDYTCELLS_AVAILABLE:
+                try:
+                    # Try with allele precision first
+                    normalized = tr.standardize(gene, precision='allele')
+                    if normalized:
+                        if gene != normalized:
+                            logger.debug(f"tidytcells: {gene} -> {normalized}")
+                        return normalized
+                except Exception:
+                    # Try without allele (gene-level only)
+                    try:
+                        gene_base = gene.split('*')[0] if '*' in gene else gene
+                        normalized = tr.standardize(gene_base, precision='gene')
+                        if normalized:
+                            # Re-add allele if original had one
+                            if '*' in gene:
+                                allele = gene.split('*')[1]
+                                normalized = f"{normalized}*{allele}"
+                            logger.debug(f"tidytcells (no allele): {gene} -> {normalized}")
+                            return normalized
+                    except Exception as e:
+                        logger.debug(f"tidytcells failed for {gene}: {e}")
+
+            # PRIORITY 2: Try format_to_imgt (EXISTING)
             if self.use_imgt_formatter:
                 imgt_gene = standardize_to_imgt(gene)
                 if imgt_gene:
                     if gene != imgt_gene:
                         logger.debug(f"IMGT format: {gene} -> {imgt_gene}")
                     return imgt_gene
-            
-            # Fallback to tcrconvert if available and chain is specified
+
+            # PRIORITY 3: Fallback to tcrconvert (EXISTING)
             if chain and TCRCONVERT_AVAILABLE:
                 imgt_gene = self.convert_to_imgt(gene, chain)
                 if imgt_gene:
                     logger.debug(f"tcrconvert: {gene} -> {imgt_gene}")
                     return imgt_gene
-            
-            # Last resort: manual normalization
+
+            # PRIORITY 4: Manual normalization (EXISTING)
             # Remove "TCR" prefix if present (e.g., TCRAV -> TRAV)
             gene = re.sub(r'^TCR([AB][VDJ])', r'TR\1', gene)
-            
+
             # Normalize numbering (remove leading zeros)
             # TRAV01-02 -> TRAV1-2
             gene = re.sub(r'([TRAV|TRBV|TRAJ|TRBJ|TRAD|TRBD])0*(\d+)-0*(\d+)', r'\1\2-\3', gene)
-            
+
             logger.debug(f"Manual normalization: {gene}")
             return gene
-            
+
         except Exception as e:
             logger.debug(f"Gene normalization failed for {gene}: {e}")
             return None
