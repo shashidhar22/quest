@@ -38,6 +38,16 @@ except ImportError:
     HAS_ESM3 = False
     # ESM3 not available - will fallback to ESM2
 
+# Try to import TCR stitcher and CDR identifier
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
+    from parsers.tcr_stitcher import TCRStitcher
+    from parsers.cdr_region_identifier import CDRRegionIdentifier
+    HAS_TCR_TOOLS = True
+except ImportError:
+    HAS_TCR_TOOLS = False
+    print("Warning: TCR stitcher/CDR identifier not available")
+
 
 class SequenceTokenizerBase:
     """Base class for all tokenizers."""
@@ -960,18 +970,140 @@ def concatenate_molecule_sequences(row: Dict, model_type: str = None) -> str:
             return "-".join(sequences)
 
 
+def add_full_tcr_and_cdr_positions(chunk_rows: List[Dict]) -> List[Dict]:
+    """
+    Add full-length TCR sequences and CDR positions to chunk rows.
+
+    For each row with TRA/TRB data:
+    1. Stitch full-length sequences using TCRStitcher
+    2. Identify CDR1, CDR2, CDR3 positions using CDRRegionIdentifier
+    3. Add columns: tra_full, trb_full, tra_cdr1_pos, tra_cdr2_pos, tra_cdr3_pos,
+                    trb_cdr1_pos, trb_cdr2_pos, trb_cdr3_pos
+
+    Args:
+        chunk_rows: List of row dictionaries
+
+    Returns:
+        Updated list of row dictionaries with full TCR data
+    """
+    if not HAS_TCR_TOOLS:
+        # Add empty columns if tools not available
+        for row in chunk_rows:
+            row['tra_full'] = ''
+            row['trb_full'] = ''
+            row['tra_cdr1_pos'] = None
+            row['tra_cdr2_pos'] = None
+            row['tra_cdr3_pos'] = None
+            row['trb_cdr1_pos'] = None
+            row['trb_cdr2_pos'] = None
+            row['trb_cdr3_pos'] = None
+        return chunk_rows
+
+    # Initialize tools
+    stitcher = TCRStitcher(species="HUMAN")
+    cdr_identifier = CDRRegionIdentifier()
+
+    print(f"   🧬 Stitching full TCR sequences and identifying CDR regions...")
+
+    tra_stitch_count = 0
+    trb_stitch_count = 0
+    tra_cdr_count = 0
+    trb_cdr_count = 0
+
+    for row in tqdm(chunk_rows, desc="   Processing TCRs", leave=False):
+        # Initialize columns
+        row['tra_full'] = ''
+        row['trb_full'] = ''
+        row['tra_cdr1_pos'] = None
+        row['tra_cdr2_pos'] = None
+        row['tra_cdr3_pos'] = None
+        row['trb_cdr1_pos'] = None
+        row['trb_cdr2_pos'] = None
+        row['trb_cdr3_pos'] = None
+
+        # Process TRA
+        tra_cdr3 = row.get('tra', '')
+        trav_gene = row.get('trav_gene', '')
+        traj_gene = row.get('traj_gene', '')
+
+        if tra_cdr3 and trav_gene and traj_gene:
+            # Stitch full TRA sequence
+            tra_full = stitcher.stitch_tcr(
+                cdr3=tra_cdr3,
+                v_gene=trav_gene,
+                j_gene=traj_gene,
+                chain='TRA'
+            )
+
+            if tra_full:
+                row['tra_full'] = tra_full
+                tra_stitch_count += 1
+
+                # Identify CDR regions
+                cdr_regions = cdr_identifier.get_cdr_regions(
+                    full_sequence=tra_full,
+                    cdr3_sequence=tra_cdr3,
+                    v_gene=trav_gene,
+                    chain='TRA'
+                )
+
+                if cdr_regions:
+                    # Store positions as tuples (start, end)
+                    row['tra_cdr1_pos'] = cdr_regions.get('cdr1')
+                    row['tra_cdr2_pos'] = cdr_regions.get('cdr2')
+                    row['tra_cdr3_pos'] = cdr_regions.get('cdr3')
+                    tra_cdr_count += 1
+
+        # Process TRB
+        trb_cdr3 = row.get('trb', '')
+        trbv_gene = row.get('trbv_gene', '')
+        trbj_gene = row.get('trbj_gene', '')
+
+        if trb_cdr3 and trbv_gene and trbj_gene:
+            # Stitch full TRB sequence
+            trb_full = stitcher.stitch_tcr(
+                cdr3=trb_cdr3,
+                v_gene=trbv_gene,
+                j_gene=trbj_gene,
+                chain='TRB'
+            )
+
+            if trb_full:
+                row['trb_full'] = trb_full
+                trb_stitch_count += 1
+
+                # Identify CDR regions
+                cdr_regions = cdr_identifier.get_cdr_regions(
+                    full_sequence=trb_full,
+                    cdr3_sequence=trb_cdr3,
+                    v_gene=trbv_gene,
+                    chain='TRB'
+                )
+
+                if cdr_regions:
+                    row['trb_cdr1_pos'] = cdr_regions.get('cdr1')
+                    row['trb_cdr2_pos'] = cdr_regions.get('cdr2')
+                    row['trb_cdr3_pos'] = cdr_regions.get('cdr3')
+                    trb_cdr_count += 1
+
+    print(f"   ✓ Stitched: {tra_stitch_count:,} TRA, {trb_stitch_count:,} TRB")
+    print(f"   ✓ CDR positions: {tra_cdr_count:,} TRA, {trb_cdr_count:,} TRB")
+
+    return chunk_rows
+
+
 def create_tokenize_function(tokenizer, model_type: str):
     """
     Create a tokenization function for HuggingFace Dataset.map().
     This function will be called by the Dataset's parallel processing.
-    
+
     Handles both new format (permutation_key, sequence) and old format (tra, trb, peptide, mhc_one, mhc_two).
     """
     def tokenize_function(examples):
         """Tokenize a batch of examples from HuggingFace Dataset."""
         # Concatenate sequences for each example
         sequences = []
-        
+
         # Check if new format (has 'permutation_key' and 'sequence' columns)
         if 'permutation_key' in examples and 'sequence' in examples:
             # New format: use sequence column directly
@@ -992,15 +1124,15 @@ def create_tokenize_function(tokenizer, model_type: str):
                     'mhc_two': examples['mhc_two'][i],
                 }
                 sequences.append(concatenate_molecule_sequences(row, model_type))
-        
+
         # Tokenize entire batch
         encoded = tokenizer.tokenize_batch(sequences)
-        
+
         # Add sequences to output
         encoded['sequence'] = sequences
-        
+
         return encoded
-    
+
     return tokenize_function
 
 
@@ -1138,7 +1270,10 @@ def tokenize_dataset(
                 counts = pkey_split_counts[pkey]
                 total = sum(counts.values())
                 print(f"      {pkey}: {counts} (total: {total})")
-        
+
+        # Add full TCR sequences and CDR positions (NEW)
+        chunk_rows = add_full_tcr_and_cdr_positions(chunk_rows)
+
         # Convert to HuggingFace Dataset for parallel tokenization
         print(f"   ⚡ Creating Dataset...")
         chunk_dataset = Dataset.from_list(chunk_rows)
@@ -1164,6 +1299,16 @@ def tokenize_dataset(
             for col in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']:
                 if col in chunk_dataset.column_names:
                     tokenized_dataset = tokenized_dataset.add_column(col, chunk_dataset[col])
+
+        # Add back TCR-specific columns (NEW - for full_tra/full_trb modes)
+        tcr_columns = [
+            'tra_full', 'trb_full', 'trav_gene', 'traj_gene', 'trbv_gene', 'trbj_gene',
+            'tra_cdr1_pos', 'tra_cdr2_pos', 'tra_cdr3_pos',
+            'trb_cdr1_pos', 'trb_cdr2_pos', 'trb_cdr3_pos'
+        ]
+        for col in tcr_columns:
+            if col in chunk_dataset.column_names:
+                tokenized_dataset = tokenized_dataset.add_column(col, chunk_dataset[col])
         
         # Convert to list for splitting
         tokenized_rows = tokenized_dataset.to_pandas().to_dict('records')
