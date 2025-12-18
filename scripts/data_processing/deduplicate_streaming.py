@@ -96,9 +96,14 @@ def process_single_parquet(args: tuple) -> tuple:
     
     # Initialize stitcher if needed (once per process)
     stitcher = None
+    gene_norm_failures = {'trav': 0, 'traj': 0, 'trbv': 0, 'trbj': 0}
+
     if stitch_tcr and STITCHER_AVAILABLE:
         try:
             stitcher = TCRStitcher(species="HUMAN")
+            # Suppress tidytcells warnings for cleaner output
+            import logging
+            logging.getLogger('tidytcells').setLevel(logging.ERROR)
         except Exception as e:
             print(f"Warning: Failed to initialize TCRStitcher in process: {e}")
             stitcher = None
@@ -122,36 +127,74 @@ def process_single_parquet(args: tuple) -> tuple:
                             'trbv_gene', 'trbj_gene', 'trbd_gene']  # TRB gene segments
                 }
                 
-                # Stitch full-length sequences if requested and not already present
+                # Normalize gene names using tidytcells (Priority 1) and stitch sequences
                 if stitcher is not None:
                     try:
-                        # Stitch TRA if we have CDR3 + genes but no full-length sequence
-                        if ('tra' in molecule_data and molecule_data.get('tra') and 
-                            ('tra_full' not in molecule_data or not molecule_data.get('tra_full'))):
-                            stitch_attempt_count += 1
-                            tra_full = stitcher.stitch_tcr(
-                                cdr3=molecule_data.get('tra'),
-                                v_gene=molecule_data.get('trav_gene'),
-                                j_gene=molecule_data.get('traj_gene'),
-                                chain='TRA'
-                            )
-                            if tra_full:
-                                molecule_data['tra_full'] = tra_full
-                                stitch_success_count += 1
-                        
-                        # Stitch TRB if we have CDR3 + genes but no full-length sequence
-                        if ('trb' in molecule_data and molecule_data.get('trb') and 
-                            ('trb_full' not in molecule_data or not molecule_data.get('trb_full'))):
-                            stitch_attempt_count += 1
-                            trb_full = stitcher.stitch_tcr(
-                                cdr3=molecule_data.get('trb'),
-                                v_gene=molecule_data.get('trbv_gene'),
-                                j_gene=molecule_data.get('trbj_gene'),
-                                chain='TRB'
-                            )
-                            if trb_full:
-                                molecule_data['trb_full'] = trb_full
-                                stitch_success_count += 1
+                        # Process TRA: normalize genes, then stitch if needed
+                        if 'tra' in molecule_data and molecule_data.get('tra'):
+                            # Normalize TRA genes using tidytcells (via TCRStitcher)
+                            trav = molecule_data.get('trav_gene')
+                            traj = molecule_data.get('traj_gene')
+
+                            if trav:
+                                norm_trav = stitcher.normalize_gene_name(trav, 'TRA')
+                                if norm_trav:
+                                    molecule_data['trav_gene'] = norm_trav
+                                else:
+                                    gene_norm_failures['trav'] += 1
+
+                            if traj:
+                                norm_traj = stitcher.normalize_gene_name(traj, 'TRA')
+                                if norm_traj:
+                                    molecule_data['traj_gene'] = norm_traj
+                                else:
+                                    gene_norm_failures['traj'] += 1
+
+                            # Stitch TRA if we have CDR3 + genes but no full-length sequence
+                            if ('tra_full' not in molecule_data or not molecule_data.get('tra_full')):
+                                stitch_attempt_count += 1
+                                tra_full = stitcher.stitch_tcr(
+                                    cdr3=molecule_data.get('tra'),
+                                    v_gene=molecule_data.get('trav_gene'),
+                                    j_gene=molecule_data.get('traj_gene'),
+                                    chain='TRA'
+                                )
+                                if tra_full:
+                                    molecule_data['tra_full'] = tra_full
+                                    stitch_success_count += 1
+
+                        # Process TRB: normalize genes, then stitch if needed
+                        if 'trb' in molecule_data and molecule_data.get('trb'):
+                            # Normalize TRB genes using tidytcells (via TCRStitcher)
+                            trbv = molecule_data.get('trbv_gene')
+                            trbj = molecule_data.get('trbj_gene')
+
+                            if trbv:
+                                norm_trbv = stitcher.normalize_gene_name(trbv, 'TRB')
+                                if norm_trbv:
+                                    molecule_data['trbv_gene'] = norm_trbv
+                                else:
+                                    gene_norm_failures['trbv'] += 1
+
+                            if trbj:
+                                norm_trbj = stitcher.normalize_gene_name(trbj, 'TRB')
+                                if norm_trbj:
+                                    molecule_data['trbj_gene'] = norm_trbj
+                                else:
+                                    gene_norm_failures['trbj'] += 1
+
+                            # Stitch TRB if we have CDR3 + genes but no full-length sequence
+                            if ('trb_full' not in molecule_data or not molecule_data.get('trb_full')):
+                                stitch_attempt_count += 1
+                                trb_full = stitcher.stitch_tcr(
+                                    cdr3=molecule_data.get('trb'),
+                                    v_gene=molecule_data.get('trbv_gene'),
+                                    j_gene=molecule_data.get('trbj_gene'),
+                                    chain='TRB'
+                                )
+                                if trb_full:
+                                    molecule_data['trb_full'] = trb_full
+                                    stitch_success_count += 1
                     except Exception as e:
                         # Don't fail the whole file for stitching errors
                         pass
@@ -167,8 +210,15 @@ def process_single_parquet(args: tuple) -> tuple:
     if stitch_tcr and stitch_attempt_count > 0:
         success_rate = (stitch_success_count / stitch_attempt_count * 100) if stitch_attempt_count > 0 else 0
         print(f"Stitching stats for {pf}: {stitch_success_count}/{stitch_attempt_count} ({success_rate:.1f}%)")
-    
-    return lines, valid_count
+
+        # Print gene normalization summary
+        total_failures = sum(gene_norm_failures.values())
+        if total_failures > 0:
+            print(f"  Gene normalization failures: {total_failures} " +
+                  f"(TRAV: {gene_norm_failures['trav']}, TRAJ: {gene_norm_failures['traj']}, " +
+                  f"TRBV: {gene_norm_failures['trbv']}, TRBJ: {gene_norm_failures['trbj']})")
+
+    return lines, valid_count, gene_norm_failures
 
 def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str, num_workers: int = None, stitch_tcr: bool = False) -> int:
     """
@@ -185,17 +235,30 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
         print(f"   ℹ️  TCR stitching ENABLED - will generate full-length sequences from CDR3 + gene segments")
     
     with open(temp_file, 'w') as out:
+        total_gene_failures = {'trav': 0, 'traj': 0, 'trbv': 0, 'trbj': 0}
+
         with Pool(num_workers) as pool:
             # Process files in parallel
             args_list = [(pf, mode, stitch_tcr) for pf in parquet_files]
-            
+
             with tqdm(desc="Extracting parquet files", unit=" files", total=len(parquet_files)) as pbar:
-                for lines, count in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
+                for lines, count, gene_failures in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
                     # Write all lines from this file
                     out.writelines(lines)
                     valid_count += count
+                    # Aggregate gene normalization failures
+                    for gene_type in total_gene_failures:
+                        total_gene_failures[gene_type] += gene_failures.get(gene_type, 0)
                     pbar.update(1)
-    
+
+        # Print final gene normalization summary
+        if stitch_tcr and sum(total_gene_failures.values()) > 0:
+            print(f"\n📊 Gene Normalization Summary:")
+            print(f"   Total failures: {sum(total_gene_failures.values())}")
+            for gene_type, count in total_gene_failures.items():
+                if count > 0:
+                    print(f"     {gene_type.upper()}: {count:,} malformed gene names")
+
     return valid_count
 
 def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, mode: str,
@@ -216,11 +279,15 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
     chunk_idx = 0
     valid_count = 0
 
+    total_gene_failures = {'trav': 0, 'traj': 0, 'trbv': 0, 'trbj': 0}
     args_list = [(pf, mode, stitch_tcr) for pf in parquet_files]
     with Pool(num_workers) as pool:
         with tqdm(desc="Extracting + chunking", unit=" files", total=len(parquet_files)) as pbar:
-            for lines, count in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
+            for lines, count, gene_failures in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
                 valid_count += count
+                # Aggregate gene normalization failures
+                for gene_type in total_gene_failures:
+                    total_gene_failures[gene_type] += gene_failures.get(gene_type, 0)
                 # Append lines and spill when needed
                 if lines:
                     current_chunk.extend(lines)
@@ -246,6 +313,15 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
         chunk_idx += 1
 
     print(f"   ℹ️  Created {len(chunk_files)} sorted chunk files (streamed)")
+
+    # Print final gene normalization summary
+    if stitch_tcr and sum(total_gene_failures.values()) > 0:
+        print(f"\n📊 Gene Normalization Summary:")
+        print(f"   Total failures: {sum(total_gene_failures.values())}")
+        for gene_type, count in total_gene_failures.items():
+            if count > 0:
+                print(f"     {gene_type.upper()}: {count:,} malformed gene names")
+
     return chunk_files, valid_count
 
 def merge_sorted_files(chunk_files: List[Path], output_file: Path, temp_dir: Path, max_open_files: int = 256) -> None:
