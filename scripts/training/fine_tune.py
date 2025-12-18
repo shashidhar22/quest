@@ -53,6 +53,16 @@ except ImportError:
     ESM3_AVAILABLE = False
     print("⚠️  ESM3 package not available. Install with: pip install esm")
 
+# Try to import CDR region identifier
+try:
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
+    from parsers.cdr_region_identifier import CDRRegionIdentifier
+    CDR_IDENTIFIER_AVAILABLE = True
+except ImportError:
+    CDR_IDENTIFIER_AVAILABLE = False
+    print("⚠️  CDRRegionIdentifier not available")
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -174,43 +184,58 @@ class ESM3ForMaskedLM(nn.Module):
 def filter_dataset_by_mode(dataset: Any, mode: str) -> Any:
     """
     Filter dataset based on the fine-tuning mode.
-    
+
     Args:
         dataset: HuggingFace dataset with 'permutation_key' field
-        mode: One of ['mlm', 'tra', 'trb', 'tra_trb_pairing', 'tcr_mhc', 'peptide_mhc', 'specificity']
-    
+        mode: One of ['mlm', 'tra', 'trb', 'full_tra', 'full_trb', 'tra_trb_pairing',
+                      'tcr_mhc', 'peptide_mhc', 'specificity']
+
     Returns:
         Filtered dataset
     """
     print(f"Filtering dataset for mode: {mode}")
     original_size = len(dataset)
-    
+
     if mode == "mlm":
         # Use all data
         filtered = dataset
-        
+
     elif mode in ["tra", "trb"]:
         # Only sequences with the specific chain type
         filtered = dataset.filter(lambda x: x["permutation_key"] == mode)
-        
+
+    elif mode == "full_tra":
+        # TRA sequences with full-length sequence available (NEW)
+        filtered = dataset.filter(lambda x: (
+            x["permutation_key"] == "tra" and
+            x.get("tra_full", "") != ""
+        ))
+
+    elif mode == "full_trb":
+        # TRB sequences with full-length sequence available (NEW)
+        filtered = dataset.filter(lambda x: (
+            x["permutation_key"] == "trb" and
+            x.get("trb_full", "") != ""
+        ))
+
     elif mode == "tra_trb_pairing":
         # Examples containing both TRA and TRB
         filtered = dataset.filter(lambda x: "tra" in x["permutation_key"] and "trb" in x["permutation_key"])
-        
+
     elif mode == "tcr_mhc":
         # At least one TCR chain (tra/trb) AND at least one MHC (mhc_one/mhc_two)
         filtered = dataset.filter(lambda x: (
             ("tra" in x["permutation_key"] or "trb" in x["permutation_key"]) and
             ("mhc_one" in x["permutation_key"] or "mhc_two" in x["permutation_key"])
         ))
-        
+
     elif mode == "peptide_mhc":
         # Peptide AND at least one MHC
         filtered = dataset.filter(lambda x: (
             "peptide" in x["permutation_key"] and
             ("mhc_one" in x["permutation_key"] or "mhc_two" in x["permutation_key"])
         ))
-        
+
     elif mode == "specificity":
         # At least one TCR chain, peptide, and at least one MHC
         filtered = dataset.filter(lambda x: (
@@ -220,10 +245,10 @@ def filter_dataset_by_mode(dataset: Any, mode: str) -> Any:
         ))
     else:
         raise ValueError(f"Unknown mode: {mode}")
-    
+
     filtered_size = len(filtered)
     print(f"Filtered: {original_size:,} -> {filtered_size:,} examples ({filtered_size/original_size*100:.1f}% retained)")
-    
+
     return filtered
 
 
@@ -246,7 +271,7 @@ class TaskSpecificMaskingCollator:
         """
         Args:
             tokenizer: HuggingFace tokenizer
-            mode: Masking strategy mode
+            mode: Masking strategy mode (includes new 'full_tra', 'full_trb')
             mlm_probability: Probability for random MLM masking
             cdr3_mask_length: Number of amino acids to mask in CDR3 region
         """
@@ -254,12 +279,19 @@ class TaskSpecificMaskingCollator:
         self.mode = mode.lower()
         self.mlm_probability = mlm_probability
         self.cdr3_mask_length = cdr3_mask_length
-        
+
         # Token IDs
         self.mask_token_id = tokenizer.mask_token_id
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.cls_token_id = tokenizer.cls_token_id if hasattr(tokenizer, 'cls_token_id') else None
         self.sep_token_id = tokenizer.sep_token_id if hasattr(tokenizer, 'sep_token_id') else None
+
+        # Initialize CDR identifier for full_tra/full_trb modes (NEW)
+        if mode in ['full_tra', 'full_trb'] and CDR_IDENTIFIER_AVAILABLE:
+            self.cdr_identifier = CDRRegionIdentifier()
+            print(f"✓ Initialized CDR identifier for mode: {mode}")
+        else:
+            self.cdr_identifier = None
         
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Apply masking and create batch."""
@@ -273,6 +305,10 @@ class TaskSpecificMaskingCollator:
             masked_inputs, labels = self._mask_mlm(input_ids_list)
         elif self.mode in ["tra", "trb"]:
             masked_inputs, labels = self._mask_cdr3_middle(input_ids_list, permutation_keys)
+        elif self.mode == "full_tra":  # NEW
+            masked_inputs, labels = self._mask_cdr_regions_tra(input_ids_list, features)
+        elif self.mode == "full_trb":  # NEW
+            masked_inputs, labels = self._mask_cdr_regions_trb(input_ids_list, features)
         elif self.mode == "tra_trb_pairing":
             masked_inputs, labels = self._mask_first_chain(input_ids_list)
         elif self.mode == "tcr_mhc":
@@ -609,11 +645,225 @@ class TaskSpecificMaskingCollator:
             labels.append(label_ids)
         
         return masked_inputs, labels
-    
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Full CDR Masking (NEW - full_tra, full_trb modes)
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    def _mask_cdr_regions_tra(
+        self,
+        input_ids_list: List[List[int]],
+        features: List[Dict[str, Any]]
+    ) -> Tuple[List[List[int]], List[List[int]]]:
+        """
+        Mask CDR1, CDR2, and CDR3 regions of TRA full-length sequences.
+
+        Strategy:
+        1. First check for pre-calculated CDR positions (tra_cdr1_pos, tra_cdr2_pos, tra_cdr3_pos)
+        2. If not available, calculate on-the-fly using CDRRegionIdentifier
+        3. Map AA positions to token positions
+        4. Mask mlm_probability% of tokens within CDR regions
+        5. Use 80/10/10 strategy (80% [MASK], 10% random, 10% keep)
+        6. If CDR regions can't be identified, skip masking (all labels = -100)
+        """
+        masked_inputs = []
+        labels = []
+
+        for input_ids, feature in zip(input_ids_list, features):
+            input_ids = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
+            label_ids = [-100] * len(input_ids)
+
+            # Get required fields
+            tra_full = feature.get('tra_full', '')
+
+            # Skip if missing full sequence
+            if not tra_full:
+                masked_inputs.append(input_ids)
+                labels.append(label_ids)
+                continue
+
+            # PRIORITY 1: Use pre-calculated CDR positions (from tokenization)
+            cdr_regions = {}
+            if feature.get('tra_cdr1_pos') is not None:
+                cdr_regions['cdr1'] = feature['tra_cdr1_pos']
+            if feature.get('tra_cdr2_pos') is not None:
+                cdr_regions['cdr2'] = feature['tra_cdr2_pos']
+            if feature.get('tra_cdr3_pos') is not None:
+                cdr_regions['cdr3'] = feature['tra_cdr3_pos']
+
+            # PRIORITY 2: Calculate on-the-fly if pre-calculated not available
+            if not cdr_regions and self.cdr_identifier:
+                tra_cdr3 = feature.get('tra', '')
+                trav_gene = feature.get('trav_gene', '')
+
+                if tra_cdr3 and trav_gene:
+                    cdr_regions = self.cdr_identifier.get_cdr_regions(
+                        full_sequence=tra_full,
+                        cdr3_sequence=tra_cdr3,
+                        v_gene=trav_gene,
+                        chain='TRA'
+                    )
+
+            # Skip if CDR regions not identified
+            if not cdr_regions:
+                masked_inputs.append(input_ids)
+                labels.append(label_ids)
+                continue
+
+            # Map AA positions to token positions
+            aa_to_token = self._map_aa_to_tokens(tra_full, input_ids)
+
+            # Mask tokens within CDR regions
+            for region_name, (aa_start, aa_end) in cdr_regions.items():
+                # Convert AA positions to token positions
+                token_start = aa_to_token.get(aa_start)
+                token_end = aa_to_token.get(aa_end - 1)  # End is exclusive
+
+                if token_start is None or token_end is None:
+                    continue
+
+                # Mask mlm_probability% of tokens in this region
+                for i in range(token_start, token_end + 1):
+                    if i >= len(input_ids) or self._is_special_token(input_ids[i]):
+                        continue
+
+                    if random.random() < self.mlm_probability:
+                        label_ids[i] = input_ids[i]
+
+                        # 80/10/10 strategy
+                        prob = random.random()
+                        if prob < 0.8:
+                            input_ids[i] = self.mask_token_id
+                        elif prob < 0.9:
+                            input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
+                        # else: keep original (10%)
+
+            masked_inputs.append(input_ids)
+            labels.append(label_ids)
+
+        return masked_inputs, labels
+
+    def _mask_cdr_regions_trb(
+        self,
+        input_ids_list: List[List[int]],
+        features: List[Dict[str, Any]]
+    ) -> Tuple[List[List[int]], List[List[int]]]:
+        """
+        Mask CDR1, CDR2, and CDR3 regions of TRB full-length sequences.
+        Same logic as _mask_cdr_regions_tra but for TRB chain.
+
+        Strategy:
+        1. First check for pre-calculated CDR positions (trb_cdr1_pos, trb_cdr2_pos, trb_cdr3_pos)
+        2. If not available, calculate on-the-fly using CDRRegionIdentifier
+        3. Map AA positions to token positions and mask
+        """
+        masked_inputs = []
+        labels = []
+
+        for input_ids, feature in zip(input_ids_list, features):
+            input_ids = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
+            label_ids = [-100] * len(input_ids)
+
+            # Get required fields
+            trb_full = feature.get('trb_full', '')
+
+            # Skip if missing full sequence
+            if not trb_full:
+                masked_inputs.append(input_ids)
+                labels.append(label_ids)
+                continue
+
+            # PRIORITY 1: Use pre-calculated CDR positions (from tokenization)
+            cdr_regions = {}
+            if feature.get('trb_cdr1_pos') is not None:
+                cdr_regions['cdr1'] = feature['trb_cdr1_pos']
+            if feature.get('trb_cdr2_pos') is not None:
+                cdr_regions['cdr2'] = feature['trb_cdr2_pos']
+            if feature.get('trb_cdr3_pos') is not None:
+                cdr_regions['cdr3'] = feature['trb_cdr3_pos']
+
+            # PRIORITY 2: Calculate on-the-fly if pre-calculated not available
+            if not cdr_regions and self.cdr_identifier:
+                trb_cdr3 = feature.get('trb', '')
+                trbv_gene = feature.get('trbv_gene', '')
+
+                if trb_cdr3 and trbv_gene:
+                    cdr_regions = self.cdr_identifier.get_cdr_regions(
+                        full_sequence=trb_full,
+                        cdr3_sequence=trb_cdr3,
+                        v_gene=trbv_gene,
+                        chain='TRB'
+                    )
+
+            # Skip if CDR regions not identified
+            if not cdr_regions:
+                masked_inputs.append(input_ids)
+                labels.append(label_ids)
+                continue
+
+            # Map and mask (same logic as TRA)
+            aa_to_token = self._map_aa_to_tokens(trb_full, input_ids)
+
+            for region_name, (aa_start, aa_end) in cdr_regions.items():
+                token_start = aa_to_token.get(aa_start)
+                token_end = aa_to_token.get(aa_end - 1)
+
+                if token_start is None or token_end is None:
+                    continue
+
+                for i in range(token_start, token_end + 1):
+                    if i >= len(input_ids) or self._is_special_token(input_ids[i]):
+                        continue
+
+                    if random.random() < self.mlm_probability:
+                        label_ids[i] = input_ids[i]
+
+                        prob = random.random()
+                        if prob < 0.8:
+                            input_ids[i] = self.mask_token_id
+                        elif prob < 0.9:
+                            input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
+
+            masked_inputs.append(input_ids)
+            labels.append(label_ids)
+
+        return masked_inputs, labels
+
+    def _map_aa_to_tokens(
+        self,
+        aa_sequence: str,
+        token_ids: List[int]
+    ) -> Dict[int, int]:
+        """
+        Map amino acid positions to token positions.
+
+        For character-level tokenizers (ESM2, ProtBERT):
+        - 1 AA = 1 token (plus offset for special tokens)
+
+        Args:
+            aa_sequence: Full amino acid sequence
+            token_ids: Tokenized sequence
+
+        Returns:
+            Dict mapping AA position -> token position
+        """
+        # Find sequence boundaries (skip CLS/special tokens)
+        seq_start, seq_end = self._find_sequence_boundaries(token_ids)
+
+        # For character-level tokenization
+        # AA position i maps to token position (seq_start + i)
+        aa_to_token = {}
+        for aa_pos in range(len(aa_sequence)):
+            token_pos = seq_start + aa_pos
+            if token_pos < seq_end and token_pos < len(token_ids):
+                aa_to_token[aa_pos] = token_pos
+
+        return aa_to_token
+
     # ─────────────────────────────────────────────────────────────────────────────
     # Batch creation with padding
     # ─────────────────────────────────────────────────────────────────────────────
-    
+
     def _create_batch(
         self,
         masked_inputs: List[List[int]],
@@ -1064,7 +1314,7 @@ def main():
     parser.add_argument("--dataset_path", type=str, required=True,
                         help="Path to HuggingFace dataset directory")
     parser.add_argument("--mode", type=str, required=True,
-                        choices=["mlm", "tra", "trb", "tra_trb_pairing", "tcr_mhc", "peptide_mhc", "specificity"],
+                        choices=["mlm", "tra", "trb", "full_tra", "full_trb", "tra_trb_pairing", "tcr_mhc", "peptide_mhc", "specificity"],
                         help="Fine-tuning mode (determines data filtering and masking strategy)")
     
     # Model arguments
