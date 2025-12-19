@@ -896,44 +896,117 @@ class TaskSpecificMaskingCollator:
 # 3. METRICS AND LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class StreamingMetricsTracker:
+    """
+    Tracks accuracy and perplexity incrementally during evaluation.
+    Prevents OOM by processing each batch separately instead of storing all logits.
+
+    This enables evaluating on full validation sets with large models by computing
+    metrics batch-by-batch instead of loading all predictions into memory at once.
+    """
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset all counters for a new evaluation run."""
+        self.total_correct = 0
+        self.total_tokens = 0
+        self.total_loss = 0.0
+        self.num_batches = 0
+
+    def update(self, logits: np.ndarray, labels: np.ndarray):
+        """
+        Update metrics with a single batch.
+
+        Args:
+            logits: Shape (batch_size, seq_len, vocab_size)
+            labels: Shape (batch_size, seq_len)
+        """
+        # Mask out -100 labels (padding/non-masked tokens)
+        mask = labels != -100
+
+        # Calculate accuracy
+        preds = np.argmax(logits, axis=-1)
+        correct = (preds[mask] == labels[mask]).sum()
+        self.total_correct += correct
+        self.total_tokens += mask.sum()
+
+        # Calculate loss for perplexity (use float64 for numerical stability)
+        logits_masked = logits[mask].astype(np.float64)
+        labels_masked = labels[mask].astype(np.int64)
+
+        # Compute cross-entropy loss in chunks to avoid memory spike
+        chunk_size = 10000  # Process 10k tokens at a time
+        for i in range(0, len(labels_masked), chunk_size):
+            chunk_logits = logits_masked[i:i+chunk_size]
+            chunk_labels = labels_masked[i:i+chunk_size]
+
+            # Log-softmax
+            logits_max = np.max(chunk_logits, axis=-1, keepdims=True)
+            logits_shifted = chunk_logits - logits_max
+            log_sum_exp = np.log(np.sum(np.exp(logits_shifted), axis=-1, keepdims=True))
+            log_probs = logits_shifted - log_sum_exp
+
+            # Negative log likelihood
+            nll = -log_probs[np.arange(len(chunk_labels)), chunk_labels]
+            self.total_loss += nll.sum()
+
+        self.num_batches += 1
+
+    def compute(self) -> Dict[str, float]:
+        """Compute final metrics from accumulated statistics."""
+        if self.total_tokens == 0:
+            return {"accuracy": 0.0, "perplexity": float('inf')}
+
+        accuracy = self.total_correct / self.total_tokens
+        avg_loss = self.total_loss / self.total_tokens
+        perplexity = math.exp(avg_loss) if avg_loss < 100 else float('inf')
+
+        return {
+            "accuracy": float(accuracy),
+            "perplexity": float(perplexity),
+        }
+
+
+# Global metrics tracker (initialized before training)
+metrics_tracker = StreamingMetricsTracker()
+
+
+def preprocess_logits_for_metrics(logits, labels):
+    """
+    Called by Trainer for EACH BATCH before concatenation.
+    This is where we do incremental processing to avoid OOM.
+
+    Args:
+        logits: Tensor of shape (batch_size, seq_len, vocab_size)
+        labels: Tensor of shape (batch_size, seq_len)
+
+    Returns:
+        Dummy tensor (we've already processed the data)
+    """
+    # Move to CPU and convert to numpy immediately
+    logits_np = logits.detach().cpu().numpy()
+    labels_np = labels.detach().cpu().numpy()
+
+    # Update metrics tracker
+    metrics_tracker.update(logits_np, labels_np)
+
+    # Return dummy predictions (just argmax) to save memory
+    # Trainer still needs something, but we've already computed what we need
+    preds = logits.argmax(dim=-1)
+    return preds
+
+
 def compute_metrics(eval_pred: Any) -> Dict[str, float]:
-    """Compute accuracy and perplexity for evaluation."""
-    accuracy_metric = evaluate.load("accuracy")
-    
-    logits, labels = eval_pred.predictions, eval_pred.label_ids
-    
-    # Mask out -100 labels
-    mask = labels != -100
-    
-    # Calculate accuracy on masked positions
-    preds = np.argmax(logits, axis=-1)
-    accuracy = accuracy_metric.compute(
-        predictions=preds[mask],
-        references=labels[mask]
-    )["accuracy"]
-    
-    # Calculate loss and perplexity using numpy to avoid OOM issues
-    # Convert to float64 for numerical stability
-    logits_masked = logits[mask].astype(np.float64)
-    labels_masked = labels[mask].astype(np.int64)
-    
-    # Compute cross-entropy loss manually using numpy (more memory efficient)
-    # Apply log-softmax
-    logits_max = np.max(logits_masked, axis=-1, keepdims=True)
-    logits_shifted = logits_masked - logits_max
-    log_sum_exp = np.log(np.sum(np.exp(logits_shifted), axis=-1, keepdims=True))
-    log_probs = logits_shifted - log_sum_exp
-    
-    # Get log probability of correct class
-    nll = -log_probs[np.arange(len(labels_masked)), labels_masked]
-    loss = np.mean(nll)
-    
-    perplexity = math.exp(loss) if loss < 100 else float('inf')
-    
-    return {
-        "accuracy": accuracy,
-        "perplexity": perplexity,
-    }
+    """
+    Memory-efficient metrics computation using streaming approach.
+
+    This function receives full arrays from Trainer, but we've already
+    processed them batch-by-batch using preprocess_logits_for_metrics.
+    We just return the accumulated results.
+    """
+    # Return accumulated metrics from streaming tracker
+    return metrics_tracker.compute()
 
 
 def log_prediction_examples(
@@ -1632,7 +1705,52 @@ def main():
         lora_config=lora_config,
         enable_gradient_checkpointing=args.gradient_checkpointing,
     )
-    
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Model-size-aware memory optimizations
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    # Count model parameters
+    num_params = sum(p.numel() for p in model.parameters())
+    num_params_m = num_params / 1e6
+    print(f"\n📊 Model size: {num_params_m:.0f}M parameters")
+
+    # Auto-scale eval_accumulation_steps based on model size
+    # Prevents OOM during evaluation by moving predictions to CPU more frequently
+    if args.eval_accumulation_steps == 10:  # Using default value
+        if num_params_m < 50:  # Small models (8M, 35M)
+            default_eval_accum = 10
+        elif num_params_m < 200:  # Medium models (150M)
+            default_eval_accum = 20
+        elif num_params_m < 1000:  # Large models (650M)
+            default_eval_accum = 50
+        else:  # Very large (3B+)
+            default_eval_accum = 100
+
+        if args.eval_accumulation_steps != default_eval_accum:
+            args.eval_accumulation_steps = default_eval_accum
+            print(f"🔧 Auto-adjusted eval_accumulation_steps to {default_eval_accum} based on model size")
+
+    # Auto-apply memory optimizations for large models (650M+)
+    if num_params_m > 500:
+        print(f"\n🔧 AUTO-OPTIMIZATION: Large model detected ({num_params_m:.0f}M params)")
+
+        if not args.gradient_checkpointing:
+            args.gradient_checkpointing = True
+            print("   → Enabling gradient checkpointing (saves ~30-40% memory)")
+
+        if args.batch_size > 4:
+            print(f"   ⚠️  WARNING: Batch size {args.batch_size} may be too large for this model!")
+            print(f"   → Recommend: --batch_size 4 or lower")
+            print(f"   → Current effective batch: {args.batch_size * args.gradient_accumulation_steps}")
+
+        if args.eval_batch_size > 4:
+            old_eval_batch = args.eval_batch_size
+            args.eval_batch_size = 4
+            print(f"   → Reducing eval batch size from {old_eval_batch} to 4")
+
+        print()
+
     # ─────────────────────────────────────────────────────────────────────────────
     # Check model's max position embeddings vs dataset max length
     # ─────────────────────────────────────────────────────────────────────────────
@@ -1787,6 +1905,7 @@ def main():
         eval_dataset=val_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics if use_metrics else None,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics if use_metrics else None,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
     
@@ -1888,8 +2007,12 @@ def main():
     
     print("\nRunning final evaluation...")
     print(f"  Evaluating on {len(val_dataset):,} validation examples")
-    
+
     try:
+        # Reset metrics tracker before evaluation
+        if use_metrics:
+            metrics_tracker.reset()
+
         eval_results = trainer.evaluate()
         
         print("\nFinal Evaluation Results:")
