@@ -532,6 +532,33 @@ def matches_mode(pkey: str, mode: Optional[str]) -> bool:
         return True
 
 
+def detect_existing_output(output_dir: Path) -> Tuple[Dict[str, int], int]:
+    """
+    Detect existing tokenized output to enable resume functionality.
+
+    Returns:
+        Tuple of (split_counts dict, total_rows_processed)
+    """
+    split_counts = {'train': 0, 'validation': 0, 'test': 0}
+    total_rows = 0
+
+    for split_name in ['train', 'validation', 'test']:
+        split_dir = output_dir / split_name
+        if split_dir.exists():
+            # Count existing parquet files
+            parquet_files = sorted(split_dir.glob("chunk_*.parquet"))
+            for pf in parquet_files:
+                try:
+                    table = pq.read_table(pf)
+                    num_rows = len(table)
+                    split_counts[split_name] += num_rows
+                    total_rows += num_rows
+                except Exception as e:
+                    print(f"⚠️  Warning: Could not read {pf}: {e}")
+
+    return split_counts, total_rows
+
+
 def stratified_split_rows(
     chunk_rows: List[Dict],
     train_ratio: float = 0.8,
@@ -970,25 +997,44 @@ def concatenate_molecule_sequences(row: Dict, model_type: str = None) -> str:
             return "-".join(sequences)
 
 
-def add_full_tcr_and_cdr_positions(chunk_rows: List[Dict]) -> List[Dict]:
+def add_full_tcr_and_cdr_positions(chunk_rows: List[Dict]) -> Tuple[List[Dict], Dict]:
     """
     Add full-length TCR sequences and CDR positions to chunk rows.
 
     For each row with TRA/TRB data:
-    1. Stitch full-length sequences using TCRStitcher
-    2. Identify CDR1, CDR2, CDR3 positions using CDRRegionIdentifier
-    3. Add columns: tra_full, trb_full, tra_cdr1_pos, tra_cdr2_pos, tra_cdr3_pos,
-                    trb_cdr1_pos, trb_cdr2_pos, trb_cdr3_pos
+    1. Standardize gene names using tidytcells (via TCRStitcher)
+    2. Stitch full-length sequences using TCRStitcher
+    3. Identify CDR1, CDR2, CDR3 positions using CDRRegionIdentifier
+    4. Add columns:
+       - Gene names: trav_gene_std, traj_gene_std, trbv_gene_std, trbj_gene_std (standardized)
+       - Full sequences: tra_full, trb_full
+       - CDR positions: tra_cdr1_pos, tra_cdr2_pos, tra_cdr3_pos, trb_cdr1_pos, trb_cdr2_pos, trb_cdr3_pos
 
     Args:
         chunk_rows: List of row dictionaries
 
     Returns:
-        Updated list of row dictionaries with full TCR data
+        Tuple of (updated list of row dictionaries, statistics dictionary)
     """
+    stats = {
+        'tra_attempted': 0,
+        'tra_gene_std': 0,
+        'tra_stitched': 0,
+        'tra_cdr': 0,
+        'trb_attempted': 0,
+        'trb_gene_std': 0,
+        'trb_stitched': 0,
+        'trb_cdr': 0,
+        'by_pkey': {}  # Per-permutation-key breakdown
+    }
+
     if not HAS_TCR_TOOLS:
         # Add empty columns if tools not available
         for row in chunk_rows:
+            row['trav_gene_std'] = ''
+            row['traj_gene_std'] = ''
+            row['trbv_gene_std'] = ''
+            row['trbj_gene_std'] = ''
             row['tra_full'] = ''
             row['trb_full'] = ''
             row['tra_cdr1_pos'] = None
@@ -997,21 +1043,20 @@ def add_full_tcr_and_cdr_positions(chunk_rows: List[Dict]) -> List[Dict]:
             row['trb_cdr1_pos'] = None
             row['trb_cdr2_pos'] = None
             row['trb_cdr3_pos'] = None
-        return chunk_rows
+        return chunk_rows, stats
 
     # Initialize tools
     stitcher = TCRStitcher(species="HUMAN")
     cdr_identifier = CDRRegionIdentifier()
 
-    print(f"   🧬 Stitching full TCR sequences and identifying CDR regions...")
-
-    tra_stitch_count = 0
-    trb_stitch_count = 0
-    tra_cdr_count = 0
-    trb_cdr_count = 0
+    print(f"   🧬 Standardizing gene names (tidytcells), stitching full TCR sequences, and identifying CDR regions...")
 
     for row in tqdm(chunk_rows, desc="   Processing TCRs", leave=False):
         # Initialize columns
+        row['trav_gene_std'] = ''
+        row['traj_gene_std'] = ''
+        row['trbv_gene_std'] = ''
+        row['trbj_gene_std'] = ''
         row['tra_full'] = ''
         row['trb_full'] = ''
         row['tra_cdr1_pos'] = None
@@ -1021,38 +1066,65 @@ def add_full_tcr_and_cdr_positions(chunk_rows: List[Dict]) -> List[Dict]:
         row['trb_cdr2_pos'] = None
         row['trb_cdr3_pos'] = None
 
+        # Get permutation key for statistics
+        pkey = row.get('permutation_key', get_permutation_signature(row))
+        if pkey not in stats['by_pkey']:
+            stats['by_pkey'][pkey] = {
+                'tra_attempted': 0, 'tra_gene_std': 0, 'tra_stitched': 0, 'tra_cdr': 0,
+                'trb_attempted': 0, 'trb_gene_std': 0, 'trb_stitched': 0, 'trb_cdr': 0
+            }
+
         # Process TRA
         tra_cdr3 = row.get('tra', '')
         trav_gene = row.get('trav_gene', '')
         traj_gene = row.get('traj_gene', '')
 
         if tra_cdr3 and trav_gene and traj_gene:
-            # Stitch full TRA sequence
-            tra_full = stitcher.stitch_tcr(
-                cdr3=tra_cdr3,
-                v_gene=trav_gene,
-                j_gene=traj_gene,
-                chain='TRA'
-            )
+            stats['tra_attempted'] += 1
+            stats['by_pkey'][pkey]['tra_attempted'] += 1
 
-            if tra_full:
-                row['tra_full'] = tra_full
-                tra_stitch_count += 1
+            # Standardize gene names using tidytcells (via TCRStitcher.normalize_gene_name)
+            trav_gene_std = stitcher.normalize_gene_name(trav_gene, 'TRA')
+            traj_gene_std = stitcher.normalize_gene_name(traj_gene, 'TRA')
 
-                # Identify CDR regions
-                cdr_regions = cdr_identifier.get_cdr_regions(
-                    full_sequence=tra_full,
-                    cdr3_sequence=tra_cdr3,
-                    v_gene=trav_gene,
+            # Store standardized gene names
+            if trav_gene_std:
+                row['trav_gene_std'] = trav_gene_std
+            if traj_gene_std:
+                row['traj_gene_std'] = traj_gene_std
+
+            if trav_gene_std and traj_gene_std:
+                stats['tra_gene_std'] += 1
+                stats['by_pkey'][pkey]['tra_gene_std'] += 1
+
+                # Stitch full TRA sequence using standardized gene names
+                tra_full = stitcher.stitch_tcr(
+                    cdr3=tra_cdr3,
+                    v_gene=trav_gene_std,
+                    j_gene=traj_gene_std,
                     chain='TRA'
                 )
 
-                if cdr_regions:
-                    # Store positions as tuples (start, end)
-                    row['tra_cdr1_pos'] = cdr_regions.get('cdr1')
-                    row['tra_cdr2_pos'] = cdr_regions.get('cdr2')
-                    row['tra_cdr3_pos'] = cdr_regions.get('cdr3')
-                    tra_cdr_count += 1
+                if tra_full:
+                    row['tra_full'] = tra_full
+                    stats['tra_stitched'] += 1
+                    stats['by_pkey'][pkey]['tra_stitched'] += 1
+
+                    # Identify CDR regions using standardized gene name
+                    cdr_regions = cdr_identifier.get_cdr_regions(
+                        full_sequence=tra_full,
+                        cdr3_sequence=tra_cdr3,
+                        v_gene=trav_gene_std,
+                        chain='TRA'
+                    )
+
+                    if cdr_regions:
+                        # Store positions as tuples (start, end)
+                        row['tra_cdr1_pos'] = cdr_regions.get('cdr1')
+                        row['tra_cdr2_pos'] = cdr_regions.get('cdr2')
+                        row['tra_cdr3_pos'] = cdr_regions.get('cdr3')
+                        stats['tra_cdr'] += 1
+                        stats['by_pkey'][pkey]['tra_cdr'] += 1
 
         # Process TRB
         trb_cdr3 = row.get('trb', '')
@@ -1060,36 +1132,56 @@ def add_full_tcr_and_cdr_positions(chunk_rows: List[Dict]) -> List[Dict]:
         trbj_gene = row.get('trbj_gene', '')
 
         if trb_cdr3 and trbv_gene and trbj_gene:
-            # Stitch full TRB sequence
-            trb_full = stitcher.stitch_tcr(
-                cdr3=trb_cdr3,
-                v_gene=trbv_gene,
-                j_gene=trbj_gene,
-                chain='TRB'
-            )
+            stats['trb_attempted'] += 1
+            stats['by_pkey'][pkey]['trb_attempted'] += 1
 
-            if trb_full:
-                row['trb_full'] = trb_full
-                trb_stitch_count += 1
+            # Standardize gene names using tidytcells (via TCRStitcher.normalize_gene_name)
+            trbv_gene_std = stitcher.normalize_gene_name(trbv_gene, 'TRB')
+            trbj_gene_std = stitcher.normalize_gene_name(trbj_gene, 'TRB')
 
-                # Identify CDR regions
-                cdr_regions = cdr_identifier.get_cdr_regions(
-                    full_sequence=trb_full,
-                    cdr3_sequence=trb_cdr3,
-                    v_gene=trbv_gene,
+            # Store standardized gene names
+            if trbv_gene_std:
+                row['trbv_gene_std'] = trbv_gene_std
+            if trbj_gene_std:
+                row['trbj_gene_std'] = trbj_gene_std
+
+            if trbv_gene_std and trbj_gene_std:
+                stats['trb_gene_std'] += 1
+                stats['by_pkey'][pkey]['trb_gene_std'] += 1
+
+                # Stitch full TRB sequence using standardized gene names
+                trb_full = stitcher.stitch_tcr(
+                    cdr3=trb_cdr3,
+                    v_gene=trbv_gene_std,
+                    j_gene=trbj_gene_std,
                     chain='TRB'
                 )
 
-                if cdr_regions:
-                    row['trb_cdr1_pos'] = cdr_regions.get('cdr1')
-                    row['trb_cdr2_pos'] = cdr_regions.get('cdr2')
-                    row['trb_cdr3_pos'] = cdr_regions.get('cdr3')
-                    trb_cdr_count += 1
+                if trb_full:
+                    row['trb_full'] = trb_full
+                    stats['trb_stitched'] += 1
+                    stats['by_pkey'][pkey]['trb_stitched'] += 1
 
-    print(f"   ✓ Stitched: {tra_stitch_count:,} TRA, {trb_stitch_count:,} TRB")
-    print(f"   ✓ CDR positions: {tra_cdr_count:,} TRA, {trb_cdr_count:,} TRB")
+                    # Identify CDR regions using standardized gene name
+                    cdr_regions = cdr_identifier.get_cdr_regions(
+                        full_sequence=trb_full,
+                        cdr3_sequence=trb_cdr3,
+                        v_gene=trbv_gene_std,
+                        chain='TRB'
+                    )
 
-    return chunk_rows
+                    if cdr_regions:
+                        row['trb_cdr1_pos'] = cdr_regions.get('cdr1')
+                        row['trb_cdr2_pos'] = cdr_regions.get('cdr2')
+                        row['trb_cdr3_pos'] = cdr_regions.get('cdr3')
+                        stats['trb_cdr'] += 1
+                        stats['by_pkey'][pkey]['trb_cdr'] += 1
+
+    print(f"   ✓ Gene names standardized: {stats['tra_gene_std']:,} TRA, {stats['trb_gene_std']:,} TRB")
+    print(f"   ✓ Stitched: {stats['tra_stitched']:,} TRA, {stats['trb_stitched']:,} TRB")
+    print(f"   ✓ CDR positions: {stats['tra_cdr']:,} TRA, {stats['trb_cdr']:,} TRB")
+
+    return chunk_rows, stats
 
 
 def create_tokenize_function(tokenizer, model_type: str):
@@ -1151,10 +1243,12 @@ def tokenize_dataset(
     num_workers: int = 50,
     oversample: bool = False,
     mode: Optional[str] = None,
+    resume: bool = False,
+    skip_tcr_stitching: bool = False,
 ):
     """
     Main tokenization function with streaming support.
-    
+
     Args:
         chunk_size: Rows per chunk (default 10M = ~15GB RAM). Max ~40M for 600GB buffer.
         num_workers: Parallel workers for Dataset.map()
@@ -1162,6 +1256,8 @@ def tokenize_dataset(
         sample_mode: Sampling strategy - 'proportional' (maintain distribution) or 'balanced' (equal per permutation)
         oversample: If True and sample_mode='balanced', duplicate underrepresented samples to reach target
         mode: Filter mode - only include permutation keys matching this mode (mlm, tra, trb, tra_trb_pairing, tcr_mhc, peptide_mhc, specificity)
+        resume: If True, resume from existing output (skip already processed rows)
+        skip_tcr_stitching: If True, skip expensive TCR stitching/CDR identification (much faster, but no full-length TCR sequences)
     """
     print(f"\n{'='*60}")
     print(f"TOKENIZATION: {model_type.upper()}")
@@ -1173,8 +1269,33 @@ def tokenize_dataset(
     if sample:
         oversample_str = ", with oversampling" if oversample else ""
         print(f"⚙️  Sampling: {sample:,} sequences (mode: {sample_mode or 'first-N'}{oversample_str})")
+    if resume:
+        print(f"⚙️  Resume mode: enabled")
+    if skip_tcr_stitching:
+        print(f"⚡ TCR stitching: DISABLED (fast mode)")
     print()
-    
+
+    # Check for existing output and calculate resume point
+    skip_rows = 0
+    existing_split_counts = {'train': 0, 'validation': 0, 'test': 0}
+
+    if resume:
+        print(f"🔍 Checking for existing output...")
+        existing_split_counts, existing_total = detect_existing_output(output_dir)
+
+        if existing_total > 0:
+            skip_rows = existing_total
+            print(f"✓ Found existing output: {existing_total:,} rows already processed")
+            print(f"   Train: {existing_split_counts['train']:,}, Val: {existing_split_counts['validation']:,}, Test: {existing_split_counts['test']:,}")
+            print(f"   Resuming from row {skip_rows:,}...")
+
+            # If sampling, check if we've already reached the sample size
+            if sample and existing_total >= sample:
+                print(f"⚠️  Sample size ({sample:,}) already reached. Nothing to do.")
+                return
+        else:
+            print(f"   No existing output found. Starting from beginning.")
+
     # Create tokenizer
     if model_type == "protbert":
         tokenizer = ProtBERTTokenizer(max_length)
@@ -1220,27 +1341,70 @@ def tokenize_dataset(
     output_dir.mkdir(parents=True, exist_ok=True)
     for split in ['train', 'validation', 'test']:
         (output_dir / split).mkdir(parents=True, exist_ok=True)
-    
-    # Initialize counters
+
+    # Initialize counters (use existing counts if resuming)
     split_writers = {
         'train': [],
         'validation': [],
         'test': []
     }
-    split_counts = {'train': 0, 'validation': 0, 'test': 0}
+    split_counts = existing_split_counts.copy() if resume else {'train': 0, 'validation': 0, 'test': 0}
+
+    # Calculate starting chunk number based on existing files
+    starting_chunk_nums = {'train': 0, 'validation': 0, 'test': 0}
+    if resume:
+        for split_name in ['train', 'validation', 'test']:
+            split_dir = output_dir / split_name
+            if split_dir.exists():
+                existing_chunks = list(split_dir.glob("chunk_*.parquet"))
+                if existing_chunks:
+                    # Get the highest chunk number
+                    chunk_nums = [int(f.stem.split('_')[1]) for f in existing_chunks]
+                    starting_chunk_nums[split_name] = max(chunk_nums) + 1
     
     # Track per-permutation split distribution for validation
     pkey_split_totals: Dict[str, Dict[str, int]] = {}
-    
+
+    # Track cumulative TCR stitching statistics
+    cumulative_tcr_stats = {
+        'tra_attempted': 0,
+        'tra_gene_std': 0,
+        'tra_stitched': 0,
+        'tra_cdr': 0,
+        'trb_attempted': 0,
+        'trb_gene_std': 0,
+        'trb_stitched': 0,
+        'trb_cdr': 0,
+        'by_pkey': {}
+    }
+
     # Process in streaming chunks
     print(f"\n📦 Processing dataset in chunks...")
     np.random.seed(42)
-    
+
     chunk_num = 0
+    processing_chunk_num = 0  # Tracks chunks actually processed (for display)
+    rows_skipped = 0
+
     for chunk_rows, total_rows in stream_parquet_files(input_dir, sample, chunk_size, sample_mode, num_workers, oversample, mode):
-        chunk_num += 1
-        print(f"\n📦 Processing chunk {chunk_num} ({len(chunk_rows):,} rows, total: {total_rows:,})")
-        
+        chunk_num += 1  # Always increment for consistent seed generation
+
+        # Skip chunks if resuming
+        if resume and rows_skipped < skip_rows:
+            rows_to_skip_in_chunk = min(len(chunk_rows), skip_rows - rows_skipped)
+
+            if rows_to_skip_in_chunk >= len(chunk_rows):
+                # Skip entire chunk
+                rows_skipped += len(chunk_rows)
+                continue
+            else:
+                # Skip partial chunk
+                chunk_rows = chunk_rows[rows_to_skip_in_chunk:]
+                rows_skipped += rows_to_skip_in_chunk
+
+        processing_chunk_num += 1
+        print(f"\n📦 Processing chunk {processing_chunk_num} (stream chunk {chunk_num}) ({len(chunk_rows):,} rows, total: {total_rows:,})")
+
         # Stratified split assignment for this chunk (preserves class balance)
         train_ratio = 1 - test_split - val_split
         chunk_splits = stratified_split_rows(
@@ -1250,13 +1414,13 @@ def tokenize_dataset(
             test_ratio=test_split,
             seed=42 + chunk_num  # Vary seed per chunk for variety
         )
-        
+
         # Log split distribution for first chunk to validate stratification
-        if chunk_num == 1:
+        if processing_chunk_num == 1:
             from collections import Counter
             split_counts_preview = Counter(chunk_splits)
             print(f"   📊 Chunk 1 split preview: {dict(split_counts_preview)}")
-            
+
             # Show per-class distribution for validation
             pkey_split_counts: Dict[str, Dict[str, int]] = {}
             for i, row in enumerate(chunk_rows):
@@ -1264,15 +1428,63 @@ def tokenize_dataset(
                 if pkey not in pkey_split_counts:
                     pkey_split_counts[pkey] = {'train': 0, 'validation': 0, 'test': 0}
                 pkey_split_counts[pkey][chunk_splits[i]] += 1
-            
+
             print(f"   📊 Stratified split by class (first 5):")
             for pkey in list(pkey_split_counts.keys())[:5]:
                 counts = pkey_split_counts[pkey]
                 total = sum(counts.values())
                 print(f"      {pkey}: {counts} (total: {total})")
 
-        # Add full TCR sequences and CDR positions (NEW)
-        chunk_rows = add_full_tcr_and_cdr_positions(chunk_rows)
+        # Add full TCR sequences and CDR positions (NEW) - skip if disabled
+        if not skip_tcr_stitching:
+            chunk_rows, chunk_tcr_stats = add_full_tcr_and_cdr_positions(chunk_rows)
+        else:
+            # Skip TCR stitching - create empty stats
+            chunk_tcr_stats = {
+                'tra_attempted': 0, 'tra_gene_std': 0, 'tra_stitched': 0, 'tra_cdr': 0,
+                'trb_attempted': 0, 'trb_gene_std': 0, 'trb_stitched': 0, 'trb_cdr': 0,
+                'by_pkey': {}
+            }
+            # Add empty columns for consistency
+            for row in chunk_rows:
+                row['trav_gene_std'] = ''
+                row['traj_gene_std'] = ''
+                row['trbv_gene_std'] = ''
+                row['trbj_gene_std'] = ''
+                row['tra_full'] = ''
+                row['trb_full'] = ''
+                row['tra_cdr1_pos'] = None
+                row['tra_cdr2_pos'] = None
+                row['tra_cdr3_pos'] = None
+                row['trb_cdr1_pos'] = None
+                row['trb_cdr2_pos'] = None
+                row['trb_cdr3_pos'] = None
+
+        # Accumulate statistics
+        cumulative_tcr_stats['tra_attempted'] += chunk_tcr_stats['tra_attempted']
+        cumulative_tcr_stats['tra_gene_std'] += chunk_tcr_stats['tra_gene_std']
+        cumulative_tcr_stats['tra_stitched'] += chunk_tcr_stats['tra_stitched']
+        cumulative_tcr_stats['tra_cdr'] += chunk_tcr_stats['tra_cdr']
+        cumulative_tcr_stats['trb_attempted'] += chunk_tcr_stats['trb_attempted']
+        cumulative_tcr_stats['trb_gene_std'] += chunk_tcr_stats['trb_gene_std']
+        cumulative_tcr_stats['trb_stitched'] += chunk_tcr_stats['trb_stitched']
+        cumulative_tcr_stats['trb_cdr'] += chunk_tcr_stats['trb_cdr']
+
+        # Merge per-permutation-key stats
+        for pkey, pkey_stats in chunk_tcr_stats['by_pkey'].items():
+            if pkey not in cumulative_tcr_stats['by_pkey']:
+                cumulative_tcr_stats['by_pkey'][pkey] = {
+                    'tra_attempted': 0, 'tra_gene_std': 0, 'tra_stitched': 0, 'tra_cdr': 0,
+                    'trb_attempted': 0, 'trb_gene_std': 0, 'trb_stitched': 0, 'trb_cdr': 0
+                }
+            for key in pkey_stats:
+                cumulative_tcr_stats['by_pkey'][pkey][key] += pkey_stats[key]
+
+        # Display cumulative statistics
+        tra_success_rate = (cumulative_tcr_stats['tra_stitched'] / cumulative_tcr_stats['tra_attempted'] * 100) if cumulative_tcr_stats['tra_attempted'] > 0 else 0
+        trb_success_rate = (cumulative_tcr_stats['trb_stitched'] / cumulative_tcr_stats['trb_attempted'] * 100) if cumulative_tcr_stats['trb_attempted'] > 0 else 0
+        print(f"   📊 Cumulative: TRA {cumulative_tcr_stats['tra_stitched']:,}/{cumulative_tcr_stats['tra_attempted']:,} ({tra_success_rate:.1f}%), "
+              f"TRB {cumulative_tcr_stats['trb_stitched']:,}/{cumulative_tcr_stats['trb_attempted']:,} ({trb_success_rate:.1f}%)")
 
         # Convert to HuggingFace Dataset for parallel tokenization
         print(f"   ⚡ Creating Dataset...")
@@ -1302,7 +1514,9 @@ def tokenize_dataset(
 
         # Add back TCR-specific columns (NEW - for full_tra/full_trb modes)
         tcr_columns = [
-            'tra_full', 'trb_full', 'trav_gene', 'traj_gene', 'trbv_gene', 'trbj_gene',
+            'tra_full', 'trb_full',
+            'trav_gene', 'traj_gene', 'trbv_gene', 'trbj_gene',
+            'trav_gene_std', 'traj_gene_std', 'trbv_gene_std', 'trbj_gene_std',  # Standardized gene names
             'tra_cdr1_pos', 'tra_cdr2_pos', 'tra_cdr3_pos',
             'trb_cdr1_pos', 'trb_cdr2_pos', 'trb_cdr3_pos'
         ]
@@ -1324,17 +1538,18 @@ def tokenize_dataset(
         for split_name in ['train', 'validation', 'test']:
             split_mask = chunk_splits == split_name
             split_data = [tokenized_rows[i] for i in range(len(tokenized_rows)) if split_mask[i]]
-            
+
             if split_data:
-                # Write chunk to parquet
+                # Write chunk to parquet (use starting_chunk_nums for proper numbering when resuming)
                 df = pa.Table.from_pylist(split_data)
-                chunk_file = output_dir / split_name / f"chunk_{split_counts[split_name]:06d}.parquet"
+                chunk_file = output_dir / split_name / f"chunk_{starting_chunk_nums[split_name]:06d}.parquet"
                 pq.write_table(df, chunk_file)
-                
+
                 split_counts[split_name] += len(split_data)
                 split_writers[split_name].append(chunk_file)
+                starting_chunk_nums[split_name] += 1
         
-        print(f"   ✓ Chunk {chunk_num} complete")
+        print(f"   ✓ Chunk {processing_chunk_num} complete")
         print(f"   📊 Cumulative: Train={split_counts['train']:,}, "
               f"Val={split_counts['validation']:,}, Test={split_counts['test']:,}")
     
@@ -1363,7 +1578,59 @@ def tokenize_dataset(
         smallest_counts = pkey_split_totals[smallest_pkey]
         print(f"\n✓ Smallest class '{smallest_pkey}' preserved with stratified split:")
         print(f"  Train: {smallest_counts['train']:,}, Val: {smallest_counts['validation']:,}, Test: {smallest_counts['test']:,}")
-    
+
+    # Print TCR stitching summary (only if not skipped)
+    if not skip_tcr_stitching:
+        print(f"\n{'='*60}")
+        print(f"🧬 TCR STITCHING SUMMARY")
+        print(f"{'='*60}")
+
+        # Overall statistics
+        print(f"\n📊 Overall Statistics:")
+        print(f"  TRA:")
+        print(f"    Attempted:          {cumulative_tcr_stats['tra_attempted']:10,}")
+        print(f"    Gene standardized:  {cumulative_tcr_stats['tra_gene_std']:10,} ({100*cumulative_tcr_stats['tra_gene_std']/cumulative_tcr_stats['tra_attempted']:.1f}%)" if cumulative_tcr_stats['tra_attempted'] > 0 else "    Gene standardized:  0")
+        print(f"    Successfully stitched: {cumulative_tcr_stats['tra_stitched']:7,} ({100*cumulative_tcr_stats['tra_stitched']/cumulative_tcr_stats['tra_attempted']:.1f}%)" if cumulative_tcr_stats['tra_attempted'] > 0 else "    Successfully stitched: 0")
+        print(f"    CDR positions found: {cumulative_tcr_stats['tra_cdr']:9,} ({100*cumulative_tcr_stats['tra_cdr']/cumulative_tcr_stats['tra_stitched']:.1f}%)" if cumulative_tcr_stats['tra_stitched'] > 0 else "    CDR positions found: 0")
+
+        print(f"\n  TRB:")
+        print(f"    Attempted:          {cumulative_tcr_stats['trb_attempted']:10,}")
+        print(f"    Gene standardized:  {cumulative_tcr_stats['trb_gene_std']:10,} ({100*cumulative_tcr_stats['trb_gene_std']/cumulative_tcr_stats['trb_attempted']:.1f}%)" if cumulative_tcr_stats['trb_attempted'] > 0 else "    Gene standardized:  0")
+        print(f"    Successfully stitched: {cumulative_tcr_stats['trb_stitched']:7,} ({100*cumulative_tcr_stats['trb_stitched']/cumulative_tcr_stats['trb_attempted']:.1f}%)" if cumulative_tcr_stats['trb_attempted'] > 0 else "    Successfully stitched: 0")
+        print(f"    CDR positions found: {cumulative_tcr_stats['trb_cdr']:9,} ({100*cumulative_tcr_stats['trb_cdr']/cumulative_tcr_stats['trb_stitched']:.1f}%)" if cumulative_tcr_stats['trb_stitched'] > 0 else "    CDR positions found: 0")
+
+        # Per-permutation-key breakdown
+        if cumulative_tcr_stats['by_pkey']:
+            print(f"\n📊 Per-Permutation-Key Breakdown:")
+            print(f"{'Permutation Key':<30} {'TRA Att.':>10} {'TRA Stitch':>12} {'Success %':>10} {'TRB Att.':>10} {'TRB Stitch':>12} {'Success %':>10}")
+            print(f"{'-'*110}")
+
+            # Sort by permutation key name for readability
+            for pkey in sorted(cumulative_tcr_stats['by_pkey'].keys()):
+                pkey_stats = cumulative_tcr_stats['by_pkey'][pkey]
+
+                tra_att = pkey_stats['tra_attempted']
+                tra_stitch = pkey_stats['tra_stitched']
+                tra_success = (100 * tra_stitch / tra_att) if tra_att > 0 else 0
+
+                trb_att = pkey_stats['trb_attempted']
+                trb_stitch = pkey_stats['trb_stitched']
+                trb_success = (100 * trb_stitch / trb_att) if trb_att > 0 else 0
+
+                # Only show if there were any TCR attempts
+                if tra_att > 0 or trb_att > 0:
+                    print(f"{pkey:<30} {tra_att:>10,} {tra_stitch:>12,} {tra_success:>9.1f}% {trb_att:>10,} {trb_stitch:>12,} {trb_success:>9.1f}%")
+
+            print(f"{'-'*110}")
+
+            # Summary stats
+            total_tra_att = sum(s['tra_attempted'] for s in cumulative_tcr_stats['by_pkey'].values())
+            total_tra_stitch = sum(s['tra_stitched'] for s in cumulative_tcr_stats['by_pkey'].values())
+            total_trb_att = sum(s['trb_attempted'] for s in cumulative_tcr_stats['by_pkey'].values())
+            total_trb_stitch = sum(s['trb_stitched'] for s in cumulative_tcr_stats['by_pkey'].values())
+
+            print(f"{'TOTAL':<30} {total_tra_att:>10,} {total_tra_stitch:>12,} {100*total_tra_stitch/total_tra_att if total_tra_att > 0 else 0:>9.1f}% {total_trb_att:>10,} {total_trb_stitch:>12,} {100*total_trb_stitch/total_trb_att if total_trb_att > 0 else 0:>9.1f}%")
+
     # Create HuggingFace datasets from parquet chunks
     print(f"\n💾 Creating HuggingFace DatasetDict...")
     datasets_dict = {}
@@ -1415,7 +1682,9 @@ def main():
     parser.add_argument("--val-split", type=float, default=0.1, help="Validation split fraction")
     parser.add_argument("--chunk-size", type=int, default=10_000_000, help="Number of rows per chunk (default: 10M = ~15GB RAM)")
     parser.add_argument("--num-workers", type=int, default=16, help="Number of parallel workers for tokenization (default: 16, recommended: 8-24)")
-    
+    parser.add_argument("--resume", action="store_true", help="Resume from existing output (skip already processed rows)")
+    parser.add_argument("--skip-tcr-stitching", action="store_true", help="Skip expensive TCR stitching/CDR identification (much faster)")
+
     args = parser.parse_args()
     
     input_dir = Path(args.input_dir)
@@ -1440,6 +1709,8 @@ def main():
         num_workers=args.num_workers,
         oversample=args.oversample,
         mode=args.mode,
+        resume=args.resume,
+        skip_tcr_stitching=args.skip_tcr_stitching,
     )
 
 
