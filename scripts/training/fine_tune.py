@@ -1375,6 +1375,10 @@ def main():
                         help="Evaluate every N steps (default: once per epoch)")
     parser.add_argument("--save_steps", type=int, default=None,
                         help="Save checkpoint every N steps (default: once per epoch)")
+    parser.add_argument("--save_total_limit", type=int, default=3,
+                        help="Maximum number of checkpoints to keep (deletes older ones to save space)")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Resume from checkpoint. Use 'auto' to automatically detect latest checkpoint, or provide path to specific checkpoint")
     parser.add_argument("--max_eval_samples", type=int, default=None,
                         help="Maximum number of evaluation samples to use (useful for large validation sets)")
     parser.add_argument("--eval_accumulation_steps", type=int, default=10,
@@ -1735,6 +1739,7 @@ def main():
         eval_steps=args.eval_steps,
         save_strategy="epoch" if args.save_steps is None else "steps",
         save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,  # Limit checkpoints to save space
         load_best_model_at_end=True,
         metric_for_best_model=best_metric,
         greater_is_better=metric_greater_is_better,
@@ -1786,20 +1791,57 @@ def main():
     )
     
     # ─────────────────────────────────────────────────────────────────────────────
+    # Detect checkpoint for resumption (AWS Spot Instance support)
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    resume_checkpoint = None
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint.lower() == "auto":
+            # Auto-detect latest checkpoint
+            checkpoints = []
+            if os.path.isdir(args.output_dir):
+                for dirname in os.listdir(args.output_dir):
+                    if dirname.startswith("checkpoint-"):
+                        checkpoint_path = os.path.join(args.output_dir, dirname)
+                        if os.path.isdir(checkpoint_path):
+                            checkpoints.append(checkpoint_path)
+
+            if checkpoints:
+                # Sort by checkpoint number to get the latest
+                checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+                resume_checkpoint = checkpoints[-1]
+                print(f"\n🔄 AUTO-RESUME: Found {len(checkpoints)} checkpoint(s)")
+                print(f"   Resuming from latest: {resume_checkpoint}")
+            else:
+                print(f"\n⚠️  AUTO-RESUME: No checkpoints found in {args.output_dir}")
+                print(f"   Starting training from scratch")
+        else:
+            # Use specified checkpoint
+            resume_checkpoint = args.resume_from_checkpoint
+            if os.path.isdir(resume_checkpoint):
+                print(f"\n🔄 RESUME: Using checkpoint: {resume_checkpoint}")
+            else:
+                print(f"\n⚠️  WARNING: Checkpoint not found: {resume_checkpoint}")
+                print(f"   Starting training from scratch")
+                resume_checkpoint = None
+
+    # ─────────────────────────────────────────────────────────────────────────────
     # Train
     # ─────────────────────────────────────────────────────────────────────────────
-    
+
     print("\n" + "="*80)
     print("Starting training...")
+    if resume_checkpoint:
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
     print("="*80 + "\n")
-    
+
     # Clear CUDA cache before training
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         print("🔧 Cleared CUDA cache before training")
-    
+
     try:
-        trainer.train()
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
     except torch.cuda.OutOfMemoryError as e:
         print("\n" + "="*80)
         print("❌ CUDA OUT OF MEMORY ERROR")
