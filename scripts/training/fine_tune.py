@@ -25,7 +25,7 @@ import torch.nn as nn
 import wandb
 import evaluate
 from collections import Counter
-from datasets import load_from_disk
+from datasets import load_from_disk, Dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForMaskedLM,
@@ -64,6 +64,72 @@ except ImportError:
     print("⚠️  CDRRegionIdentifier not available")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SAGEMAKER ENVIRONMENT DETECTION AND PATH RESOLUTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def is_sagemaker_environment() -> bool:
+    """
+    Detect if running in AWS SageMaker training environment.
+
+    Returns:
+        True if running in SageMaker, False otherwise
+    """
+    return os.environ.get('SM_MODEL_DIR') is not None
+
+
+def get_sagemaker_paths() -> Dict[str, Any]:
+    """
+    Get SageMaker standard paths and environment metadata.
+
+    Returns:
+        Dictionary with SageMaker paths and metadata, or empty dict if not in SageMaker
+    """
+    if not is_sagemaker_environment():
+        return {}
+
+    return {
+        'model_dir': os.environ.get('SM_MODEL_DIR', '/opt/ml/model'),
+        'training_dir': os.environ.get('SM_CHANNEL_TRAINING', '/opt/ml/input/data/training'),
+        'validation_dir': os.environ.get('SM_CHANNEL_VALIDATION',
+                                        os.environ.get('SM_CHANNEL_TRAINING')),
+        'output_dir': os.environ.get('SM_OUTPUT_DATA_DIR', '/opt/ml/output/data'),
+        'checkpoint_dir': '/opt/ml/checkpoints',
+        'num_gpus': int(os.environ.get('SM_NUM_GPUS', '1')),
+        'hosts': os.environ.get('SM_HOSTS', '').split(',') if os.environ.get('SM_HOSTS') else [],
+        'current_host': os.environ.get('SM_CURRENT_HOST', 'algo-1'),
+    }
+
+
+def resolve_path_for_environment(user_path: str, path_type: str = 'dataset') -> str:
+    """
+    Resolve user-provided path to appropriate environment location.
+
+    In local environments, returns the user path unchanged.
+    In SageMaker, returns standard SageMaker paths based on path_type.
+
+    Args:
+        user_path: Path provided by user (may be placeholder in SageMaker)
+        path_type: Type of path - 'dataset', 'output', or 'checkpoint'
+
+    Returns:
+        Resolved path appropriate for current environment
+    """
+    if not is_sagemaker_environment():
+        return user_path
+
+    sm_paths = get_sagemaker_paths()
+
+    if path_type == 'dataset':
+        return sm_paths['training_dir']
+    elif path_type == 'output':
+        return sm_paths['model_dir']
+    elif path_type == 'checkpoint':
+        return sm_paths['checkpoint_dir']
+
+    return user_path
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -189,6 +255,8 @@ def filter_dataset_by_mode(dataset: Any, mode: str) -> Any:
         dataset: HuggingFace dataset with 'permutation_key' field
         mode: One of ['mlm', 'tra', 'trb', 'full_tra', 'full_trb', 'tra_trb_pairing',
                       'tcr_mhc', 'peptide_mhc', 'specificity']
+              - tcr_mhc: At least one TCR chain AND at least one MHC, excluding examples with peptide
+              - peptide_mhc: Peptide AND at least one MHC, excluding examples with TCR chains
 
     Returns:
         Filtered dataset
@@ -223,17 +291,20 @@ def filter_dataset_by_mode(dataset: Any, mode: str) -> Any:
         filtered = dataset.filter(lambda x: "tra" in x["permutation_key"] and "trb" in x["permutation_key"])
 
     elif mode == "tcr_mhc":
-        # At least one TCR chain (tra/trb) AND at least one MHC (mhc_one/mhc_two)
+        # At least one TCR chain (tra/trb) AND at least one MHC (mhc_one/mhc_two), NO peptide
         filtered = dataset.filter(lambda x: (
             ("tra" in x["permutation_key"] or "trb" in x["permutation_key"]) and
-            ("mhc_one" in x["permutation_key"] or "mhc_two" in x["permutation_key"])
+            ("mhc_one" in x["permutation_key"] or "mhc_two" in x["permutation_key"]) and
+            "peptide" not in x["permutation_key"]
         ))
 
     elif mode == "peptide_mhc":
-        # Peptide AND at least one MHC
+        # Peptide AND at least one MHC, NO TCR chains
         filtered = dataset.filter(lambda x: (
             "peptide" in x["permutation_key"] and
-            ("mhc_one" in x["permutation_key"] or "mhc_two" in x["permutation_key"])
+            ("mhc_one" in x["permutation_key"] or "mhc_two" in x["permutation_key"]) and
+            "tra" not in x["permutation_key"] and
+            "trb" not in x["permutation_key"]
         ))
 
     elif mode == "specificity":
@@ -1302,7 +1373,103 @@ def load_model_and_tokenizer(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 5. MAIN TRAINING FUNCTION
+# 5. CUSTOM STREAMING EVALUATION TRAINER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class StreamingEvalTrainer(Trainer):
+    """
+    Custom Trainer that supports streaming evaluation for large validation sets.
+
+    Uses DataLoader to process validation data in chunks, accumulating only
+    metrics (not predictions) to minimize GPU memory usage.
+    """
+
+    def evaluate(
+        self,
+        eval_dataset: Optional[Dataset] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        """
+        Streaming evaluation that processes full dataset without OOM.
+
+        Unlike standard Trainer.evaluate(), this method:
+        - Processes data in batches without accumulating all predictions
+        - Only stores running metrics (loss, accuracy, perplexity)
+        - Handles arbitrarily large validation sets
+        """
+        # Setup
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+
+        model = self._wrap_model(self.model, training=False)
+        model.eval()
+
+        # Initialize metrics
+        total_loss = 0.0
+        total_correct = 0
+        total_tokens = 0
+        num_batches = 0
+
+        # Streaming evaluation loop
+        with torch.no_grad():
+            for batch in tqdm(eval_dataloader, desc="Evaluating"):
+                # Move batch to device
+                batch = self._prepare_inputs(batch)
+
+                # Forward pass
+                with self.compute_loss_context_manager():
+                    outputs = model(**batch)
+
+                loss = outputs.loss
+                logits = outputs.logits
+                labels = batch.get("labels", batch.get("input_ids"))
+
+                # Accumulate loss
+                total_loss += loss.item()
+                num_batches += 1
+
+                # Compute accuracy (only for non-padding tokens)
+                if labels is not None:
+                    # Get predictions
+                    predictions = torch.argmax(logits, dim=-1)
+
+                    # Mask for valid tokens (not padding, not special tokens)
+                    mask = labels != -100
+
+                    # Count correct predictions
+                    correct = (predictions[mask] == labels[mask]).sum().item()
+                    total_correct += correct
+                    total_tokens += mask.sum().item()
+
+                # Free memory after each batch
+                del outputs, logits, predictions, mask
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # Compute final metrics
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+        accuracy = total_correct / total_tokens if total_tokens > 0 else 0.0
+        perplexity = math.exp(avg_loss) if avg_loss < 100 else float('inf')
+
+        metrics = {
+            f"{metric_key_prefix}_loss": avg_loss,
+            f"{metric_key_prefix}_accuracy": accuracy,
+            f"{metric_key_prefix}_perplexity": perplexity,
+            f"{metric_key_prefix}_samples": len(eval_dataset),
+        }
+
+        # Log callback
+        self.log(metrics)
+        self.control = self.callback_handler.on_evaluate(
+            self.args, self.state, self.control, metrics
+        )
+
+        return metrics
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. MAIN TRAINING FUNCTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -1315,7 +1482,10 @@ def main():
                         help="Path to HuggingFace dataset directory")
     parser.add_argument("--mode", type=str, required=True,
                         choices=["mlm", "tra", "trb", "full_tra", "full_trb", "tra_trb_pairing", "tcr_mhc", "peptide_mhc", "specificity"],
-                        help="Fine-tuning mode (determines data filtering and masking strategy)")
+                        help="Fine-tuning mode (determines data filtering and masking strategy). "
+                             "If dataset was filtered during tokenization, use --skip-mode-filter")
+    parser.add_argument("--skip-mode-filter", action="store_true", default=True,
+                        help="Skip mode-based filtering (use if dataset was already filtered during tokenization)")
     
     # Model arguments
     parser.add_argument("--model_path", type=str, required=True,
@@ -1380,7 +1550,8 @@ def main():
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Resume from checkpoint. Use 'auto' to automatically detect latest checkpoint, or provide path to specific checkpoint")
     parser.add_argument("--max_eval_samples", type=int, default=None,
-                        help="Maximum number of evaluation samples to use (useful for large validation sets)")
+                        help="Maximum number of evaluation samples to use. "
+                             "Leave unset to evaluate on full validation set with streaming evaluation.")
     parser.add_argument("--eval_accumulation_steps", type=int, default=10,
                         help="Number of batches to accumulate before moving predictions to CPU. "
                              "Prevents OOM during evaluation with large vocab models (e.g., BERT). "
@@ -1512,32 +1683,78 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────────
     # Initialize W&B (only on main process to avoid duplicate logging)
     # ─────────────────────────────────────────────────────────────────────────────
-    
+
     if args.wandb_project and is_main_process:
+        # Generate run name and config
+        run_name = args.wandb_run_name
+        config = vars(args).copy()
+
+        if is_sagemaker_environment():
+            sm_paths = get_sagemaker_paths()
+
+            # Auto-generate run name with job context
+            if run_name is None:
+                job_name = os.environ.get('TRAINING_JOB_NAME', 'sagemaker-job')
+                run_name = f"{job_name}-{sm_paths['current_host']}"
+
+            # Add SageMaker metadata to config
+            config.update({
+                'sagemaker_training': True,
+                'sagemaker_job_name': os.environ.get('TRAINING_JOB_NAME', 'unknown'),
+                'sagemaker_host': sm_paths['current_host'],
+                'sagemaker_num_gpus': sm_paths['num_gpus'],
+                'sagemaker_hosts': len(sm_paths['hosts']),
+            })
+
         wandb.init(
             project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=vars(args),
+            name=run_name,
+            config=config,
             settings=wandb.Settings(
                 # Disable system metrics to reduce clutter
                 _disable_stats=True,
                 _disable_meta=True,
             )
         )
+
+        if is_sagemaker_environment():
+            print(f"📊 W&B tracking enabled for SageMaker job")
     
     # ─────────────────────────────────────────────────────────────────────────────
     # Load and filter dataset
     # ─────────────────────────────────────────────────────────────────────────────
-    
-    print(f"\nLoading dataset from: {args.dataset_path}")
-    dataset = load_from_disk(args.dataset_path)
+
+    # Resolve dataset path for environment (local vs SageMaker)
+    dataset_path = resolve_path_for_environment(args.dataset_path, 'dataset')
+
+    # Log environment information
+    if is_sagemaker_environment():
+        sm_paths = get_sagemaker_paths()
+        print(f"\n🚀 Running in SageMaker Training Environment")
+        print(f"   Training Job: {os.environ.get('TRAINING_JOB_NAME', 'unknown')}")
+        print(f"   Current Host: {sm_paths['current_host']}")
+        print(f"   Total Hosts: {len(sm_paths['hosts'])}")
+        print(f"   GPUs Available: {sm_paths['num_gpus']}")
+        print(f"   Training Data: {dataset_path}")
+        print(f"   Checkpoint Dir: {sm_paths['checkpoint_dir']}")
+        print(f"   Model Output: {sm_paths['model_dir']}")
+    else:
+        print(f"\n💻 Running in Local Environment")
+
+    print(f"\nLoading dataset from: {dataset_path}")
+    dataset = load_from_disk(dataset_path)
     
     print(f"Dataset splits: {list(dataset.keys())}")
     print(f"Dataset columns: {dataset['train'].column_names}")
     
-    # Filter datasets by mode
-    train_dataset = filter_dataset_by_mode(dataset["train"], args.mode)
-    val_dataset = filter_dataset_by_mode(dataset["validation"], args.mode)
+    # Filter datasets by mode (skip if dataset was pre-filtered)
+    if args.skip_mode_filter:
+        print(f"⏭️  Skipping mode filtering (dataset already filtered during tokenization)")
+        train_dataset = dataset["train"]
+        val_dataset = dataset["validation"]
+    else:
+        train_dataset = filter_dataset_by_mode(dataset["train"], args.mode)
+        val_dataset = filter_dataset_by_mode(dataset["validation"], args.mode)
     
     # Use smaller subset for testing
     if args.test:
@@ -1546,13 +1763,9 @@ def main():
         val_dataset = val_dataset.shuffle(seed=args.seed).select(range(min(200, len(val_dataset))))
     
     # Check maximum sequence length in dataset
-    print("\n📏 Checking dataset sequence lengths...")
     max_train_len = max(len(x['input_ids']) for x in train_dataset.select(range(min(1000, len(train_dataset)))))
     max_val_len = max(len(x['input_ids']) for x in val_dataset.select(range(min(1000, len(val_dataset)))))
     dataset_max_len = max(max_train_len, max_val_len)
-    print(f"   Max length in sample (train): {max_train_len}")
-    print(f"   Max length in sample (val): {max_val_len}")
-    print(f"   Dataset max length: {dataset_max_len}")
     
     # Truncate sequences if max_seq_length is specified (saves memory)
     if args.max_seq_length is not None:
@@ -1576,44 +1789,10 @@ def main():
         print(f"\n⚠️  Limiting validation set from {len(val_dataset):,} to {args.max_eval_samples:,} examples")
         val_dataset = val_dataset.shuffle(seed=args.seed).select(range(args.max_eval_samples))
     
-    # Auto-adjust eval batch size AND limit eval set for very large validation sets to prevent OOM
-    # Scale thresholds based on sequence length (shorter sequences = less memory)
-    # Reference: 512 tokens is the "standard" length; scale accordingly
-    seq_length_factor = max(1, dataset_max_len / 512)  # e.g., 32/512 = 0.0625 -> factor = 1 (min)
-    
-    # For short sequences, we can handle much larger batches and val sets
-    # A 32-token sequence uses ~16x less memory than a 512-token sequence
-    memory_scale = 512 / max(32, dataset_max_len)  # e.g., 512/32 = 16x
-    
-    adjusted_val_threshold = int(50000 * memory_scale)  # e.g., 800k for 32-token seqs
-    adjusted_min_batch = max(4, int(4 * memory_scale))  # e.g., 64 for 32-token seqs
-    
-    if len(val_dataset) > adjusted_val_threshold:
-        if args.max_eval_samples is None:
-            # Automatically limit validation set size
-            old_val_size = len(val_dataset)
-            args.max_eval_samples = adjusted_val_threshold
-            val_dataset = val_dataset.shuffle(seed=args.seed).select(range(args.max_eval_samples))
-            print(f"\n⚠️  Very large validation set detected ({old_val_size:,} examples)")
-            print(f"   Automatically limiting to {args.max_eval_samples:,} examples to prevent OOM during evaluation")
-            print(f"   (threshold adjusted for {dataset_max_len}-token sequences)")
-        
-        if args.eval_batch_size > adjusted_min_batch:
-            old_eval_batch = args.eval_batch_size
-            args.eval_batch_size = adjusted_min_batch
-            print(f"   Also reducing eval batch size from {old_eval_batch} to {args.eval_batch_size}")
-    
-    print(f"\n📊 Eval settings (adjusted for {dataset_max_len}-token sequences):")
-    print(f"   Validation set size: {len(val_dataset):,}")
+    print(f"\n📊 Dataset sizes:")
+    print(f"   Training: {len(train_dataset):,} examples")
+    print(f"   Validation: {len(val_dataset):,} examples")
     print(f"   Eval batch size: {args.eval_batch_size}")
-    
-    # Log dataset statistics (only on main process)
-    train_stats = log_dataset_statistics(train_dataset, "train", log_to_wandb=args.wandb_project is not None and is_main_process)
-    val_stats = log_dataset_statistics(val_dataset, "validation", log_to_wandb=args.wandb_project is not None and is_main_process)
-    
-    if args.wandb_project and is_main_process:
-        wandb.log(train_stats)
-        wandb.log(val_stats)
     
     # ─────────────────────────────────────────────────────────────────────────────
     # Load model and tokenizer
@@ -1708,6 +1887,40 @@ def main():
     # Setup training arguments
     # ─────────────────────────────────────────────────────────────────────────────
 
+    # Resolve checkpoint directory for environment (local vs SageMaker)
+    checkpoint_dir = resolve_path_for_environment(args.output_dir, 'checkpoint')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    if is_sagemaker_environment():
+        print(f"\n💾 Checkpoint Configuration:")
+        print(f"   Directory: {checkpoint_dir}")
+        print(f"   (Auto-synced to S3 for Spot Training)")
+
+    # Optimize checkpoint frequency for SageMaker Spot Training
+    save_strategy = "epoch" if args.save_steps is None else "steps"
+    save_steps = args.save_steps
+    save_total_limit = args.save_total_limit
+
+    # Eval strategy must match save strategy when load_best_model_at_end=True
+    eval_strategy = "epoch" if args.eval_steps is None else "steps"
+    eval_steps = args.eval_steps
+
+    if is_sagemaker_environment():
+        # Save more frequently for Spot resilience
+        if save_steps is None or save_steps > 500:
+            save_steps = 500
+            save_strategy = 'steps'
+            # Match eval strategy to save strategy
+            if eval_steps is None:
+                eval_steps = save_steps  # Evaluate at same frequency as saving
+                eval_strategy = 'steps'
+            print(f"\n💾 Checkpointing every {save_steps} steps (Spot resilience)")
+
+        # Keep more checkpoints (S3 storage is cheap)
+        if save_total_limit < 5:
+            save_total_limit = 5
+            print(f"   Keeping last {save_total_limit} checkpoints")
+
     # Disable compute_metrics for BERT (but not ProtBERT) to save memory during evaluation
     # (BERT's 29k vocab creates huge prediction tensors)
     model_path_lower = args.model_path.lower()
@@ -1716,16 +1929,16 @@ def main():
     use_metrics = not is_bert or is_protbert  # Disable for BERT, but keep for ProtBERT
 
     if not use_metrics:
-        print("\n⚠️  Disabling accuracy/perplexity metrics for BERT to save memory")
-        print("   Will use validation loss as best model metric instead")
-        print("   (BERT's 29k vocabulary creates huge prediction tensors)\n")
+        print("\n⚠️  Note: Using custom streaming evaluation for BERT")
+        print("   Metrics (accuracy/perplexity) will be computed efficiently in streaming mode")
+        print("   (BERT's large vocabulary is handled without storing all predictions)\n")
 
     # Use loss for BERT (no metrics), accuracy for others
     best_metric = "loss" if not use_metrics else "accuracy"
     metric_greater_is_better = False if not use_metrics else True
 
     training_args = TrainingArguments(
-        output_dir=args.output_dir,
+        output_dir=checkpoint_dir,  # Use checkpoint_dir instead of args.output_dir
         num_train_epochs=args.num_epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
@@ -1734,12 +1947,12 @@ def main():
         warmup_steps=args.warmup_steps,
         max_grad_norm=args.max_grad_norm,
 
-        # Evaluation and saving
-        eval_strategy="epoch" if args.eval_steps is None else "steps",
-        eval_steps=args.eval_steps,
-        save_strategy="epoch" if args.save_steps is None else "steps",
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,  # Limit checkpoints to save space
+        # Evaluation and saving (strategies must match when load_best_model_at_end=True)
+        eval_strategy=eval_strategy,
+        eval_steps=eval_steps,
+        save_strategy=save_strategy,
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,  # Increased for SageMaker Spot training
         load_best_model_at_end=True,
         metric_for_best_model=best_metric,
         greater_is_better=metric_greater_is_better,
@@ -1780,29 +1993,42 @@ def main():
     # Create Trainer
     # ─────────────────────────────────────────────────────────────────────────────
 
-    trainer = Trainer(
+    trainer = StreamingEvalTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=data_collator,
-        compute_metrics=compute_metrics if use_metrics else None,
+        compute_metrics=None,  # Not used in streaming eval (we compute manually)
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
     
     # ─────────────────────────────────────────────────────────────────────────────
-    # Detect checkpoint for resumption (AWS Spot Instance support)
+    # Detect checkpoint for resumption (Local + SageMaker Spot Training)
     # ─────────────────────────────────────────────────────────────────────────────
+
+    # SageMaker Spot Training: Auto-enable resume if checkpoints exist
+    if is_sagemaker_environment() and args.resume_from_checkpoint is None:
+        if os.path.isdir(checkpoint_dir):
+            existing_checkpoints = [
+                d for d in os.listdir(checkpoint_dir)
+                if d.startswith("checkpoint-") and
+                   os.path.isdir(os.path.join(checkpoint_dir, d))
+            ]
+            if existing_checkpoints:
+                print(f"\n🔄 SPOT RECOVERY: Found {len(existing_checkpoints)} checkpoint(s)")
+                print(f"   Automatically enabling resumption")
+                args.resume_from_checkpoint = "auto"
 
     resume_checkpoint = None
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint.lower() == "auto":
             # Auto-detect latest checkpoint
             checkpoints = []
-            if os.path.isdir(args.output_dir):
-                for dirname in os.listdir(args.output_dir):
+            if os.path.isdir(checkpoint_dir):
+                for dirname in os.listdir(checkpoint_dir):
                     if dirname.startswith("checkpoint-"):
-                        checkpoint_path = os.path.join(args.output_dir, dirname)
+                        checkpoint_path = os.path.join(checkpoint_dir, dirname)
                         if os.path.isdir(checkpoint_path):
                             checkpoints.append(checkpoint_path)
 
@@ -1813,7 +2039,7 @@ def main():
                 print(f"\n🔄 AUTO-RESUME: Found {len(checkpoints)} checkpoint(s)")
                 print(f"   Resuming from latest: {resume_checkpoint}")
             else:
-                print(f"\n⚠️  AUTO-RESUME: No checkpoints found in {args.output_dir}")
+                print(f"\n⚠️  AUTO-RESUME: No checkpoints found in {checkpoint_dir}")
                 print(f"   Starting training from scratch")
         else:
             # Use specified checkpoint
@@ -1866,16 +2092,37 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────────
     # Save best model
     # ─────────────────────────────────────────────────────────────────────────────
-    
+
     print("\n" + "="*80)
     print("Training complete! Saving best model...")
     print("="*80 + "\n")
-    
-    best_model_dir = os.path.join(args.output_dir, "best_model")
+
+    # Determine final model directory based on environment
+    if is_sagemaker_environment():
+        sm_paths = get_sagemaker_paths()
+        best_model_dir = sm_paths['model_dir']  # /opt/ml/model
+
+        print(f"📦 SageMaker Model Packaging:")
+        print(f"   Model saved to: {best_model_dir}")
+        print(f"   SageMaker will automatically tar and upload to S3")
+
+        # Also save backup copy in checkpoints
+        checkpoint_copy = os.path.join(checkpoint_dir, "best_model")
+    else:
+        best_model_dir = os.path.join(args.output_dir, "best_model")
+        checkpoint_copy = None
+
+    # Save model
     trainer.save_model(best_model_dir)
     tokenizer.save_pretrained(best_model_dir)
-    
+
     print(f"✅ Best model saved to: {best_model_dir}")
+
+    # Save backup copy in checkpoints if SageMaker
+    if checkpoint_copy:
+        print(f"   Backup copy: {checkpoint_copy}")
+        trainer.save_model(checkpoint_copy)
+        tokenizer.save_pretrained(checkpoint_copy)
     
     # ─────────────────────────────────────────────────────────────────────────────
     # Final evaluation and logging
@@ -1900,7 +2147,7 @@ def main():
             wandb.log({"final_eval": eval_results})
     except torch.cuda.OutOfMemoryError as e:
         print(f"\n⚠️  Warning: Final evaluation failed with OOM error")
-        print(f"   This is common with large validation sets.")
+        print(f"   This is unexpected with streaming evaluation - check eval batch size.")
         print(f"   Training has completed successfully - the best model has been saved.")
         print(f"\n   To evaluate separately, use:")
         print(f"   python scripts/inference/evaluate_mlm.py \\")
