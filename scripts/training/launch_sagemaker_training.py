@@ -13,7 +13,7 @@ Features:
 - S3-based dataset and model storage
 - W&B integration for experiment tracking
 
-Example Usage:
+Example Usage (Pre-tokenized):
     python scripts/training/launch_sagemaker_training.py \
         --s3-dataset s3://my-bucket/datasets/tcr-dataset \
         --s3-output s3://my-bucket/models/esm2-finetuned \
@@ -25,6 +25,23 @@ Example Usage:
         --batch-size 32 \
         --use-lora \
         --fp16 \
+        --wandb-project tcr-quest
+
+Example Usage (On-the-fly Tokenization - 48% disk savings):
+    python scripts/training/launch_sagemaker_training.py \
+        --s3-dataset s3://my-bucket/raw-parquet/tcr-data \
+        --s3-output s3://my-bucket/models/esm2-finetuned \
+        --instance-type ml.p3.2xlarge \
+        --spot-instances \
+        --mode mlm \
+        --model-path facebook/esm2_t33_650M_UR50D \
+        --tokenize-on-fly \
+        --tokenizer-type esm2 \
+        --num-epochs 3 \
+        --batch-size 32 \
+        --use-lora \
+        --fp16 \
+        --gradient-checkpointing \
         --wandb-project tcr-quest
 
 Instance Types:
@@ -61,7 +78,8 @@ def main():
     infra_group = parser.add_argument_group('Infrastructure Configuration')
     infra_group.add_argument(
         '--s3-dataset', required=True,
-        help='S3 path to tokenized dataset directory (e.g., s3://bucket/datasets/tcr-data)'
+        help='S3 path to dataset directory. For pre-tokenized: HuggingFace dataset. '
+             'For on-the-fly: raw parquet files (e.g., s3://bucket/datasets/tcr-data)'
     )
     infra_group.add_argument(
         '--s3-output', required=True,
@@ -169,6 +187,40 @@ def main():
                           help='SageMaker training job name (default: auto-generated)')
 
     # =========================================================================
+    # Tokenization (On-the-fly)
+    # =========================================================================
+    tokenize_group = parser.add_argument_group('On-the-fly Tokenization (Optional)')
+    tokenize_group.add_argument(
+        '--tokenize-on-fly', action='store_true',
+        help='Enable on-the-fly tokenization from raw parquet files (saves 48%% disk space). '
+             'Requires --tokenizer-type. First epoch slower, subsequent epochs fast (uses cache).'
+    )
+    tokenize_group.add_argument(
+        '--tokenizer-type',
+        choices=['protbert', 'bert', 'esm2', 'esm3'],
+        help='Tokenizer type for on-the-fly tokenization (required with --tokenize-on-fly). '
+             'Must match model architecture: esm2 for ESM models, protbert for ProtBERT, etc.'
+    )
+    tokenize_group.add_argument(
+        '--tokenization-max-length', type=int, default=512,
+        help='Maximum sequence length for tokenization (default: 512)'
+    )
+    tokenize_group.add_argument(
+        '--tokenization-num-workers', type=int, default=None,
+        help='Parallel workers for tokenization (default: auto-detect, typically CPU_COUNT - 4)'
+    )
+    tokenize_group.add_argument(
+        '--tokenization-batch-size', type=int, default=5000,
+        help='Batch size for tokenization (default: 5000, higher = faster but more RAM)'
+    )
+    tokenize_group.add_argument(
+        '--use-streaming', action='store_true',
+        help='Use streaming dataset for truly lazy evaluation. Best for 100M+ examples. '
+             'Tokenizes data on-the-fly during training (no pre-processing wait). '
+             'Trade-off: Cannot shuffle across full dataset, only within buffer.'
+    )
+
+    # =========================================================================
     # Advanced
     # =========================================================================
     adv_group = parser.add_argument_group('Advanced')
@@ -180,6 +232,8 @@ def main():
                           help='Run in test mode with reduced dataset')
     adv_group.add_argument('--skip-mode-filter', action='store_true', default=True,
                           help='Skip mode filtering (dataset already filtered during tokenization)')
+    adv_group.add_argument('--no-wait', action='store_true',
+                          help='Launch job and exit (don\'t wait for completion). Useful for long jobs with SSO.')
 
     args = parser.parse_args()
 
@@ -188,6 +242,17 @@ def main():
     # =========================================================================
     if args.spot_instances and args.max_wait_hours is None:
         args.max_wait_hours = args.max_run_hours + 1
+
+    # Validate on-the-fly tokenization arguments
+    if args.tokenize_on_fly and not args.tokenizer_type:
+        print("\nERROR: --tokenizer-type is required when using --tokenize-on-fly")
+        print("Choose from: protbert, bert, esm2, esm3")
+        sys.exit(1)
+
+    if args.tokenizer_type and not args.tokenize_on_fly:
+        print("\nWARNING: --tokenizer-type specified without --tokenize-on-fly")
+        print("Enabling --tokenize-on-fly automatically")
+        args.tokenize_on_fly = True
 
     # =========================================================================
     # Get SageMaker Role and Session
@@ -215,7 +280,6 @@ def main():
     hyperparameters = {
         'mode': args.mode,
         'model_path': args.model_path,
-        'dataset_path': '/opt/ml/input/data/training',  # SageMaker mounts S3 data here
         'output_dir': '/opt/ml/checkpoints',  # SageMaker checkpoint directory
         'num_epochs': args.num_epochs,
         'batch_size': args.batch_size,
@@ -224,6 +288,35 @@ def main():
         'weight_decay': args.weight_decay,
         'gradient_accumulation_steps': args.gradient_accumulation_steps,
     }
+
+    # Add dataset path OR raw data dir based on tokenization mode
+    if args.tokenize_on_fly:
+        # On-the-fly tokenization: use raw_data_dir
+        hyperparameters['raw_data_dir'] = '/opt/ml/input/data/training'
+        hyperparameters['tokenizer_type'] = args.tokenizer_type
+        hyperparameters['tokenization_max_length'] = args.tokenization_max_length
+        # Only pass num_workers if explicitly set (otherwise auto-detect in fine_tune.py)
+        if args.tokenization_num_workers is not None:
+            hyperparameters['tokenization_num_workers'] = args.tokenization_num_workers
+        hyperparameters['tokenization_batch_size'] = args.tokenization_batch_size
+
+        # Add streaming option
+        if args.use_streaming:
+            hyperparameters['use_streaming'] = ''
+            print(f"\n🌊 STREAMING MODE enabled!")
+            print(f"  Tokenization: On-the-fly during training (NO pre-processing wait)")
+            print(f"  Best for: 100M+ examples")
+            print(f"  Trade-off: Limited shuffling (buffer-based)")
+        else:
+            print(f"\n✓ On-the-fly tokenization enabled (tokenizer: {args.tokenizer_type})")
+            print(f"  Tokenization workers: {'auto-detect' if args.tokenization_num_workers is None else args.tokenization_num_workers}")
+            print(f"  Tokenization batch size: {args.tokenization_batch_size}")
+            print(f"  First epoch: Will tokenize in parallel, then cache")
+            print(f"  Subsequent epochs: Will read from cache (fast)")
+            print(f"  Expected disk savings: ~48%")
+    else:
+        # Pre-tokenized: use dataset_path
+        hyperparameters['dataset_path'] = '/opt/ml/input/data/training'  # SageMaker mounts S3 data here
 
     # Add eval batch size if specified
     if args.eval_batch_size:
@@ -280,6 +373,14 @@ def main():
         'max_run': args.max_run_hours * 3600,  # Convert to seconds
         'keep_alive_period_in_seconds': 0,  # Don't keep instance alive after job
         'sagemaker_session': session,
+        # Enable DDP for multi-GPU training (p4d.24xlarge has 8 GPUs)
+        # This uses torchrun instead of DataParallel for efficient multi-GPU
+        'distribution': {
+            'torch_distributed': {
+                'enabled': True
+            }
+        } if args.instance_type in ['ml.p4d.24xlarge', 'ml.p3.8xlarge', 'ml.p3.16xlarge',
+                                     'ml.g5.12xlarge', 'ml.g5.48xlarge'] else None,
     }
 
     # Add spot training configuration
@@ -361,17 +462,38 @@ def main():
     # Launch Training Job
     # =========================================================================
     try:
-        estimator.fit({'training': args.s3_dataset}, wait=True)
+        # Launch job (wait=False allows SSO to expire without affecting training)
+        estimator.fit({'training': args.s3_dataset}, wait=not args.no_wait)
 
-        print("\n" + "="*80)
-        print("✅ Training job completed successfully!")
-        print("="*80)
-        print(f"\n📦 Outputs:")
-        print(f"   Job Name:         {estimator.latest_training_job.name}")
-        print(f"   Model Artifact:   {args.s3_output}/{estimator.latest_training_job.name}/output/model.tar.gz")
-        if args.spot_instances:
-            print(f"   Checkpoints:      {args.s3_output}/checkpoints")
-        print()
+        if args.no_wait:
+            # Job launched successfully, print info and exit
+            print("\n" + "="*80)
+            print("🚀 Training job launched successfully!")
+            print("="*80)
+            print(f"\n📋 Job Info:")
+            print(f"   Job Name:         {estimator.latest_training_job.name}")
+            print(f"   Output Path:      {args.s3_output}")
+            if args.spot_instances:
+                print(f"   Checkpoints:      {args.s3_output}/checkpoints")
+
+            print(f"\n📊 Monitor job:")
+            print(f"   SageMaker Console: https://console.aws.amazon.com/sagemaker/home#/jobs/{estimator.latest_training_job.name}")
+            print(f"   CloudWatch Logs:   https://console.aws.amazon.com/cloudwatch/home")
+
+            print(f"\n💡 Check status later (after re-authenticating SSO):")
+            print(f"   aws sagemaker describe-training-job --training-job-name {estimator.latest_training_job.name}")
+            print()
+        else:
+            # Waited for completion
+            print("\n" + "="*80)
+            print("✅ Training job completed successfully!")
+            print("="*80)
+            print(f"\n📦 Outputs:")
+            print(f"   Job Name:         {estimator.latest_training_job.name}")
+            print(f"   Model Artifact:   {args.s3_output}/{estimator.latest_training_job.name}/output/model.tar.gz")
+            if args.spot_instances:
+                print(f"   Checkpoints:      {args.s3_output}/checkpoints")
+            print()
 
     except KeyboardInterrupt:
         print("\n\n⚠️  Training job interrupted by user")
