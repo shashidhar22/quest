@@ -5,6 +5,38 @@ fine_tune.py
 Unified fine-tuning script with task-specific data filtering and masking strategies.
 Uses HuggingFace Accelerate for distributed training and PEFT for LoRA.
 
+DATA LOADING MODES:
+
+1. Pre-tokenized (original):
+   Uses HuggingFace dataset prepared by tokenize_sequences.py
+   Usage: --dataset_path /path/to/hf_dataset
+   Pros: Fastest training (tokenization already done)
+   Cons: High disk usage (stores raw + tokenized data)
+
+2. On-the-fly tokenization (NEW):
+   Loads raw parquet files and tokenizes during training
+   Usage: --raw_data_dir /path/to/parquet --tokenizer_type esm2
+   Pros:
+   - Memory efficient: No duplicate storage
+   - 48% disk space savings
+   - First epoch tokenizes and caches to disk
+   - Subsequent epochs read from cache (fast)
+   - Supports CDR identification for full_tra/full_trb modes
+   Cons:
+   - First epoch ~10-30min slower (one-time cost)
+   - NO TCR stitching (use tokenize_sequences.py if needed)
+
+   Example:
+   python fine_tune.py \
+       --raw_data_dir /data/raw_parquet \
+       --tokenizer_type esm2 \
+       --model_path facebook/esm2_t12_35M_UR50D \
+       --mode mlm \
+       --batch_size 32 \
+       --fp16
+
+FINE-TUNING MODES:
+
 Supports multiple fine-tuning modes:
 1. MLM: Standard masked language modeling (15% random masking)
 2. TRA/TRB: Mask middle 5 amino acids of CDR3 region
@@ -65,6 +97,60 @@ except ImportError:
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# EARLY CACHE CONFIGURATION FOR SAGEMAKER
+# ═══════════════════════════════════════════════════════════════════════════════
+# Set HuggingFace cache to EBS volume if in SageMaker (before any HF operations!)
+# This prevents the 30GB root filesystem from filling up
+if os.environ.get('SM_MODEL_DIR'):  # SageMaker environment
+    sagemaker_cache = "/opt/ml/input/data/training/.huggingface_cache"
+    sagemaker_tmp = "/opt/ml/input/data/training/.tmp"
+
+    # Create directories
+    os.makedirs(sagemaker_cache, exist_ok=True)
+    os.makedirs(sagemaker_tmp, exist_ok=True)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # FORCE override ALL cache and temporary file locations
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # HuggingFace cache locations
+    os.environ['HF_HOME'] = sagemaker_cache
+    os.environ['HF_DATASETS_CACHE'] = os.path.join(sagemaker_cache, 'datasets')
+    os.environ['TRANSFORMERS_CACHE'] = os.path.join(sagemaker_cache, 'transformers')
+    os.environ['HF_HUB_CACHE'] = os.path.join(sagemaker_cache, 'hub')
+    os.environ['HUGGINGFACE_HUB_CACHE'] = os.path.join(sagemaker_cache, 'hub')
+
+    # PyTorch cache locations
+    os.environ['PYTORCH_KERNEL_CACHE_PATH'] = os.path.join(sagemaker_cache, 'torch_kernels')
+    os.environ['TORCH_HOME'] = os.path.join(sagemaker_cache, 'torch')
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # CRITICAL: Redirect ALL temporary files to EBS volume
+    # ═══════════════════════════════════════════════════════════════════════
+    # PyArrow and HuggingFace create temporary files during parquet processing
+    # By default these go to /tmp (on root filesystem) which fills up quickly
+    os.environ['TMPDIR'] = sagemaker_tmp
+    os.environ['TEMP'] = sagemaker_tmp
+    os.environ['TMP'] = sagemaker_tmp
+    os.environ['TEMPDIR'] = sagemaker_tmp
+
+    # Arrow-specific temp directory
+    os.environ['ARROW_TMPDIR'] = sagemaker_tmp
+
+    # Python tempfile module will use TMPDIR
+    import tempfile
+    tempfile.tempdir = sagemaker_tmp
+
+    print(f"🔧 FORCED cache override for SageMaker:")
+    print(f"   HF_HOME: {os.environ['HF_HOME']}")
+    print(f"   HF_DATASETS_CACHE: {os.environ['HF_DATASETS_CACHE']}")
+    print(f"   TRANSFORMERS_CACHE: {os.environ['TRANSFORMERS_CACHE']}")
+    print(f"   TMPDIR: {os.environ['TMPDIR']} ⚠️  CRITICAL for Arrow/Parquet")
+
+    # Create all cache subdirectories
+    for subdir in ['datasets', 'transformers', 'hub', 'torch_kernels', 'torch']:
+        os.makedirs(os.path.join(sagemaker_cache, subdir), exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SAGEMAKER ENVIRONMENT DETECTION AND PATH RESOLUTION
@@ -357,6 +443,15 @@ class TaskSpecificMaskingCollator:
         self.cls_token_id = tokenizer.cls_token_id if hasattr(tokenizer, 'cls_token_id') else None
         self.sep_token_id = tokenizer.sep_token_id if hasattr(tokenizer, 'sep_token_id') else None
 
+        # Cache vocabulary size (Phase 5 optimization)
+        self.vocab_size = len(tokenizer)
+
+        # Pre-compute special token IDs for fast O(1) lookup (Phase 1 optimization)
+        self.special_token_ids = self._build_special_token_set()
+
+        # Pre-compute separator token IDs for fast lookup (Phase 2 optimization)
+        self.separator_token_ids = self._build_separator_token_set()
+
         # Initialize CDR identifier for full_tra/full_trb modes (NEW)
         if mode in ['full_tra', 'full_trb'] and CDR_IDENTIFIER_AVAILABLE:
             self.cdr_identifier = CDRRegionIdentifier()
@@ -394,24 +489,61 @@ class TaskSpecificMaskingCollator:
         # Convert to tensors and pad
         batch = self._create_batch(masked_inputs, labels)
         return batch
-    
+
+    def _build_special_token_set(self) -> set:
+        """
+        Build set of special token IDs for O(1) lookup.
+        Phase 1 optimization: Pre-compute instead of decode() in hot loop.
+        """
+        special_tokens = set()
+
+        # Add known special tokens from tokenizer attributes
+        if self.mask_token_id is not None:
+            special_tokens.add(self.mask_token_id)
+        if self.pad_token_id is not None:
+            special_tokens.add(self.pad_token_id)
+        if self.cls_token_id is not None:
+            special_tokens.add(self.cls_token_id)
+        if self.sep_token_id is not None:
+            special_tokens.add(self.sep_token_id)
+
+        # Add other common special tokens by encoding
+        for token_str in ['[CLS]', '[SEP]', '[PAD]', '[MASK]', '[UNK]',
+                          '<s>', '</s>', '<pad>', '<unk>', '<mask>',
+                          '<cls>', '<sep>', '<eos>']:
+            try:
+                token_ids = self.tokenizer.encode(token_str, add_special_tokens=False)
+                if len(token_ids) == 1:
+                    special_tokens.add(token_ids[0])
+            except:
+                pass
+
+        return special_tokens
+
+    def _build_separator_token_set(self) -> set:
+        """
+        Build set of separator token IDs for fast lookup.
+        Phase 2 optimization: Pre-compute instead of decode() in loops.
+        """
+        separator_tokens = set()
+
+        # Common separator tokens used in this codebase
+        for token_str in ['[SEP]', '[ETRA]', '[ETRB]', '[EPEP]', '[EMHO]', '[EMHT]']:
+            try:
+                token_ids = self.tokenizer.encode(token_str, add_special_tokens=False)
+                if len(token_ids) == 1:
+                    separator_tokens.add(token_ids[0])
+            except:
+                pass
+
+        return separator_tokens
+
     def _is_special_token(self, token_id: int) -> bool:
-        """Check if token is a special token."""
-        if token_id == self.pad_token_id:
-            return True
-        if self.cls_token_id is not None and token_id == self.cls_token_id:
-            return True
-        if self.sep_token_id is not None and token_id == self.sep_token_id:
-            return True
-        
-        # Check for special tokens by decoding
-        token = self.tokenizer.decode([token_id])
-        if token.startswith('[') and token.endswith(']'):
-            return True
-        if token in ['<s>', '</s>', '<pad>', '<unk>']:
-            return True
-        
-        return False
+        """
+        Check if token is a special token using pre-computed set.
+        Phase 1 optimization: O(1) set lookup instead of decode() calls.
+        """
+        return token_id in self.special_token_ids
     
     def _find_sequence_boundaries(self, input_ids: List[int]) -> Tuple[int, int]:
         """Find start and end indices of actual sequence (excluding special tokens)."""
@@ -433,45 +565,82 @@ class TaskSpecificMaskingCollator:
         return seq_start, seq_end
     
     def _find_separators(self, input_ids: List[int]) -> List[int]:
-        """Find positions of separator tokens ([SEP], [ETRA], [ETRB], etc.)."""
-        separators = []
-        for i, token_id in enumerate(input_ids):
-            token = self.tokenizer.decode([token_id])
-            if '[SEP]' in token or token in ['[ETRA]', '[ETRB]', '[EPEP]', '[EMHO]', '[EMHT]']:
-                separators.append(i)
-        return separators
-    
+        """
+        Find positions of separator tokens using pre-computed token IDs.
+        Phase 2 optimization: Token ID comparison instead of decode() calls.
+        """
+        return [i for i, token_id in enumerate(input_ids)
+                if token_id in self.separator_token_ids]
+
+    def _apply_vectorized_masking(
+        self,
+        input_ids: List[int],
+        label_ids: List[int],
+        start_idx: int,
+        end_idx: int,
+        mask_probability: float = None
+    ) -> None:
+        """
+        Apply MLM masking to a range of tokens using vectorized RNG.
+        Phase 4 optimization: Generate all random numbers at once for speed.
+
+        Args:
+            input_ids: Token IDs to modify in-place
+            label_ids: Label IDs to modify in-place
+            start_idx: Start of masking range (inclusive)
+            end_idx: End of masking range (exclusive)
+            mask_probability: Probability of masking each token (default: self.mlm_probability)
+        """
+        if mask_probability is None:
+            mask_probability = self.mlm_probability
+
+        # Collect maskable token indices in the range
+        maskable_indices = [i for i in range(start_idx, end_idx)
+                          if i < len(input_ids) and not self._is_special_token(input_ids[i])]
+
+        if not maskable_indices:
+            return
+
+        # Generate all random numbers at once (FAST!)
+        n_maskable = len(maskable_indices)
+        mask_probs = np.random.random(n_maskable)
+        action_probs = np.random.random(n_maskable)
+        random_tokens = np.random.randint(0, self.vocab_size, n_maskable)
+
+        # Apply masking with vectorized probabilities
+        for idx, i in enumerate(maskable_indices):
+            if mask_probs[idx] < mask_probability:
+                label_ids[i] = input_ids[i]
+
+                # 80% mask, 10% random, 10% keep
+                if action_probs[idx] < 0.8:
+                    input_ids[i] = self.mask_token_id
+                elif action_probs[idx] < 0.9:
+                    input_ids[i] = int(random_tokens[idx])
+                # else: keep original (10% of masked tokens)
+
     # ─────────────────────────────────────────────────────────────────────────────
     # MLM Masking (15% random)
     # ─────────────────────────────────────────────────────────────────────────────
     
     def _mask_mlm(self, input_ids_list: List[List[int]]) -> Tuple[List[List[int]], List[List[int]]]:
-        """Standard MLM masking: 15% of tokens randomly."""
+        """
+        Standard MLM masking: 15% of tokens randomly.
+        Phase 4 optimization: Uses vectorized RNG helper for faster masking.
+        """
         masked_inputs = []
         labels = []
-        
+
         for input_ids in input_ids_list:
             input_ids = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
             label_ids = [-100] * len(input_ids)
-            
-            for i, token_id in enumerate(input_ids):
-                if self._is_special_token(token_id):
-                    continue
-                
-                if random.random() < self.mlm_probability:
-                    label_ids[i] = input_ids[i]
-                    
-                    # 80% mask, 10% random, 10% keep
-                    prob = random.random()
-                    if prob < 0.8:
-                        input_ids[i] = self.mask_token_id
-                    elif prob < 0.9:
-                        input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
-                    # else: keep original
-            
+
+            # Apply vectorized masking to entire sequence
+            self._apply_vectorized_masking(input_ids, label_ids, 0, len(input_ids))
+
             masked_inputs.append(input_ids)
             labels.append(label_ids)
-        
+
         return masked_inputs, labels
     
     # ─────────────────────────────────────────────────────────────────────────────
@@ -487,39 +656,29 @@ class TaskSpecificMaskingCollator:
         Mask a percentage (mlm_probability) of the middle portion of CDR3 region.
         Instead of masking all tokens in the middle region, we mask mlm_probability% of them
         randomly (similar to standard MLM but restricted to the middle region).
+        Phase 4 optimization: Uses vectorized RNG helper for faster masking.
         """
         masked_inputs = []
         labels = []
-        
+
         for input_ids, pkey in zip(input_ids_list, permutation_keys):
             input_ids = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
             label_ids = [-100] * len(input_ids)
-            
+
             seq_start, seq_end = self._find_sequence_boundaries(input_ids)
             seq_length = seq_end - seq_start
-            
+
             if seq_length > self.cdr3_mask_length:
                 # Calculate middle region
                 middle_start = seq_start + (seq_length - self.cdr3_mask_length) // 2
                 middle_end = middle_start + self.cdr3_mask_length
-                
-                # Mask mlm_probability% of tokens in the middle region (like MLM but restricted to middle)
-                for i in range(middle_start, middle_end):
-                    if i < seq_end and not self._is_special_token(input_ids[i]):
-                        if random.random() < self.mlm_probability:
-                            label_ids[i] = input_ids[i]
-                            
-                            # Standard MLM: 80% mask, 10% random, 10% keep
-                            prob = random.random()
-                            if prob < 0.8:
-                                input_ids[i] = self.mask_token_id
-                            elif prob < 0.9:
-                                input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
-                            # else: keep original (10%)
-            
+
+                # Apply vectorized masking to middle region
+                self._apply_vectorized_masking(input_ids, label_ids, middle_start, middle_end)
+
             masked_inputs.append(input_ids)
             labels.append(label_ids)
-        
+
         return masked_inputs, labels
     
     # ─────────────────────────────────────────────────────────────────────────────
@@ -527,36 +686,29 @@ class TaskSpecificMaskingCollator:
     # ────────────────────────────────────────────────��────────────────────────────
     
     def _mask_first_chain(self, input_ids_list: List[List[int]]) -> Tuple[List[List[int]], List[List[int]]]:
-        """Mask mlm_probability% of first chain (before first separator) with 80/10/10 strategy."""
+        """
+        Mask mlm_probability% of first chain (before first separator) with 80/10/10 strategy.
+        Phase 4 optimization: Uses vectorized RNG helper for faster masking.
+        """
         masked_inputs = []
         labels = []
-        
+
         for input_ids in input_ids_list:
             input_ids = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
             label_ids = [-100] * len(input_ids)
-            
+
             separators = self._find_separators(input_ids)
             seq_start, seq_end = self._find_sequence_boundaries(input_ids)
-            
+
             if separators:
                 # Mask from sequence start to first separator
                 mask_end = separators[0]
             else:
                 # No separator found, mask first half
                 mask_end = seq_start + (seq_end - seq_start) // 2
-            
-            for i in range(seq_start, mask_end):
-                if not self._is_special_token(input_ids[i]):
-                    if random.random() < self.mlm_probability:
-                        label_ids[i] = input_ids[i]
-                        
-                        # Standard MLM: 80% mask, 10% random, 10% keep
-                        prob = random.random()
-                        if prob < 0.8:
-                            input_ids[i] = self.mask_token_id
-                        elif prob < 0.9:
-                            input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
-                        # else: keep original (10%)
+
+            # Apply vectorized masking to first chain
+            self._apply_vectorized_masking(input_ids, label_ids, seq_start, mask_end)
             
             masked_inputs.append(input_ids)
             labels.append(label_ids)
@@ -575,20 +727,21 @@ class TaskSpecificMaskingCollator:
         """
         Mask first molecule, or first two if they're both TCR chains (tra/trb)
         or both MHC chains (mhc_one/mhc_two).
+        Phase 4 optimization: Uses vectorized RNG helper for faster masking.
         """
         masked_inputs = []
         labels = []
-        
+
         for input_ids, pkey in zip(input_ids_list, permutation_keys):
             input_ids = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
             label_ids = [-100] * len(input_ids)
-            
+
             separators = self._find_separators(input_ids)
             seq_start, _ = self._find_sequence_boundaries(input_ids)
-            
+
             # Determine masking strategy based on permutation key
             molecules = pkey.lower().split('_')
-            
+
             if len(separators) >= 1:
                 # Check if first two molecules are both TCR or both MHC
                 mask_two = False
@@ -597,30 +750,20 @@ class TaskSpecificMaskingCollator:
                         mask_two = True
                     elif (molecules[0] in ['mhc_one', 'mhc_two'] and molecules[1] in ['mhc_one', 'mhc_two']):
                         mask_two = True
-                
+
                 if mask_two and len(separators) >= 2:
                     # Mask first two molecules
                     mask_end = separators[1]
                 else:
                     # Mask only first molecule
                     mask_end = separators[0]
-                
-                for i in range(seq_start, mask_end):
-                    if not self._is_special_token(input_ids[i]):
-                        if random.random() < self.mlm_probability:
-                            label_ids[i] = input_ids[i]
-                            
-                            # Standard MLM: 80% mask, 10% random, 10% keep
-                            prob = random.random()
-                            if prob < 0.8:
-                                input_ids[i] = self.mask_token_id
-                            elif prob < 0.9:
-                                input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
-                            # else: keep original (10%)
-            
+
+                # Apply vectorized masking to the region
+                self._apply_vectorized_masking(input_ids, label_ids, seq_start, mask_end)
+
             masked_inputs.append(input_ids)
             labels.append(label_ids)
-        
+
         return masked_inputs, labels
     
     # ─────────────────────────────────────────────────────────────────────────────
@@ -632,48 +775,41 @@ class TaskSpecificMaskingCollator:
         input_ids_list: List[List[int]],
         permutation_keys: List[str]
     ) -> Tuple[List[List[int]], List[List[int]]]:
-        """Mask first molecule, or both MHC chains if first two are MHC."""
+        """
+        Mask first molecule, or both MHC chains if first two are MHC.
+        Phase 4 optimization: Uses vectorized RNG helper for faster masking.
+        """
         masked_inputs = []
         labels = []
-        
+
         for input_ids, pkey in zip(input_ids_list, permutation_keys):
             input_ids = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
             label_ids = [-100] * len(input_ids)
-            
+
             separators = self._find_separators(input_ids)
             seq_start, _ = self._find_sequence_boundaries(input_ids)
-            
+
             molecules = pkey.lower().split('_')
-            
+
             if len(separators) >= 1:
                 # Check if first two are both MHC
                 mask_two = False
                 if len(molecules) >= 2:
-                    if (molecules[0] in ['mhc_one', 'mhc_two'] and 
+                    if (molecules[0] in ['mhc_one', 'mhc_two'] and
                         molecules[1] in ['mhc_one', 'mhc_two']):
                         mask_two = True
-                
+
                 if mask_two and len(separators) >= 2:
                     mask_end = separators[1]
                 else:
                     mask_end = separators[0]
-                
-                for i in range(seq_start, mask_end):
-                    if not self._is_special_token(input_ids[i]):
-                        if random.random() < self.mlm_probability:
-                            label_ids[i] = input_ids[i]
-                            
-                            # Standard MLM: 80% mask, 10% random, 10% keep
-                            prob = random.random()
-                            if prob < 0.8:
-                                input_ids[i] = self.mask_token_id
-                            elif prob < 0.9:
-                                input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
-                            # else: keep original (10%)
-            
+
+                # Apply vectorized masking to the region
+                self._apply_vectorized_masking(input_ids, label_ids, seq_start, mask_end)
+
             masked_inputs.append(input_ids)
             labels.append(label_ids)
-        
+
         return masked_inputs, labels
     
     # ─────────────────────────────────────────────────────────────────────────────
@@ -681,40 +817,33 @@ class TaskSpecificMaskingCollator:
     # ─────────────────────────────────────────────────────────────────────────────
     
     def _mask_first_molecule(self, input_ids_list: List[List[int]]) -> Tuple[List[List[int]], List[List[int]]]:
-        """Mask only the first molecule in the sequence."""
+        """
+        Mask only the first molecule in the sequence.
+        Phase 4 optimization: Uses vectorized RNG helper for faster masking.
+        """
         masked_inputs = []
         labels = []
-        
+
         for input_ids in input_ids_list:
             input_ids = input_ids.copy() if isinstance(input_ids, list) else input_ids.tolist()
             label_ids = [-100] * len(input_ids)
-            
+
             separators = self._find_separators(input_ids)
             seq_start, _ = self._find_sequence_boundaries(input_ids)
-            
+
             if separators:
                 mask_end = separators[0]
             else:
                 # Fallback: mask first third
                 seq_end = len(input_ids)
                 mask_end = seq_start + (seq_end - seq_start) // 3
-            
-            for i in range(seq_start, mask_end):
-                if not self._is_special_token(input_ids[i]):
-                    if random.random() < self.mlm_probability:
-                        label_ids[i] = input_ids[i]
-                        
-                        # Standard MLM: 80% mask, 10% random, 10% keep
-                        prob = random.random()
-                        if prob < 0.8:
-                            input_ids[i] = self.mask_token_id
-                        elif prob < 0.9:
-                            input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
-                        # else: keep original (10%)
-            
+
+            # Apply vectorized masking to first molecule
+            self._apply_vectorized_masking(input_ids, label_ids, seq_start, mask_end)
+
             masked_inputs.append(input_ids)
             labels.append(label_ids)
-        
+
         return masked_inputs, labels
 
     # ─────────────────────────────────────────────────────────────────────────────
@@ -784,7 +913,7 @@ class TaskSpecificMaskingCollator:
             # Map AA positions to token positions
             aa_to_token = self._map_aa_to_tokens(tra_full, input_ids)
 
-            # Mask tokens within CDR regions
+            # Mask tokens within CDR regions (Phase 4 optimization: vectorized)
             for region_name, (aa_start, aa_end) in cdr_regions.items():
                 # Convert AA positions to token positions
                 token_start = aa_to_token.get(aa_start)
@@ -793,21 +922,8 @@ class TaskSpecificMaskingCollator:
                 if token_start is None or token_end is None:
                     continue
 
-                # Mask mlm_probability% of tokens in this region
-                for i in range(token_start, token_end + 1):
-                    if i >= len(input_ids) or self._is_special_token(input_ids[i]):
-                        continue
-
-                    if random.random() < self.mlm_probability:
-                        label_ids[i] = input_ids[i]
-
-                        # 80/10/10 strategy
-                        prob = random.random()
-                        if prob < 0.8:
-                            input_ids[i] = self.mask_token_id
-                        elif prob < 0.9:
-                            input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
-                        # else: keep original (10%)
+                # Apply vectorized masking to this CDR region
+                self._apply_vectorized_masking(input_ids, label_ids, token_start, token_end + 1)
 
             masked_inputs.append(input_ids)
             labels.append(label_ids)
@@ -872,7 +988,7 @@ class TaskSpecificMaskingCollator:
                 labels.append(label_ids)
                 continue
 
-            # Map and mask (same logic as TRA)
+            # Map and mask (Phase 4 optimization: vectorized)
             aa_to_token = self._map_aa_to_tokens(trb_full, input_ids)
 
             for region_name, (aa_start, aa_end) in cdr_regions.items():
@@ -882,18 +998,8 @@ class TaskSpecificMaskingCollator:
                 if token_start is None or token_end is None:
                     continue
 
-                for i in range(token_start, token_end + 1):
-                    if i >= len(input_ids) or self._is_special_token(input_ids[i]):
-                        continue
-
-                    if random.random() < self.mlm_probability:
-                        label_ids[i] = input_ids[i]
-
-                        prob = random.random()
-                        if prob < 0.8:
-                            input_ids[i] = self.mask_token_id
-                        elif prob < 0.9:
-                            input_ids[i] = random.randint(0, len(self.tokenizer) - 1)
+                # Apply vectorized masking to this CDR region
+                self._apply_vectorized_masking(input_ids, label_ids, token_start, token_end + 1)
 
             masked_inputs.append(input_ids)
             labels.append(label_ids)
@@ -940,26 +1046,31 @@ class TaskSpecificMaskingCollator:
         masked_inputs: List[List[int]],
         labels: List[List[int]]
     ) -> Dict[str, torch.Tensor]:
-        """Convert lists to padded tensors."""
-        
-        # Pad sequences
+        """
+        Convert lists to padded tensors.
+        Phase 6 optimization: Use numpy pre-allocated arrays for faster padding.
+        """
+        # Get dimensions
+        batch_size = len(masked_inputs)
         max_len = max(len(seq) for seq in masked_inputs)
-        
-        padded_inputs = []
-        padded_labels = []
-        attention_masks = []
-        
-        for inp, lab in zip(masked_inputs, labels):
-            pad_len = max_len - len(inp)
-            
-            padded_inputs.append(inp + [self.pad_token_id] * pad_len)
-            padded_labels.append(lab + [-100] * pad_len)
-            attention_masks.append([1] * len(inp) + [0] * pad_len)
-        
+
+        # Pre-allocate numpy arrays (faster than list concatenation)
+        padded_inputs = np.full((batch_size, max_len), self.pad_token_id, dtype=np.int64)
+        padded_labels = np.full((batch_size, max_len), -100, dtype=np.int64)
+        attention_masks = np.zeros((batch_size, max_len), dtype=np.int64)
+
+        # Fill arrays (vectorized assignment)
+        for i, (inp, lab) in enumerate(zip(masked_inputs, labels)):
+            seq_len = len(inp)
+            padded_inputs[i, :seq_len] = inp
+            padded_labels[i, :seq_len] = lab
+            attention_masks[i, :seq_len] = 1
+
+        # Convert to tensors (numpy to torch is very fast)
         return {
-            "input_ids": torch.tensor(padded_inputs, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_masks, dtype=torch.long),
-            "labels": torch.tensor(padded_labels, dtype=torch.long),
+            "input_ids": torch.from_numpy(padded_inputs).long(),
+            "attention_mask": torch.from_numpy(attention_masks).long(),
+            "labels": torch.from_numpy(padded_labels).long(),
         }
 
 
@@ -1128,7 +1239,289 @@ def log_dataset_statistics(dataset: Any, split_name: str, log_to_wandb: bool = F
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. MODEL LOADING
+# 4. ON-THE-FLY TOKENIZATION HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def create_tokenizer_for_raw_data(
+    tokenizer_type: str,
+    model_path: str,
+    max_length: int = 512
+):
+    """
+    Create tokenizer for raw data processing.
+
+    Args:
+        tokenizer_type: One of 'protbert', 'bert', 'esm2', 'esm3'
+        model_path: Model path to load matching tokenizer
+        max_length: Maximum sequence length
+
+    Returns:
+        Tokenizer instance
+    """
+    if tokenizer_type == "protbert":
+        from transformers import BertTokenizer
+        tokenizer = BertTokenizer.from_pretrained(
+            "Rostlab/prot_bert",
+            do_lower_case=False,
+            model_max_length=max_length
+        )
+    elif tokenizer_type == "bert":
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            model_max_length=max_length
+        )
+    elif tokenizer_type in ["esm2", "esm3"]:
+        from transformers import EsmTokenizer
+        tokenizer = EsmTokenizer.from_pretrained(
+            model_path,
+            model_max_length=max_length
+        )
+    else:
+        raise ValueError(f"Unsupported tokenizer type: {tokenizer_type}")
+
+    print(f"✓ Created {tokenizer_type} tokenizer (vocab: {len(tokenizer)})")
+    return tokenizer
+
+
+def concatenate_sequences_for_tokenization(
+    row: Dict,
+    tokenizer_type: str
+) -> str:
+    """
+    Concatenate molecule sequences for tokenization.
+
+    Handles both data formats:
+    - New: 'sequence' column (space-separated molecules)
+    - Old: Individual columns (tra, trb, peptide, mhc_one, mhc_two)
+
+    Format by tokenizer type:
+    - ProtBERT/BERT: Spaces between amino acids, [SEP] between molecules
+    - ESM2/ESM3: Contiguous amino acids, dash (-) between molecules
+
+    Args:
+        row: Dictionary with sequence data
+        tokenizer_type: 'protbert', 'bert', 'esm2', or 'esm3'
+
+    Returns:
+        Concatenated sequence string
+    """
+    # New format: pre-concatenated 'sequence' column
+    if 'sequence' in row and row.get('sequence'):
+        sequence_str = str(row['sequence'])
+        if sequence_str and sequence_str != 'nan':
+            molecules = [mol for mol in sequence_str.split()
+                        if mol.upper() != 'NA']
+
+            if tokenizer_type in ['protbert', 'bert']:
+                spaced = [" ".join(list(mol)) for mol in molecules]
+                return " [SEP] ".join(spaced)
+            else:  # esm2, esm3
+                return "-".join(molecules)
+
+    # Old format: individual columns (tra, trb, peptide, mhc_one, mhc_two)
+    sequences = []
+    for field in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']:
+        val = row.get(field, '')
+        if val and str(val) not in ['nan', '', 'NA', 'na']:
+            sequences.append(str(val))
+
+    if not sequences:
+        return ""
+
+    if tokenizer_type in ['protbert', 'bert']:
+        spaced = [" ".join(list(seq)) for seq in sequences]
+        return " [SEP] ".join(spaced)
+    else:
+        return "-".join(sequences)
+
+
+def identify_cdr_positions_basic(
+    row: Dict,
+    cdr_identifier
+) -> Dict:
+    """
+    Identify CDR positions for TRA/TRB if full sequences exist.
+
+    NO TCR STITCHING - only processes if tra_full/trb_full already present.
+    Uses CDRRegionIdentifier to find CDR1/2/3 positions.
+
+    Args:
+        row: Dictionary with sequence data
+        cdr_identifier: Optional CDRRegionIdentifier instance
+
+    Returns:
+        Dictionary with added CDR position fields
+    """
+    row_copy = row.copy()
+
+    # Initialize CDR position fields
+    for chain in ['tra', 'trb']:
+        for region in ['cdr1', 'cdr2', 'cdr3']:
+            row_copy[f'{chain}_{region}_pos'] = None
+
+    if cdr_identifier is None:
+        return row_copy
+
+    # Process TRA if full sequence exists
+    if row.get('tra_full'):
+        tra_cdr3 = row.get('tra', '')
+        trav_gene = row.get('trav_gene_std', '') or row.get('trav_gene', '')
+
+        if tra_cdr3 and trav_gene:
+            try:
+                cdr_regions = cdr_identifier.get_cdr_regions(
+                    full_sequence=row['tra_full'],
+                    cdr3_sequence=tra_cdr3,
+                    v_gene=trav_gene,
+                    chain='TRA'
+                )
+                for region, pos in cdr_regions.items():
+                    row_copy[f'tra_{region}_pos'] = pos
+            except:
+                pass
+
+    # Process TRB if full sequence exists
+    if row.get('trb_full'):
+        trb_cdr3 = row.get('trb', '')
+        trbv_gene = row.get('trbv_gene_std', '') or row.get('trbv_gene', '')
+
+        if trb_cdr3 and trbv_gene:
+            try:
+                cdr_regions = cdr_identifier.get_cdr_regions(
+                    full_sequence=row['trb_full'],
+                    cdr3_sequence=trb_cdr3,
+                    v_gene=trbv_gene,
+                    chain='TRB'
+                )
+                for region, pos in cdr_regions.items():
+                    row_copy[f'trb_{region}_pos'] = pos
+            except:
+                pass
+
+    return row_copy
+
+
+def create_tokenization_function(
+    tokenizer,
+    tokenizer_type: str,
+    cdr_identifier,
+    max_length: int = 512
+):
+    """
+    Create tokenization function for HuggingFace dataset.map().
+
+    Returns a function that processes batches of raw examples.
+    OPTIMIZED for maximum throughput with vectorized operations.
+
+    Args:
+        tokenizer: Tokenizer instance
+        tokenizer_type: Type of tokenizer being used
+        cdr_identifier: Optional CDRRegionIdentifier instance
+        max_length: Maximum sequence length
+
+    Returns:
+        Function that tokenizes a batch of examples
+    """
+    # Pre-compute separator strings (avoid repeated string operations)
+    if tokenizer_type in ['protbert', 'bert']:
+        sep_token = " [SEP] "
+        def format_sequence(mol: str) -> str:
+            # Use string multiplication pattern for faster spacing
+            return " ".join(mol) if mol else ""
+    else:  # esm2, esm3
+        sep_token = "-"
+        def format_sequence(mol: str) -> str:
+            return mol if mol else ""
+
+    # Pre-define column keys to check (avoid repeated list creation)
+    sequence_columns = ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']
+    invalid_values = {'nan', '', 'NA', 'na', 'None', None}
+
+    def tokenize_batch(examples):
+        """Tokenize a batch of raw parquet rows - OPTIMIZED."""
+        # Get batch size from first column
+        first_key = next(iter(examples.keys()))
+        batch_size = len(examples[first_key])
+
+        # Step 1: Concatenate sequences - VECTORIZED
+        sequences = []
+
+        # Check if we have the 'sequence' column (new format - faster path)
+        if 'sequence' in examples:
+            seq_column = examples['sequence']
+            for i in range(batch_size):
+                seq_val = seq_column[i]
+                if seq_val and str(seq_val) not in invalid_values:
+                    molecules = [m for m in str(seq_val).split() if m.upper() != 'NA']
+                    if molecules:
+                        formatted = [format_sequence(m) for m in molecules]
+                        sequences.append(sep_token.join(formatted))
+                    else:
+                        sequences.append("")
+                else:
+                    sequences.append("")
+        else:
+            # Old format: individual columns
+            # Pre-fetch all columns once (avoid repeated dict lookups)
+            col_data = {col: examples.get(col, [None] * batch_size) for col in sequence_columns}
+
+            for i in range(batch_size):
+                parts = []
+                for col in sequence_columns:
+                    val = col_data[col][i] if i < len(col_data[col]) else None
+                    if val and str(val) not in invalid_values:
+                        parts.append(format_sequence(str(val)))
+                sequences.append(sep_token.join(parts) if parts else "")
+
+        # Step 2: Tokenize (HF batching) - Already optimized by HF
+        encoded = tokenizer(
+            sequences,
+            padding='max_length',
+            truncation=True,
+            max_length=max_length,
+            return_tensors=None
+        )
+
+        # Step 3: Add CDR positions if needed (only for full_tra/full_trb modes)
+        if cdr_identifier is not None:
+            cdr_positions = {
+                'tra_cdr1_pos': [],
+                'tra_cdr2_pos': [],
+                'tra_cdr3_pos': [],
+                'trb_cdr1_pos': [],
+                'trb_cdr2_pos': [],
+                'trb_cdr3_pos': [],
+            }
+
+            # Pre-fetch CDR-related columns
+            cdr_cols = {
+                'tra_full': examples.get('tra_full', [None] * batch_size),
+                'trb_full': examples.get('trb_full', [None] * batch_size),
+                'tra': examples.get('tra', [None] * batch_size),
+                'trb': examples.get('trb', [None] * batch_size),
+                'trav_gene_std': examples.get('trav_gene_std', [None] * batch_size),
+                'trav_gene': examples.get('trav_gene', [None] * batch_size),
+                'trbv_gene_std': examples.get('trbv_gene_std', [None] * batch_size),
+                'trbv_gene': examples.get('trbv_gene', [None] * batch_size),
+            }
+
+            for i in range(batch_size):
+                row = {k: v[i] if i < len(v) else None for k, v in cdr_cols.items()}
+                row_with_cdr = identify_cdr_positions_basic(row, cdr_identifier)
+
+                for key in cdr_positions.keys():
+                    cdr_positions[key].append(row_with_cdr.get(key))
+
+            encoded.update(cdr_positions)
+
+        return encoded
+
+    return tokenize_batch
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. MODEL LOADING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_model_and_tokenizer(
@@ -1478,8 +1871,52 @@ def main():
     )
     
     # Data arguments
-    parser.add_argument("--dataset_path", type=str, required=True,
-                        help="Path to HuggingFace dataset directory")
+    # Data source options (mutually exclusive)
+    data_source_group = parser.add_mutually_exclusive_group(required=True)
+    data_source_group.add_argument(
+        "--dataset_path",
+        type=str,
+        help="Path to pre-tokenized HuggingFace dataset (existing behavior)"
+    )
+    data_source_group.add_argument(
+        "--raw_data_dir",
+        type=str,
+        help="Path to directory with raw parquet files (on-the-fly tokenization)"
+    )
+
+    # Tokenization options (required when using --raw_data_dir)
+    parser.add_argument(
+        "--tokenizer_type",
+        type=str,
+        choices=['protbert', 'bert', 'esm2', 'esm3'],
+        help="Tokenizer type for on-the-fly tokenization (required with --raw_data_dir)"
+    )
+    parser.add_argument(
+        "--tokenization_max_length",
+        type=int,
+        default=512,
+        help="Maximum sequence length for tokenization (default: 512)"
+    )
+    parser.add_argument(
+        "--tokenization_num_workers",
+        type=int,
+        default=None,  # Auto-detect based on CPU count
+        help="Parallel workers for tokenization (default: auto-detect, typically CPU_COUNT - 4 for safety)"
+    )
+    parser.add_argument(
+        "--tokenization_batch_size",
+        type=int,
+        default=5000,  # Increased from 1000 for better throughput
+        help="Batch size for tokenization (default: 5000, higher = faster but more RAM)"
+    )
+    parser.add_argument(
+        "--use_streaming",
+        action="store_true",
+        help="Use streaming dataset for truly lazy evaluation. Best for 100M+ examples. "
+             "Tokenizes data on-the-fly during training (no pre-processing wait). "
+             "Trade-off: Cannot shuffle across full dataset, only within buffer."
+    )
+
     parser.add_argument("--mode", type=str, required=True,
                         choices=["mlm", "tra", "trb", "full_tra", "full_trb", "tra_trb_pairing", "tcr_mhc", "peptide_mhc", "specificity"],
                         help="Fine-tuning mode (determines data filtering and masking strategy). "
@@ -1578,11 +2015,54 @@ def main():
                         help="Maximum sequence length. Sequences longer than this will be truncated to save memory")
     
     args = parser.parse_args()
-    
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Auto-detect optimal tokenization workers if not specified
+    # ═══════════════════════════════════════════════════════════════════════════
+    if args.tokenization_num_workers is None and args.raw_data_dir:
+        import multiprocessing
+        cpu_count = multiprocessing.cpu_count()
+
+        # Use most CPUs but leave some for system (typically CPU_COUNT - 4)
+        # On p4d.24xlarge with 96 vCPUs, this gives 92 workers (massive parallelism!)
+        optimal_workers = max(1, cpu_count - 4)
+        args.tokenization_num_workers = optimal_workers
+
+        print(f"\n🔧 Auto-detected {cpu_count} CPUs")
+        print(f"   Setting tokenization_num_workers={optimal_workers} for maximum throughput")
+        print(f"   This should give ~{optimal_workers/8:.1f}x faster tokenization than default (8 workers)")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Cache configuration for LOCAL runs (SageMaker handled at module level)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # For SageMaker, cache was already configured at module level (lines 105-125)
+    # For local runs, set cache to raw_data_dir to avoid filling up home directory
+
+    if args.raw_data_dir and not is_sagemaker_environment():
+        # Local: Use raw data directory for cache
+        hf_cache_path = os.path.join(args.raw_data_dir, ".huggingface_cache")
+        os.makedirs(hf_cache_path, exist_ok=True)
+
+        # Set ALL HuggingFace cache environment variables
+        os.environ['HF_HOME'] = hf_cache_path
+        os.environ['HF_DATASETS_CACHE'] = os.path.join(hf_cache_path, 'datasets')
+        os.environ['TRANSFORMERS_CACHE'] = os.path.join(hf_cache_path, 'transformers')
+        os.environ['HF_HUB_CACHE'] = os.path.join(hf_cache_path, 'hub')
+        os.environ['HUGGINGFACE_HUB_CACHE'] = os.path.join(hf_cache_path, 'hub')
+        os.environ['TORCH_HOME'] = os.path.join(hf_cache_path, 'torch')
+
+        print(f"\n{'='*80}")
+        print("🔧 LOCAL CACHE CONFIGURATION")
+        print(f"{'='*80}")
+        print(f"   HF_HOME:             {os.environ['HF_HOME']}")
+        print(f"   HF_DATASETS_CACHE:   {os.environ['HF_DATASETS_CACHE']}")
+        print(f"   TRANSFORMERS_CACHE:  {os.environ['TRANSFORMERS_CACHE']}")
+        print(f"{'='*80}\n")
+
     # Set eval batch size if not provided
     if args.eval_batch_size is None:
         args.eval_batch_size = args.batch_size
-    
+
     # Set random seed
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1672,7 +2152,18 @@ def main():
     # Set PYTORCH_CUDA_ALLOC_CONF for better memory management
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     print("✅ Enabled expandable_segments for better CUDA memory management")
-    
+
+    # Configure NCCL for multi-GPU training (prevents timeout errors)
+    if torch.cuda.device_count() > 1:
+        # Increase timeout for large models (default is 10 min, increase to 30 min)
+        os.environ["NCCL_TIMEOUT"] = "1800"  # 30 minutes in seconds
+        # Enable better error reporting
+        os.environ["NCCL_DEBUG"] = "WARN"  # Set to INFO for more verbose debugging
+        # Optimize for single-node multi-GPU (p4d.24xlarge)
+        os.environ["NCCL_IB_DISABLE"] = "0"  # Enable InfiniBand if available
+        os.environ["NCCL_SOCKET_IFNAME"] = "^docker0,lo"  # Skip virtual interfaces
+        print(f"✅ Configured NCCL for {torch.cuda.device_count()} GPUs (timeout: 30min)")
+
     # ─────────────────────────────────────────────────────────────────────────────
     # Initialize Accelerator (for distributed training awareness)
     # ─────────────────────────────────────────────────────────────────────────────
@@ -1724,9 +2215,6 @@ def main():
     # Load and filter dataset
     # ─────────────────────────────────────────────────────────────────────────────
 
-    # Resolve dataset path for environment (local vs SageMaker)
-    dataset_path = resolve_path_for_environment(args.dataset_path, 'dataset')
-
     # Log environment information
     if is_sagemaker_environment():
         sm_paths = get_sagemaker_paths()
@@ -1735,64 +2223,568 @@ def main():
         print(f"   Current Host: {sm_paths['current_host']}")
         print(f"   Total Hosts: {len(sm_paths['hosts'])}")
         print(f"   GPUs Available: {sm_paths['num_gpus']}")
-        print(f"   Training Data: {dataset_path}")
         print(f"   Checkpoint Dir: {sm_paths['checkpoint_dir']}")
         print(f"   Model Output: {sm_paths['model_dir']}")
     else:
         print(f"\n💻 Running in Local Environment")
 
-    print(f"\nLoading dataset from: {dataset_path}")
-    dataset = load_from_disk(dataset_path)
-    
-    print(f"Dataset splits: {list(dataset.keys())}")
-    print(f"Dataset columns: {dataset['train'].column_names}")
-    
-    # Filter datasets by mode (skip if dataset was pre-filtered)
-    if args.skip_mode_filter:
-        print(f"⏭️  Skipping mode filtering (dataset already filtered during tokenization)")
-        train_dataset = dataset["train"]
-        val_dataset = dataset["validation"]
+    # ═══════════════════════════════════════════════════════════════════════
+    # DATA LOADING - Two Paths: Pre-tokenized OR On-the-fly
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # Initialize variables that may be set by streaming path
+    is_streaming_dataset = False
+    total_steps = -1  # -1 means use num_epochs instead
+    estimated_train_examples = 0
+
+    if args.dataset_path:
+        # ────────────────────────────────────────────────────────────────
+        # EXISTING PATH: Load pre-tokenized dataset
+        # ────────────────────────────────────────────────────────────────
+        dataset_path = resolve_path_for_environment(args.dataset_path, 'dataset')
+        print(f"\n📦 Loading PRE-TOKENIZED dataset from: {dataset_path}")
+        dataset = load_from_disk(dataset_path)
+
+    elif args.raw_data_dir:
+        # ────────────────────────────────────────────────────────────────
+        # NEW PATH: On-the-fly tokenization from raw parquet
+        # ────────────────────────────────────────────────────────────────
+        raw_data_path_str = resolve_path_for_environment(args.raw_data_dir, 'dataset')
+
+        # DDP-AWARE TOKENIZATION: Only main process tokenizes, others wait
+        # This prevents 8x redundant work when running with 8 GPUs
+        world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+        is_distributed = world_size > 1
+
+        if is_distributed:
+            print(f"\n🔄 DDP Mode Detected: Rank {local_rank}/{world_size}")
+            if not is_main_process:
+                print(f"   [Rank {local_rank}] Waiting for main process to complete tokenization...")
+
+        print(f"\n📦 Loading RAW PARQUET data from: {raw_data_path_str}")
+        print(f"   Tokenization: ON-THE-FLY (type: {args.tokenizer_type})")
+
+        # Validate arguments
+        if not args.tokenizer_type:
+            raise ValueError(
+                "--tokenizer_type required when using --raw_data_dir\n"
+                "Choose from: protbert, bert, esm2, esm3"
+            )
+
+        # Find parquet files
+        from pathlib import Path
+        from datasets import load_dataset
+        import shutil
+
+        raw_data_path = Path(raw_data_path_str)
+        parquet_files = list(raw_data_path.glob("*.parquet"))
+
+        # ═══════════════════════════════════════════════════════════════════
+        # VERIFY CACHE CONFIGURATION
+        # ═══════════════════════════════════════════════════════════════════
+        print(f"\n{'='*80}")
+        print("🔍 CACHE VERIFICATION")
+        print(f"{'='*80}")
+        print(f"   HF_HOME:               {os.environ.get('HF_HOME', '❌ NOT SET!')}")
+        print(f"   HF_DATASETS_CACHE:     {os.environ.get('HF_DATASETS_CACHE', '❌ NOT SET!')}")
+        print(f"   TRANSFORMERS_CACHE:    {os.environ.get('TRANSFORMERS_CACHE', '❌ NOT SET!')}")
+        print(f"   HF_HUB_CACHE:          {os.environ.get('HF_HUB_CACHE', '❌ NOT SET!')}")
+        print(f"   TORCH_HOME:            {os.environ.get('TORCH_HOME', '❌ NOT SET!')}")
+        print(f"\n🚨 TEMP DIRECTORIES (Critical for Arrow/Parquet):")
+        print(f"   TMPDIR:                {os.environ.get('TMPDIR', '❌ NOT SET!')}")
+        print(f"   ARROW_TMPDIR:          {os.environ.get('ARROW_TMPDIR', '❌ NOT SET!')}")
+
+        # Verify cache is NOT on root filesystem
+        cache_home = os.environ.get('HF_HOME', '')
+        tmpdir = os.environ.get('TMPDIR', '/tmp')
+
+        if cache_home.startswith('/root/') or cache_home.startswith('/home/'):
+            print(f"\n⚠️  WARNING: Cache is on HOME directory: {cache_home}")
+            print(f"   This might fill up the root filesystem!")
+        elif cache_home.startswith('/opt/ml/'):
+            print(f"\n✅ Cache is on EBS volume (not root filesystem)")
+        else:
+            print(f"\n❓ Cache location unknown - check if it's on large volume")
+
+        # Verify TMPDIR is NOT /tmp
+        if tmpdir == '/tmp' or tmpdir.startswith('/tmp/'):
+            print(f"⚠️  WARNING: TMPDIR is on root filesystem: {tmpdir}")
+            print(f"   PyArrow will create temp files here during parquet processing!")
+            print(f"   This is likely causing the disk space error!")
+        elif tmpdir.startswith('/opt/ml/'):
+            print(f"✅ TMPDIR is on EBS volume: {tmpdir}")
+        else:
+            print(f"❓ TMPDIR location: {tmpdir}")
+
+        print(f"{'='*80}\n")
+
+        # Print disk usage for debugging
+        def print_disk_usage(path="/"):
+            """Print disk usage for debugging space issues."""
+            try:
+                total, used, free = shutil.disk_usage(path)
+                print(f"\n💿 Disk Usage ({path}):")
+                print(f"   Total: {total / (1024**3):.1f} GB")
+                print(f"   Used:  {used / (1024**3):.1f} GB ({used/total*100:.1f}%)")
+                print(f"   Free:  {free / (1024**3):.1f} GB ({free/total*100:.1f}%)")
+            except Exception as e:
+                print(f"   ❌ Could not get disk usage: {e}")
+
+        # Check both root and EBS volume
+        print("\n📊 DISK SPACE CHECK:")
+        print_disk_usage("/")
+        if is_sagemaker_environment():
+            print_disk_usage("/opt/ml/input/data/training")
+
+        if not parquet_files:
+            raise ValueError(f"No parquet files found in {raw_data_path}")
+
+        print(f"   Found {len(parquet_files)} parquet files")
+
+        # Split files by train/validation based on filename
+        train_files = [str(f) for f in parquet_files if 'train' in f.name.lower()]
+        val_files = [str(f) for f in parquet_files
+                    if 'val' in f.name.lower() or 'validation' in f.name.lower()]
+
+        # If no train/val split in filenames, use all files for both
+        # (HuggingFace will handle the actual split via dataset.train_test_split())
+        if not train_files and not val_files:
+            print("⚠️  No train/val/test split detected in filenames")
+            print("   Using all parquet files - will split 80/10/10 during loading")
+            all_files = [str(f) for f in parquet_files]
+
+            # Use all files, HuggingFace dataset.load will handle them
+            # We'll split after loading
+            train_files = all_files
+            val_files = None  # Signal to split later
+        elif not train_files:
+            raise ValueError(
+                "No training parquet files found.\n"
+                "Expected: Files with 'train' in name (e.g., train_data.parquet)\n"
+                "OR: Generic parquet files (will auto-split 80/10/10)"
+            )
+        elif not val_files:
+            print("⚠️  No validation files found")
+            print("   Will create 10% validation / 10% test splits from training data")
+            val_files = None  # Signal to split later
+
+        # ═══════════════════════════════════════════════════════════════════
+        # ESTIMATE DATASET SIZE AND AUTO-ENABLE STREAMING FOR LARGE DATASETS
+        # ═══════════════════════════════════════════════════════════════════
+        total_file_size = sum(Path(f).stat().st_size for f in parquet_files)
+        # Rough estimate: ~200 bytes per example for protein sequences
+        estimated_examples = total_file_size // 200
+
+        # Auto-enable streaming for large datasets (>50M examples)
+        if estimated_examples > 50_000_000 and not args.use_streaming:
+            print(f"\n⚠️  LARGE DATASET DETECTED: ~{estimated_examples:,} examples")
+            print(f"   Auto-enabling streaming mode to avoid OOM")
+            args.use_streaming = True
+
+        # ═══════════════════════════════════════════════════════════════════
+        # STREAMING MODE: HuggingFace Trainer-compatible streaming
+        # ═══════════════════════════════════════════════════════════════════
+        # HuggingFace Trainer natively supports IterableDataset!
+        # - No need to load full dataset into memory
+        # - Tokenization happens on-the-fly
+        # - Use max_steps instead of num_train_epochs
+        if args.use_streaming:
+            print(f"\n🌊 STREAMING MODE: HuggingFace Trainer-compatible streaming!")
+            print(f"   ✓ Never loads full dataset into memory")
+            print(f"   ✓ Tokenizes on-the-fly during training")
+            print(f"   ✓ Training starts immediately")
+            print(f"   Estimated examples: ~{estimated_examples:,}")
+
+            hf_cache_dir = os.environ.get('HF_DATASETS_CACHE',
+                                         '/opt/ml/input/data/training/.huggingface_cache/datasets')
+
+            # Load as streaming dataset
+            if val_files is None:
+                # All files - split by taking portions
+                stream_dataset = load_dataset(
+                    'parquet',
+                    data_files=train_files,
+                    split='train',
+                    streaming=True,
+                    cache_dir=hf_cache_dir
+                )
+
+                # 80/10/10 split
+                train_take = int(estimated_examples * 0.8)
+                val_take = int(estimated_examples * 0.1)
+
+                shuffled = stream_dataset.shuffle(seed=args.seed, buffer_size=10000)
+                raw_streaming_train = shuffled.take(train_take)
+                raw_streaming_val = shuffled.skip(train_take).take(val_take)
+            else:
+                raw_streaming_train = load_dataset(
+                    'parquet', data_files=train_files, split='train',
+                    streaming=True, cache_dir=hf_cache_dir
+                ).shuffle(seed=args.seed, buffer_size=10000)
+
+                raw_streaming_val = load_dataset(
+                    'parquet', data_files=val_files, split='train',
+                    streaming=True, cache_dir=hf_cache_dir
+                )
+
+            is_streaming_dataset = True
+            print(f"✅ Streaming datasets ready for Trainer!")
+
+            # Create tokenizer now (needed for streaming tokenization)
+            tokenizer = create_tokenizer_for_raw_data(
+                args.tokenizer_type,
+                args.model_path,
+                args.tokenization_max_length
+            )
+
+            # Create streaming tokenization function
+            # Use max_seq_length if specified, otherwise use tokenization_max_length
+            streaming_max_len = args.max_seq_length if args.max_seq_length else args.tokenization_max_length
+
+            def streaming_tokenize(example):
+                seq = concatenate_sequences_for_tokenization(example, args.tokenizer_type)
+                encoded = tokenizer(
+                    seq,
+                    padding='max_length',
+                    truncation=True,
+                    max_length=streaming_max_len,
+                    return_tensors=None
+                )
+                return encoded
+
+            # Apply tokenization (lazy - happens during training)
+            train_dataset = raw_streaming_train.map(streaming_tokenize)
+            val_dataset = raw_streaming_val.map(streaming_tokenize)
+
+            # Set max_steps based on estimated examples
+            estimated_train_examples = int(estimated_examples * 0.8)
+            steps_per_epoch = estimated_train_examples // args.batch_size
+            total_steps = steps_per_epoch * args.num_epochs
+            print(f"   Estimated steps per epoch: {steps_per_epoch:,}")
+            print(f"   Total training steps: {total_steps:,}")
+
+            # Store for later use
+            dataset = {'train': train_dataset, 'validation': val_dataset}
+            dataset_max_len = streaming_max_len  # Use the actual max length for streaming
+
+            # Skip the non-streaming data loading
+            # Jump to model loading section below
+
+        # ═══════════════════════════════════════════════════════════════════
+        # NON-STREAMING PATH: Load full dataset (small datasets only)
+        # ═══════════════════════════════════════════════════════════════════
+        else:
+            is_streaming_dataset = False
+            tokenizer = None  # Will be created later
+
+        # Load as HuggingFace dataset (non-streaming)
+        if not args.use_streaming and val_files is None:
+            # No validation split - load all as train and split 80/10/10
+            print("   Loading parquet files and creating 80/10/10 train/val/test split...")
+
+            # Check disk space before loading
+            print_disk_usage("/")
+            print_disk_usage(str(raw_data_path))
+
+            # CRITICAL: Explicitly set cache_dir to EBS volume
+            # Environment variables alone are not enough - must pass cache_dir directly!
+            hf_cache_dir = os.environ.get('HF_DATASETS_CACHE',
+                                         '/opt/ml/input/data/training/.huggingface_cache/datasets')
+            print(f"\n💾 FORCING cache_dir to: {hf_cache_dir}")
+
+            dataset = load_dataset(
+                'parquet',
+                data_files=train_files,
+                split='train',
+                cache_dir=hf_cache_dir  # ← CRITICAL: Force cache to EBS volume
+            )
+
+            # Check disk space after loading
+            print("\n   After loading parquet:")
+            print_disk_usage("/")
+            print_disk_usage(str(raw_data_path))
+
+            # Split into train (80%) and temp (20%)
+            print("   Creating 80/20 split...")
+            print_disk_usage("/")
+            split1 = dataset.train_test_split(test_size=0.2, seed=args.seed)
+
+            print("   Creating 10/10 split from remaining 20%...")
+            print_disk_usage("/")
+            # Split temp (20%) into validation (10%) and test (10%)
+            split2 = split1['test'].train_test_split(test_size=0.5, seed=args.seed)
+
+            print("   Splits created")
+            print_disk_usage("/")
+
+            # Create final dataset dict
+            from datasets import DatasetDict
+            dataset = DatasetDict({
+                'train': split1['train'],
+                'validation': split2['train'],
+                'test': split2['test']
+            })
+
+            print(f"   Created splits: train={len(dataset['train'])}, "
+                  f"validation={len(dataset['validation'])}, test={len(dataset['test'])}")
+            print(f"   Test split will be exported AFTER training completes")
+        elif not args.use_streaming:
+            # Explicit train/val files (non-streaming)
+            # CRITICAL: Explicitly set cache_dir to EBS volume
+            hf_cache_dir = os.environ.get('HF_DATASETS_CACHE',
+                                         '/opt/ml/input/data/training/.huggingface_cache/datasets')
+            print(f"\n💾 FORCING cache_dir to: {hf_cache_dir}")
+
+            dataset = load_dataset(
+                'parquet',
+                data_files={'train': train_files, 'validation': val_files},
+                cache_dir=hf_cache_dir  # ← CRITICAL: Force cache to EBS volume
+            )
+
+            # Note: test split not available with explicit files unless 'test' files exist
+            if 'test' not in dataset:
+                print("   Note: No test split available (only train/validation files provided)")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # TOKENIZATION: Only needed for non-streaming path
+        # ═══════════════════════════════════════════════════════════════════
+        # For streaming: tokenization already configured above (tokenizer created there)
+        # For non-streaming: create tokenizer and do parallel tokenization here
+
+        if not is_streaming_dataset:
+            # Create tokenizer (only for non-streaming - streaming creates it earlier)
+            tokenizer = create_tokenizer_for_raw_data(
+                args.tokenizer_type,
+                args.model_path,
+                args.tokenization_max_length
+            )
+            # Initialize CDR identifier if needed for full_tra/full_trb modes
+            cdr_identifier = None
+            if args.mode in ['full_tra', 'full_trb']:
+                if CDR_IDENTIFIER_AVAILABLE:
+                    from parsers.cdr_region_identifier import CDRRegionIdentifier
+                    cdr_identifier = CDRRegionIdentifier()
+                    print("✓ Initialized CDRRegionIdentifier for CDR masking")
+                else:
+                    print("⚠️  CDRRegionIdentifier not available")
+                    print("   full_tra/full_trb modes may not work correctly")
+
+            # Create tokenization function
+            tokenize_fn = create_tokenization_function(
+                tokenizer,
+                args.tokenizer_type,
+                cdr_identifier,
+                args.tokenization_max_length
+            )
+            # ─────────────────────────────────────────────────────────────────
+            # PARALLEL TOKENIZATION: Utilize all CPUs for maximum throughput
+            # ─────────────────────────────────────────────────────────────────
+            # For large datasets (938M+ examples), parallel tokenization is critical.
+            # With 96 CPUs on p4d.24xlarge, we can achieve ~100k examples/s
+            # instead of ~1k examples/s with single-threaded processing.
+            #
+            # DDP-AWARE: In distributed training, only rank 0 does tokenization
+            # to prevent 8x redundant work. Other ranks wait via file-based sync
+            # (NCCL barrier would timeout for long tokenization jobs).
+
+            # Calculate estimated time
+            total_examples = sum(len(dataset[split]) for split in dataset.keys())
+
+            # File-based synchronization for DDP (avoids NCCL timeout)
+            import time
+            sync_file = os.path.join(
+                os.environ.get('HF_DATASETS_CACHE', '/tmp'),
+                '.tokenization_complete'
+            )
+
+            # Determine if we should run tokenization (only main process in DDP)
+            should_tokenize = is_main_process or not is_distributed
+
+            if is_distributed:
+                if is_main_process:
+                    # Remove sync file if it exists from previous run
+                    if os.path.exists(sync_file):
+                        os.remove(sync_file)
+                        print(f"   Removed old sync file: {sync_file}")
+                else:
+                    # Wait briefly to ensure main process removes old sync file
+                    time.sleep(5)
+
+            if should_tokenize:
+                print(f"\n⚡ Setting up PARALLEL tokenization...")
+                print(f"   Workers: {args.tokenization_num_workers}")
+                print(f"   Batch size: {args.tokenization_batch_size}")
+                print(f"   Expected throughput: ~{args.tokenization_num_workers * 1000} examples/s")
+
+                estimated_throughput = args.tokenization_num_workers * 1000  # ~1000 ex/s per worker
+                estimated_hours = total_examples / estimated_throughput / 3600
+                print(f"   Dataset size: {total_examples:,} examples")
+                print(f"   Estimated time: {estimated_hours:.1f} hours")
+
+                dataset = dataset.map(
+                    tokenize_fn,
+                    batched=True,
+                    batch_size=args.tokenization_batch_size,
+                    num_proc=args.tokenization_num_workers,  # USE ALL CPUS!
+                    desc="Tokenizing",
+                    load_from_cache_file=True,  # Use automatic caching
+                    writer_batch_size=args.tokenization_batch_size * 10,  # Faster writes
+                )
+
+                print(f"✓ Parallel tokenization complete!")
+
+                # Signal completion via file (for DDP sync)
+                if is_distributed:
+                    with open(sync_file, 'w') as f:
+                        f.write('done')
+                    print(f"   Signaled completion to other ranks")
+
+            else:
+                # ───────────────────────────────────────────────────────────
+                # FILE-BASED SYNC: Wait for main process to finish tokenization
+                # ───────────────────────────────────────────────────────────
+                # Using file-based sync instead of NCCL barrier to avoid timeout
+                # (tokenization can take hours, NCCL times out after 10 min)
+                print(f"\n⏳ [Rank {local_rank}] Waiting for main process to tokenize...")
+                print(f"   Checking for sync file: {sync_file}")
+
+                wait_start = time.time()
+                check_interval = 30  # Check every 30 seconds
+
+                while not os.path.exists(sync_file):
+                    elapsed = time.time() - wait_start
+                    print(f"   [Rank {local_rank}] Still waiting... ({elapsed/60:.1f} min elapsed)")
+                    time.sleep(check_interval)
+
+                elapsed = time.time() - wait_start
+                print(f"   [Rank {local_rank}] Main process finished after {elapsed/60:.1f} min")
+
+                # Load from cache
+                print(f"   [Rank {local_rank}] Loading tokenized dataset from cache...")
+                dataset = dataset.map(
+                    tokenize_fn,
+                    batched=True,
+                    batch_size=args.tokenization_batch_size,
+                    num_proc=1,  # Single-threaded for cache load (fast)
+                    desc=f"Loading [Rank {local_rank}]",
+                    load_from_cache_file=True,
+                )
+                print(f"   [Rank {local_rank}] Cache loaded!")
+
+            # Final DDP sync (short barrier - should be fast now)
+            if is_distributed:
+                print(f"   [Rank {local_rank}] Final sync...")
+                accelerator.wait_for_everyone()
+                print(f"   [Rank {local_rank}] All ranks ready!")
+
+        # Remove raw columns to save memory (only for non-streaming datasets)
+        if not is_streaming_dataset:
+            columns_to_remove = [
+                col for col in dataset['train'].column_names
+                if col not in ['input_ids', 'attention_mask', 'permutation_key',
+                              'tra_cdr1_pos', 'tra_cdr2_pos', 'tra_cdr3_pos',
+                              'trb_cdr1_pos', 'trb_cdr2_pos', 'trb_cdr3_pos',
+                              'tra_full', 'trb_full', 'tra', 'trb',
+                              'trav_gene', 'traj_gene', 'trbv_gene', 'trbj_gene']
+            ]
+
+            if columns_to_remove:
+                print(f"   Removing {len(columns_to_remove)} raw columns to save memory")
+                dataset = dataset.remove_columns(columns_to_remove)
+
     else:
-        train_dataset = filter_dataset_by_mode(dataset["train"], args.mode)
-        val_dataset = filter_dataset_by_mode(dataset["validation"], args.mode)
-    
-    # Use smaller subset for testing
-    if args.test:
-        print("\n⚠️  Running in TEST mode with reduced dataset size")
-        train_dataset = train_dataset.shuffle(seed=args.seed).select(range(min(1000, len(train_dataset))))
-        val_dataset = val_dataset.shuffle(seed=args.seed).select(range(min(200, len(val_dataset))))
-    
-    # Check maximum sequence length in dataset
-    max_train_len = max(len(x['input_ids']) for x in train_dataset.select(range(min(1000, len(train_dataset)))))
-    max_val_len = max(len(x['input_ids']) for x in val_dataset.select(range(min(1000, len(val_dataset)))))
-    dataset_max_len = max(max_train_len, max_val_len)
-    
-    # Truncate sequences if max_seq_length is specified (saves memory)
-    if args.max_seq_length is not None:
-        print(f"\n✂️  Truncating sequences to max length: {args.max_seq_length}")
-        
-        def truncate_sequence(example):
-            if len(example['input_ids']) > args.max_seq_length:
-                example['input_ids'] = example['input_ids'][:args.max_seq_length]
-                if 'attention_mask' in example:
-                    example['attention_mask'] = example['attention_mask'][:args.max_seq_length]
-                if 'labels' in example:
-                    example['labels'] = example['labels'][:args.max_seq_length]
-            return example
-        
-        train_dataset = train_dataset.map(truncate_sequence, desc="Truncating training sequences")
-        val_dataset = val_dataset.map(truncate_sequence, desc="Truncating validation sequences")
-        dataset_max_len = args.max_seq_length
-    
-    # Limit validation set size if specified
-    if args.max_eval_samples is not None and len(val_dataset) > args.max_eval_samples:
-        print(f"\n⚠️  Limiting validation set from {len(val_dataset):,} to {args.max_eval_samples:,} examples")
-        val_dataset = val_dataset.shuffle(seed=args.seed).select(range(args.max_eval_samples))
-    
-    print(f"\n📊 Dataset sizes:")
-    print(f"   Training: {len(train_dataset):,} examples")
-    print(f"   Validation: {len(val_dataset):,} examples")
-    print(f"   Eval batch size: {args.eval_batch_size}")
+        raise ValueError(
+            "Must specify either:\n"
+            "  --dataset_path (for pre-tokenized data)\n"
+            "  --raw_data_dir (for on-the-fly tokenization)"
+        )
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Continue with existing training logic
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # Handle streaming vs non-streaming datasets differently
+    if is_streaming_dataset:
+        # Streaming: train_dataset and val_dataset already set above
+        # dataset_max_len already set from tokenization_max_length
+        print(f"\n🌊 STREAMING DATASET:")
+        print(f"   Type: IterableDataset (no len() available)")
+        print(f"   Max sequence length: {dataset_max_len}")
+        print(f"   Estimated training examples: ~{estimated_train_examples:,}")
+
+        # For test mode with streaming, limit steps instead of examples
+        if args.test:
+            print("\n⚠️  Running in TEST mode - limiting to 100 steps")
+            total_steps = 100  # Override total_steps for test mode
+
+        # For streaming, truncation is applied lazily in the tokenization function
+        if args.max_seq_length is not None:
+            print(f"\n✂️  Truncation to {args.max_seq_length} applied during streaming tokenization")
+            dataset_max_len = args.max_seq_length
+
+        # Limit validation set for streaming using take()
+        if args.max_eval_samples is not None:
+            print(f"\n⚠️  Limiting validation set to {args.max_eval_samples:,} examples")
+            val_dataset = val_dataset.take(args.max_eval_samples)
+
+        print(f"\n📊 Dataset info:")
+        print(f"   Training: ~{estimated_train_examples:,} examples (streaming)")
+        print(f"   Validation: streaming (size determined at runtime)")
+        print(f"   Total training steps: {total_steps:,}")
+        print(f"   Eval batch size: {args.eval_batch_size}")
+    else:
+        # Non-streaming: standard dataset handling
+        print(f"\nDataset splits: {list(dataset.keys())}")
+        if hasattr(dataset['train'], 'column_names'):
+            print(f"Dataset columns: {dataset['train'].column_names}")
+
+        # Filter datasets by mode (skip if dataset was pre-filtered)
+        if args.skip_mode_filter:
+            print(f"⏭️  Skipping mode filtering (dataset already filtered during tokenization)")
+            train_dataset = dataset["train"]
+            val_dataset = dataset["validation"]
+        else:
+            train_dataset = filter_dataset_by_mode(dataset["train"], args.mode)
+            val_dataset = filter_dataset_by_mode(dataset["validation"], args.mode)
+
+        # Use smaller subset for testing
+        if args.test:
+            print("\n⚠️  Running in TEST mode with reduced dataset size")
+            train_dataset = train_dataset.shuffle(seed=args.seed).select(range(min(1000, len(train_dataset))))
+            val_dataset = val_dataset.shuffle(seed=args.seed).select(range(min(200, len(val_dataset))))
+
+        # Check maximum sequence length in dataset
+        max_train_len = max(len(x['input_ids']) for x in train_dataset.select(range(min(1000, len(train_dataset)))))
+        max_val_len = max(len(x['input_ids']) for x in val_dataset.select(range(min(1000, len(val_dataset)))))
+        dataset_max_len = max(max_train_len, max_val_len)
+
+        # Truncate sequences if max_seq_length is specified (saves memory)
+        if args.max_seq_length is not None:
+            print(f"\n✂️  Truncating sequences to max length: {args.max_seq_length}")
+
+            def truncate_sequence(example):
+                if len(example['input_ids']) > args.max_seq_length:
+                    example['input_ids'] = example['input_ids'][:args.max_seq_length]
+                    if 'attention_mask' in example:
+                        example['attention_mask'] = example['attention_mask'][:args.max_seq_length]
+                    if 'labels' in example:
+                        example['labels'] = example['labels'][:args.max_seq_length]
+                return example
+
+            train_dataset = train_dataset.map(truncate_sequence, desc="Truncating training sequences")
+            val_dataset = val_dataset.map(truncate_sequence, desc="Truncating validation sequences")
+            dataset_max_len = args.max_seq_length
+
+        # Limit validation set size if specified
+        if args.max_eval_samples is not None and len(val_dataset) > args.max_eval_samples:
+            print(f"\n⚠️  Limiting validation set from {len(val_dataset):,} to {args.max_eval_samples:,} examples")
+            val_dataset = val_dataset.shuffle(seed=args.seed).select(range(args.max_eval_samples))
+
+        print(f"\n📊 Dataset sizes:")
+        print(f"   Training: {len(train_dataset):,} examples")
+        print(f"   Validation: {len(val_dataset):,} examples")
+        print(f"   Eval batch size: {args.eval_batch_size}")
     
     # ─────────────────────────────────────────────────────────────────────────────
     # Load model and tokenizer
@@ -1859,14 +2851,15 @@ def main():
         # Dataset already has 'labels' column - just use simple padding
         print(f"\n✅ Using PRE-MASKED dataset (much faster!)")
         print(f"   Masking was done offline with mode: {args.mode}")
-        
-        # Check if labels column exists
-        if "labels" not in train_dataset.column_names:
-            raise ValueError(
-                "Dataset does not have 'labels' column. "
-                "Please pre-mask the dataset using scripts/data_processing/pre_mask_dataset.py"
-            )
-        
+
+        # Check if labels column exists (only for non-streaming datasets)
+        if not is_streaming_dataset and hasattr(train_dataset, 'column_names'):
+            if "labels" not in train_dataset.column_names:
+                raise ValueError(
+                    "Dataset does not have 'labels' column. "
+                    "Please pre-mask the dataset using scripts/data_processing/pre_mask_dataset.py"
+                )
+
         from transformers import default_data_collator
         # Use the simplest collator - just pads to max length in batch
         data_collator = default_data_collator
@@ -1937,9 +2930,15 @@ def main():
     best_metric = "loss" if not use_metrics else "accuracy"
     metric_greater_is_better = False if not use_metrics else True
 
+    # For streaming datasets, use max_steps instead of epochs
+    # (epochs don't make sense for IterableDataset with unknown length)
+    training_epochs = None if is_streaming_dataset else args.num_epochs
+    training_max_steps = total_steps if is_streaming_dataset else -1
+
     training_args = TrainingArguments(
         output_dir=checkpoint_dir,  # Use checkpoint_dir instead of args.output_dir
-        num_train_epochs=args.num_epochs,
+        num_train_epochs=training_epochs if training_epochs else 1,  # Trainer requires at least 1
+        max_steps=training_max_steps,  # For streaming: use max_steps; for non-streaming: -1 (disabled)
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         learning_rate=args.learning_rate,
@@ -1970,14 +2969,16 @@ def main():
         lr_scheduler_type="cosine",
         optim=args.optim,  # Can be adamw_8bit for memory savings
         
-        # Memory optimization
+        # Memory optimization & Data Loading
+        # Use 8+ workers for multi-GPU to prevent data loading bottlenecks
+        dataloader_num_workers=8,  # At least 1 per GPU for 8-GPU instances like p4d.24xlarge
         dataloader_pin_memory=True,  # Enable for faster CPU->GPU transfer (disable if OOM)
+        dataloader_drop_last=True,  # Drop incomplete batches to avoid DDP hangs
         auto_find_batch_size=False,  # Don't auto-adjust, use user's settings
         eval_accumulation_steps=args.eval_accumulation_steps,  # CRITICAL: Prevents OOM with large vocab models like BERT
 
         # Other
         seed=args.seed,
-        dataloader_num_workers=4,  # Increased for faster data loading with pre-masked data
         dataloader_prefetch_factor=2,  # Prefetch 2 batches per worker for better throughput
         remove_unused_columns=True,  # Remove extra columns like permutation_key
         label_names=["labels"],
@@ -2123,7 +3124,50 @@ def main():
         print(f"   Backup copy: {checkpoint_copy}")
         trainer.save_model(checkpoint_copy)
         tokenizer.save_pretrained(checkpoint_copy)
-    
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Export test split (after training, before evaluation)
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    if 'test' in dataset and is_main_process:
+        print(f"\n{'='*80}")
+        print("💾 EXPORTING TEST SPLIT (Post-Training)")
+        print(f"{'='*80}")
+
+        # Determine save location
+        if is_sagemaker_environment():
+            sm_paths = get_sagemaker_paths()
+            test_split_dir = os.path.join(sm_paths['output_dir'], 'test_split')
+        else:
+            test_split_dir = os.path.join(args.output_dir, 'test_split')
+
+        os.makedirs(test_split_dir, exist_ok=True)
+
+        # Export raw test split (parquet)
+        test_split_raw_path = os.path.join(test_split_dir, 'test_raw.parquet')
+        try:
+            dataset['test'].to_parquet(test_split_raw_path)
+            print(f"✓ Saved raw test split: {test_split_raw_path}")
+            print(f"  Rows: {len(dataset['test'])}")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not save raw test split: {e}")
+
+        # Export tokenized test split (HuggingFace dataset format)
+        test_tokenized_path = os.path.join(test_split_dir, 'test_tokenized')
+        try:
+            dataset['test'].save_to_disk(test_tokenized_path)
+            print(f"✓ Saved tokenized test split: {test_tokenized_path}")
+            print(f"  Columns: {dataset['test'].column_names}")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not save tokenized test split: {e}")
+
+        if is_sagemaker_environment():
+            print(f"\n📤 Test splits will be uploaded to S3:")
+            print(f"   Raw parquet:  s3://<output-bucket>/.../test_split/test_raw.parquet")
+            print(f"   Tokenized:    s3://<output-bucket>/.../test_split/test_tokenized/")
+
+        print(f"{'='*80}\n")
+
     # ─────────────────────────────────────────────────────────────────────────────
     # Final evaluation and logging
     # ─────────────────────────────────────────────────────────────────────────────
