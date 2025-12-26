@@ -102,6 +102,13 @@ def main():
         '--role', default=None,
         help='IAM role ARN for SageMaker (default: auto-detect from SageMaker session)'
     )
+    infra_group.add_argument(
+        '--entry-script',
+        default='fine_tune.py',
+        choices=['fine_tune.py', 'esm_fine_tune.py'],
+        help='Training script to use. fine_tune.py: full-featured with multiple modes. '
+             'esm_fine_tune.py: efficient MLM-only for ESM2 models (recommended for pure MLM).'
+    )
 
     # =========================================================================
     # Spot Training Arguments
@@ -254,6 +261,17 @@ def main():
         print("Enabling --tokenize-on-fly automatically")
         args.tokenize_on_fly = True
 
+    # Validate esm_fine_tune.py compatibility
+    if args.entry_script == 'esm_fine_tune.py':
+        if args.mode != 'mlm':
+            print(f"\nWARNING: esm_fine_tune.py only supports MLM mode.")
+            print(f"Ignoring --mode {args.mode} (will use MLM)")
+
+        if args.tokenize_on_fly:
+            print("\nERROR: esm_fine_tune.py does not support on-the-fly tokenization.")
+            print("Use fine_tune.py or pre-tokenize your dataset.")
+            sys.exit(1)
+
     # =========================================================================
     # Get SageMaker Role and Session
     # =========================================================================
@@ -275,92 +293,135 @@ def main():
         sys.exit(1)
 
     # =========================================================================
-    # Build Hyperparameters (passed as CLI args to fine_tune.py)
+    # Build Hyperparameters (passed as CLI args to training script)
     # =========================================================================
-    hyperparameters = {
-        'mode': args.mode,
-        'model_path': args.model_path,
-        'output_dir': '/opt/ml/checkpoints',  # SageMaker checkpoint directory
-        'num_epochs': args.num_epochs,
-        'batch_size': args.batch_size,
-        'learning_rate': args.learning_rate,
-        'warmup_steps': args.warmup_steps,
-        'weight_decay': args.weight_decay,
-        'gradient_accumulation_steps': args.gradient_accumulation_steps,
-    }
+    if args.entry_script == 'esm_fine_tune.py':
+        # esm_fine_tune.py uses different argument names
+        hyperparameters = {
+            'dataset_path': '/opt/ml/input/data/training',
+            'output_dir': '/opt/ml/checkpoints',
+            'model_name': args.model_path,
+            'num_epochs': args.num_epochs,
+            'per_device_train_batch_size': args.batch_size,
+            'per_device_eval_batch_size': args.eval_batch_size or args.batch_size,
+            'learning_rate': args.learning_rate,
+            'warmup_ratio': 0.1,  # esm_fine_tune uses ratio, not steps
+            'weight_decay': args.weight_decay,
+            'gradient_accumulation_steps': args.gradient_accumulation_steps,
+        }
 
-    # Add dataset path OR raw data dir based on tokenization mode
-    if args.tokenize_on_fly:
-        # On-the-fly tokenization: use raw_data_dir
-        hyperparameters['raw_data_dir'] = '/opt/ml/input/data/training'
-        hyperparameters['tokenizer_type'] = args.tokenizer_type
-        hyperparameters['tokenization_max_length'] = args.tokenization_max_length
-        # Only pass num_workers if explicitly set (otherwise auto-detect in fine_tune.py)
-        if args.tokenization_num_workers is not None:
-            hyperparameters['tokenization_num_workers'] = args.tokenization_num_workers
-        hyperparameters['tokenization_batch_size'] = args.tokenization_batch_size
-
-        # Add streaming option
-        if args.use_streaming:
-            hyperparameters['use_streaming'] = ''
-            print(f"\n🌊 STREAMING MODE enabled!")
-            print(f"  Tokenization: On-the-fly during training (NO pre-processing wait)")
-            print(f"  Best for: 100M+ examples")
-            print(f"  Trade-off: Limited shuffling (buffer-based)")
-        else:
-            print(f"\n✓ On-the-fly tokenization enabled (tokenizer: {args.tokenizer_type})")
-            print(f"  Tokenization workers: {'auto-detect' if args.tokenization_num_workers is None else args.tokenization_num_workers}")
-            print(f"  Tokenization batch size: {args.tokenization_batch_size}")
-            print(f"  First epoch: Will tokenize in parallel, then cache")
-            print(f"  Subsequent epochs: Will read from cache (fast)")
-            print(f"  Expected disk savings: ~48%")
-    else:
-        # Pre-tokenized: use dataset_path
-        hyperparameters['dataset_path'] = '/opt/ml/input/data/training'  # SageMaker mounts S3 data here
-
-    # Add eval batch size if specified
-    if args.eval_batch_size:
-        hyperparameters['eval_batch_size'] = args.eval_batch_size
-
-    # Add LoRA parameters
-    if args.use_lora:
-        hyperparameters['use_lora'] = ''  # Store-true flags
+        # LoRA is always used in esm_fine_tune.py, configure rank/alpha
         hyperparameters['lora_r'] = args.lora_r
         hyperparameters['lora_alpha'] = args.lora_alpha
 
-    # Add precision
-    if args.fp16:
-        hyperparameters['fp16'] = ''
-    if args.bf16:
-        hyperparameters['bf16'] = ''
+        # W&B via report_to flag (auto-enable when wandb_project is set)
+        if args.wandb_project:
+            hyperparameters['report_to'] = 'wandb'
+        else:
+            hyperparameters['report_to'] = 'tensorboard'
 
-    # Add gradient checkpointing
-    if args.gradient_checkpointing:
-        hyperparameters['gradient_checkpointing'] = ''
+        # esm_fine_tune.py defaults to bf16 (A100 optimized)
+        # Only override if fp16 explicitly requested
+        if args.fp16:
+            hyperparameters['fp16'] = ''
+            hyperparameters['bf16'] = 'false'
 
-    # Add max sequence length
-    if args.max_seq_length:
-        hyperparameters['max_seq_length'] = args.max_seq_length
+        # Gradient checkpointing (enabled by default in esm_fine_tune.py)
+        # No need to pass unless we want to disable it
 
-    # Add W&B
-    if args.wandb_project:
-        hyperparameters['wandb_project'] = args.wandb_project
-    if args.wandb_run_name:
-        hyperparameters['wandb_run_name'] = args.wandb_run_name
+        # Dataloader optimization for multi-GPU
+        hyperparameters['dataloader_num_workers'] = 16
 
-    # Add test mode
-    if args.test:
-        hyperparameters['test'] = ''
+        print(f"\n✓ Using esm_fine_tune.py (efficient MLM-only script)")
+        print(f"  LoRA: r={args.lora_r}, alpha={args.lora_alpha}")
+        print(f"  Precision: {'fp16' if args.fp16 else 'bf16 (default)'}")
 
-    # Add skip mode filter
-    if args.skip_mode_filter:
-        hyperparameters['skip-mode-filter'] = ''
+    else:
+        # fine_tune.py (original behavior)
+        hyperparameters = {
+            'mode': args.mode,
+            'model_path': args.model_path,
+            'output_dir': '/opt/ml/checkpoints',  # SageMaker checkpoint directory
+            'num_epochs': args.num_epochs,
+            'batch_size': args.batch_size,
+            'learning_rate': args.learning_rate,
+            'warmup_steps': args.warmup_steps,
+            'weight_decay': args.weight_decay,
+            'gradient_accumulation_steps': args.gradient_accumulation_steps,
+        }
+
+        # Add dataset path OR raw data dir based on tokenization mode
+        if args.tokenize_on_fly:
+            # On-the-fly tokenization: use raw_data_dir
+            hyperparameters['raw_data_dir'] = '/opt/ml/input/data/training'
+            hyperparameters['tokenizer_type'] = args.tokenizer_type
+            hyperparameters['tokenization_max_length'] = args.tokenization_max_length
+            # Only pass num_workers if explicitly set (otherwise auto-detect in fine_tune.py)
+            if args.tokenization_num_workers is not None:
+                hyperparameters['tokenization_num_workers'] = args.tokenization_num_workers
+            hyperparameters['tokenization_batch_size'] = args.tokenization_batch_size
+
+            # Add streaming option
+            if args.use_streaming:
+                hyperparameters['use_streaming'] = ''
+                print(f"\n🌊 STREAMING MODE enabled!")
+                print(f"  Tokenization: On-the-fly during training (NO pre-processing wait)")
+                print(f"  Best for: 100M+ examples")
+                print(f"  Trade-off: Limited shuffling (buffer-based)")
+            else:
+                print(f"\n✓ On-the-fly tokenization enabled (tokenizer: {args.tokenizer_type})")
+                print(f"  Tokenization workers: {'auto-detect' if args.tokenization_num_workers is None else args.tokenization_num_workers}")
+                print(f"  Tokenization batch size: {args.tokenization_batch_size}")
+                print(f"  First epoch: Will tokenize in parallel, then cache")
+                print(f"  Subsequent epochs: Will read from cache (fast)")
+                print(f"  Expected disk savings: ~48%")
+        else:
+            # Pre-tokenized: use dataset_path
+            hyperparameters['dataset_path'] = '/opt/ml/input/data/training'  # SageMaker mounts S3 data here
+
+        # Add eval batch size if specified
+        if args.eval_batch_size:
+            hyperparameters['eval_batch_size'] = args.eval_batch_size
+
+        # Add LoRA parameters
+        if args.use_lora:
+            hyperparameters['use_lora'] = ''  # Store-true flags
+            hyperparameters['lora_r'] = args.lora_r
+            hyperparameters['lora_alpha'] = args.lora_alpha
+
+        # Add precision
+        if args.fp16:
+            hyperparameters['fp16'] = ''
+        if args.bf16:
+            hyperparameters['bf16'] = ''
+
+        # Add gradient checkpointing
+        if args.gradient_checkpointing:
+            hyperparameters['gradient_checkpointing'] = ''
+
+        # Add max sequence length
+        if args.max_seq_length:
+            hyperparameters['max_seq_length'] = args.max_seq_length
+
+        # Add W&B
+        if args.wandb_project:
+            hyperparameters['wandb_project'] = args.wandb_project
+        if args.wandb_run_name:
+            hyperparameters['wandb_run_name'] = args.wandb_run_name
+
+        # Add test mode
+        if args.test:
+            hyperparameters['test'] = ''
+
+        # Add skip mode filter
+        if args.skip_mode_filter:
+            hyperparameters['skip-mode-filter'] = ''
 
     # =========================================================================
     # Configure PyTorch Estimator
     # =========================================================================
     estimator_args = {
-        'entry_point': 'fine_tune.py',
+        'entry_point': args.entry_script,
         'source_dir': 'scripts/training',
         'role': role,
         'instance_type': args.instance_type,
@@ -427,6 +488,7 @@ def main():
     print("🚀 Launching SageMaker Training Job")
     print("="*80)
     print(f"\n📊 Infrastructure:")
+    print(f"   Training Script:  {args.entry_script}")
     print(f"   Instance Type:    {args.instance_type}")
     print(f"   Instance Count:   {args.instance_count}")
     print(f"   Volume Size:      {args.volume_size} GB")
@@ -440,17 +502,24 @@ def main():
     print(f"   Dataset (S3):     {args.s3_dataset}")
     print(f"   Output (S3):      {args.s3_output}")
     print(f"   Model:            {args.model_path}")
-    print(f"   Mode:             {args.mode}")
+    if args.entry_script == 'esm_fine_tune.py':
+        print(f"   Mode:             mlm (esm_fine_tune.py only supports MLM)")
+    else:
+        print(f"   Mode:             {args.mode}")
 
     print(f"\n⚙️  Training Configuration:")
     print(f"   Epochs:           {args.num_epochs}")
     print(f"   Batch Size:       {args.batch_size}")
     print(f"   Learning Rate:    {args.learning_rate}")
-    print(f"   LoRA:             {args.use_lora}")
-    if args.use_lora:
+    if args.entry_script == 'esm_fine_tune.py':
+        print(f"   LoRA:             True (always enabled)")
         print(f"   LoRA Rank:        {args.lora_r}")
+    else:
+        print(f"   LoRA:             {args.use_lora}")
+        if args.use_lora:
+            print(f"   LoRA Rank:        {args.lora_r}")
     print(f"   FP16:             {args.fp16}")
-    print(f"   BF16:             {args.bf16}")
+    print(f"   BF16:             {args.bf16 if args.entry_script != 'esm_fine_tune.py' else not args.fp16}")
 
     if args.wandb_project:
         print(f"\n📈 Logging:")
