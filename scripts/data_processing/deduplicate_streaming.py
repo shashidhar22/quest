@@ -226,7 +226,7 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
     Returns number of valid rows extracted.
     """
     if num_workers is None:
-        num_workers = max(1, cpu_count() - 2)  # Leave 2 cores free
+        num_workers = cpu_count()  # Use all cores for maximum throughput
     
     valid_count = 0
     
@@ -234,7 +234,7 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
     if stitch_tcr:
         print(f"   ℹ️  TCR stitching ENABLED - will generate full-length sequences from CDR3 + gene segments")
     
-    with open(temp_file, 'w') as out:
+    with open(temp_file, 'w', buffering=8*1024*1024) as out:  # 8MB write buffer
         total_gene_failures = {'trav': 0, 'traj': 0, 'trbv': 0, 'trbj': 0}
 
         with Pool(num_workers) as pool:
@@ -268,7 +268,7 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
     a giant intermediate extract file. Returns (chunk_files, valid_count).
     """
     if num_workers is None:
-        num_workers = max(1, cpu_count() - 2)
+        num_workers = cpu_count()  # Use all cores for maximum throughput
 
     print(f"   ℹ️  Using {num_workers} parallel workers (streaming extract)")
     if stitch_tcr:
@@ -297,7 +297,7 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
                         del current_chunk[:chunk_size]
                         to_write.sort()
                         out_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
-                        with open(out_path, 'w') as cf:
+                        with open(out_path, 'w', buffering=8*1024*1024) as cf:  # 8MB write buffer
                             cf.writelines(to_write)
                         chunk_files.append(out_path)
                         chunk_idx += 1
@@ -307,7 +307,7 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
     if current_chunk:
         current_chunk.sort()
         out_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
-        with open(out_path, 'w') as cf:
+        with open(out_path, 'w', buffering=8*1024*1024) as cf:  # 8MB write buffer
             cf.writelines(current_chunk)
         chunk_files.append(out_path)
         chunk_idx += 1
@@ -341,7 +341,7 @@ def merge_sorted_files(chunk_files: List[Path], output_file: Path, temp_dir: Pat
     def merge_group(files: List[Path], out_path: Path):
         file_iters = []
         for p in files:
-            f = open(p, 'r')
+            f = open(p, 'r', buffering=8*1024*1024)  # 8MB read buffer
             file_iters.append((f, iter(f)))
         try:
             heap = []
@@ -351,7 +351,7 @@ def merge_sorted_files(chunk_files: List[Path], output_file: Path, temp_dir: Pat
                     heapq.heappush(heap, (line, idx))
                 except StopIteration:
                     pass
-            with open(out_path, 'w') as out:
+            with open(out_path, 'w', buffering=8*1024*1024) as out:  # 8MB write buffer
                 while heap:
                     line, idx = heapq.heappop(heap)
                     out.write(line)
@@ -401,7 +401,7 @@ def extract_and_sort_streaming(parquet_files: List[str], sorted_file: Path, temp
     merge_sorted_files(chunk_files, sorted_file, temp_dir, max_open_files=max_open_files)
     return valid_count, time.time() - start
 
-def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size: int = 50_000_000, max_open_files: int = 256) -> float:
+def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size: int = 200_000_000, max_open_files: int = 1024) -> float:
     """
     External merge sort implemented in Python:
     - Read input in chunks of `chunk_size` lines
@@ -419,7 +419,7 @@ def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size
     # Phase 1: create sorted chunk files
     current_chunk: List[str] = []
     chunk_idx = 0
-    with open(input_file, 'r') as f:
+    with open(input_file, 'r', buffering=8*1024*1024) as f:  # 8MB read buffer
         for line in tqdm(f, desc="   Reading and sorting chunks", unit=" lines", unit_scale=True):
             if not line:
                 continue
@@ -427,7 +427,7 @@ def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size
             if len(current_chunk) >= chunk_size:
                 current_chunk.sort()
                 chunk_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
-                with open(chunk_path, 'w') as cf:
+                with open(chunk_path, 'w', buffering=8*1024*1024) as cf:  # 8MB write buffer
                     cf.writelines(current_chunk)
                 chunk_files.append(chunk_path)
                 current_chunk = []
@@ -437,7 +437,7 @@ def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size
         if current_chunk:
             current_chunk.sort()
             chunk_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
-            with open(chunk_path, 'w') as cf:
+            with open(chunk_path, 'w', buffering=8*1024*1024) as cf:  # 8MB write buffer
                 cf.writelines(current_chunk)
             chunk_files.append(chunk_path)
             current_chunk = []
@@ -454,7 +454,7 @@ def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size
     def merge_group(files: List[Path], out_path: Path):
         file_iters = []
         for p in files:
-            f = open(p, 'r')
+            f = open(p, 'r', buffering=8*1024*1024)  # 8MB read buffer
             file_iters.append((f, iter(f)))
 
         try:
@@ -467,7 +467,7 @@ def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size
                 except StopIteration:
                     pass
 
-            with open(out_path, 'w') as out:
+            with open(out_path, 'w', buffering=8*1024*1024) as out:  # 8MB write buffer
                 while heap:
                     line, idx = heapq.heappop(heap)
                     out.write(line)
@@ -517,7 +517,7 @@ def external_sort(input_file: Path, output_file: Path, temp_dir: Path, buffer_si
     NOTE: This function is kept for compatibility but PyArrow sort is now preferred.
     """
     if num_threads is None:
-        num_threads = max(4, cpu_count() - 2)  # Use most cores, leave 2 free
+        num_threads = cpu_count()  # Use all cores for maximum throughput
     
     start_time = time.time()
     
@@ -552,7 +552,7 @@ def stream_deduplicate(input_file: Path, output_file: Path) -> int:
     unique_count = 0
     prev_key = None
     
-    with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
+    with open(input_file, 'r', buffering=8*1024*1024) as infile, open(output_file, 'w', buffering=8*1024*1024) as outfile:  # 8MB buffers
         with tqdm(desc="Deduplicating", unit=" rows", unit_scale=True) as pbar:
             for line in infile:
                 if not line.strip():
@@ -645,11 +645,11 @@ def generate_permutations(input_file: Path, output_file: Path, mode: str, max_pe
     Generate permutations for each unique molecule combination (parallelized).
     For tra/trb modes: skip permutations (only 1 ordering makes sense)
     For other modes: generate all permutations up to max_perms
-    
+
     Returns number of permutations generated.
     """
     print(f"\n📊 Stage 2: Generating permutations (mode={mode})...")
-    
+
     # For single-chain modes, skip permutation generation
     if mode in ['tra', 'trb']:
         print(f"   ℹ️  Skipping permutation generation for {mode} mode (single chain)")
@@ -658,36 +658,39 @@ def generate_permutations(input_file: Path, output_file: Path, mode: str, max_pe
         with open(input_file, 'r') as f:
             count = sum(1 for _ in f)
         return count
-    
+
     if num_workers is None:
-        num_workers = max(1, cpu_count() - 2)
-    
+        num_workers = cpu_count()  # Use all cores for maximum throughput
+
     print(f"   ℹ️  Using {num_workers} parallel workers")
-    
-    # Read input file in batches
-    batch_size = 10000  # Process 10k molecules per batch
+
+    # Stream input file in batches - memory efficient for large files
+    batch_size = 100000  # Process 100k molecules per batch
     perm_count = 0
-    
-    with open(input_file, 'r') as infile:
-        lines = infile.readlines()
-    
-    total_molecules = len(lines)
-    
-    # Create batches
-    batches = []
-    for i in range(0, len(lines), batch_size):
-        batch = lines[i:i+batch_size]
-        batches.append((batch, mode, max_perms))
-    
-    # Process batches in parallel
-    with open(output_file, 'w') as outfile:
+
+    # Generator function to yield batches without loading entire file
+    def batch_generator():
+        """Yield batches of lines from input file without loading all into memory."""
+        with open(input_file, 'r', buffering=8*1024*1024) as infile:
+            batch = []
+            for line in infile:
+                batch.append(line)
+                if len(batch) >= batch_size:
+                    yield (batch, mode, max_perms)
+                    batch = []
+            # Yield final partial batch
+            if batch:
+                yield (batch, mode, max_perms)
+
+    # Process batches in parallel using streaming generator
+    with open(output_file, 'w', buffering=16*1024*1024) as outfile:  # 16MB write buffer for large output
         with Pool(num_workers) as pool:
-            with tqdm(desc="Generating permutations", unit=" batches", total=len(batches)) as pbar:
-                for output_lines in pool.imap_unordered(process_molecule_batch, batches, chunksize=1):
+            with tqdm(desc="Generating permutations", unit=" batches", unit_scale=False) as pbar:
+                for output_lines in pool.imap_unordered(process_molecule_batch, batch_generator(), chunksize=1):
                     outfile.writelines(output_lines)
                     perm_count += len(output_lines)
                     pbar.update(1)
-    
+
     return perm_count
 
 def deduplicate_permutations(input_file: Path, output_file: Path, temp_dir: Path, 
@@ -722,12 +725,12 @@ def deduplicate_permutations(input_file: Path, output_file: Path, temp_dir: Path
 def parse_permutation_key(perm_key: str) -> tuple[List[str], Dict[str, str]]:
     """
     Parse permutation key to extract field order and sequences.
-    
+
     Handles three formats:
     1. Old format (multi): "tra:AAA|peptide:CCC|mhc_one:DDD" - extracts sequences from key
     2. Old format (single): "tra:AAA" - single molecule with sequence
     3. New format: "tra_peptide_mhc_one" - no sequences in key
-    
+
     Returns:
         - field_order: list of field names in order
         - sequences_dict: dict mapping field names to sequences (empty for new format)
@@ -743,8 +746,33 @@ def parse_permutation_key(perm_key: str) -> tuple[List[str], Dict[str, str]]:
                 sequences_dict[field_name] = sequence
         return field_order, sequences_dict
     else:
-        # New format - just field names separated by _, no sequences
-        return perm_key.split('_'), {}
+        # New format - field names separated by _, but some fields contain underscores
+        # Known field names (longer names first to match greedily)
+        known_fields = ['mhc_one', 'mhc_two', 'peptide', 'tra', 'trb']
+
+        field_order = []
+        remaining = perm_key
+
+        while remaining:
+            matched = False
+            for field in known_fields:
+                if remaining.startswith(field):
+                    field_order.append(field)
+                    remaining = remaining[len(field):]
+                    # Remove leading underscore separator if present
+                    if remaining.startswith('_'):
+                        remaining = remaining[1:]
+                    matched = True
+                    break
+
+            if not matched:
+                # Unknown format, skip to next underscore or end
+                if '_' in remaining:
+                    remaining = remaining.split('_', 1)[1]
+                else:
+                    break
+
+        return field_order, {}
 
 
 def concatenate_sequences(row_dict: Dict, field_order: List[str], sequences_dict: Dict[str, str], use_full: bool = False) -> str:
@@ -1038,9 +1066,9 @@ def main():
     parser.add_argument("--no-permutations", action="store_true", help="Skip permutation generation entirely")
     parser.add_argument("--keep-all-permutations", action="store_true", help="Generate permutations but skip permutation deduplication")
     parser.add_argument("--buffer-size", default="50G", help="Sort buffer size (e.g., 50G) - only used with --use-unix-sort")
-    parser.add_argument("--num-workers", type=int, default=None, help="Number of parallel workers (default: CPU count - 2)")
-    parser.add_argument("--sort-chunk-size", type=int, default=50_000_000, help="Chunk size for PyArrow sort (default: 50M lines)")
-    parser.add_argument("--sort-max-open-files", type=int, default=256, help="Max files to open per merge pass (default: 256)")
+    parser.add_argument("--num-workers", type=int, default=None, help="Number of parallel workers (default: all CPU cores)")
+    parser.add_argument("--sort-chunk-size", type=int, default=200_000_000, help="Chunk size for PyArrow sort (default: 200M lines)")
+    parser.add_argument("--sort-max-open-files", type=int, default=1024, help="Max files to open per merge pass (default: 1024)")
     parser.add_argument("--use-unix-sort", action="store_true", help="Use Unix sort instead of PyArrow sort (not recommended for large datasets)")
     parser.add_argument("--stitch-tcr", action="store_true", help="Generate full-length TCR sequences from CDR3 + gene segments using stitchr")
     parser.add_argument("--resume", action="store_true", help="Resume from existing intermediate files (chunk files, sorted files, etc.)")
@@ -1158,7 +1186,7 @@ def main():
                 print("\n📊 Step 1/2: Extracting + building sorted chunks (streaming)...")
                 valid_count, sort_time = extract_and_sort_streaming(
                     all_files, sorted_file, work_dir, args.mode,
-                    args.num_workers if args.num_workers else max(1, cpu_count()-2),
+                    args.num_workers if args.num_workers else cpu_count(),
                     args.sort_chunk_size, args.sort_max_open_files, args.stitch_tcr
                 )
                 print(f"✓ Streamed extract+sort in {sort_time:.1f}s ({sort_time/60:.1f} min)")
