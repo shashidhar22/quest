@@ -249,9 +249,12 @@ def main():
 
     # Apply torch.compile for speedup (PyTorch 2.0+)
     if args.torch_compile:
-        if local_rank == 0:
-            print(f"Applying torch.compile (mode={args.torch_compile_mode})")
-        model = torch.compile(model, mode=args.torch_compile_mode)
+        if args.quantization == "none":
+            if local_rank == 0:
+                print(f"Applying torch.compile (mode={args.torch_compile_mode})")
+            model = torch.compile(model, mode=args.torch_compile_mode)
+        elif local_rank == 0:
+            print("Skipping torch.compile because quantization is enabled (not compatible)")
 
     # Load datasets
     train_path = os.path.join(args.dataset_path, "train")
