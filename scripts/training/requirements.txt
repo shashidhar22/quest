@@ -3,27 +3,31 @@
 # =============================================================================
 # This file is automatically detected and installed by SageMaker before training.
 #
+# IMPORTANT: SageMaker containers have pre-installed packages that may conflict.
+# We use explicit versions with --upgrade behavior to override pre-installed versions.
+#
 # NOTE: SageMaker PyTorch containers already include:
 #   - torch (version controlled by framework_version in launch script)
 #   - numpy, scipy, pandas
 #   - boto3, s3fs (for S3 access)
 #   - tqdm, scikit-learn
-#
-# We only install packages that are NOT pre-installed.
-# Version constraints ensure compatibility with PyTorch 2.8 and Python 3.12.
 # =============================================================================
 
-# Hugging Face ecosystem (not pre-installed)
-# Minimum versions compatible with PyTorch 2.8 and Python 3.12
-transformers>=4.35.0         # Requires 4.35+ for PyTorch 2.x compatibility
-accelerate>=1.0.0            # Multi-GPU and optimization support
-peft>=0.18.0                 # Parameter-efficient fine-tuning
-datasets>=4.0.0              # Dataset handling
-evaluate>=0.4.0              # Model evaluation metrics
+# Hugging Face ecosystem - latest versions
+transformers                 # Latest version
+accelerate                   # Latest version
+peft                         # Latest version
+datasets                     # Latest version
+tokenizers                   # Latest version
+evaluate                     # Model evaluation metrics
 
 # Monitoring
-wandb>=0.16.0                # Experiment tracking
+wandb                        # Experiment tracking
+
+# Performance optimizations
+flash-attn                   # Flash Attention 2 (may already be in SageMaker container)
+bitsandbytes                 # For 8-bit/4-bit quantization (QLoRA)
 
 # Tokenizer dependencies
-sentencepiece>=0.1.99        # Tokenization (required by some transformers)
+sentencepiece                # Tokenization (required by some transformers)
 protobuf>=3.20.0,<5.0.0      # Protocol buffers (required by sentencepiece)
