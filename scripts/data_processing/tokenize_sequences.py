@@ -8,6 +8,8 @@ import argparse
 import json
 import os
 import sys
+import time
+from multiprocessing import Pool
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import pyarrow.parquet as pq
@@ -38,16 +40,6 @@ except ImportError:
     HAS_ESM3 = False
     # ESM3 not available - will fallback to ESM2
 
-# Try to import TCR stitcher and CDR identifier
-try:
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
-    from parsers.tcr_stitcher import TCRStitcher
-    from parsers.cdr_region_identifier import CDRRegionIdentifier
-    HAS_TCR_TOOLS = True
-except ImportError:
-    HAS_TCR_TOOLS = False
-    print("Warning: TCR stitcher/CDR identifier not available")
-
 
 class SequenceTokenizerBase:
     """Base class for all tokenizers."""
@@ -75,18 +67,33 @@ class ProtBERTTokenizer(SequenceTokenizerBase):
     ProtBERT tokenizer - amino acids separated by spaces.
     Uses BERT's vocabulary with special tokens.
     """
-    
-    def __init__(self, max_length: int = 512):
+
+    def __init__(self, max_length: int = 512, use_fast: bool = True):
         super().__init__(max_length)
         if not HAS_TRANSFORMERS:
             raise ImportError("transformers required for ProtBERT")
-        
-        # Use pre-trained ProtBERT tokenizer
-        self.tokenizer = BertTokenizer.from_pretrained(
-            "Rostlab/prot_bert",
-            do_lower_case=False
-        )
-        print(f"✓ Loaded ProtBERT tokenizer (vocab size: {len(self.tokenizer)})")
+
+        # Try to load fast tokenizer first, fallback to slow if unavailable
+        try:
+            self.tokenizer = BertTokenizer.from_pretrained(
+                "Rostlab/prot_bert",
+                do_lower_case=False,
+                use_fast=use_fast
+            )
+            is_fast = getattr(self.tokenizer, 'is_fast', False)
+            tokenizer_type = "Fast (Rust)" if is_fast else "Slow (Python)"
+            print(f"✓ Loaded ProtBERT tokenizer ({tokenizer_type}, vocab size: {len(self.tokenizer)})")
+        except Exception as e:
+            if use_fast:
+                print(f"⚠️  Fast tokenizer unavailable, falling back to slow: {e}")
+                self.tokenizer = BertTokenizer.from_pretrained(
+                    "Rostlab/prot_bert",
+                    do_lower_case=False,
+                    use_fast=False
+                )
+                print(f"✓ Loaded ProtBERT tokenizer (Slow/Python, vocab size: {len(self.tokenizer)})")
+            else:
+                raise
     
     def _add_spaces(self, seq: str) -> str:
         """Add spaces between amino acids for ProtBERT."""
@@ -125,18 +132,33 @@ class StandardBERTTokenizer(SequenceTokenizerBase):
     Standard BERT tokenizer (e.g., google-bert/bert-base-uncased) for protein sequences.
     Uses character-level tokenization with spaces between amino acids.
     """
-    
-    def __init__(self, max_length: int = 512, model_name: str = "google-bert/bert-base-uncased"):
+
+    def __init__(self, max_length: int = 512, model_name: str = "google-bert/bert-base-uncased", use_fast: bool = True):
         super().__init__(max_length)
         if not HAS_TRANSFORMERS:
             raise ImportError("transformers required for BERT")
-        
-        # Use standard BERT tokenizer
-        self.tokenizer = BertTokenizer.from_pretrained(
-            model_name,
-            do_lower_case=False  # Keep amino acids case-sensitive
-        )
-        print(f"✓ Loaded Standard BERT tokenizer from {model_name} (vocab size: {len(self.tokenizer)})")
+
+        # Try to load fast tokenizer first, fallback to slow if unavailable
+        try:
+            self.tokenizer = BertTokenizer.from_pretrained(
+                model_name,
+                do_lower_case=False,  # Keep amino acids case-sensitive
+                use_fast=use_fast
+            )
+            is_fast = getattr(self.tokenizer, 'is_fast', False)
+            tokenizer_type = "Fast (Rust)" if is_fast else "Slow (Python)"
+            print(f"✓ Loaded Standard BERT tokenizer from {model_name} ({tokenizer_type}, vocab size: {len(self.tokenizer)})")
+        except Exception as e:
+            if use_fast:
+                print(f"⚠️  Fast tokenizer unavailable, falling back to slow: {e}")
+                self.tokenizer = BertTokenizer.from_pretrained(
+                    model_name,
+                    do_lower_case=False,
+                    use_fast=False
+                )
+                print(f"✓ Loaded Standard BERT tokenizer (Slow/Python, vocab size: {len(self.tokenizer)})")
+            else:
+                raise
     
     def _add_spaces(self, seq: str) -> str:
         """Add spaces between amino acids."""
@@ -173,15 +195,20 @@ class ESM2Tokenizer(SequenceTokenizerBase):
     """
     ESM-2 tokenizer - no spaces, direct amino acid encoding.
     """
-    
-    def __init__(self, max_length: int = 512, model_name: str = "facebook/esm2_t6_8M_UR50D"):
+
+    def __init__(self, max_length: int = 512, model_name: str = "facebook/esm2_t6_8M_UR50D", use_fast: bool = True):
         super().__init__(max_length)
         if not HAS_TRANSFORMERS:
             raise ImportError("transformers required for ESM-2")
-        
+
+        # Note: ESM tokenizers do not have fast implementations as of 2025
+        # The use_fast parameter is accepted for API consistency but ignored
+        if use_fast:
+            print(f"ℹ️  Note: ESM2 tokenizer does not have a fast implementation (use_fast ignored)")
+
         # Use ESM-2 tokenizer
         self.tokenizer = EsmTokenizer.from_pretrained(model_name)
-        print(f"✓ Loaded ESM-2 tokenizer from {model_name} (vocab size: {len(self.tokenizer)})")
+        print(f"✓ Loaded ESM-2 tokenizer from {model_name} (Python only, vocab size: {len(self.tokenizer)})")
     
     def tokenize_batch(self, sequences: List[str]) -> Dict[str, List[List[int]]]:
         """
@@ -633,6 +660,48 @@ def stratified_split_rows(
     return split_assignments
 
 
+def random_split_rows(
+    chunk_rows: List[Dict],
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    seed: int = 42
+) -> np.ndarray:
+    """
+    Perform random split on chunk rows without stratification.
+
+    Args:
+        chunk_rows: List of row dictionaries
+        train_ratio: Fraction for training set (default 0.8)
+        val_ratio: Fraction for validation set (default 0.1)
+        test_ratio: Fraction for test set (default 0.1)
+        seed: Random seed for reproducibility
+
+    Returns:
+        numpy array of split assignments ('train', 'validation', 'test')
+    """
+    np.random.seed(seed)
+    n = len(chunk_rows)
+
+    # Create shuffled indices
+    indices = np.arange(n)
+    np.random.shuffle(indices)
+
+    # Calculate split boundaries
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
+
+    # Initialize split assignments
+    split_assignments = np.empty(n, dtype=object)
+
+    # Assign splits
+    split_assignments[indices[:n_train]] = 'train'
+    split_assignments[indices[n_train:n_train + n_val]] = 'validation'
+    split_assignments[indices[n_train + n_val:]] = 'test'
+
+    return split_assignments
+
+
 def _count_permutations_in_file(args) -> tuple[Dict[str, int], int]:
     """
     Count permutations in a single parquet file.
@@ -647,8 +716,13 @@ def _count_permutations_in_file(args) -> tuple[Dict[str, int], int]:
     
     # Read parquet file
     table = pq.read_table(file_path)
-    df = table.to_pandas()
-    rows = df.to_dict('records')
+    # Convert PyArrow table directly to dict (faster than pandas intermediate step)
+    rows_dict = table.to_pydict()
+    # Convert column-oriented dict to row-oriented list of dicts
+    rows = [
+        {col: rows_dict[col][i] for col in rows_dict.keys()}
+        for i in range(len(table))
+    ]
     
     for row in rows:
         perm = get_permutation_signature(row)
@@ -808,8 +882,13 @@ def stream_parquet_files(input_dir: Path, sample: Optional[int] = None, chunk_si
     
     for pf in tqdm(parquet_files, desc="Processing parquet files"):
         table = pq.read_table(pf)
-        df = table.to_pandas()
-        rows = df.to_dict('records')
+        # Convert PyArrow table directly to dict (faster than pandas intermediate step)
+        rows_dict = table.to_pydict()
+        # Convert column-oriented dict to row-oriented list of dicts
+        rows = [
+            {col: rows_dict[col][i] for col in rows_dict.keys()}
+            for i in range(len(table))
+        ]
         
         for row in rows:
             # Check if we should include this row based on mode filter
@@ -997,10 +1076,16 @@ def concatenate_molecule_sequences(row: Dict, model_type: str = None) -> str:
             return "-".join(sequences)
 
 
+<<<<<<< HEAD
 def add_full_tcr_and_cdr_positions(chunk_rows: List[Dict]) -> Tuple[List[Dict], Dict]:
+=======
+def _concatenate_batch_worker(args):
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
     """
-    Add full-length TCR sequences and CDR positions to chunk rows.
+    Worker function for parallel sequence concatenation.
+    Processes a batch of rows and returns concatenated sequences.
 
+<<<<<<< HEAD
     For each row with TRA/TRB data:
     1. Standardize gene names using tidytcells (via TCRStitcher)
     2. Stitch full-length sequences using TCRStitcher
@@ -1009,11 +1094,39 @@ def add_full_tcr_and_cdr_positions(chunk_rows: List[Dict]) -> Tuple[List[Dict], 
        - Gene names: trav_gene_std, traj_gene_std, trbv_gene_std, trbj_gene_std (standardized)
        - Full sequences: tra_full, trb_full
        - CDR positions: tra_cdr1_pos, tra_cdr2_pos, tra_cdr3_pos, trb_cdr1_pos, trb_cdr2_pos, trb_cdr3_pos
+=======
+    This function is designed to be called by multiprocessing.Pool.map()
+    to parallelize the sequence concatenation across multiple CPU cores.
+
+    Args:
+        args: Tuple of (row_batch, model_type)
+            row_batch: List of row dictionaries to process
+            model_type: Model type for formatting (esm2, protbert, etc.)
+
+    Returns:
+        List of concatenated sequences (one per row in the batch)
+    """
+    row_batch, model_type = args
+    return [concatenate_molecule_sequences(row, model_type) for row in row_batch]
+
+
+def concatenate_sequences_arrow_esm2(chunk_rows: List[Dict], model_type: str) -> List[str]:
+    """
+    Ultra-fast concatenation using PyArrow vectorized operations for ESM-2.
+
+    This function uses PyArrow's compute functions to perform string operations
+    in a vectorized manner, which is significantly faster than Python loops.
+
+    Works best for new format data (has 'sequence' column) where concatenation
+    is a simple string replacement operation.
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
 
     Args:
         chunk_rows: List of row dictionaries
+        model_type: Model type (esm2, esm3, protbert, etc.)
 
     Returns:
+<<<<<<< HEAD
         Tuple of (updated list of row dictionaries, statistics dictionary)
     """
     stats = {
@@ -1044,11 +1157,19 @@ def add_full_tcr_and_cdr_positions(chunk_rows: List[Dict]) -> Tuple[List[Dict], 
             row['trb_cdr2_pos'] = None
             row['trb_cdr3_pos'] = None
         return chunk_rows, stats
+=======
+        List of concatenated sequences
+    """
+    import pyarrow.compute as pc
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
 
-    # Initialize tools
-    stitcher = TCRStitcher(species="HUMAN")
-    cdr_identifier = CDRRegionIdentifier()
+    # Check if we have the new format (sequence column)
+    if chunk_rows and 'sequence' in chunk_rows[0]:
+        # New format: convert to PyArrow array for vectorized operations
+        sequences = [row.get('sequence', '') for row in chunk_rows]
+        arrow_array = pa.array(sequences, type=pa.string())
 
+<<<<<<< HEAD
     print(f"   🧬 Standardizing gene names (tidytcells), stitching full TCR sequences, and identifying CDR regions...")
 
     for row in tqdm(chunk_rows, desc="   Processing TCRs", leave=False):
@@ -1182,6 +1303,26 @@ def add_full_tcr_and_cdr_positions(chunk_rows: List[Dict]) -> Tuple[List[Dict], 
     print(f"   ✓ CDR positions: {stats['tra_cdr']:,} TRA, {stats['trb_cdr']:,} TRB")
 
     return chunk_rows, stats
+=======
+        if model_type in ['esm2', 'esm3']:
+            # ESM-2/ESM-3: "MOL1 MOL2 MOL3" → "MOL1-MOL2-MOL3"
+            # Single vectorized operation: replace all spaces with dashes
+            result_array = pc.replace_substring(arrow_array, ' ', '-')
+            return result_array.to_pylist()
+
+        elif model_type in ['protbert', 'bert']:
+            # ProtBERT: Need to add spaces between amino acids and use [SEP]
+            # This is more complex and better handled by parallel Python
+            return None
+
+        else:
+            # BPE/LSTM/Transformer: same as ESM (dash separator)
+            result_array = pc.replace_substring(arrow_array, ' ', '-')
+            return result_array.to_pylist()
+
+    # Old format or complex case: return None to trigger fallback
+    return None
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
 
 
 def create_tokenize_function(tokenizer, model_type: str):
@@ -1228,6 +1369,320 @@ def create_tokenize_function(tokenizer, model_type: str):
     return tokenize_function
 
 
+def create_tokenize_function_fast(tokenizer):
+    """
+    Create a FAST tokenization function that uses pre-computed concatenated sequences.
+    This avoids calling concatenate_molecule_sequences for every row during map().
+    """
+    def tokenize_function(examples):
+        # Just tokenize the pre-computed 'concatenated_sequence' field
+        sequences = examples['concatenated_sequence']
+
+        # Tokenize entire batch
+        encoded = tokenizer.tokenize_batch(sequences)
+
+        # Add sequences to output
+        encoded['sequence'] = sequences
+
+        return encoded
+
+    return tokenize_function
+
+
+def detect_existing_split_chunks(output_dir: Path) -> Dict:
+    """
+    Detect existing train/val/test chunks and return resume state.
+
+    Returns dict with:
+        - chunks_exist: bool
+        - train_chunk_files: List[Path] of existing train chunk directories
+        - val_chunk_files: List[Path] of existing val chunk directories
+        - test_chunk_files: List[Path] of existing test chunk directories
+        - completed_chunk_nums: List[int] of completed chunk numbers (chunks that exist in all 3 splits)
+        - metadata: Dict from resume_metadata.json (if exists)
+        - last_chunk_num: int, highest chunk number found
+    """
+    train_chunks_dir = output_dir / "train_chunks"
+    val_chunks_dir = output_dir / "val_chunks"
+    test_chunks_dir = output_dir / "test_chunks"
+
+    if not any(d.exists() for d in [train_chunks_dir, val_chunks_dir, test_chunks_dir]):
+        return {
+            'chunks_exist': False,
+            'train_chunk_files': [],
+            'val_chunk_files': [],
+            'test_chunk_files': [],
+            'completed_chunk_nums': [],
+            'metadata': None,
+            'last_chunk_num': 0
+        }
+
+    # Find chunks for each split
+    train_chunks = sorted([p for p in train_chunks_dir.glob("chunk_*") if p.is_dir()]) if train_chunks_dir.exists() else []
+    val_chunks = sorted([p for p in val_chunks_dir.glob("chunk_*") if p.is_dir()]) if val_chunks_dir.exists() else []
+    test_chunks = sorted([p for p in test_chunks_dir.glob("chunk_*") if p.is_dir()]) if test_chunks_dir.exists() else []
+
+    # Extract chunk numbers for each split
+    def extract_chunk_nums(chunk_list):
+        nums = []
+        for chunk_path in chunk_list:
+            try:
+                chunk_num = int(chunk_path.name.split('_')[1])
+                nums.append(chunk_num)
+            except (IndexError, ValueError):
+                print(f"⚠️  Warning: Malformed chunk directory name: {chunk_path.name}")
+                continue
+        return set(nums)
+
+    train_nums = extract_chunk_nums(train_chunks)
+    val_nums = extract_chunk_nums(val_chunks)
+    test_nums = extract_chunk_nums(test_chunks)
+
+    # Find intersection (all three splits must exist for a chunk to be considered complete)
+    completed_chunk_nums = sorted(train_nums & val_nums & test_nums)
+
+    # Load metadata
+    metadata_file = output_dir / "resume_metadata.json"
+    metadata = None
+    if metadata_file.exists():
+        try:
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to load resume metadata: {e}")
+
+    last_chunk_num = max(completed_chunk_nums) if completed_chunk_nums else 0
+
+    return {
+        'chunks_exist': bool(completed_chunk_nums),
+        'train_chunk_files': train_chunks,
+        'val_chunk_files': val_chunks,
+        'test_chunk_files': test_chunks,
+        'completed_chunk_nums': completed_chunk_nums,
+        'metadata': metadata,
+        'last_chunk_num': last_chunk_num
+    }
+
+
+def validate_chunk_compatibility(metadata: Dict, current_params: Dict) -> Tuple[bool, List[str]]:
+    """
+    Validate that existing chunks are compatible with current run parameters.
+
+    Args:
+        metadata: Resume metadata from detect_existing_chunks()
+        current_params: Dict of current run parameters
+
+    Returns:
+        (is_compatible, list_of_issues)
+    """
+    if metadata is None:
+        # No metadata file - assume incompatible for safety
+        return False, ["No resume metadata file found (chunks may be from old version)"]
+
+    issues = []
+    critical_params = ['model_type', 'max_length', 'chunk_size']
+    warning_params = ['batch_size', 'num_workers', 'use_fast_tokenizer']
+
+    # Check critical parameters (must match exactly)
+    for param in critical_params:
+        if param in metadata and param in current_params:
+            if metadata[param] != current_params[param]:
+                issues.append(f"CRITICAL: {param} mismatch (saved: {metadata[param]}, current: {current_params[param]})")
+
+    # Check warning parameters (log but allow)
+    for param in warning_params:
+        if param in metadata and param in current_params:
+            if metadata[param] != current_params[param]:
+                print(f"⚠️  Warning: {param} changed (saved: {metadata[param]}, current: {current_params[param]})")
+
+    # Sampling parameter changes
+    if 'sample' in metadata and 'sample' in current_params:
+        if metadata['sample'] != current_params['sample']:
+            issues.append(f"CRITICAL: sample size changed (saved: {metadata['sample']}, current: {current_params['sample']})")
+
+    if 'sample_mode' in metadata and 'sample_mode' in current_params:
+        if metadata['sample_mode'] != current_params['sample_mode']:
+            issues.append(f"CRITICAL: sample_mode changed (saved: {metadata['sample_mode']}, current: {current_params['sample_mode']})")
+
+    is_compatible = not any(issue.startswith("CRITICAL") for issue in issues)
+    return is_compatible, issues
+
+
+def save_resume_metadata_with_splits(
+    output_dir: Path,
+    params: Dict,
+    completed_chunks: List[int],
+    rows_per_split: Dict[str, int]
+):
+    """
+    Save resume metadata for split-during-tokenization approach.
+
+    Args:
+        output_dir: Output directory
+        params: Dict of run parameters
+        completed_chunks: List of completed chunk numbers
+        rows_per_split: Dict with keys 'train', 'validation', 'test' and their row counts
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata_file = output_dir / "resume_metadata.json"
+
+    from datetime import datetime
+
+    # Accumulate total rows if metadata exists
+    total_rows_per_split = {'train': 0, 'validation': 0, 'test': 0}
+    if metadata_file.exists():
+        try:
+            with open(metadata_file, 'r') as f:
+                old_metadata = json.load(f)
+                if 'total_rows_per_split' in old_metadata:
+                    total_rows_per_split = old_metadata['total_rows_per_split']
+        except Exception:
+            pass
+
+    # Add current chunk's rows
+    for split, count in rows_per_split.items():
+        total_rows_per_split[split] = total_rows_per_split.get(split, 0) + count
+
+    metadata = {
+        'version': '2.0',  # New version for split-during-tokenization
+        'splitting_approach': 'split_during_tokenization',
+        'model_type': params.get('model_type'),
+        'max_length': params.get('max_length'),
+        'batch_size': params.get('batch_size'),
+        'num_workers': params.get('num_workers'),
+        'chunk_size': params.get('chunk_size'),
+        'sample': params.get('sample'),
+        'sample_mode': params.get('sample_mode'),
+        'mode': params.get('mode'),
+        'stratified_split': params.get('stratified_split'),
+        'test_split': params.get('test_split'),
+        'val_split': params.get('val_split'),
+        'use_fast_tokenizer': params.get('use_fast_tokenizer'),
+        'completed_chunks': sorted(completed_chunks),
+        'total_chunks_expected': params.get('total_chunks_expected', len(completed_chunks)),
+        'last_updated': datetime.utcnow().isoformat() + 'Z',
+        'total_rows_per_split': total_rows_per_split,
+        'last_chunk_rows_per_split': rows_per_split
+    }
+
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+
+def concatenate_chunks_in_batches(
+    chunk_files: List[Path],
+    batch_size: int = 5,
+    split_name: str = "dataset"
+) -> Dataset:
+    """
+    Concatenate chunks in batches to avoid OOM.
+
+    Args:
+        chunk_files: List of chunk directory paths
+        batch_size: Number of chunks to load at once (default: 5)
+        split_name: Name of the split for logging (train/val/test)
+
+    Returns:
+        Concatenated Dataset
+    """
+    from datasets import concatenate_datasets, load_from_disk
+    import gc
+
+    if not chunk_files:
+        raise ValueError(f"No chunk files provided for {split_name}")
+
+    accumulated_dataset = None
+    num_batches = (len(chunk_files) + batch_size - 1) // batch_size
+
+    for i in range(0, len(chunk_files), batch_size):
+        batch = chunk_files[i:i+batch_size]
+        batch_num = i//batch_size + 1
+        print(f"   Loading {split_name} batch {batch_num}/{num_batches} ({len(batch)} chunks)...")
+
+        # Load batch
+        batch_datasets = [load_from_disk(str(p)) for p in batch]
+        batch_concat = concatenate_datasets(batch_datasets)
+        del batch_datasets
+        gc.collect()
+
+        # Accumulate
+        if accumulated_dataset is None:
+            accumulated_dataset = batch_concat
+        else:
+            print(f"   Merging batch {batch_num} with accumulated dataset...")
+            accumulated_dataset = concatenate_datasets([accumulated_dataset, batch_concat])
+            del batch_concat
+            gc.collect()
+
+    return accumulated_dataset
+
+
+def validate_split_balance(
+    pkey_train_counts: Dict[str, int],
+    pkey_val_counts: Dict[str, int],
+    pkey_test_counts: Dict[str, int],
+    expected_train_ratio: float,
+    expected_val_ratio: float,
+    expected_test_ratio: float,
+    tolerance: float = 0.05
+) -> Tuple[bool, List[str]]:
+    """
+    Validate that splits maintain expected class balance.
+
+    Args:
+        pkey_train_counts: Count of each permutation_key in train split
+        pkey_val_counts: Count of each permutation_key in val split
+        pkey_test_counts: Count of each permutation_key in test split
+        expected_train_ratio: Expected train fraction (e.g., 0.8)
+        expected_val_ratio: Expected validation fraction (e.g., 0.1)
+        expected_test_ratio: Expected test fraction (e.g., 0.1)
+        tolerance: Tolerance for balance check (default: 0.05 = ±5%)
+
+    Returns:
+        Tuple of (is_balanced, list_of_warnings)
+    """
+    warnings = []
+    all_balanced = True
+
+    all_pkeys = set(pkey_train_counts.keys()) | set(pkey_val_counts.keys()) | set(pkey_test_counts.keys())
+
+    print(f"\n📊 Split Balance Validation (tolerance: ±{tolerance*100:.1f}%):")
+    print(f"{'Permutation Key':<30} {'Train %':>10} {'Val %':>10} {'Test %':>10} {'Status':>10}")
+    print("-" * 72)
+
+    for pkey in sorted(all_pkeys):
+        train_count = pkey_train_counts.get(pkey, 0)
+        val_count = pkey_val_counts.get(pkey, 0)
+        test_count = pkey_test_counts.get(pkey, 0)
+        total = train_count + val_count + test_count
+
+        if total == 0:
+            continue
+
+        train_ratio = train_count / total
+        val_ratio = val_count / total
+        test_ratio = test_count / total
+
+        train_ok = abs(train_ratio - expected_train_ratio) <= tolerance
+        val_ok = abs(val_ratio - expected_val_ratio) <= tolerance
+        test_ok = abs(test_ratio - expected_test_ratio) <= tolerance
+
+        status = "✓" if (train_ok and val_ok and test_ok) else "⚠️"
+        if not (train_ok and val_ok and test_ok):
+            all_balanced = False
+            warnings.append(f"{pkey}: Train {train_ratio:.1%}, Val {val_ratio:.1%}, Test {test_ratio:.1%}")
+
+        print(f"{pkey:<30} {train_ratio:>9.1%} {val_ratio:>9.1%} {test_ratio:>9.1%} {status:>10}")
+
+    if not all_balanced:
+        print(f"\n⚠️  Warning: {len(warnings)} classes not balanced within tolerance")
+    else:
+        print(f"\n✓ All classes balanced within tolerance")
+
+    return all_balanced, warnings
+
+
 def tokenize_dataset(
     input_dir: Path,
     output_dir: Path,
@@ -1239,33 +1694,53 @@ def tokenize_dataset(
     train_bpe: bool = False,
     test_split: float = 0.1,
     val_split: float = 0.1,
-    chunk_size: int = 10_000_000,
-    num_workers: int = 50,
+    chunk_size: int = 50_000_000,
+    batch_size: int = 10000,
+    num_workers: int = 40,
+    precompute_workers: int = 60,
+    use_legacy_pipeline: bool = False,
+    use_incremental_write: bool = True,
     oversample: bool = False,
     mode: Optional[str] = None,
+<<<<<<< HEAD
     resume: bool = False,
     skip_tcr_stitching: bool = False,
 ):
     """
     Main tokenization function with streaming support.
+=======
+    use_fast_tokenizer: bool = True,
+    stratified_split: bool = True,
+    resume: bool = False,
+):
+    """
+    Main tokenization function with streaming support (OPTIMIZED).
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
 
     Args:
-        chunk_size: Rows per chunk (default 10M = ~15GB RAM). Max ~40M for 600GB buffer.
-        num_workers: Parallel workers for Dataset.map()
+        chunk_size: Rows per chunk (default 50M = ~7.5GB RAM)
+        batch_size: Batch size for Dataset.map() tokenization (default 10000)
+        num_workers: Parallel workers for Dataset.map() (default 40)
+        precompute_workers: Parallel workers for sequence pre-computation (default 60, 0=disable parallelization)
         sample: Number of sequences to sample (optional)
         sample_mode: Sampling strategy - 'proportional' (maintain distribution) or 'balanced' (equal per permutation)
         oversample: If True and sample_mode='balanced', duplicate underrepresented samples to reach target
         mode: Filter mode - only include permutation keys matching this mode (mlm, tra, trb, tra_trb_pairing, tcr_mhc, peptide_mhc, specificity)
+<<<<<<< HEAD
         resume: If True, resume from existing output (skip already processed rows)
         skip_tcr_stitching: If True, skip expensive TCR stitching/CDR identification (much faster, but no full-length TCR sequences)
+=======
+        stratified_split: If True, use stratified split to maintain class balance; if False, use random split
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
     """
     print(f"\n{'='*60}")
-    print(f"TOKENIZATION: {model_type.upper()}")
+    print(f"TOKENIZATION: {model_type.upper()} (SPLIT-DURING-TOKENIZATION)")
     print(f"{'='*60}\n")
     print(f"⚙️  Chunk size: {chunk_size:,} rows")
-    print(f"⚙️  Batch size: 1000 sequences per tokenization call")
+    print(f"⚙️  Batch size: {batch_size:,} sequences per tokenization call")
     print(f"⚙️  Workers: {num_workers}")
     print(f"⚙️  Max RAM usage: ~{chunk_size * 150 / 1e9:.0f}GB per chunk")
+    print(f"⚙️  Split strategy: {'Stratified' if stratified_split else 'Random'} ({test_split:.0%} test, {val_split:.0%} val, {1-test_split-val_split:.0%} train)")
     if sample:
         oversample_str = ", with oversampling" if oversample else ""
         print(f"⚙️  Sampling: {sample:,} sequences (mode: {sample_mode or 'first-N'}{oversample_str})")
@@ -1275,6 +1750,7 @@ def tokenize_dataset(
         print(f"⚡ TCR stitching: DISABLED (fast mode)")
     print()
 
+<<<<<<< HEAD
     # Check for existing output and calculate resume point
     skip_rows = 0
     existing_split_counts = {'train': 0, 'validation': 0, 'test': 0}
@@ -1295,26 +1771,78 @@ def tokenize_dataset(
                 return
         else:
             print(f"   No existing output found. Starting from beginning.")
+=======
+    # Resume detection
+    resume_state = None
+    if resume:
+        print(f"\n{'='*60}")
+        print(f"🔄 RESUME MODE ENABLED")
+        print(f"{'='*60}")
+
+        resume_state = detect_existing_split_chunks(output_dir)
+
+        if resume_state['chunks_exist']:
+            print(f"✓ Found {len(resume_state['completed_chunk_nums'])} existing split chunks")
+            print(f"   Chunk numbers: {resume_state['completed_chunk_nums']}")
+            print(f"   Train chunks: {len(resume_state['train_chunk_files'])}")
+            print(f"   Val chunks: {len(resume_state['val_chunk_files'])}")
+            print(f"   Test chunks: {len(resume_state['test_chunk_files'])}")
+            if resume_state['last_chunk_num'] > 0:
+                print(f"   Last completed chunk: {resume_state['last_chunk_num']}")
+
+            # Validate compatibility
+            current_params = {
+                'model_type': model_type,
+                'max_length': max_length,
+                'batch_size': batch_size,
+                'num_workers': num_workers,
+                'chunk_size': chunk_size,
+                'sample': sample,
+                'sample_mode': sample_mode,
+                'mode': mode,
+                'stratified_split': stratified_split,
+                'test_split': test_split,
+                'val_split': val_split,
+                'use_fast_tokenizer': use_fast_tokenizer
+            }
+
+            is_compatible, issues = validate_chunk_compatibility(resume_state['metadata'], current_params)
+
+            if not is_compatible:
+                print(f"\n❌ INCOMPATIBLE CHUNKS DETECTED:")
+                for issue in issues:
+                    print(f"   - {issue}")
+                print(f"\n💡 Options:")
+                print(f"   1. Delete split chunk directories and restart from scratch")
+                print(f"   2. Use same parameters as original run")
+                raise ValueError("Cannot resume: incompatible chunk parameters")
+
+            print(f"✓ Chunk compatibility validated")
+            print(f"   Will resume from chunk {resume_state['last_chunk_num'] + 1}")
+        else:
+            print(f"ℹ️  No existing split chunks found, starting from scratch")
+            resume_state = None
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
 
     # Create tokenizer
     if model_type == "protbert":
-        tokenizer = ProtBERTTokenizer(max_length)
+        tokenizer = ProtBERTTokenizer(max_length, use_fast=use_fast_tokenizer)
     elif model_type == "bert":
-        tokenizer = StandardBERTTokenizer(max_length, model_name="google-bert/bert-base-cased")
+        tokenizer = StandardBERTTokenizer(max_length, model_name="google-bert/bert-base-cased", use_fast=use_fast_tokenizer)
     elif model_type == "esm2":
-        tokenizer = ESM2Tokenizer(max_length)
+        tokenizer = ESM2Tokenizer(max_length, use_fast=use_fast_tokenizer)
     elif model_type == "esm3":
-        tokenizer = ESM3Tokenizer(max_length)
+        tokenizer = ESM3Tokenizer(max_length)  # ESM3 uses custom tokenizer, no use_fast parameter
     elif model_type in ["bpe", "lstm", "transformer"]:
         tokenizer = BPETokenizer(max_length, vocab_size)
-        
+
         # Train BPE if requested
         if train_bpe:
             print("\n🔧 Training BPE tokenizer (streaming mode)...")
             all_sequences = []
             sequence_count = 0
             max_training_sequences = 1_000_000  # Limit for BPE training
-            
+
             for chunk_rows, _ in stream_parquet_files(input_dir, sample, chunk_size, sample_mode, num_workers, mode=mode):
                 for row in chunk_rows:
                     for field in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']:
@@ -1328,7 +1856,7 @@ def tokenize_dataset(
                         break
                 if sequence_count >= max_training_sequences:
                     break
-            
+
             print(f"Training BPE on {len(all_sequences):,} sequences...")
             tokenizer.train_on_sequences(all_sequences, output_dir / "tokenizer")
         else:
@@ -1336,9 +1864,10 @@ def tokenize_dataset(
             tokenizer.load(output_dir / "tokenizer")
     else:
         raise ValueError(f"Unknown model type: {model_type}")
-    
-    # Create output directories
+
+    # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
+<<<<<<< HEAD
     for split in ['train', 'validation', 'test']:
         (output_dir / split).mkdir(parents=True, exist_ok=True)
 
@@ -1377,11 +1906,43 @@ def tokenize_dataset(
         'trb_cdr': 0,
         'by_pkey': {}
     }
+=======
+
+    # Setup for split-during-tokenization chunk processing
+    if use_incremental_write:
+        # Incremental mode: save split chunks to disk immediately
+        train_chunks_dir = output_dir / "train_chunks"
+        val_chunks_dir = output_dir / "val_chunks"
+        test_chunks_dir = output_dir / "test_chunks"
+
+        for split_dir in [train_chunks_dir, val_chunks_dir, test_chunks_dir]:
+            split_dir.mkdir(parents=True, exist_ok=True)
+
+        train_chunk_files = []
+        val_chunk_files = []
+        test_chunk_files = []
+
+        print(f"💾 Incremental write mode enabled - split chunks will be saved to:")
+        print(f"   Train: {train_chunks_dir}")
+        print(f"   Val:   {val_chunks_dir}")
+        print(f"   Test:  {test_chunks_dir}")
+    else:
+        # Legacy mode: accumulate all chunks in memory (may cause OOM!)
+        all_tokenized_chunks = []
+        print(f"⚠️  Legacy mode: accumulating chunks in memory (may cause OOM on large datasets)")
+        print(f"⚠️  Note: Split-during-tokenization requires incremental write mode")
+
+    # Track per-permutation distribution for each split
+    pkey_train_counts: Dict[str, int] = {}
+    pkey_val_counts: Dict[str, int] = {}
+    pkey_test_counts: Dict[str, int] = {}
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
 
     # Process in streaming chunks
     print(f"\n📦 Processing dataset in chunks...")
     np.random.seed(42)
 
+<<<<<<< HEAD
     chunk_num = 0
     processing_chunk_num = 0  # Tracks chunks actually processed (for display)
     rows_skipped = 0
@@ -1485,33 +2046,116 @@ def tokenize_dataset(
         trb_success_rate = (cumulative_tcr_stats['trb_stitched'] / cumulative_tcr_stats['trb_attempted'] * 100) if cumulative_tcr_stats['trb_attempted'] > 0 else 0
         print(f"   📊 Cumulative: TRA {cumulative_tcr_stats['tra_stitched']:,}/{cumulative_tcr_stats['tra_attempted']:,} ({tra_success_rate:.1f}%), "
               f"TRB {cumulative_tcr_stats['trb_stitched']:,}/{cumulative_tcr_stats['trb_attempted']:,} ({trb_success_rate:.1f}%)")
+=======
+    # Initialize chunk counter (resume from last chunk if needed)
+    if resume_state and resume_state['chunks_exist']:
+        chunk_num = resume_state['last_chunk_num']
+        print(f"\n📦 Resuming from chunk {chunk_num + 1} (skipping {chunk_num} completed chunks)")
+        chunks_to_skip = set(resume_state['completed_chunk_nums'])
+    else:
+        chunk_num = 0
+        chunks_to_skip = set()
 
-        # Convert to HuggingFace Dataset for parallel tokenization
-        print(f"   ⚡ Creating Dataset...")
-        chunk_dataset = Dataset.from_list(chunk_rows)
-        
-        # Tokenize using Dataset.map with multiprocessing
-        print(f"   ⚡ Tokenizing with {num_workers} workers...")
-        tokenize_fn = create_tokenize_function(tokenizer, model_type)
+    total_rows_processed = 0
+
+    for chunk_rows, total_rows in stream_parquet_files(input_dir, sample, chunk_size, sample_mode, num_workers, oversample, mode):
+        chunk_num += 1
+
+        # Skip this chunk if already completed
+        if chunk_num in chunks_to_skip:
+            print(f"\n📦 Skipping chunk {chunk_num} (already completed)")
+            continue
+
+        chunk_start_time = time.time()
+        print(f"\n📦 Processing chunk {chunk_num} ({len(chunk_rows):,} rows, total: {total_rows:,})")
+
+        # Track permutation distribution
+        if chunk_num == 1:
+            from collections import Counter
+            pkey_counts = Counter([row.get('permutation_key', get_permutation_signature(row)) for row in chunk_rows])
+            print(f"   📊 Chunk 1 permutation distribution (first 5):")
+            for pkey, count in list(pkey_counts.items())[:5]:
+                print(f"      {pkey}: {count:,}")
+
+        # PRE-COMPUTE concatenated sequences to avoid per-row function calls during tokenization
+        precompute_start = time.time()
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
+
+        # Try PyArrow vectorization first (fastest for ESM-2/ESM-3 with new format)
+        # Skip if legacy pipeline is requested
+        if not use_legacy_pipeline:
+            concatenated_sequences = concatenate_sequences_arrow_esm2(chunk_rows, model_type)
+        else:
+            concatenated_sequences = None
+
+        if concatenated_sequences is not None:
+            # PyArrow vectorization succeeded (ESM-2/ESM-3 with new format)
+            print(f"   ⚡ Pre-computing concatenated sequences (PyArrow vectorized)...")
+            precompute_time = time.time() - precompute_start
+            print(f"      ⏱️  Pre-compute time: {precompute_time:.2f}s ({len(chunk_rows)/precompute_time:.0f} rows/sec)")
+
+        elif precompute_workers > 0 and len(chunk_rows) > 10000:
+            # Fallback: Parallel mode for complex cases or old format
+            print(f"   ⚡ Pre-computing concatenated sequences with {precompute_workers} workers...")
+            batch_size_worker = max(1000, len(chunk_rows) // precompute_workers)
+            batches = [
+                (chunk_rows[i:i+batch_size_worker], model_type)
+                for i in range(0, len(chunk_rows), batch_size_worker)
+            ]
+
+            with Pool(precompute_workers) as pool:
+                results = pool.map(_concatenate_batch_worker, batches)
+
+            # Flatten results from all workers
+            concatenated_sequences = [seq for batch_result in results for seq in batch_result]
+            precompute_time = time.time() - precompute_start
+            print(f"      ⏱️  Pre-compute time: {precompute_time:.2f}s ({len(chunk_rows)/precompute_time:.0f} rows/sec)")
+
+        else:
+            # Sequential mode: fallback for small chunks or when parallelization is disabled
+            print(f"   ⚡ Pre-computing concatenated sequences (sequential)...")
+            concatenated_sequences = [
+                concatenate_molecule_sequences(row, model_type)
+                for row in chunk_rows
+            ]
+            precompute_time = time.time() - precompute_start
+            print(f"      ⏱️  Pre-compute time: {precompute_time:.2f}s ({len(chunk_rows)/precompute_time:.0f} rows/sec)")
+
+        # Create HuggingFace Dataset with concatenated sequences (optimized zero-copy path)
+        print(f"   ⚡ Creating Dataset with concatenated sequences...")
+        dataset_start = time.time()
+
+        # Convert chunk_rows to PyArrow table
+        table = pa.Table.from_pylist(chunk_rows)
+
+        # Append concatenated sequences as a new column (zero-copy operation)
+        concat_array = pa.array(concatenated_sequences, type=pa.string())
+        table = table.append_column('concatenated_sequence', concat_array)
+
+        # Create Dataset from PyArrow table (zero-copy!)
+        chunk_dataset = Dataset(arrow_table=table)
+
+        dataset_time = time.time() - dataset_start
+        print(f"      ⏱️  Dataset creation time: {dataset_time:.2f}s")
+
+        # Note: Row mutation step eliminated! (previously ~5-7 seconds)
+
+        # Tokenize using Dataset.map with multiprocessing (FAST version)
+        # Uses pre-computed 'concatenated_sequence' field to avoid per-row overhead
+        print(f"   ⚡ Tokenizing with {min(40, num_workers)} workers (batch_size={batch_size:,})...")
+        tokenize_start = time.time()
+        tokenize_fn_fast = create_tokenize_function_fast(tokenizer)
         tokenized_dataset = chunk_dataset.map(
-            tokenize_fn,
+            tokenize_fn_fast,
             batched=True,
-            batch_size=1000,
-            num_proc=num_workers,
-            remove_columns=chunk_dataset.column_names,
+            batch_size=batch_size,
+            num_proc=min(40, num_workers),
             desc="   Tokenizing"
         )
-        
-        # Add back original columns (handle both new and old formats)
-        if 'permutation_key' in chunk_dataset.column_names:
-            # New format: add back permutation_key
-            tokenized_dataset = tokenized_dataset.add_column('permutation_key', chunk_dataset['permutation_key'])
-        else:
-            # Old format: add back individual molecule columns
-            for col in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']:
-                if col in chunk_dataset.column_names:
-                    tokenized_dataset = tokenized_dataset.add_column(col, chunk_dataset[col])
+        tokenize_time = time.time() - tokenize_start
+        print(f"      ⏱️  Tokenization time: {tokenize_time:.2f}s")
 
+<<<<<<< HEAD
         # Add back TCR-specific columns (NEW - for full_tra/full_trb modes)
         tcr_columns = [
             'tra_full', 'trb_full',
@@ -1554,9 +2198,146 @@ def tokenize_dataset(
               f"Val={split_counts['validation']:,}, Test={split_counts['test']:,}")
     
     # Print stratified split validation summary
+=======
+        # ===== NEW: Split the tokenized dataset into train/val/test =====
+        print(f"   🎯 Splitting chunk into train/val/test...")
+        split_start = time.time()
+
+        # Fast column access - get all permutation keys at once (avoid slow indexed access)
+        if 'permutation_key' in tokenized_dataset.column_names:
+            pkeys = tokenized_dataset['permutation_key']
+        else:
+            pkeys = [''] * len(tokenized_dataset)
+
+        chunk_rows_for_split = [{'permutation_key': pkey} for pkey in pkeys]
+
+        # Get split assignments using stratified or random split
+        if stratified_split:
+            split_assignments = stratified_split_rows(
+                chunk_rows_for_split,
+                train_ratio=1.0 - test_split - val_split,
+                val_ratio=val_split,
+                test_ratio=test_split,
+                seed=42
+            )
+        else:
+            split_assignments = random_split_rows(
+                chunk_rows_for_split,
+                train_ratio=1.0 - test_split - val_split,
+                val_ratio=val_split,
+                test_ratio=test_split,
+                seed=42
+            )
+
+        # Create indices for each split
+        train_indices = np.where(split_assignments == 'train')[0].tolist()
+        val_indices = np.where(split_assignments == 'validation')[0].tolist()
+        test_indices = np.where(split_assignments == 'test')[0].tolist()
+
+        # Select rows for each split (zero-copy operation)
+        train_dataset = tokenized_dataset.select(train_indices)
+        val_dataset = tokenized_dataset.select(val_indices)
+        test_dataset = tokenized_dataset.select(test_indices)
+
+        split_time = time.time() - split_start
+        print(f"      Train: {len(train_dataset):,} ({len(train_dataset)/len(tokenized_dataset)*100:.1f}%)")
+        print(f"      Val:   {len(val_dataset):,} ({len(val_dataset)/len(tokenized_dataset)*100:.1f}%)")
+        print(f"      Test:  {len(test_dataset):,} ({len(test_dataset)/len(tokenized_dataset)*100:.1f}%)")
+        print(f"      ⏱️  Split time: {split_time:.2f}s")
+
+        # Track permutation distribution for each split
+        if 'permutation_key' in tokenized_dataset.column_names:
+            for pkey in train_dataset['permutation_key']:
+                pkey_train_counts[pkey] = pkey_train_counts.get(pkey, 0) + 1
+            for pkey in val_dataset['permutation_key']:
+                pkey_val_counts[pkey] = pkey_val_counts.get(pkey, 0) + 1
+            for pkey in test_dataset['permutation_key']:
+                pkey_test_counts[pkey] = pkey_test_counts.get(pkey, 0) + 1
+
+        # Save split chunks or accumulate
+        chunk_size_rows = len(tokenized_dataset)  # Save before potentially deleting
+        if use_incremental_write:
+            # Incremental mode: save three split chunks to disk immediately
+            train_path = train_chunks_dir / f"chunk_{chunk_num:04d}"
+            val_path = val_chunks_dir / f"chunk_{chunk_num:04d}"
+            test_path = test_chunks_dir / f"chunk_{chunk_num:04d}"
+
+            print(f"   💾 Saving split chunks...")
+            save_start = time.time()
+
+            train_dataset.save_to_disk(str(train_path))
+            val_dataset.save_to_disk(str(val_path))
+            test_dataset.save_to_disk(str(test_path))
+
+            save_time = time.time() - save_start
+            print(f"      ⏱️  Save time: {save_time:.2f}s")
+
+            train_chunk_files.append(train_path)
+            val_chunk_files.append(val_path)
+            test_chunk_files.append(test_path)
+
+            # Update resume metadata after each successful chunk
+            if resume:
+                completed_chunks = resume_state['completed_chunk_nums'] if resume_state and resume_state['chunks_exist'] else []
+                completed_chunks.append(chunk_num)
+
+                current_params = {
+                    'model_type': model_type,
+                    'max_length': max_length,
+                    'batch_size': batch_size,
+                    'num_workers': num_workers,
+                    'chunk_size': chunk_size,
+                    'sample': sample,
+                    'sample_mode': sample_mode,
+                    'mode': mode,
+                    'stratified_split': stratified_split,
+                    'test_split': test_split,
+                    'val_split': val_split,
+                    'use_fast_tokenizer': use_fast_tokenizer
+                }
+
+                rows_per_split = {
+                    'train': len(train_dataset),
+                    'validation': len(val_dataset),
+                    'test': len(test_dataset)
+                }
+
+                save_resume_metadata_with_splits(output_dir, current_params, completed_chunks, rows_per_split)
+
+                # Update resume_state for next iteration
+                if resume_state is None:
+                    resume_state = {'completed_chunk_nums': []}
+                resume_state['completed_chunk_nums'] = completed_chunks
+
+            # Clear from memory
+            del tokenized_dataset, train_dataset, val_dataset, test_dataset, chunk_dataset
+            import gc
+            gc.collect()
+        else:
+            # Legacy mode: accumulate in memory (may cause OOM!)
+            all_tokenized_chunks.append(tokenized_dataset)
+            print(f"⚠️  Warning: Legacy mode doesn't support split-during-tokenization")
+
+        total_rows_processed += chunk_size_rows
+
+        chunk_total_time = time.time() - chunk_start_time
+        print(f"\n   ✓ Chunk {chunk_num} complete ({chunk_size_rows:,} rows)")
+        print(f"   ⏱️  TOTAL CHUNK TIME: {chunk_total_time:.2f}s ({len(chunk_rows)/chunk_total_time:.0f} rows/sec)")
+        print(f"   📊 Breakdown:")
+        print(f"      - Pre-compute:          {precompute_time:6.2f}s ({precompute_time/chunk_total_time*100:5.1f}%)")
+        print(f"      - Dataset creation:     {dataset_time:6.2f}s ({dataset_time/chunk_total_time*100:5.1f}%)")
+        print(f"      - Tokenization:         {tokenize_time:6.2f}s ({tokenize_time/chunk_total_time*100:5.1f}%)")
+        print(f"      - Splitting:            {split_time:6.2f}s ({split_time/chunk_total_time*100:5.1f}%)")
+        other_time = chunk_total_time - precompute_time - dataset_time - tokenize_time - split_time
+        print(f"      - Other (I/O, etc):     {other_time:6.2f}s ({other_time/chunk_total_time*100:5.1f}%)")
+        print(f"   📊 Cumulative total: {total_rows_processed:,} rows")
+
+    # Concatenate split chunks separately (batched approach to avoid OOM)
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
     print(f"\n{'='*60}")
-    print(f"📊 STRATIFIED SPLIT VALIDATION")
+    print(f"🔗 CONCATENATING SPLIT CHUNKS")
     print(f"{'='*60}")
+<<<<<<< HEAD
     print(f"\nPer-permutation split distribution:")
     
     # Sort by total count to show smallest classes first (most important for balanced sampling)
@@ -1644,20 +2425,152 @@ def tokenize_dataset(
     
     dataset_dict_obj = DatasetDict(datasets_dict)
     
+=======
+
+    from datasets import DatasetDict, concatenate_datasets, load_from_disk
+    import gc
+
+    if use_incremental_write:
+        # Memory-efficient batched concatenation for each split
+
+        # Collect all chunk files (both resumed and new)
+        all_train_files = []
+        all_val_files = []
+        all_test_files = []
+
+        # Add resumed chunks if exist
+        if resume_state and resume_state['chunks_exist']:
+            all_train_files.extend(resume_state['train_chunk_files'])
+            all_val_files.extend(resume_state['val_chunk_files'])
+            all_test_files.extend(resume_state['test_chunk_files'])
+            print(f"📦 Including resumed chunks:")
+            print(f"   Train: {len(resume_state['train_chunk_files'])}")
+            print(f"   Val:   {len(resume_state['val_chunk_files'])}")
+            print(f"   Test:  {len(resume_state['test_chunk_files'])}")
+
+        # Add newly created chunks
+        all_train_files.extend(train_chunk_files)
+        all_val_files.extend(val_chunk_files)
+        all_test_files.extend(test_chunk_files)
+
+        print(f"\n📦 Total chunks to concatenate:")
+        print(f"   Train: {len(all_train_files)}")
+        print(f"   Val:   {len(all_val_files)}")
+        print(f"   Test:  {len(all_test_files)}")
+
+        # Concatenate train chunks (use batching due to size)
+        print(f"\n🔗 Concatenating train chunks...")
+        concat_start = time.time()
+        train_dataset = concatenate_chunks_in_batches(all_train_files, batch_size=5, split_name="train")
+        train_time = time.time() - concat_start
+        print(f"   ✓ Train dataset: {len(train_dataset):,} rows ({train_time:.2f}s)")
+        gc.collect()
+
+        # Concatenate val chunks (can do all at once - smaller)
+        print(f"\n🔗 Concatenating val chunks...")
+        concat_start = time.time()
+        val_datasets = [load_from_disk(str(p)) for p in all_val_files]
+        val_dataset = concatenate_datasets(val_datasets)
+        val_time = time.time() - concat_start
+        print(f"   ✓ Val dataset: {len(val_dataset):,} rows ({val_time:.2f}s)")
+        del val_datasets
+        gc.collect()
+
+        # Concatenate test chunks (can do all at once - smaller)
+        print(f"\n🔗 Concatenating test chunks...")
+        concat_start = time.time()
+        test_datasets = [load_from_disk(str(p)) for p in all_test_files]
+        test_dataset = concatenate_datasets(test_datasets)
+        test_time = time.time() - concat_start
+        print(f"   ✓ Test dataset: {len(test_dataset):,} rows ({test_time:.2f}s)")
+        del test_datasets
+        gc.collect()
+
+        # Create final DatasetDict
+        dataset_dict_obj = DatasetDict({
+            'train': train_dataset,
+            'validation': val_dataset,
+            'test': test_dataset
+        })
+
+        total_rows = len(train_dataset) + len(val_dataset) + len(test_dataset)
+        print(f"\n✓ Split sizes:")
+        print(f"  Train:      {len(train_dataset):,} ({len(train_dataset)/total_rows*100:.1f}%)")
+        print(f"  Validation: {len(val_dataset):,} ({len(val_dataset)/total_rows*100:.1f}%)")
+        print(f"  Test:       {len(test_dataset):,} ({len(test_dataset)/total_rows*100:.1f}%)")
+        print(f"  Total:      {total_rows:,}")
+
+        # Validate split balance
+        if pkey_train_counts or pkey_val_counts or pkey_test_counts:
+            validate_split_balance(
+                pkey_train_counts,
+                pkey_val_counts,
+                pkey_test_counts,
+                expected_train_ratio=1.0 - test_split - val_split,
+                expected_val_ratio=val_split,
+                expected_test_ratio=test_split,
+                tolerance=0.05
+            )
+
+        # Clean up temporary split chunks
+        print(f"\n🧹 Cleaning up temporary split chunk files...")
+        import shutil
+        for split_dir in [train_chunks_dir, val_chunks_dir, test_chunks_dir]:
+            if split_dir.exists():
+                for chunk_path in split_dir.iterdir():
+                    if chunk_path.is_dir():
+                        shutil.rmtree(chunk_path, ignore_errors=True)
+                shutil.rmtree(split_dir, ignore_errors=True)
+                print(f"   ✓ Cleaned {split_dir.name}")
+
+        # Force garbage collection
+        gc.collect()
+    else:
+        # Legacy mode: direct concatenation (high memory usage)
+        print(f"⚠️  Warning: Legacy mode doesn't support split-during-tokenization")
+        print(f"Concatenating {len(all_tokenized_chunks)} chunks into single dataset...")
+        concat_start = time.time()
+        full_dataset = concatenate_datasets(all_tokenized_chunks)
+        concat_time = time.time() - concat_start
+        print(f"   ⏱️  Concatenation time: {concat_time:.2f}s")
+        print(f"✓ Concatenated dataset: {len(full_dataset):,} rows")
+
+        # Perform splits the old way
+        train_val_test_split = full_dataset.train_test_split(test_size=test_split, seed=42)
+        val_ratio_adjusted = val_split / (1 - test_split)
+        train_val_split = train_val_test_split['train'].train_test_split(test_size=val_ratio_adjusted, seed=42)
+
+        dataset_dict_obj = DatasetDict({
+            'train': train_val_split['train'],
+            'validation': train_val_split['test'],
+            'test': train_val_test_split['test']
+        })
+
+        # Clear chunks from memory
+        del all_tokenized_chunks, full_dataset
+        gc.collect()
+
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
     # Save HuggingFace dataset
+    print(f"\n{'='*60}")
+    print(f"💾 SAVING DATASET")
+    print(f"{'='*60}")
     hf_output_dir = output_dir / "hf_dataset"
+    print(f"Saving to {hf_output_dir}...")
     dataset_dict_obj.save_to_disk(str(hf_output_dir))
     print(f"✓ Saved HuggingFace dataset to {hf_output_dir}")
-    
+
     # Save tokenizer
     print(f"\n💾 Saving tokenizer...")
     tokenizer.save(output_dir / "tokenizer")
-    
+    print(f"✓ Saved tokenizer to {output_dir / 'tokenizer'}")
+
     print(f"\n{'='*60}")
     print(f"✅ TOKENIZATION COMPLETE")
     print(f"{'='*60}")
     print(f"Output directory: {output_dir}")
-    print(f"Tokenizer saved to: {output_dir / 'tokenizer'}")
+    print(f"HuggingFace dataset: {hf_output_dir}")
+    print(f"Tokenizer: {output_dir / 'tokenizer'}")
 
 
 def main():
@@ -1680,10 +2593,30 @@ def main():
     parser.add_argument("--train-bpe", action="store_true", help="Train BPE tokenizer (required for first run)")
     parser.add_argument("--test-split", type=float, default=0.1, help="Test split fraction")
     parser.add_argument("--val-split", type=float, default=0.1, help="Validation split fraction")
+<<<<<<< HEAD
     parser.add_argument("--chunk-size", type=int, default=10_000_000, help="Number of rows per chunk (default: 10M = ~15GB RAM)")
     parser.add_argument("--num-workers", type=int, default=16, help="Number of parallel workers for tokenization (default: 16, recommended: 8-24)")
     parser.add_argument("--resume", action="store_true", help="Resume from existing output (skip already processed rows)")
     parser.add_argument("--skip-tcr-stitching", action="store_true", help="Skip expensive TCR stitching/CDR identification (much faster)")
+=======
+    parser.add_argument("--chunk-size", type=int, default=50_000_000, help="Number of rows per chunk (default: 50M = ~7.5GB RAM)")
+    parser.add_argument("--batch-size", type=int, default=50000, help="Batch size for tokenization (default: 50000, larger = faster but more RAM)")
+    parser.add_argument("--num-workers", type=int, default=16, help="Number of parallel workers for tokenization (default: 16, reduced from 40 to prevent shared memory issues)")
+    parser.add_argument("--precompute-workers", type=int, default=32, help="Number of parallel workers for sequence pre-computation (default: 32, reduced from 60 to prevent overhead)")
+    parser.add_argument("--use-legacy-pipeline", action="store_true", help="Use legacy pipeline without optimizations (for debugging/comparison)")
+    parser.add_argument("--incremental-write", action="store_true", default=True, help="Write chunks incrementally to avoid OOM (default: True)")
+    parser.add_argument("--no-incremental-write", action="store_false", dest="incremental_write", help="Disable incremental writing (may cause OOM on large datasets)")
+    parser.add_argument("--use-fast-tokenizer", action="store_true", default=True,
+                       help="Use fast Rust-based tokenizers where available (default: True, 2-10x faster for BERT/ProtBERT)")
+    parser.add_argument("--no-fast-tokenizer", action="store_false", dest="use_fast_tokenizer",
+                       help="Disable fast tokenizers (use Python implementation)")
+    parser.add_argument("--stratified-split", action="store_true", default=True,
+                       help="Use stratified split to maintain class balance (default: True)")
+    parser.add_argument("--random-split", action="store_false", dest="stratified_split",
+                       help="Use random split instead of stratified split")
+    parser.add_argument("--resume", action="store_true",
+                       help="Resume from existing split chunk directories (skip already-completed chunks)")
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
 
     args = parser.parse_args()
     
@@ -1706,11 +2639,21 @@ def main():
         test_split=args.test_split,
         val_split=args.val_split,
         chunk_size=args.chunk_size,
+        batch_size=args.batch_size,
         num_workers=args.num_workers,
+        precompute_workers=0 if args.use_legacy_pipeline else args.precompute_workers,
+        use_legacy_pipeline=args.use_legacy_pipeline,
+        use_incremental_write=args.incremental_write,
         oversample=args.oversample,
         mode=args.mode,
+<<<<<<< HEAD
         resume=args.resume,
         skip_tcr_stitching=args.skip_tcr_stitching,
+=======
+        use_fast_tokenizer=args.use_fast_tokenizer,
+        stratified_split=args.stratified_split,
+        resume=args.resume,
+>>>>>>> 2a62664 (Updated to incrementally write toeknized shards and implement stratified data splits)
     )
 
 

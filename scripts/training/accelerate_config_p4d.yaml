@@ -1,0 +1,22 @@
+# Accelerate configuration for p4d.24xlarge (8x A100 40GB)
+#
+# Usage:
+#   accelerate launch --config_file accelerate_config_p4d.yaml esm_fine_tune.py \
+#       --dataset_path /path/to/data --output_dir ./output
+#
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+downcast_bf16: 'no'
+enable_cpu_affinity: true
+gpu_ids: all
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false

@@ -226,7 +226,7 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
     Returns number of valid rows extracted.
     """
     if num_workers is None:
-        num_workers = max(1, cpu_count() - 2)  # Leave 2 cores free
+        num_workers = cpu_count()  # Use all cores for maximum throughput
     
     valid_count = 0
     
@@ -234,7 +234,7 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
     if stitch_tcr:
         print(f"   ℹ️  TCR stitching ENABLED - will generate full-length sequences from CDR3 + gene segments")
     
-    with open(temp_file, 'w') as out:
+    with open(temp_file, 'w', buffering=8*1024*1024) as out:  # 8MB write buffer
         total_gene_failures = {'trav': 0, 'traj': 0, 'trbv': 0, 'trbj': 0}
 
         with Pool(num_workers) as pool:
@@ -268,7 +268,7 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
     a giant intermediate extract file. Returns (chunk_files, valid_count).
     """
     if num_workers is None:
-        num_workers = max(1, cpu_count() - 2)
+        num_workers = cpu_count()  # Use all cores for maximum throughput
 
     print(f"   ℹ️  Using {num_workers} parallel workers (streaming extract)")
     if stitch_tcr:
@@ -297,7 +297,7 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
                         del current_chunk[:chunk_size]
                         to_write.sort()
                         out_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
-                        with open(out_path, 'w') as cf:
+                        with open(out_path, 'w', buffering=8*1024*1024) as cf:  # 8MB write buffer
                             cf.writelines(to_write)
                         chunk_files.append(out_path)
                         chunk_idx += 1
@@ -307,7 +307,7 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
     if current_chunk:
         current_chunk.sort()
         out_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
-        with open(out_path, 'w') as cf:
+        with open(out_path, 'w', buffering=8*1024*1024) as cf:  # 8MB write buffer
             cf.writelines(current_chunk)
         chunk_files.append(out_path)
         chunk_idx += 1
@@ -341,7 +341,7 @@ def merge_sorted_files(chunk_files: List[Path], output_file: Path, temp_dir: Pat
     def merge_group(files: List[Path], out_path: Path):
         file_iters = []
         for p in files:
-            f = open(p, 'r')
+            f = open(p, 'r', buffering=8*1024*1024)  # 8MB read buffer
             file_iters.append((f, iter(f)))
         try:
             heap = []
@@ -351,7 +351,7 @@ def merge_sorted_files(chunk_files: List[Path], output_file: Path, temp_dir: Pat
                     heapq.heappush(heap, (line, idx))
                 except StopIteration:
                     pass
-            with open(out_path, 'w') as out:
+            with open(out_path, 'w', buffering=8*1024*1024) as out:  # 8MB write buffer
                 while heap:
                     line, idx = heapq.heappop(heap)
                     out.write(line)
@@ -401,7 +401,7 @@ def extract_and_sort_streaming(parquet_files: List[str], sorted_file: Path, temp
     merge_sorted_files(chunk_files, sorted_file, temp_dir, max_open_files=max_open_files)
     return valid_count, time.time() - start
 
-def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size: int = 50_000_000, max_open_files: int = 256) -> float:
+def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size: int = 200_000_000, max_open_files: int = 1024) -> float:
     """
     External merge sort implemented in Python:
     - Read input in chunks of `chunk_size` lines
@@ -419,7 +419,7 @@ def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size
     # Phase 1: create sorted chunk files
     current_chunk: List[str] = []
     chunk_idx = 0
-    with open(input_file, 'r') as f:
+    with open(input_file, 'r', buffering=8*1024*1024) as f:  # 8MB read buffer
         for line in tqdm(f, desc="   Reading and sorting chunks", unit=" lines", unit_scale=True):
             if not line:
                 continue
@@ -427,7 +427,7 @@ def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size
             if len(current_chunk) >= chunk_size:
                 current_chunk.sort()
                 chunk_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
-                with open(chunk_path, 'w') as cf:
+                with open(chunk_path, 'w', buffering=8*1024*1024) as cf:  # 8MB write buffer
                     cf.writelines(current_chunk)
                 chunk_files.append(chunk_path)
                 current_chunk = []
@@ -437,7 +437,7 @@ def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size
         if current_chunk:
             current_chunk.sort()
             chunk_path = temp_dir / f"chunk_{chunk_idx:06d}.txt"
-            with open(chunk_path, 'w') as cf:
+            with open(chunk_path, 'w', buffering=8*1024*1024) as cf:  # 8MB write buffer
                 cf.writelines(current_chunk)
             chunk_files.append(chunk_path)
             current_chunk = []
@@ -454,7 +454,7 @@ def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size
     def merge_group(files: List[Path], out_path: Path):
         file_iters = []
         for p in files:
-            f = open(p, 'r')
+            f = open(p, 'r', buffering=8*1024*1024)  # 8MB read buffer
             file_iters.append((f, iter(f)))
 
         try:
@@ -467,7 +467,7 @@ def pyarrow_sort(input_file: Path, output_file: Path, temp_dir: Path, chunk_size
                 except StopIteration:
                     pass
 
-            with open(out_path, 'w') as out:
+            with open(out_path, 'w', buffering=8*1024*1024) as out:  # 8MB write buffer
                 while heap:
                     line, idx = heapq.heappop(heap)
                     out.write(line)
@@ -517,7 +517,7 @@ def external_sort(input_file: Path, output_file: Path, temp_dir: Path, buffer_si
     NOTE: This function is kept for compatibility but PyArrow sort is now preferred.
     """
     if num_threads is None:
-        num_threads = max(4, cpu_count() - 2)  # Use most cores, leave 2 free
+        num_threads = cpu_count()  # Use all cores for maximum throughput
     
     start_time = time.time()
     
@@ -552,7 +552,7 @@ def stream_deduplicate(input_file: Path, output_file: Path) -> int:
     unique_count = 0
     prev_key = None
     
-    with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
+    with open(input_file, 'r', buffering=8*1024*1024) as infile, open(output_file, 'w', buffering=8*1024*1024) as outfile:  # 8MB buffers
         with tqdm(desc="Deduplicating", unit=" rows", unit_scale=True) as pbar:
             for line in infile:
                 if not line.strip():
@@ -645,11 +645,11 @@ def generate_permutations(input_file: Path, output_file: Path, mode: str, max_pe
     Generate permutations for each unique molecule combination (parallelized).
     For tra/trb modes: skip permutations (only 1 ordering makes sense)
     For other modes: generate all permutations up to max_perms
-    
+
     Returns number of permutations generated.
     """
     print(f"\n📊 Stage 2: Generating permutations (mode={mode})...")
-    
+
     # For single-chain modes, skip permutation generation
     if mode in ['tra', 'trb']:
         print(f"   ℹ️  Skipping permutation generation for {mode} mode (single chain)")
@@ -658,36 +658,39 @@ def generate_permutations(input_file: Path, output_file: Path, mode: str, max_pe
         with open(input_file, 'r') as f:
             count = sum(1 for _ in f)
         return count
-    
+
     if num_workers is None:
-        num_workers = max(1, cpu_count() - 2)
-    
+        num_workers = cpu_count()  # Use all cores for maximum throughput
+
     print(f"   ℹ️  Using {num_workers} parallel workers")
-    
-    # Read input file in batches
-    batch_size = 10000  # Process 10k molecules per batch
+
+    # Stream input file in batches - memory efficient for large files
+    batch_size = 100000  # Process 100k molecules per batch
     perm_count = 0
-    
-    with open(input_file, 'r') as infile:
-        lines = infile.readlines()
-    
-    total_molecules = len(lines)
-    
-    # Create batches
-    batches = []
-    for i in range(0, len(lines), batch_size):
-        batch = lines[i:i+batch_size]
-        batches.append((batch, mode, max_perms))
-    
-    # Process batches in parallel
-    with open(output_file, 'w') as outfile:
+
+    # Generator function to yield batches without loading entire file
+    def batch_generator():
+        """Yield batches of lines from input file without loading all into memory."""
+        with open(input_file, 'r', buffering=8*1024*1024) as infile:
+            batch = []
+            for line in infile:
+                batch.append(line)
+                if len(batch) >= batch_size:
+                    yield (batch, mode, max_perms)
+                    batch = []
+            # Yield final partial batch
+            if batch:
+                yield (batch, mode, max_perms)
+
+    # Process batches in parallel using streaming generator
+    with open(output_file, 'w', buffering=16*1024*1024) as outfile:  # 16MB write buffer for large output
         with Pool(num_workers) as pool:
-            with tqdm(desc="Generating permutations", unit=" batches", total=len(batches)) as pbar:
-                for output_lines in pool.imap_unordered(process_molecule_batch, batches, chunksize=1):
+            with tqdm(desc="Generating permutations", unit=" batches", unit_scale=False) as pbar:
+                for output_lines in pool.imap_unordered(process_molecule_batch, batch_generator(), chunksize=1):
                     outfile.writelines(output_lines)
                     perm_count += len(output_lines)
                     pbar.update(1)
-    
+
     return perm_count
 
 def deduplicate_permutations(input_file: Path, output_file: Path, temp_dir: Path, 
@@ -722,12 +725,12 @@ def deduplicate_permutations(input_file: Path, output_file: Path, temp_dir: Path
 def parse_permutation_key(perm_key: str) -> tuple[List[str], Dict[str, str]]:
     """
     Parse permutation key to extract field order and sequences.
-    
+
     Handles three formats:
     1. Old format (multi): "tra:AAA|peptide:CCC|mhc_one:DDD" - extracts sequences from key
     2. Old format (single): "tra:AAA" - single molecule with sequence
     3. New format: "tra_peptide_mhc_one" - no sequences in key
-    
+
     Returns:
         - field_order: list of field names in order
         - sequences_dict: dict mapping field names to sequences (empty for new format)
@@ -743,8 +746,33 @@ def parse_permutation_key(perm_key: str) -> tuple[List[str], Dict[str, str]]:
                 sequences_dict[field_name] = sequence
         return field_order, sequences_dict
     else:
-        # New format - just field names separated by _, no sequences
-        return perm_key.split('_'), {}
+        # New format - field names separated by _, but some fields contain underscores
+        # Known field names (longer names first to match greedily)
+        known_fields = ['mhc_one', 'mhc_two', 'peptide', 'tra', 'trb']
+
+        field_order = []
+        remaining = perm_key
+
+        while remaining:
+            matched = False
+            for field in known_fields:
+                if remaining.startswith(field):
+                    field_order.append(field)
+                    remaining = remaining[len(field):]
+                    # Remove leading underscore separator if present
+                    if remaining.startswith('_'):
+                        remaining = remaining[1:]
+                    matched = True
+                    break
+
+            if not matched:
+                # Unknown format, skip to next underscore or end
+                if '_' in remaining:
+                    remaining = remaining.split('_', 1)[1]
+                else:
+                    break
+
+        return field_order, {}
 
 
 def concatenate_sequences(row_dict: Dict, field_order: List[str], sequences_dict: Dict[str, str], use_full: bool = False) -> str:
@@ -777,6 +805,91 @@ def concatenate_sequences(row_dict: Dict, field_order: List[str], sequences_dict
             sequences.append(str(val))
     
     return " ".join(sequences)
+
+
+def detect_resume_state(work_dir: Path) -> dict:
+    """
+    Detect what stage of processing has been completed based on intermediate files.
+
+    Returns a dict with:
+        - stage: 'none', 'chunks', 'sorted', 'deduped', 'permutations', 'final'
+        - chunk_files: list of chunk files (if stage >= 'chunks')
+        - sorted_file: path to sorted file (if exists)
+        - deduped_file: path to deduped file (if exists)
+        - perm_file: path to permutations file (if exists)
+        - final_file: path to final file (if exists)
+        - valid_count: number of valid rows (if detectable)
+        - unique_count: number of unique molecules (if detectable)
+        - perm_count: number of permutations (if detectable)
+    """
+    state = {
+        'stage': 'none',
+        'chunk_files': [],
+        'sorted_file': None,
+        'deduped_file': None,
+        'perm_file': None,
+        'final_file': None,
+        'valid_count': None,
+        'unique_count': None,
+        'perm_count': None
+    }
+
+    sorted_file = work_dir / "sorted.txt"
+    deduped_file = work_dir / "deduped.txt"
+    perm_file = work_dir / "permutations.txt"
+    final_file = work_dir / "final.txt"
+
+    # Check for final output (Stage 3 complete)
+    if final_file.exists():
+        state['stage'] = 'final'
+        state['final_file'] = final_file
+        # Count lines
+        with open(final_file, 'r') as f:
+            state['perm_count'] = sum(1 for _ in f)
+        return state
+
+    # Check for permutations file (Stage 2 complete)
+    if perm_file.exists():
+        state['stage'] = 'permutations'
+        state['perm_file'] = perm_file
+        # Count lines
+        with open(perm_file, 'r') as f:
+            state['perm_count'] = sum(1 for _ in f)
+        return state
+
+    # Check for deduped file (Stage 1 complete)
+    if deduped_file.exists():
+        state['stage'] = 'deduped'
+        state['deduped_file'] = deduped_file
+        # Count lines
+        with open(deduped_file, 'r') as f:
+            state['unique_count'] = sum(1 for _ in f)
+        return state
+
+    # Check for sorted file (Stage 1 sort complete, needs dedup)
+    if sorted_file.exists():
+        state['stage'] = 'sorted'
+        state['sorted_file'] = sorted_file
+        return state
+
+    # Check for chunk files (extraction complete, needs merge)
+    chunk_files = sorted(work_dir.glob("chunk_*.txt"))
+    if chunk_files:
+        state['stage'] = 'chunks'
+        state['chunk_files'] = chunk_files
+        # Try to estimate valid_count from chunk files
+        total_lines = 0
+        for chunk in chunk_files[:5]:  # Sample first 5 chunks
+            with open(chunk, 'r') as f:
+                total_lines += sum(1 for _ in f)
+        if len(chunk_files) <= 5:
+            state['valid_count'] = total_lines
+        else:
+            # Estimate based on sample
+            state['valid_count'] = int(total_lines * len(chunk_files) / 5)
+        return state
+
+    return state
 
 
 def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Path, batch_size: int = 1000000):
@@ -953,12 +1066,13 @@ def main():
     parser.add_argument("--no-permutations", action="store_true", help="Skip permutation generation entirely")
     parser.add_argument("--keep-all-permutations", action="store_true", help="Generate permutations but skip permutation deduplication")
     parser.add_argument("--buffer-size", default="50G", help="Sort buffer size (e.g., 50G) - only used with --use-unix-sort")
-    parser.add_argument("--num-workers", type=int, default=None, help="Number of parallel workers (default: CPU count - 2)")
-    parser.add_argument("--sort-chunk-size", type=int, default=50_000_000, help="Chunk size for PyArrow sort (default: 50M lines)")
-    parser.add_argument("--sort-max-open-files", type=int, default=256, help="Max files to open per merge pass (default: 256)")
+    parser.add_argument("--num-workers", type=int, default=None, help="Number of parallel workers (default: all CPU cores)")
+    parser.add_argument("--sort-chunk-size", type=int, default=200_000_000, help="Chunk size for PyArrow sort (default: 200M lines)")
+    parser.add_argument("--sort-max-open-files", type=int, default=1024, help="Max files to open per merge pass (default: 1024)")
     parser.add_argument("--use-unix-sort", action="store_true", help="Use Unix sort instead of PyArrow sort (not recommended for large datasets)")
     parser.add_argument("--stitch-tcr", action="store_true", help="Generate full-length TCR sequences from CDR3 + gene segments using stitchr")
-    
+    parser.add_argument("--resume", action="store_true", help="Resume from existing intermediate files (chunk files, sorted files, etc.)")
+
     args = parser.parse_args()
     
     # Setup temp directory (for small ops)
@@ -986,82 +1100,163 @@ def main():
     all_files = []
     for path in args.path:
         all_files.extend(glob.glob(f"{path}/**/*.parquet", recursive=True))
-    
+
     print(f"📁 Found {len(all_files):,} parquet files")
-    
+
     if args.sample:
         import random
         all_files = random.sample(all_files, min(args.sample, len(all_files)))
         print(f"📊 Sampling {len(all_files):,} files")
-    
+
+    # Check for resume state
+    resume_state = None
+    if args.resume:
+        resume_state = detect_resume_state(work_dir)
+        if resume_state['stage'] != 'none':
+            print(f"\n🔄 RESUME MODE ENABLED")
+            print(f"   Detected stage: {resume_state['stage']}")
+            if resume_state['stage'] == 'chunks':
+                print(f"   Found {len(resume_state['chunk_files'])} chunk files")
+                if resume_state['valid_count']:
+                    print(f"   Estimated valid rows: {resume_state['valid_count']:,}")
+            elif resume_state['stage'] == 'sorted':
+                print(f"   Found sorted file: {resume_state['sorted_file']}")
+            elif resume_state['stage'] == 'deduped':
+                print(f"   Found deduped file: {resume_state['deduped_file']}")
+                if resume_state['unique_count']:
+                    print(f"   Unique molecules: {resume_state['unique_count']:,}")
+            elif resume_state['stage'] == 'permutations':
+                print(f"   Found permutations file: {resume_state['perm_file']}")
+                if resume_state['perm_count']:
+                    print(f"   Permutations: {resume_state['perm_count']:,}")
+            elif resume_state['stage'] == 'final':
+                print(f"   Found final file: {resume_state['final_file']}")
+                if resume_state['perm_count']:
+                    print(f"   Final rows: {resume_state['perm_count']:,}")
+                print(f"   Skipping directly to output writing")
+        else:
+            print(f"\n🔄 RESUME MODE ENABLED (no existing files found, starting from scratch)")
+
     # Stage 1: Molecule deduplication
-    print(f"\n{'='*60}")
-    print(f"STAGE 1: MOLECULE DEDUPLICATION (mode={args.mode})")
-    print(f"{'='*60}")
-    
     sorted_file = work_dir / "sorted.txt"
     deduped_file = work_dir / "deduped.txt"
-    
-    if args.use_unix_sort:
-        # Traditional: extract → external sort
-        extract_file = work_dir / "extract.txt"
-        print("\n📊 Step 1/3: Extracting and tagging molecules...")
-        valid_count = extract_parquet_to_temp(all_files, extract_file, args.mode, args.num_workers, args.stitch_tcr)
-        size_gb = extract_file.stat().st_size / (1024**3)
-        print(f"✓ Extracted {valid_count:,} valid molecules ({size_gb:.2f} GB)")
 
-        print("\n📊 Step 2/3: External Unix sort...")
-        sort_time = external_sort(extract_file, sorted_file, work_dir, args.buffer_size, args.num_workers)
-        print(f"✓ Sorted in {sort_time:.1f}s ({sort_time/60:.1f} min)")
-        extract_file.unlink()
+    # Skip Stage 1 if resuming from later stages
+    if resume_state and resume_state['stage'] in ['deduped', 'permutations', 'final']:
+        print(f"\n{'='*60}")
+        print(f"STAGE 1: MOLECULE DEDUPLICATION - SKIPPED (resuming from {resume_state['stage']})")
+        print(f"{'='*60}")
+        unique_count = resume_state.get('unique_count', 0)
+        valid_count = resume_state.get('valid_count', 0)
+        # Use the deduped file from resume state
+        if resume_state['deduped_file'] and resume_state['deduped_file'].exists():
+            deduped_file = resume_state['deduped_file']
     else:
-        # Streaming: extract directly into sorted chunks → merge, no giant extract file
-        print("\n📊 Step 1/2: Extracting + building sorted chunks (streaming)...")
-        valid_count, sort_time = extract_and_sort_streaming(
-            all_files, sorted_file, work_dir, args.mode,
-            args.num_workers if args.num_workers else max(1, cpu_count()-2),
-            args.sort_chunk_size, args.sort_max_open_files, args.stitch_tcr
-        )
-        print(f"✓ Streamed extract+sort in {sort_time:.1f}s ({sort_time/60:.1f} min)")
-    
-    # Deduplicate
-    print("\n📊 Step 3/3: Streaming deduplication...")
-    unique_count = stream_deduplicate(sorted_file, deduped_file)
-    print(f"✓ Found {unique_count:,} unique molecules")
-    sorted_file.unlink()
+        print(f"\n{'='*60}")
+        print(f"STAGE 1: MOLECULE DEDUPLICATION (mode={args.mode})")
+        print(f"{'='*60}")
+
+        # Check if we can resume from chunks or sorted file
+        if resume_state and resume_state['stage'] == 'chunks':
+            print(f"\n🔄 Resuming from {len(resume_state['chunk_files'])} existing chunk files...")
+            print("\n📊 Step 1/2: Merging existing chunks...")
+            merge_sorted_files(resume_state['chunk_files'], sorted_file, work_dir, max_open_files=args.sort_max_open_files)
+            valid_count = resume_state.get('valid_count', 0)
+        elif resume_state and resume_state['stage'] == 'sorted':
+            print(f"\n🔄 Resuming from existing sorted file...")
+            # Use the existing sorted file
+            sorted_file = resume_state['sorted_file']
+            valid_count = 0  # Unknown, will be counted during dedup
+        else:
+            # Normal processing - extract and sort
+            if args.use_unix_sort:
+                # Traditional: extract → external sort
+                extract_file = work_dir / "extract.txt"
+                print("\n📊 Step 1/3: Extracting and tagging molecules...")
+                valid_count = extract_parquet_to_temp(all_files, extract_file, args.mode, args.num_workers, args.stitch_tcr)
+                size_gb = extract_file.stat().st_size / (1024**3)
+                print(f"✓ Extracted {valid_count:,} valid molecules ({size_gb:.2f} GB)")
+
+                print("\n📊 Step 2/3: External Unix sort...")
+                sort_time = external_sort(extract_file, sorted_file, work_dir, args.buffer_size, args.num_workers)
+                print(f"✓ Sorted in {sort_time:.1f}s ({sort_time/60:.1f} min)")
+                extract_file.unlink()
+            else:
+                # Streaming: extract directly into sorted chunks → merge, no giant extract file
+                print("\n📊 Step 1/2: Extracting + building sorted chunks (streaming)...")
+                valid_count, sort_time = extract_and_sort_streaming(
+                    all_files, sorted_file, work_dir, args.mode,
+                    args.num_workers if args.num_workers else cpu_count(),
+                    args.sort_chunk_size, args.sort_max_open_files, args.stitch_tcr
+                )
+                print(f"✓ Streamed extract+sort in {sort_time:.1f}s ({sort_time/60:.1f} min)")
+
+        # Deduplicate (unless we already have deduped file)
+        if not (resume_state and resume_state['stage'] == 'sorted'):
+            print("\n📊 Step 3/3: Streaming deduplication...")
+        else:
+            print("\n📊 Step 2/2: Streaming deduplication...")
+        unique_count = stream_deduplicate(sorted_file, deduped_file)
+        print(f"✓ Found {unique_count:,} unique molecules")
+        sorted_file.unlink()
     
     # Stage 2: Permutation generation (if requested)
     if not args.no_permutations:
-        print(f"\n{'='*60}")
-        print(f"STAGE 2: PERMUTATION GENERATION")
-        print(f"{'='*60}")
-        
         perm_file = work_dir / "permutations.txt"
-        perm_count = generate_permutations(deduped_file, perm_file, args.mode, args.max_permutations, args.num_workers)
-        print(f"✓ Generated {perm_count:,} permutations ({perm_count/unique_count:.1f}x expansion)")
-        deduped_file.unlink()
-        
+
+        # Skip Stage 2 if resuming from later stages
+        if resume_state and resume_state['stage'] in ['permutations', 'final']:
+            print(f"\n{'='*60}")
+            print(f"STAGE 2: PERMUTATION GENERATION - SKIPPED (resuming from {resume_state['stage']})")
+            print(f"{'='*60}")
+            perm_count = resume_state.get('perm_count', 0)
+            # Use the perm file from resume state if available
+            if resume_state['perm_file'] and resume_state['perm_file'].exists():
+                perm_file = resume_state['perm_file']
+            # Don't delete deduped_file if we skipped this stage
+        else:
+            print(f"\n{'='*60}")
+            print(f"STAGE 2: PERMUTATION GENERATION")
+            print(f"{'='*60}")
+
+            perm_count = generate_permutations(deduped_file, perm_file, args.mode, args.max_permutations, args.num_workers)
+            print(f"✓ Generated {perm_count:,} permutations ({perm_count/unique_count:.1f}x expansion)")
+            deduped_file.unlink()
+
         # Stage 3: Permutation deduplication (optional)
         if args.keep_all_permutations:
             print(f"\n📊 Skipping permutation deduplication (keeping all {perm_count:,} permutations)")
             final_file = perm_file
             final_count = perm_count
         else:
-            print(f"\n{'='*60}")
-            print(f"STAGE 3: PERMUTATION DEDUPLICATION")
-            print(f"{'='*60}")
-            
-            final_file = work_dir / "final.txt"
-            final_count = deduplicate_permutations(
-                perm_file, final_file, work_dir, 
-                args.buffer_size, args.num_workers,
-                args.use_unix_sort, args.sort_chunk_size,
-                args.sort_max_open_files
-            )
-            print(f"✓ Kept {final_count:,} unique permutations")
-            perm_file.unlink()
+            # Skip Stage 3 if resuming from final stage
+            if resume_state and resume_state['stage'] == 'final':
+                print(f"\n{'='*60}")
+                print(f"STAGE 3: PERMUTATION DEDUPLICATION - SKIPPED (resuming from final)")
+                print(f"{'='*60}")
+                final_file = resume_state['final_file']
+                final_count = resume_state.get('perm_count', 0)
+            else:
+                print(f"\n{'='*60}")
+                print(f"STAGE 3: PERMUTATION DEDUPLICATION")
+                print(f"{'='*60}")
+
+                final_file = work_dir / "final.txt"
+                final_count = deduplicate_permutations(
+                    perm_file, final_file, work_dir,
+                    args.buffer_size, args.num_workers,
+                    args.use_unix_sort, args.sort_chunk_size,
+                    args.sort_max_open_files
+                )
+                print(f"✓ Kept {final_count:,} unique permutations")
+                perm_file.unlink()
     else:
-        final_file = deduped_file
+        # When --no-permutations is used
+        if resume_state and resume_state['stage'] == 'deduped':
+            # Use the deduped file from resume
+            final_file = resume_state['deduped_file']
+        else:
+            final_file = deduped_file
         final_count = unique_count
     
     # Write output
