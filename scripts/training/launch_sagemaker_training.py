@@ -357,6 +357,7 @@ def main():
         print(f"  LoRA: r={args.lora_r}, alpha={args.lora_alpha}")
         print(f"  Batch: {args.batch_size} x 8 GPUs x {args.gradient_accumulation_steps} accum")
         print(f"  Effective batch size: {args.batch_size * 8 * args.gradient_accumulation_steps}")
+        print(f"  Gradient Checkpointing: {args.gradient_checkpointing}")
 
     else:
         # fine_tune.py (original behavior)
