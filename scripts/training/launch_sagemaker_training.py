@@ -59,6 +59,7 @@ import sys
 try:
     import sagemaker
     from sagemaker.pytorch import PyTorch
+    from sagemaker.inputs import TrainingInput
 except ImportError:
     print("ERROR: SageMaker SDK not installed.")
     print("Install with: pip install 'sagemaker<3.0'")
@@ -108,6 +109,11 @@ def main():
         choices=['fine_tune.py', 'esm_fine_tune.py'],
         help='Training script to use. fine_tune.py: full-featured with multiple modes. '
              'esm_fine_tune.py: efficient MLM-only for ESM2 models (recommended for pure MLM).'
+    )
+    infra_group.add_argument(
+        '--fast-file', action='store_true',
+        help='Use FastFile mode to stream data directly from S3 (no upfront download). '
+             'HIGHLY RECOMMENDED for large datasets (100GB+). Eliminates data download time.'
     )
 
     # =========================================================================
@@ -162,6 +168,13 @@ def main():
                             help='Weight decay (default: 0.01)')
     train_group.add_argument('--gradient-accumulation-steps', type=int, default=1,
                             help='Gradient accumulation steps (default: 1)')
+    train_group.add_argument('--max-steps', type=int, default=None,
+                            help='Maximum training steps (overrides --num-epochs). Recommended for large datasets.')
+    train_group.add_argument('--torch-compile', action='store_true',
+                            help='Enable torch.compile() for 10-30%% speedup (PyTorch 2.0+)')
+    train_group.add_argument('--torch-compile-mode', type=str, default='reduce-overhead',
+                            choices=['default', 'reduce-overhead', 'max-autotune'],
+                            help='torch.compile mode (default: reduce-overhead)')
 
     # =========================================================================
     # Optimization Arguments
@@ -173,6 +186,13 @@ def main():
                           help='LoRA rank (default: 16)')
     opt_group.add_argument('--lora-alpha', type=int, default=32,
                           help='LoRA alpha (default: 32)')
+    opt_group.add_argument('--lora-dropout', type=float, default=0.05,
+                          help='LoRA dropout (default: 0.05)')
+    opt_group.add_argument('--lora-target-modules', type=str, default='all-linear',
+                          help='LoRA target modules (default: all-linear)')
+    opt_group.add_argument('--quantization', type=str, default='none',
+                          choices=['none', '4bit', '8bit'],
+                          help='Quantization precision for QLoRA (default: none)')
     opt_group.add_argument('--fp16', action='store_true',
                           help='Use FP16 mixed precision training')
     opt_group.add_argument('--bf16', action='store_true',
@@ -231,10 +251,13 @@ def main():
     # Advanced
     # =========================================================================
     adv_group = parser.add_argument_group('Advanced')
-    adv_group.add_argument('--framework-version', default='2.8',
-                          help='PyTorch framework version (default: 2.8)')
-    adv_group.add_argument('--py-version', default='py312',
-                          help='Python version (default: py312)')
+    adv_group.add_argument('--image-uri', default=None,
+                          help='Custom Docker image URI (overrides framework-version/py-version). '
+                               'Example: 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.9.0-gpu-py312-cu130-ubuntu22.04-sagemaker')
+    adv_group.add_argument('--framework-version', default='2.5.1',
+                          help='PyTorch framework version (default: 2.5.1). Ignored if --image-uri is set.')
+    adv_group.add_argument('--py-version', default='py311',
+                          help='Python version (default: py311). Ignored if --image-uri is set.')
     adv_group.add_argument('--test', action='store_true',
                           help='Run in test mode with reduced dataset')
     adv_group.add_argument('--skip-mode-filter', action='store_true', default=True,
@@ -272,6 +295,7 @@ def main():
             print("Use fine_tune.py or pre-tokenize your dataset.")
             sys.exit(1)
 
+
     # =========================================================================
     # Get SageMaker Role and Session
     # =========================================================================
@@ -296,45 +320,43 @@ def main():
     # Build Hyperparameters (passed as CLI args to training script)
     # =========================================================================
     if args.entry_script == 'esm_fine_tune.py':
-        # esm_fine_tune.py uses different argument names
+        # esm_fine_tune.py - simplified MLM-only script
         hyperparameters = {
             'dataset_path': '/opt/ml/input/data/training',
             'output_dir': '/opt/ml/checkpoints',
             'model_name': args.model_path,
-            'num_epochs': args.num_epochs,
             'per_device_train_batch_size': args.batch_size,
-            'per_device_eval_batch_size': args.eval_batch_size or args.batch_size,
+            'per_device_eval_batch_size': args.eval_batch_size or args.batch_size * 2,
             'learning_rate': args.learning_rate,
-            'warmup_ratio': 0.1,  # esm_fine_tune uses ratio, not steps
             'weight_decay': args.weight_decay,
             'gradient_accumulation_steps': args.gradient_accumulation_steps,
+            'lora_r': args.lora_r,
+            'lora_alpha': args.lora_alpha,
+            'lora_dropout': args.lora_dropout,
+            'lora_target_modules': args.lora_target_modules,
+            'quantization': args.quantization,
+            'report_to': 'wandb' if args.wandb_project else 'tensorboard',
         }
 
-        # LoRA is always used in esm_fine_tune.py, configure rank/alpha
-        hyperparameters['lora_r'] = args.lora_r
-        hyperparameters['lora_alpha'] = args.lora_alpha
+        if args.torch_compile:
+            hyperparameters['torch_compile'] = ''
+            hyperparameters['torch_compile_mode'] = args.torch_compile_mode
 
-        # W&B via report_to flag (auto-enable when wandb_project is set)
-        if args.wandb_project:
-            hyperparameters['report_to'] = 'wandb'
+        if args.gradient_checkpointing:
+            hyperparameters['gradient_checkpointing'] = ''
+
+        # Training mode: max_steps or num_epochs
+        if args.max_steps:
+            hyperparameters['max_steps'] = args.max_steps
+            print(f"\nSteps-based training: {args.max_steps:,} steps")
         else:
-            hyperparameters['report_to'] = 'tensorboard'
-
-        # esm_fine_tune.py defaults to bf16 (A100 optimized)
-        # Only override if fp16 explicitly requested
-        if args.fp16:
-            hyperparameters['fp16'] = ''
-            hyperparameters['bf16'] = 'false'
-
-        # Gradient checkpointing (enabled by default in esm_fine_tune.py)
-        # No need to pass unless we want to disable it
-
-        # Dataloader optimization for multi-GPU
-        hyperparameters['dataloader_num_workers'] = 16
+            hyperparameters['num_epochs'] = args.num_epochs
+            print(f"\nEpoch-based training: {args.num_epochs} epochs")
 
         print(f"\n✓ Using esm_fine_tune.py (efficient MLM-only script)")
         print(f"  LoRA: r={args.lora_r}, alpha={args.lora_alpha}")
-        print(f"  Precision: {'fp16' if args.fp16 else 'bf16 (default)'}")
+        print(f"  Batch: {args.batch_size} x 8 GPUs x {args.gradient_accumulation_steps} accum")
+        print(f"  Effective batch size: {args.batch_size * 8 * args.gradient_accumulation_steps}")
 
     else:
         # fine_tune.py (original behavior)
@@ -426,8 +448,6 @@ def main():
         'role': role,
         'instance_type': args.instance_type,
         'instance_count': args.instance_count,
-        'framework_version': args.framework_version,
-        'py_version': args.py_version,
         'output_path': args.s3_output,
         'hyperparameters': hyperparameters,
         'volume_size': args.volume_size,
@@ -443,6 +463,14 @@ def main():
         } if args.instance_type in ['ml.p4d.24xlarge', 'ml.p3.8xlarge', 'ml.p3.16xlarge',
                                      'ml.g5.12xlarge', 'ml.g5.48xlarge'] else None,
     }
+
+    # Use custom image URI or default framework version
+    if args.image_uri:
+        estimator_args['image_uri'] = args.image_uri
+        print(f"\nUsing custom image: {args.image_uri}")
+    else:
+        estimator_args['framework_version'] = args.framework_version
+        estimator_args['py_version'] = args.py_version
 
     # Add spot training configuration
     if args.spot_instances:
@@ -500,6 +528,7 @@ def main():
 
     print(f"\n📁 Data & Model:")
     print(f"   Dataset (S3):     {args.s3_dataset}")
+    print(f"   Input Mode:       {'FastFile (streaming from S3)' if args.fast_file else 'File (download first)'}")
     print(f"   Output (S3):      {args.s3_output}")
     print(f"   Model:            {args.model_path}")
     if args.entry_script == 'esm_fine_tune.py':
@@ -508,18 +537,26 @@ def main():
         print(f"   Mode:             {args.mode}")
 
     print(f"\n⚙️  Training Configuration:")
-    print(f"   Epochs:           {args.num_epochs}")
+    if args.max_steps:
+        print(f"   Training:         {args.max_steps:,} steps")
+    else:
+        print(f"   Training:         {args.num_epochs} epochs")
     print(f"   Batch Size:       {args.batch_size}")
     print(f"   Learning Rate:    {args.learning_rate}")
     if args.entry_script == 'esm_fine_tune.py':
         print(f"   LoRA:             True (always enabled)")
         print(f"   LoRA Rank:        {args.lora_r}")
+        print(f"   LoRA Target:      {args.lora_target_modules}")
+        print(f"   Quantization:     {args.quantization}")
+        print(f"   Grad Checkpoint:  {args.gradient_checkpointing}")
     else:
         print(f"   LoRA:             {args.use_lora}")
         if args.use_lora:
             print(f"   LoRA Rank:        {args.lora_r}")
     print(f"   FP16:             {args.fp16}")
     print(f"   BF16:             {args.bf16 if args.entry_script != 'esm_fine_tune.py' else not args.fp16}")
+    if args.torch_compile:
+        print(f"   torch.compile:    {args.torch_compile_mode}")
 
     if args.wandb_project:
         print(f"\n📈 Logging:")
@@ -530,9 +567,30 @@ def main():
     # =========================================================================
     # Launch Training Job
     # =========================================================================
+    # Configure input channel
+    if args.fast_file:
+        # FastFile mode: streams directly from S3, no upfront download
+        # Perfect for large datasets - training starts immediately
+        # IMPORTANT: S3 prefix must end with '/' for folders to avoid ambiguity
+        s3_path = args.s3_dataset
+        if not s3_path.endswith('/'):
+            s3_path = s3_path + '/'
+            print(f"📁 Added trailing '/' to S3 path: {s3_path}")
+
+        training_input = TrainingInput(
+            s3_path,
+            input_mode='FastFile',
+            s3_data_type='S3Prefix',
+            distribution='FullyReplicated',  # Each GPU gets full dataset access
+        )
+        print("📡 Using FastFile mode - streaming directly from S3")
+    else:
+        # File mode: downloads entire dataset before training
+        training_input = args.s3_dataset
+
     try:
         # Launch job (wait=False allows SSO to expire without affecting training)
-        estimator.fit({'training': args.s3_dataset}, wait=not args.no_wait)
+        estimator.fit({'training': training_input}, wait=not args.no_wait)
 
         if args.no_wait:
             # Job launched successfully, print info and exit
