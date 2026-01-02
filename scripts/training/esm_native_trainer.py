@@ -20,17 +20,19 @@ Features:
 - BF16 mixed precision
 - Checkpointing and early stopping
 - Optimized DataCollator with pure tensor operations
+- Length-bucketed batching (groups similar-length sequences to minimize padding)
 """
 
 import argparse
 import glob
 import os
 from datetime import timedelta
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Sampler
 from torch.amp import GradScaler, autocast
 from datasets import load_from_disk, concatenate_datasets
 from peft import LoraConfig, TaskType, get_peft_model
@@ -40,6 +42,189 @@ import numpy as np
 import wandb
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+class LengthBucketSampler(Sampler):
+    """
+    Groups sequences by length buckets to minimize padding waste.
+
+    Instead of packing (which causes cross-attention contamination),
+    this sampler groups similar-length sequences so that when padded
+    to batch max, the padding overhead is minimal.
+
+    For a distribution where 92% of data is 256-384 tokens:
+    - Sequences in same bucket get batched together
+    - Each batch pads to its own max (not global max)
+    - No 4D attention masks needed, Flash Attention 2 works perfectly
+    """
+
+    def __init__(
+        self,
+        lengths: np.ndarray,
+        batch_size: int,
+        bucket_boundaries: List[int] = [128, 256, 384, 512, 768],
+        shuffle: bool = True,
+        drop_last: bool = True,
+        seed: int = 42,
+    ):
+        self.lengths = np.asarray(lengths)
+        self.batch_size = batch_size
+        self.bucket_boundaries = sorted(bucket_boundaries)
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self.epoch = 0
+
+        # Assign each sequence to a bucket (0 to num_buckets)
+        # np.digitize returns bucket index for each length
+        self.bucket_ids = np.digitize(self.lengths, self.bucket_boundaries)
+        self.num_buckets = len(self.bucket_boundaries) + 1
+
+        # Pre-compute indices per bucket for efficiency
+        self.bucket_indices = [
+            np.where(self.bucket_ids == b)[0] for b in range(self.num_buckets)
+        ]
+
+    def set_epoch(self, epoch: int):
+        """Set epoch for reproducible shuffling."""
+        self.epoch = epoch
+
+    def __len__(self):
+        if self.drop_last:
+            return (len(self.lengths) // self.batch_size) * self.batch_size
+        return len(self.lengths)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+
+        # Collect all batch chunks
+        all_batches = []
+
+        for bucket_idx in range(self.num_buckets):
+            indices = self.bucket_indices[bucket_idx].copy()
+            if len(indices) == 0:
+                continue
+
+            if self.shuffle:
+                rng.shuffle(indices)
+
+            # Split into batch-sized chunks
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i + self.batch_size]
+                if len(batch) == self.batch_size:
+                    all_batches.append(batch)
+                elif not self.drop_last:
+                    all_batches.append(batch)
+
+        # Shuffle batch order (keeps sequences within batch from same bucket)
+        if self.shuffle:
+            rng.shuffle(all_batches)
+
+        # Flatten and yield
+        if all_batches:
+            all_indices = np.concatenate(all_batches)
+            return iter(all_indices.tolist())
+        return iter([])
+
+
+class DistributedLengthBucketSampler(LengthBucketSampler):
+    """
+    Distributed version of LengthBucketSampler for multi-GPU training.
+
+    Each rank gets a subset of the data while maintaining:
+    - Length-based bucketing within each rank
+    - Deterministic shuffling across epochs
+    - Proper data partitioning (no overlap between ranks)
+    """
+
+    def __init__(
+        self,
+        lengths: np.ndarray,
+        batch_size: int,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        bucket_boundaries: List[int] = [128, 256, 384, 512, 768],
+        shuffle: bool = True,
+        drop_last: bool = True,
+        seed: int = 42,
+    ):
+        # Get distributed info
+        if num_replicas is None:
+            num_replicas = dist.get_world_size() if dist.is_initialized() else 1
+        if rank is None:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+        # Initialize parent (don't drop_last yet, we handle it at distributed level)
+        super().__init__(
+            lengths=lengths,
+            batch_size=batch_size,
+            bucket_boundaries=bucket_boundaries,
+            shuffle=shuffle,
+            drop_last=False,  # Handle at distributed level
+            seed=seed,
+        )
+
+        self.drop_last_distributed = drop_last
+
+        # Calculate samples per replica
+        total_size = len(self.lengths)
+        if self.drop_last_distributed:
+            # Make divisible by (batch_size * num_replicas)
+            self.total_size = (total_size // (batch_size * num_replicas)) * (batch_size * num_replicas)
+        else:
+            # Pad to make divisible
+            self.total_size = ((total_size + num_replicas - 1) // num_replicas) * num_replicas
+
+        self.num_samples = self.total_size // self.num_replicas
+
+    def __len__(self):
+        return self.num_samples
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+
+        # Build global ordering with bucket grouping
+        all_batches = []
+
+        for bucket_idx in range(self.num_buckets):
+            indices = self.bucket_indices[bucket_idx].copy()
+            if len(indices) == 0:
+                continue
+
+            if self.shuffle:
+                rng.shuffle(indices)
+
+            # Create batches
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i + self.batch_size]
+                if len(batch) == self.batch_size:
+                    all_batches.append(batch)
+
+        # Shuffle batch order globally
+        if self.shuffle:
+            rng.shuffle(all_batches)
+
+        # Flatten to global indices
+        if all_batches:
+            all_indices = np.concatenate(all_batches).tolist()
+        else:
+            all_indices = list(range(len(self.lengths)))
+
+        # Pad if necessary
+        if len(all_indices) < self.total_size:
+            padding = all_indices[:self.total_size - len(all_indices)]
+            all_indices.extend(padding)
+
+        # Truncate if necessary
+        all_indices = all_indices[:self.total_size]
+
+        # Subsample for this rank
+        indices = all_indices[self.rank:self.total_size:self.num_replicas]
+
+        return iter(indices)
 
 
 class DataCollatorForMLMWithPacking:
@@ -229,6 +414,179 @@ class DataCollatorForMLMDynamic:
         return input_ids, labels
 
 
+class DataCollatorForMLMWithVarlen:
+    """
+    Packs sequences with proper Block Diagonal Masking.
+    1. Resets Position IDs (Fixes RoPE embeddings)
+    2. Creates 4D Attention Mask (Fixes Cross-Protein Contamination)
+
+    Each sequence in a pack only attends to itself via explicit 4D mask.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        max_seq_length: int = 1024,
+        mlm_probability: float = 0.15,
+    ):
+        self.tokenizer = tokenizer
+        self.max_seq_length = max_seq_length
+        self.mlm_probability = mlm_probability
+        self.pad_token_id = tokenizer.pad_token_id
+        self.mask_token_id = tokenizer.mask_token_id
+        self.vocab_size = len(tokenizer)
+
+        # Cache special token IDs for MLM masking
+        special_ids = [
+            tokenizer.pad_token_id,
+            tokenizer.cls_token_id,
+            tokenizer.eos_token_id,
+            tokenizer.sep_token_id,
+            tokenizer.unk_token_id,
+        ]
+        self.special_token_ids = torch.tensor(
+            [x for x in special_ids if x is not None], dtype=torch.long
+        )
+
+    def __call__(self, examples):
+        """Pack sequences and generate 4D block diagonal attention mask."""
+        sequences = []
+        for ex in examples:
+            ids = ex.get("input_ids", ex) if isinstance(ex, dict) else ex
+            if not isinstance(ids, torch.Tensor):
+                ids = torch.tensor(ids, dtype=torch.long)
+            elif ids.dtype != torch.long:
+                ids = ids.long()
+            sequences.append(ids)
+
+        # Pack and generate 4D mask
+        packed_batch = self._pack_with_4d_mask(sequences)
+
+        # Apply MLM masking
+        input_ids, labels = self._apply_mlm_masking(
+            packed_batch["input_ids"], packed_batch["valid_mask"]
+        )
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": packed_batch["attention_mask"],  # 4D Block Diagonal
+            "position_ids": packed_batch["position_ids"],      # Resets per protein
+            "labels": labels,
+        }
+
+    def _pack_with_4d_mask(self, sequences):
+        """Pack sequences with 4D block diagonal attention mask."""
+        input_ids_list = []
+        position_ids_list = []
+        attention_masks_list = []
+
+        current_tokens = []
+        current_len = 0
+
+        # Truncate sequences that exceed max_seq_length and sort by length
+        truncated_seqs = []
+        for seq in sequences:
+            if len(seq) > self.max_seq_length:
+                seq = seq[:self.max_seq_length]
+            truncated_seqs.append(seq)
+
+        # Sort sequences by length (descending) for tighter packing
+        sequences = sorted(truncated_seqs, key=len, reverse=True)
+
+        for seq in sequences:
+            if current_len + len(seq) > self.max_seq_length:
+                # Flush current pack if not empty
+                if current_tokens:
+                    self._flush_pack(
+                        current_tokens, input_ids_list, position_ids_list, attention_masks_list
+                    )
+                current_tokens = []
+                current_len = 0
+
+            current_tokens.append(seq)
+            current_len += len(seq)
+
+        # Flush final pack
+        if current_tokens:
+            self._flush_pack(
+                current_tokens, input_ids_list, position_ids_list, attention_masks_list
+            )
+
+        # Stack into batch
+        batch_input_ids = torch.stack(input_ids_list)
+        batch_position_ids = torch.stack(position_ids_list)
+        batch_attention_mask = torch.stack(attention_masks_list)
+
+        # Valid mask for MLM (1D per sample)
+        valid_mask = (batch_input_ids != self.pad_token_id).long()
+
+        # Reshape for Transformers: (Batch, 1, Seq, Seq)
+        batch_attention_mask = batch_attention_mask.unsqueeze(1)
+
+        return {
+            "input_ids": batch_input_ids,
+            "position_ids": batch_position_ids,
+            "attention_mask": batch_attention_mask,
+            "valid_mask": valid_mask,
+        }
+
+    def _flush_pack(self, tokens, input_ids_list, position_ids_list, attention_masks_list):
+        """Flush a pack of sequences into the batch lists."""
+        full_ids = torch.full((self.max_seq_length,), self.pad_token_id, dtype=torch.long)
+        full_pos = torch.zeros((self.max_seq_length,), dtype=torch.long)
+
+        # 2D Block Diagonal Mask - ADDITIVE format for HuggingFace
+        # 0 = can attend, -inf = cannot attend (masked out after softmax)
+        mask_2d = torch.full(
+            (self.max_seq_length, self.max_seq_length),
+            float("-inf"),
+            dtype=torch.float32
+        )
+
+        start_idx = 0
+        for seq in tokens:
+            end_idx = start_idx + len(seq)
+
+            # Fill IDs
+            full_ids[start_idx:end_idx] = seq
+
+            # Fill Positions (0, 1, 2... for each sequence)
+            full_pos[start_idx:end_idx] = torch.arange(len(seq), dtype=torch.long)
+
+            # Block Diagonal: this segment attends only to itself
+            # Set to 0 (can attend) instead of -inf (masked)
+            mask_2d[start_idx:end_idx, start_idx:end_idx] = 0.0
+
+            start_idx = end_idx
+
+        input_ids_list.append(full_ids)
+        position_ids_list.append(full_pos)
+        attention_masks_list.append(mask_2d)
+
+    def _apply_mlm_masking(self, input_ids, valid_mask):
+        """Apply MLM masking using vectorized operations."""
+        labels = input_ids.clone()
+        rand_mask = torch.rand(input_ids.shape)
+
+        special_mask = torch.isin(input_ids, self.special_token_ids)
+        is_token = (valid_mask == 1) & ~special_mask
+
+        masked_indices = is_token & (rand_mask < self.mlm_probability)
+        labels[~masked_indices] = -100
+
+        mask_type = torch.rand(input_ids.shape)
+        input_ids = input_ids.clone()
+        input_ids[masked_indices & (mask_type < 0.8)] = self.mask_token_id
+
+        random_idx = masked_indices & (mask_type >= 0.8) & (mask_type < 0.9)
+        if random_idx.any():
+            input_ids[random_idx] = torch.randint(
+                self.vocab_size, (random_idx.sum(),), dtype=torch.long
+            )
+
+        return input_ids, labels
+
+
 class EarlyStopping:
     """Early stopping with patience and minimum delta."""
 
@@ -326,22 +684,36 @@ class NativeESMTrainer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.unk_token
 
-        # Load model with Flash Attention 2
-        try:
+        # Choose attention implementation
+        # varlen uses 4D mask which requires SDPA (FA2 doesn't support arbitrary 4D masks)
+        use_varlen = self.config.get("use_varlen", False)
+
+        if use_varlen:
+            # Use SDPA for 4D attention mask support
             self.model = AutoModelForMaskedLM.from_pretrained(
                 model_name,
-                attn_implementation="flash_attention_2",
+                attn_implementation="sdpa",
                 torch_dtype=torch.bfloat16,
             )
             if self._is_main_process():
-                print("✓ Using Flash Attention 2")
-        except Exception as e:
-            if self._is_main_process():
-                print(f"Flash Attention 2 not available: {e}")
-            self.model = AutoModelForMaskedLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.bfloat16,
-            )
+                print("✓ Using SDPA (for 4D block diagonal mask)")
+        else:
+            # Use Flash Attention 2 for standard attention
+            try:
+                self.model = AutoModelForMaskedLM.from_pretrained(
+                    model_name,
+                    attn_implementation="flash_attention_2",
+                    torch_dtype=torch.bfloat16,
+                )
+                if self._is_main_process():
+                    print("✓ Using Flash Attention 2")
+            except Exception as e:
+                if self._is_main_process():
+                    print(f"Flash Attention 2 not available: {e}")
+                self.model = AutoModelForMaskedLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.bfloat16,
+                )
 
         # Enable gradient checkpointing
         if self.config.get("gradient_checkpointing", True):
@@ -372,6 +744,14 @@ class NativeESMTrainer:
                 find_unused_parameters=False,
             )
 
+        # Optional: Apply torch.compile for speedup
+        if self.config.get("use_compile", False):
+            if self._is_main_process():
+                print("Compiling model with torch.compile...")
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            if self._is_main_process():
+                print("✓ Model compiled")
+
     def _setup_dataloaders(self):
         """Setup train and validation dataloaders."""
         train_path = os.path.join(self.config["dataset_path"], "train")
@@ -386,10 +766,19 @@ class NativeESMTrainer:
             print(f"Train: {len(self.train_dataset):,} sequences")
             print(f"Val: {len(self.val_dataset):,} sequences")
 
-        # Choose collator based on use_packing flag
-        if self.config.get("use_packing", False):
+        # Choose collator based on packing flags
+        if self.config.get("use_varlen", False):
             if self._is_main_process():
-                print("Using packing collator (sequences packed to max_seq_length)")
+                print("Using varlen collator (packing with proper block diagonal masking)")
+            self.data_collator = DataCollatorForMLMWithVarlen(
+                tokenizer=self.tokenizer,
+                max_seq_length=self.config.get("max_seq_length", 1024),
+                mlm_probability=self.config.get("mlm_probability", 0.15),
+            )
+        elif self.config.get("use_packing", False):
+            if self._is_main_process():
+                print("WARNING: Using legacy packing (has cross-sequence attention bug)")
+                print("         Consider using --use_varlen instead")
             self.data_collator = DataCollatorForMLMWithPacking(
                 tokenizer=self.tokenizer,
                 max_seq_length=self.config.get("max_seq_length", 1024),
@@ -403,13 +792,46 @@ class NativeESMTrainer:
                 mlm_probability=self.config.get("mlm_probability", 0.15),
             )
 
-        # Samplers
-        if self.is_distributed:
-            train_sampler = DistributedSampler(self.train_dataset, shuffle=True, drop_last=True)
-            val_sampler = DistributedSampler(self.val_dataset, shuffle=False)
+        # Samplers - use length bucketing to minimize padding waste
+        bucket_boundaries = self.config.get("bucket_boundaries", [128, 256, 384, 512, 768])
+
+        if self.config.get("use_length_bucketing", True) and "length" in self.train_dataset.column_names:
+            if self._is_main_process():
+                print(f"Using length-bucketed sampling with boundaries: {bucket_boundaries}")
+
+            # Get lengths as numpy array for sampler
+            train_lengths = np.array(self.train_dataset["length"])
+
+            if self.is_distributed:
+                train_sampler = DistributedLengthBucketSampler(
+                    lengths=train_lengths,
+                    batch_size=self.config.get("batch_size", 16),
+                    bucket_boundaries=bucket_boundaries,
+                    shuffle=True,
+                    drop_last=True,
+                    num_replicas=self.world_size,
+                    rank=self.global_rank,
+                )
+                val_sampler = DistributedSampler(self.val_dataset, shuffle=False)
+            else:
+                train_sampler = LengthBucketSampler(
+                    lengths=train_lengths,
+                    batch_size=self.config.get("batch_size", 16),
+                    bucket_boundaries=bucket_boundaries,
+                    shuffle=True,
+                    drop_last=True,
+                )
+                val_sampler = None
         else:
-            train_sampler = None
-            val_sampler = None
+            # Fallback to standard sampling
+            if self._is_main_process():
+                print("Using standard random sampling (length bucketing disabled)")
+            if self.is_distributed:
+                train_sampler = DistributedSampler(self.train_dataset, shuffle=True, drop_last=True)
+                val_sampler = DistributedSampler(self.val_dataset, shuffle=False)
+            else:
+                train_sampler = None
+                val_sampler = None
 
         # DataLoaders optimized for p4d.24xlarge
         self.train_loader = DataLoader(
@@ -436,16 +858,38 @@ class NativeESMTrainer:
             collate_fn=self.data_collator,
         )
 
-    def _load_dataset(self, path: str):
-        """Load sharded dataset."""
+    def _load_dataset(self, path: str, compute_lengths: bool = True):
+        """Load sharded dataset and optionally compute lengths for bucketing."""
         shard_dirs = sorted(glob.glob(os.path.join(path, "shard_*")))
         if not shard_dirs:
             shard_dirs = sorted(glob.glob(os.path.join(path, "shard_batch_*")))
 
         if shard_dirs:
             datasets = [load_from_disk(s) for s in shard_dirs]
-            return concatenate_datasets(datasets)
-        return load_from_disk(path)
+            dataset = concatenate_datasets(datasets)
+        else:
+            dataset = load_from_disk(path)
+
+        # Compute lengths on-the-fly if needed for bucketing
+        if compute_lengths and self.config.get("use_length_bucketing", True):
+            if "length" not in dataset.column_names:
+                if self._is_main_process():
+                    print(f"Computing sequence lengths for {path}...")
+                # Use efficient batched map with multiple processes
+                if "attention_mask" in dataset.column_names:
+                    dataset = dataset.map(
+                        lambda x: {"length": sum(x["attention_mask"])},
+                        num_proc=min(8, os.cpu_count() or 1),
+                        desc="Computing lengths",
+                    )
+                else:
+                    dataset = dataset.map(
+                        lambda x: {"length": len(x["input_ids"])},
+                        num_proc=min(8, os.cpu_count() or 1),
+                        desc="Computing lengths",
+                    )
+
+        return dataset
 
     def _setup_optimizer(self):
         """Setup optimizer with fused AdamW."""
@@ -532,11 +976,16 @@ class NativeESMTrainer:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             labels = batch["labels"].to(self.device)
+            # Position IDs for varlen attention (resets for each packed sequence)
+            position_ids = batch.get("position_ids")
+            if position_ids is not None:
+                position_ids = position_ids.to(self.device)
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    position_ids=position_ids,
                     labels=labels,
                 )
                 loss = outputs.loss / grad_accum
@@ -612,11 +1061,16 @@ class NativeESMTrainer:
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
+                # Position IDs for varlen attention
+                position_ids = batch.get("position_ids")
+                if position_ids is not None:
+                    position_ids = position_ids.to(self.device)
 
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
                     outputs = self.model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        position_ids=position_ids,
                         labels=labels,
                     )
 
@@ -732,7 +1186,20 @@ def parse_args():
     parser.add_argument("--mlm_probability", type=float, default=0.15)
     parser.add_argument("--max_seq_length", type=int, default=1024)
     parser.add_argument("--use_packing", action="store_true", default=False,
-                        help="Use sequence packing (slower for uniform-length data)")
+                        help="Use sequence packing (WARNING: has cross-sequence attention bug)")
+    parser.add_argument("--use_varlen", action="store_true", default=False,
+                        help="Use varlen packing with proper block diagonal masking (recommended)")
+    parser.add_argument("--use_compile", action="store_true", default=False,
+                        help="Use torch.compile for potential speedup (~10-20%%)")
+
+    # Length bucketing (recommended over packing - avoids cross-attention issues)
+    parser.add_argument("--use_length_bucketing", action="store_true", default=True,
+                        help="Group similar-length sequences to minimize padding (recommended)")
+    parser.add_argument("--no_length_bucketing", action="store_false", dest="use_length_bucketing",
+                        help="Disable length bucketing, use random sampling")
+    parser.add_argument("--bucket_boundaries", type=int, nargs="+",
+                        default=[128, 256, 384, 512, 768],
+                        help="Length bucket boundaries (default: [128, 256, 384, 512, 768])")
 
     # Optimization
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
