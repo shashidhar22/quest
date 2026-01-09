@@ -7,15 +7,18 @@ to learn TCR alpha-beta chain pairing from positive pairs only.
 
 Usage:
     torchrun --nproc_per_node=8 tcr_contrastive_trainer.py \
-        --dataset_path /path/to/data \
-        --output_dir ./output
+        --data_path data/deduplicated/full/foundation_permutations/ \
+        --output_dir ./output \
+        --permutation_keys tra_trb
 
 Features:
+- Loads parquet files with permutation_key filtering
 - Dual encoder with shared ESM2 backbone + LoRA
 - InfoNCE loss with in-batch negatives (handles soft negatives gracefully)
 - Symmetric loss (alpha->beta and beta->alpha directions)
 - Learnable temperature parameter
 - Retrieval metrics: MRR, Recall@K
+- 80/10/10 train/val/test split
 - DDP for multi-GPU training
 """
 
@@ -23,24 +26,143 @@ import argparse
 import glob
 import os
 from datetime import timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import ClassVar, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import concatenate_datasets, load_from_disk
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 import wandb
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+# =============================================================================
+# Dataset
+# =============================================================================
+
+
+class TCRParquetDataset(Dataset):
+    """
+    Dataset for loading TCR pairs from parquet files.
+
+    Loads sequences filtered by permutation_key (e.g., 'tra_trb'),
+    splits them into alpha and beta chains, and supports train/val/test splits.
+    """
+
+    # Class-level cache for loaded data
+    _cache: Dict[str, Tuple[List[str], List[str]]] = {}
+
+    def __init__(
+        self,
+        data_path: str,
+        permutation_keys: List[str] = ["tra_trb"],
+        split: str = "train",
+        train_ratio: float = 0.8,
+        val_ratio: float = 0.1,
+        seed: int = 42,
+        local_rank: int = 0,
+    ):
+        """
+        Args:
+            data_path: Path to directory containing parquet files
+            permutation_keys: List of permutation keys to filter (e.g., ['tra_trb'])
+            split: One of 'train', 'val', or 'test'
+            train_ratio: Fraction of data for training (default 0.8)
+            val_ratio: Fraction of data for validation (default 0.1)
+            seed: Random seed for reproducible splits
+            local_rank: Local rank for DDP (only rank 0 prints)
+        """
+        self.split = split
+        is_main = local_rank == 0
+
+        # Create cache key
+        cache_key = f"{data_path}:{','.join(sorted(permutation_keys))}"
+
+        # Check if data is already cached
+        if cache_key in TCRParquetDataset._cache:
+            if is_main:
+                print(f"Using cached data for {split} split...")
+            alpha_seqs, beta_seqs = TCRParquetDataset._cache[cache_key]
+        else:
+            # Load all parquet files
+            parquet_files = sorted(glob.glob(os.path.join(data_path, "*.parquet")))
+            if not parquet_files:
+                raise ValueError(f"No parquet files found in {data_path}")
+
+            if is_main:
+                print(f"Loading {len(parquet_files)} parquet files...")
+
+            # Load and filter data using pyarrow for speed
+            import pyarrow.parquet as pq
+
+            alpha_seqs = []
+            beta_seqs = []
+
+            # Load in batches for memory efficiency
+            iterator = tqdm(parquet_files, desc="Loading", disable=not is_main)
+            for pf in iterator:
+                table = pq.read_table(pf, columns=["permutation_key", "sequence"])
+                df = table.to_pandas()
+                df = df[df["permutation_key"].isin(permutation_keys)]
+
+                # Split sequences immediately to save memory
+                for seq in df["sequence"].values:
+                    parts = seq.split(" ")
+                    if len(parts) >= 2:
+                        alpha_seqs.append(parts[0])
+                        beta_seqs.append(parts[1])
+
+            if not alpha_seqs:
+                raise ValueError(f"No sequences found with permutation_keys: {permutation_keys}")
+
+            if is_main:
+                print(f"Loaded {len(alpha_seqs):,} pairs with keys: {permutation_keys}")
+
+            # Cache the loaded data
+            TCRParquetDataset._cache[cache_key] = (alpha_seqs, beta_seqs)
+
+        # Create deterministic train/val/test split
+        n_total = len(alpha_seqs)
+        np.random.seed(seed)
+        indices = np.random.permutation(n_total)
+
+        train_end = int(n_total * train_ratio)
+        val_end = int(n_total * (train_ratio + val_ratio))
+
+        if split == "train":
+            selected_indices = indices[:train_end]
+        elif split == "val":
+            selected_indices = indices[train_end:val_end]
+        elif split == "test":
+            selected_indices = indices[val_end:]
+        else:
+            raise ValueError(f"split must be 'train', 'val', or 'test', got {split}")
+
+        # Filter to selected split
+        self.alpha_seqs = [alpha_seqs[i] for i in selected_indices]
+        self.beta_seqs = [beta_seqs[i] for i in selected_indices]
+
+        if is_main:
+            print(f"{split.capitalize()} set: {len(self.alpha_seqs):,} pairs")
+
+    def __len__(self) -> int:
+        return len(self.alpha_seqs)
+
+    def __getitem__(self, idx: int) -> Dict[str, str]:
+        return {
+            "alpha_seq": self.alpha_seqs[idx],
+            "beta_seq": self.beta_seqs[idx],
+        }
 
 
 # =============================================================================
@@ -52,8 +174,8 @@ class ContrastivePairCollator:
     """
     Collator for TCR pairing contrastive learning.
 
-    Takes combined sequences [CLS] alpha [SEP] beta [SEP] and splits them
-    into separate alpha and beta tensors for the dual encoder.
+    Takes raw amino acid sequences for alpha and beta chains,
+    tokenizes them separately, and returns padded tensors.
 
     Outputs:
     - alpha_input_ids: (batch, max_alpha_len)
@@ -65,108 +187,48 @@ class ContrastivePairCollator:
     def __init__(
         self,
         tokenizer,
+        max_length: int = 320,
         pad_to_multiple_of: int = 8,
     ):
         self.tokenizer = tokenizer
-        self.pad_token_id = tokenizer.pad_token_id
-        self.sep_token_id = tokenizer.sep_token_id
-        self.cls_token_id = tokenizer.cls_token_id
+        self.max_length = max_length
         self.pad_to_multiple_of = pad_to_multiple_of
-
-    def _split_at_sep(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Split combined sequence at first SEP token.
-
-        Input:  [CLS] alpha_tokens [SEP] beta_tokens [SEP] [PAD]...
-        Output: ([CLS] alpha_tokens [SEP]), ([CLS] beta_tokens [SEP])
-        """
-        # Find first SEP position
-        sep_positions = (input_ids == self.sep_token_id).nonzero(as_tuple=True)[0]
-
-        if len(sep_positions) == 0:
-            # No SEP found, treat entire sequence as alpha
-            alpha = input_ids
-            beta = torch.tensor([self.cls_token_id, self.sep_token_id], dtype=torch.long)
-        else:
-            first_sep = sep_positions[0].item()
-
-            # Alpha: [CLS] ... [SEP] (includes CLS and first SEP)
-            alpha = input_ids[: first_sep + 1]
-
-            # Beta: Need to add [CLS], take tokens after first SEP until second SEP or end
-            if len(sep_positions) > 1:
-                second_sep = sep_positions[1].item()
-                beta_tokens = input_ids[first_sep + 1 : second_sep + 1]
-            else:
-                # No second SEP, take rest excluding padding
-                rest = input_ids[first_sep + 1 :]
-                # Remove padding
-                non_pad_mask = rest != self.pad_token_id
-                if non_pad_mask.any():
-                    last_non_pad = non_pad_mask.nonzero(as_tuple=True)[0][-1].item()
-                    beta_tokens = rest[: last_non_pad + 1]
-                else:
-                    beta_tokens = torch.tensor([], dtype=torch.long)
-
-            # Add CLS to beta
-            beta = torch.cat(
-                [torch.tensor([self.cls_token_id], dtype=torch.long), beta_tokens]
-            )
-
-            # Ensure beta ends with SEP
-            if len(beta) == 0 or beta[-1] != self.sep_token_id:
-                beta = torch.cat([beta, torch.tensor([self.sep_token_id], dtype=torch.long)])
-
-        return alpha, beta
 
     def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
         """
         Process batch of examples.
 
-        Each example should have 'input_ids' with combined alpha-beta sequence.
+        Each example should have 'alpha_seq' and 'beta_seq' as raw amino acid strings.
         """
-        alpha_seqs = []
-        beta_seqs = []
+        alpha_seqs = [ex["alpha_seq"] for ex in examples]
+        beta_seqs = [ex["beta_seq"] for ex in examples]
 
-        for ex in examples:
-            input_ids = ex.get("input_ids", ex)
-            if isinstance(input_ids, list):
-                input_ids = torch.tensor(input_ids, dtype=torch.long)
-            elif not isinstance(input_ids, torch.Tensor):
-                input_ids = torch.tensor(input_ids, dtype=torch.long)
+        # Tokenize alpha sequences
+        alpha_encoded = self.tokenizer(
+            alpha_seqs,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        )
 
-            alpha, beta = self._split_at_sep(input_ids)
-            alpha_seqs.append(alpha)
-            beta_seqs.append(beta)
-
-        # Pad sequences
-        alpha_padded = self._pad_sequences(alpha_seqs)
-        beta_padded = self._pad_sequences(beta_seqs)
-
-        # Create attention masks
-        alpha_mask = (alpha_padded != self.pad_token_id).long()
-        beta_mask = (beta_padded != self.pad_token_id).long()
+        # Tokenize beta sequences
+        beta_encoded = self.tokenizer(
+            beta_seqs,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+            pad_to_multiple_of=self.pad_to_multiple_of,
+        )
 
         return {
-            "alpha_input_ids": alpha_padded,
-            "alpha_attention_mask": alpha_mask,
-            "beta_input_ids": beta_padded,
-            "beta_attention_mask": beta_mask,
+            "alpha_input_ids": alpha_encoded["input_ids"],
+            "alpha_attention_mask": alpha_encoded["attention_mask"],
+            "beta_input_ids": beta_encoded["input_ids"],
+            "beta_attention_mask": beta_encoded["attention_mask"],
         }
-
-    def _pad_sequences(self, sequences: List[torch.Tensor]) -> torch.Tensor:
-        """Pad sequences to max length in batch, rounded to multiple of 8."""
-        max_len = max(len(s) for s in sequences)
-
-        # Round up to multiple of pad_to_multiple_of
-        if self.pad_to_multiple_of and max_len % self.pad_to_multiple_of != 0:
-            max_len = ((max_len // self.pad_to_multiple_of) + 1) * self.pad_to_multiple_of
-
-        padded = torch.full((len(sequences), max_len), self.pad_token_id, dtype=torch.long)
-        for i, seq in enumerate(sequences):
-            padded[i, : len(seq)] = seq
-
-        return padded
 
 
 # =============================================================================
@@ -188,7 +250,7 @@ class TCRDualEncoder(nn.Module):
         projection_dim: int = 256,
         use_projection: bool = True,
         pooling: str = "cls",
-        initial_temperature: float = 0.07,
+        initial_temperature: float = 0.2,
     ):
         super().__init__()
 
@@ -206,6 +268,7 @@ class TCRDualEncoder(nn.Module):
         if use_projection:
             self.projection = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, projection_dim),
             )
@@ -218,7 +281,7 @@ class TCRDualEncoder(nn.Module):
     @property
     def temperature(self) -> torch.Tensor:
         """Get temperature from log scale."""
-        return self.log_temperature.exp().clamp(min=0.01, max=1.0)
+        return self.log_temperature.exp().clamp(min=0.05, max=0.5)
 
     def encode(
         self,
@@ -612,25 +675,50 @@ class TCRContrastiveTrainer:
             self.model = DDP(
                 self.model,
                 device_ids=[self.local_rank],
-                find_unused_parameters=False,
+                find_unused_parameters=True,  # Needed for LoRA + learnable temperature
             )
 
     def _setup_dataloaders(self):
         """Setup train and validation dataloaders."""
-        train_path = os.path.join(self.config["dataset_path"], "train")
-        val_path = os.path.join(self.config["dataset_path"], "val")
-        if not os.path.exists(val_path):
-            val_path = os.path.join(self.config["dataset_path"], "validation")
+        data_path = self.config["data_path"]
+        permutation_keys = self.config.get("permutation_keys", ["tra_trb"])
+        if isinstance(permutation_keys, str):
+            permutation_keys = [permutation_keys]
 
-        self.train_dataset = self._load_dataset(train_path)
-        self.val_dataset = self._load_dataset(val_path)
+        train_ratio = self.config.get("train_ratio", 0.8)
+        val_ratio = self.config.get("val_ratio", 0.1)
 
         if self._is_main_process():
-            print(f"Train: {len(self.train_dataset):,} pairs")
-            print(f"Val: {len(self.val_dataset):,} pairs")
+            print(f"Loading data from: {data_path}")
+            print(f"Permutation keys: {permutation_keys}")
+            print(f"Split ratios: train={train_ratio}, val={val_ratio}, test={1-train_ratio-val_ratio}")
+
+        # Load datasets from parquet files
+        self.train_dataset = TCRParquetDataset(
+            data_path=data_path,
+            permutation_keys=permutation_keys,
+            split="train",
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            local_rank=self.local_rank,
+        )
+
+        self.val_dataset = TCRParquetDataset(
+            data_path=data_path,
+            permutation_keys=permutation_keys,
+            split="val",
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            local_rank=self.local_rank,
+        )
+
+        # Synchronize all ranks after data loading
+        if self.is_distributed:
+            dist.barrier()
 
         self.data_collator = ContrastivePairCollator(
             tokenizer=self.tokenizer,
+            max_length=self.config.get("max_length", 320),
             pad_to_multiple_of=8,
         )
 
@@ -664,20 +752,6 @@ class TCRContrastiveTrainer:
             persistent_workers=True,
             collate_fn=self.data_collator,
         )
-
-    def _load_dataset(self, path: str):
-        """Load sharded dataset."""
-        shard_dirs = sorted(glob.glob(os.path.join(path, "shard_*")))
-        if not shard_dirs:
-            shard_dirs = sorted(glob.glob(os.path.join(path, "shard_batch_*")))
-
-        if shard_dirs:
-            datasets = [load_from_disk(s) for s in shard_dirs]
-            dataset = concatenate_datasets(datasets)
-        else:
-            dataset = load_from_disk(path)
-
-        return dataset
 
     def _setup_optimizer(self):
         """Setup optimizer with cosine scheduler."""
@@ -932,10 +1006,20 @@ def parse_args():
     )
 
     # Required
-    parser.add_argument("--dataset_path", type=str, required=True,
-                        help="Path to tokenized TCR pair dataset")
+    parser.add_argument("--data_path", type=str, required=True,
+                        help="Path to parquet files directory")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Output directory for checkpoints")
+
+    # Data
+    parser.add_argument("--permutation_keys", type=str, nargs="+", default=["tra_trb"],
+                        help="Permutation keys to filter (e.g., tra_trb)")
+    parser.add_argument("--train_ratio", type=float, default=0.8,
+                        help="Fraction of data for training")
+    parser.add_argument("--val_ratio", type=float, default=0.1,
+                        help="Fraction of data for validation")
+    parser.add_argument("--max_length", type=int, default=336,
+                        help="Maximum sequence length for tokenization")
 
     # Model
     parser.add_argument("--model_name", type=str, default="facebook/esm2_t33_650M_UR50D")
@@ -943,6 +1027,10 @@ def parse_args():
                         help="Dimension of projection head output")
     parser.add_argument("--pooling", type=str, default="cls", choices=["cls", "mean"],
                         help="Pooling strategy for sequence embedding")
+    parser.add_argument("--use_projection", action="store_true", default=True,
+                        help="Use projection head on embeddings")
+    parser.add_argument("--no_projection", action="store_false", dest="use_projection",
+                        help="Disable projection head, use raw ESM2 embeddings")
 
     # LoRA
     parser.add_argument("--use_lora", action="store_true", default=True)
@@ -952,7 +1040,7 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.05)
 
     # Contrastive Learning
-    parser.add_argument("--temperature", type=float, default=0.07,
+    parser.add_argument("--temperature", type=float, default=0.2,
                         help="Initial temperature for InfoNCE")
     parser.add_argument("--symmetric_loss", action="store_true", default=True,
                         help="Use symmetric InfoNCE (both directions)")

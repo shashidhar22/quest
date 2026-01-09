@@ -45,11 +45,17 @@ Example Usage (On-the-fly Tokenization - 48% disk savings):
         --wandb-project tcr-quest
 
 Instance Types:
+    NVIDIA GPU Instances:
     - ml.p3.2xlarge:   1x V100 GPU, 16GB VRAM  (single GPU training)
     - ml.p3.8xlarge:   4x V100 GPU, 64GB VRAM  (multi-GPU training)
     - ml.p3.16xlarge:  8x V100 GPU, 128GB VRAM (large-scale training)
     - ml.g5.xlarge:    1x A10G GPU, 24GB VRAM  (cost-effective option)
     - ml.g5.12xlarge:  4x A10G GPU, 96GB VRAM  (multi-GPU cost-effective)
+
+    AWS Trainium Instances (Neuron SDK):
+    - ml.trn1.2xlarge:   1x Trainium chip, 32GB HBM  (single chip training)
+    - ml.trn1.32xlarge:  16x Trainium chips, 512GB HBM (large-scale training)
+    - ml.trn1n.32xlarge: 16x Trainium chips, high bandwidth networking
 """
 
 import argparse
@@ -64,6 +70,77 @@ except ImportError:
     print("ERROR: SageMaker SDK not installed.")
     print("Install with: pip install 'sagemaker<3.0'")
     sys.exit(1)
+
+# Trainium instance types for auto-detection
+TRAINIUM_INSTANCE_TYPES = [
+    'ml.trn1.2xlarge',
+    'ml.trn1.32xlarge',
+    'ml.trn1n.32xlarge',
+]
+
+# Multi-GPU/chip instance types for distributed training
+DISTRIBUTED_INSTANCE_TYPES = [
+    # NVIDIA GPU
+    'ml.p4d.24xlarge',
+    'ml.p3.8xlarge',
+    'ml.p3.16xlarge',
+    'ml.g5.12xlarge',
+    'ml.g5.48xlarge',
+    # Trainium
+    'ml.trn1.32xlarge',
+    'ml.trn1n.32xlarge',
+]
+
+# Neuron container images by region (PyTorch 2.1 with Neuron SDK)
+# See: https://github.com/aws/deep-learning-containers/blob/master/available_images.md
+NEURON_CONTAINER_IMAGES = {
+    'us-east-1': '763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training-neuronx:2.1.2-neuronx-py310-sdk2.20.2-ubuntu22.04',
+    'us-east-2': '763104351884.dkr.ecr.us-east-2.amazonaws.com/pytorch-training-neuronx:2.1.2-neuronx-py310-sdk2.20.2-ubuntu22.04',
+    'us-west-2': '763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training-neuronx:2.1.2-neuronx-py310-sdk2.20.2-ubuntu22.04',
+    'eu-west-1': '763104351884.dkr.ecr.eu-west-1.amazonaws.com/pytorch-training-neuronx:2.1.2-neuronx-py310-sdk2.20.2-ubuntu22.04',
+    'ap-northeast-1': '763104351884.dkr.ecr.ap-northeast-1.amazonaws.com/pytorch-training-neuronx:2.1.2-neuronx-py310-sdk2.20.2-ubuntu22.04',
+}
+
+
+def detect_backend(instance_type: str, explicit_backend: str = 'auto') -> str:
+    """
+    Detect the hardware backend based on instance type.
+
+    Args:
+        instance_type: SageMaker instance type (e.g., 'ml.p3.2xlarge', 'ml.trn1.2xlarge')
+        explicit_backend: Explicitly specified backend ('auto', 'cuda', 'xla')
+
+    Returns:
+        Backend string: 'cuda' or 'xla'
+    """
+    if explicit_backend != 'auto':
+        return explicit_backend
+
+    if instance_type in TRAINIUM_INSTANCE_TYPES:
+        return 'xla'
+    return 'cuda'
+
+
+def get_neuron_image(region: str) -> str:
+    """
+    Get the Neuron container image URI for a given region.
+
+    Args:
+        region: AWS region name
+
+    Returns:
+        Container image URI
+
+    Raises:
+        ValueError: If region is not supported
+    """
+    if region not in NEURON_CONTAINER_IMAGES:
+        supported = ', '.join(NEURON_CONTAINER_IMAGES.keys())
+        raise ValueError(
+            f"Trainium training is not supported in region '{region}'. "
+            f"Supported regions: {supported}"
+        )
+    return NEURON_CONTAINER_IMAGES[region]
 
 
 def main():
@@ -114,6 +191,12 @@ def main():
         '--fast-file', action='store_true',
         help='Use FastFile mode to stream data directly from S3 (no upfront download). '
              'HIGHLY RECOMMENDED for large datasets (100GB+). Eliminates data download time.'
+    )
+    infra_group.add_argument(
+        '--backend', default='auto',
+        choices=['auto', 'cuda', 'xla'],
+        help='Hardware backend. auto: detect from instance type (Trainium->xla, GPU->cuda). '
+             'cuda: NVIDIA GPU with NCCL. xla: AWS Trainium with XLA.'
     )
 
     # =========================================================================
@@ -295,6 +378,20 @@ def main():
             print("Use fine_tune.py or pre-tokenize your dataset.")
             sys.exit(1)
 
+    # =========================================================================
+    # Backend Detection (CUDA vs XLA/Trainium)
+    # =========================================================================
+    detected_backend = detect_backend(args.instance_type, args.backend)
+    is_trainium = detected_backend == 'xla'
+
+    if is_trainium:
+        print(f"\n🧠 Trainium backend detected (instance: {args.instance_type})")
+        print("   Using XLA/Neuron SDK for training")
+        print("   Flash Attention disabled (using eager attention)")
+        if args.fp16:
+            print("   WARNING: FP16 not recommended on Trainium, using BF16 instead")
+            args.fp16 = False
+            args.bf16 = True
 
     # =========================================================================
     # Get SageMaker Role and Session
@@ -440,6 +537,9 @@ def main():
         if args.skip_mode_filter:
             hyperparameters['skip-mode-filter'] = ''
 
+        # Add backend for hardware-agnostic training
+        hyperparameters['backend'] = detected_backend
+
     # =========================================================================
     # Configure PyTorch Estimator
     # =========================================================================
@@ -455,20 +555,29 @@ def main():
         'max_run': args.max_run_hours * 3600,  # Convert to seconds
         'keep_alive_period_in_seconds': 0,  # Don't keep instance alive after job
         'sagemaker_session': session,
-        # Enable DDP for multi-GPU training (p4d.24xlarge has 8 GPUs)
-        # This uses torchrun instead of DataParallel for efficient multi-GPU
+        # Enable distributed training for multi-GPU/chip instances
+        # Uses torchrun for both CUDA (NCCL) and XLA (Trainium) backends
         'distribution': {
             'torch_distributed': {
                 'enabled': True
             }
-        } if args.instance_type in ['ml.p4d.24xlarge', 'ml.p3.8xlarge', 'ml.p3.16xlarge',
-                                     'ml.g5.12xlarge', 'ml.g5.48xlarge'] else None,
+        } if args.instance_type in DISTRIBUTED_INSTANCE_TYPES else None,
     }
 
-    # Use custom image URI or default framework version
+    # Use custom image URI, Neuron image for Trainium, or default framework version
     if args.image_uri:
         estimator_args['image_uri'] = args.image_uri
         print(f"\nUsing custom image: {args.image_uri}")
+    elif is_trainium:
+        # Use Neuron container image for Trainium instances
+        region = session.boto_region_name
+        try:
+            neuron_image = get_neuron_image(region)
+            estimator_args['image_uri'] = neuron_image
+            print(f"\nUsing Neuron image for Trainium: {neuron_image}")
+        except ValueError as e:
+            print(f"\nERROR: {e}")
+            sys.exit(1)
     else:
         estimator_args['framework_version'] = args.framework_version
         estimator_args['py_version'] = args.py_version
@@ -520,6 +629,7 @@ def main():
     print(f"   Training Script:  {args.entry_script}")
     print(f"   Instance Type:    {args.instance_type}")
     print(f"   Instance Count:   {args.instance_count}")
+    print(f"   Backend:          {detected_backend} {'(Trainium/XLA)' if is_trainium else '(NVIDIA/CUDA)'}")
     print(f"   Volume Size:      {args.volume_size} GB")
     print(f"   Spot Training:    {args.spot_instances}")
     if args.spot_instances:

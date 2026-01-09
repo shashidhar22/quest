@@ -24,16 +24,19 @@ import os
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp import autocast
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
+
+# Backend abstraction for hardware-agnostic training
+from .backends import AcceleratorBackend, get_backend
+from .base_trainer import BaseTCRTrainer
 
 # Optional: LoRA support
 try:
@@ -80,13 +83,19 @@ class TCRCrossEncoder(nn.Module):
         hidden_dim: int = 256,
         dropout: float = 0.1,
         pooling: str = "cls",
+        attn_implementation: Optional[str] = "flash_attention_2",
+        torch_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
 
+        # Load encoder with backend-appropriate attention implementation
+        encoder_kwargs = {"torch_dtype": torch_dtype}
+        if attn_implementation:
+            encoder_kwargs["attn_implementation"] = attn_implementation
+
         self.encoder = AutoModel.from_pretrained(
             model_name,
-            attn_implementation="flash_attention_2",
-            torch_dtype=torch.bfloat16,
+            **encoder_kwargs,
         )
 
         esm_hidden = self.encoder.config.hidden_size
@@ -407,44 +416,52 @@ class CrossEncoderCollator:
 # =============================================================================
 
 
-class TCRCrossEncoderTrainer:
-    """Trainer for cross-encoder TCR alpha-beta pairing."""
+class TCRCrossEncoderTrainer(BaseTCRTrainer):
+    """
+    Trainer for cross-encoder TCR alpha-beta pairing.
 
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    Extends BaseTCRTrainer with cross-encoder-specific functionality:
+    - Binary classification for alpha-beta pair matching
+    - In-batch negative sampling
+    - Support for CUDA and Trainium backends
+    """
 
-        # Setup output directory
-        self.output_dir = Path(config["output_dir"])
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, config: Dict[str, Any], backend: Optional[AcceleratorBackend] = None):
+        """
+        Initialize cross-encoder trainer.
 
-        # Setup debug logging
-        self.debug_log = self.output_dir / "debug.log"
-        with open(self.debug_log, "w") as f:
-            f.write(f"Debug log started at {datetime.now()}\n")
-            f.write(f"Config: {config}\n")
-            f.write("=" * 60 + "\n\n")
+        Args:
+            config: Training configuration
+            backend: Accelerator backend (auto-detected if None)
+        """
+        # Initialize base trainer
+        super().__init__(config, backend)
 
-    def _log(self, message: str, also_print: bool = True):
-        """Log message to debug file and optionally print."""
-        with open(self.debug_log, "a") as f:
-            f.write(message + "\n")
-        if also_print:
-            print(message)
+        # Setup loss function with positive class weighting
+        pos_weight = self.config.get("pos_weight")
+        if pos_weight is None:
+            pos_weight = self.config.get("neg_ratio", 3)
+        self.criterion = CrossEncoderBCELoss(pos_weight=pos_weight)
 
-    def _setup_model(self):
-        """Initialize model, tokenizer, and loss function."""
-        self._log(f"Loading model: {self.config['model_name']}")
+    def _create_model(self) -> nn.Module:
+        """Create TCRCrossEncoder with backend-appropriate settings."""
+        model_name = self.config.get("model_name", "facebook/esm2_t33_650M_UR50D")
+        self._log(f"Loading model: {model_name}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config["model_name"])
+        # Setup tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.model = TCRCrossEncoder(
-            model_name=self.config["model_name"],
+        # Get backend-specific kwargs
+        load_kwargs = self._get_model_load_kwargs()
+
+        model = TCRCrossEncoder(
+            model_name=model_name,
             hidden_dim=self.config.get("hidden_dim", 256),
             dropout=self.config.get("dropout", 0.1),
             pooling=self.config.get("pooling", "cls"),
+            **load_kwargs,
         )
 
         # Apply LoRA if requested
@@ -456,40 +473,39 @@ class TCRCrossEncoderTrainer:
                 lora_dropout=self.config.get("lora_dropout", 0.05),
                 bias="none",
             )
-            self.model.encoder = get_peft_model(self.model.encoder, lora_config)
+            model.encoder = get_peft_model(model.encoder, lora_config)
             self._log("Applied LoRA to encoder")
-            self.model.encoder.print_trainable_parameters()
+            if self._is_main_process():
+                model.encoder.print_trainable_parameters()
         elif not self.config.get("use_lora", False):
             # Freeze encoder if LoRA is not used
-            for param in self.model.encoder.parameters():
+            for param in model.encoder.parameters():
                 param.requires_grad = False
             self._log("Encoder frozen (no LoRA)")
 
-        # Setup loss function
-        pos_weight = self.config.get("pos_weight")
-        if pos_weight is None:
-            pos_weight = self.config.get("neg_ratio", 3)
-        self.criterion = CrossEncoderBCELoss(pos_weight=pos_weight)
+        return model
 
-        self.model.to(self.device)
-
-        # Count parameters
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        self._log(f"Total params: {total_params:,}")
-        self._log(f"Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
-
-    def _setup_data(self, include_val: bool = True):
-        """Initialize dataset and dataloader."""
-        self._log("Setting up data...")
-
-        self.train_dataset = TCRParquetDataset(
+    def _create_datasets(self) -> Tuple[Dataset, Optional[Dataset]]:
+        """Create train and validation datasets."""
+        train_dataset = TCRParquetDataset(
             data_path=self.config["data_path"],
             permutation_keys=self.config.get("permutation_keys", ["tra_trb"]),
             split="train",
+            local_rank=self.local_rank,
         )
 
-        self.collator = CrossEncoderCollator(
+        val_dataset = TCRParquetDataset(
+            data_path=self.config["data_path"],
+            permutation_keys=self.config.get("permutation_keys", ["tra_trb"]),
+            split="val",
+            local_rank=self.local_rank,
+        )
+
+        return train_dataset, val_dataset
+
+    def _create_collator(self):
+        """Create data collator for cross-encoder."""
+        return CrossEncoderCollator(
             tokenizer=self.tokenizer,
             max_length=self.config.get("max_length", 320),
             neg_ratio=self.config.get("neg_ratio", 3),
@@ -497,36 +513,21 @@ class TCRCrossEncoderTrainer:
             var_region_len=self.config.get("var_region_len", 150),
         )
 
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=self.config.get("batch_size", 16),
-            shuffle=True,
-            num_workers=self.config.get("num_workers", 4),
-            collate_fn=self.collator,
-            pin_memory=True,
-        )
+    def _compute_loss(self, model: nn.Module, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Compute loss for cross-encoder binary classification."""
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        labels = batch["labels"]
 
-        self._log(f"Train dataset size: {len(self.train_dataset)}")
-        self._log(f"Train loader batches: {len(self.train_loader)}")
+        logits = model(input_ids, attention_mask)
+        loss_dict = self.criterion(logits, labels)
 
-        if include_val:
-            self.val_dataset = TCRParquetDataset(
-                data_path=self.config["data_path"],
-                permutation_keys=self.config.get("permutation_keys", ["tra_trb"]),
-                split="val",
-            )
-
-            self.val_loader = DataLoader(
-                self.val_dataset,
-                batch_size=self.config.get("batch_size", 16),
-                shuffle=False,
-                num_workers=self.config.get("num_workers", 4),
-                collate_fn=self.collator,
-                pin_memory=True,
-            )
-
-            self._log(f"Val dataset size: {len(self.val_dataset)}")
-            self._log(f"Val loader batches: {len(self.val_loader)}")
+        return {
+            "loss": loss_dict["loss"],
+            "accuracy": loss_dict["accuracy"],
+            "pos_accuracy": loss_dict["pos_accuracy"],
+            "neg_accuracy": loss_dict["neg_accuracy"],
+        }
 
     def _setup_optimizer(self, lr: Optional[float] = None):
         """Initialize optimizer."""
@@ -600,7 +601,7 @@ class TCRCrossEncoderTrainer:
         for step in range(num_steps):
             self.optimizer.zero_grad()
 
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
+            with self.backend.autocast_context():
                 logits = self.model(input_ids, attention_mask)
                 loss_dict = self.criterion(logits, labels)
 
@@ -612,7 +613,7 @@ class TCRCrossEncoderTrainer:
                 self.model.parameters(), max_norm=1.0
             )
 
-            self.optimizer.step()
+            self.backend.optimizer_step(self.optimizer, self.model)
 
             if step == 0:
                 initial_loss = loss.item()
@@ -681,7 +682,7 @@ class TCRCrossEncoderTrainer:
             attention_mask = batch["attention_mask"].to(self.device)
             labels = batch["labels"].to(self.device)
 
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
+            with self.backend.autocast_context():
                 logits = self.model(input_ids, attention_mask)
                 loss_dict = self.criterion(logits, labels)
 
@@ -701,7 +702,7 @@ class TCRCrossEncoderTrainer:
         }
 
     def _save_checkpoint(self, path: Path, epoch: int, step: int, metrics: Dict[str, float]):
-        """Save model checkpoint."""
+        """Save model checkpoint using backend-appropriate method."""
         checkpoint = {
             "epoch": epoch,
             "step": step,
@@ -711,7 +712,7 @@ class TCRCrossEncoderTrainer:
             "metrics": metrics,
             "config": self.config,
         }
-        torch.save(checkpoint, path)
+        self.backend.save_checkpoint(checkpoint, str(path), self._is_main_process())
         self._log(f"Saved checkpoint to {path}")
 
     def train(self):
@@ -774,7 +775,7 @@ class TCRCrossEncoderTrainer:
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                with self.backend.autocast_context():
                     logits = self.model(input_ids, attention_mask)
                     loss_dict = self.criterion(logits, labels)
                     loss = loss_dict["loss"] / grad_accum_steps
@@ -794,7 +795,7 @@ class TCRCrossEncoderTrainer:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), max_norm=max_grad_norm
                     )
-                    self.optimizer.step()
+                    self.backend.optimizer_step(self.optimizer, self.model)
                     self.scheduler.step()
                     self.optimizer.zero_grad()
                     global_step += 1
@@ -985,18 +986,27 @@ def main():
     parser.add_argument("--overfit_lr", type=float, default=None,
                         help="Learning rate for overfit check (default: learning_rate)")
 
+    # Hardware backend
+    parser.add_argument("--backend", type=str, default="auto",
+                        choices=["auto", "cuda", "xla", "neuron", "trainium"],
+                        help="Hardware backend (auto detects XLA/CUDA)")
+
     args = parser.parse_args()
     config = vars(args)
 
-    # Create trainer
-    trainer = TCRCrossEncoderTrainer(config)
-    trainer._setup_model()
+    # Initialize backend
+    backend = get_backend(args.backend)
+    print(f"Using backend: {backend.name}")
+
+    # Create trainer with backend
+    trainer = TCRCrossEncoderTrainer(config, backend=backend)
+    trainer.setup_model()
 
     if args.overfit_check:
-        trainer._setup_data(include_val=False)
+        trainer.setup_data(include_val=False)
         trainer.overfit_single_batch()
     else:
-        trainer._setup_data(include_val=True)
+        trainer.setup_data(include_val=True)
         trainer.train()
 
 

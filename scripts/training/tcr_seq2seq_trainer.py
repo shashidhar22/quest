@@ -39,7 +39,7 @@ import os
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -51,6 +51,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
+
+# Backend abstraction for hardware-agnostic training
+from .backends import AcceleratorBackend, get_backend
+from .base_trainer import BaseTCRTrainer
 
 # Optional: LoRA support
 try:
@@ -147,14 +151,20 @@ class TCRSeq2SeqModel(nn.Module):
         decoder_dim: int = 1280,
         decoder_ffn_dim: int = 5120,
         dropout: float = 0.1,
+        attn_implementation: Optional[str] = "flash_attention_2",
+        torch_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
 
-        # Load ESM2 encoder with flash attention
+        # Load ESM2 encoder with appropriate attention implementation
+        # attn_implementation: "flash_attention_2" for CUDA, "eager" or None for XLA/Trainium
+        encoder_kwargs = {"torch_dtype": torch_dtype}
+        if attn_implementation:
+            encoder_kwargs["attn_implementation"] = attn_implementation
+
         self.encoder = AutoModel.from_pretrained(
             encoder_model_name,
-            attn_implementation="flash_attention_2",
-            torch_dtype=torch.bfloat16,
+            **encoder_kwargs,
         )
 
         # Get encoder config
@@ -1719,12 +1729,18 @@ class GenerationEvaluator:
 # =============================================================================
 
 
-class TCRSeq2SeqTrainer:
+class TCRSeq2SeqTrainer(BaseTCRTrainer):
     """
     Trainer for TCR conditional sequence generation.
 
+    Extends BaseTCRTrainer with seq2seq-specific functionality:
+    - Encoder-decoder architecture with ESM2 encoder
+    - Cross-attention based generation
+    - Comprehensive biological metrics for evaluation
+    - Support for CUDA and Trainium backends
+
     Features:
-    - DDP support for multi-GPU training
+    - DDP/XLA support for multi-device training
     - Mixed precision (bfloat16)
     - LoRA for encoder (optional)
     - Gradient checkpointing
@@ -1734,76 +1750,47 @@ class TCRSeq2SeqTrainer:
     - Overfit check mode
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.is_distributed = "LOCAL_RANK" in os.environ
+    def __init__(self, config: Dict[str, Any], backend: Optional[AcceleratorBackend] = None):
+        """
+        Initialize seq2seq trainer.
 
-        # Setup distributed training
-        if self.is_distributed:
-            self.local_rank = int(os.environ["LOCAL_RANK"])
-            self.global_rank = int(os.environ["RANK"])
-            self.world_size = int(os.environ["WORLD_SIZE"])
+        Args:
+            config: Training configuration
+            backend: Accelerator backend (auto-detected if None)
+        """
+        # Initialize base trainer (handles device setup, logging, etc.)
+        super().__init__(config, backend)
 
-            torch.cuda.set_device(self.local_rank)
-            dist.init_process_group(
-                backend="nccl",
-                init_method="env://",
-                timeout=timedelta(minutes=30),
-            )
-            self.device = torch.device(f"cuda:{self.local_rank}")
-        else:
-            self.local_rank = 0
-            self.global_rank = 0
-            self.world_size = 1
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Seq2seq specific: parse task
+        task_str = self.config.get("task", "ALPHA")
+        self.task = GenerationTask[task_str.upper()]
 
-        torch.set_float32_matmul_precision("high")
+        # Evaluator will be set up during data setup
+        self.evaluator = None
 
-        # Setup output directory
-        self.output_dir = Path(config["output_dir"])
-        if self._is_main_process():
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Setup logging
-        self.debug_log = self.output_dir / "training.log"
-        if self._is_main_process():
-            with open(self.debug_log, "w") as f:
-                f.write(f"Training log started at {datetime.now()}\n")
-                f.write(f"Config: {config}\n")
-                f.write("=" * 60 + "\n\n")
-
-        # Training state
-        self.global_step = 0
-        self.best_val_loss = float("inf")
-
-    def _is_main_process(self) -> bool:
-        return self.global_rank == 0
-
-    def _log(self, message: str, also_print: bool = True):
-        """Log message to file and optionally print."""
-        if self._is_main_process():
-            with open(self.debug_log, "a") as f:
-                f.write(message + "\n")
-            if also_print:
-                print(message)
-
-    def _setup_model(self):
-        """Initialize model, tokenizer, and optionally apply LoRA."""
+    def _create_model(self) -> nn.Module:
+        """Create TCRSeq2SeqModel with backend-appropriate settings."""
         model_name = self.config.get("model_name", "facebook/esm2_t33_650M_UR50D")
 
         self._log(f"Loading tokenizer and model: {model_name}")
 
+        # Setup tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.model = TCRSeq2SeqModel(
+        # Get backend-specific model loading kwargs
+        load_kwargs = self._get_model_load_kwargs()
+
+        # Create model with backend-appropriate attention implementation
+        model = TCRSeq2SeqModel(
             encoder_model_name=model_name,
             decoder_layers=self.config.get("decoder_layers", 6),
             decoder_heads=self.config.get("decoder_heads", 20),
             decoder_dim=self.config.get("decoder_dim", 1280),
             decoder_ffn_dim=self.config.get("decoder_ffn_dim", 5120),
             dropout=self.config.get("dropout", 0.1),
+            **load_kwargs,
         )
 
         # Apply LoRA if requested
@@ -1811,140 +1798,108 @@ class TCRSeq2SeqTrainer:
             if not PEFT_AVAILABLE:
                 self._log("Warning: peft not available, skipping LoRA")
             else:
-                self.model = apply_lora_to_encoder(self.model, self.config)
+                model = apply_lora_to_encoder(model, self.config)
                 self._log("Applied LoRA to encoder")
                 if self._is_main_process():
-                    self.model.encoder.print_trainable_parameters()
+                    model.encoder.print_trainable_parameters()
 
         # Freeze encoder if not using LoRA
         if not self.config.get("use_lora", False) and self.config.get("freeze_encoder", True):
-            for param in self.model.encoder.parameters():
+            for param in model.encoder.parameters():
                 param.requires_grad = False
             self._log("Encoder frozen (no LoRA)")
 
         # Enable gradient checkpointing for encoder
         if self.config.get("gradient_checkpointing", True):
-            self.model.encoder.gradient_checkpointing_enable(
+            model.encoder.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
             self._log("Gradient checkpointing enabled")
 
-        self.model.to(self.device)
+        return model
 
-        # Wrap with DDP
-        if self.is_distributed:
-            self.model = DDP(
-                self.model,
-                device_ids=[self.local_rank],
-                find_unused_parameters=True,
-            )
-
-        # Count parameters
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        self._log(f"Total params: {total_params:,}")
-        self._log(f"Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
-
-    def _setup_data(self, include_val: bool = True):
-        """Initialize datasets and dataloaders."""
-        self._log("Setting up data...")
-
-        # Parse task
-        task_str = self.config.get("task", "ALPHA")
-        task = GenerationTask[task_str.upper()]
-
+    def _create_datasets(self) -> Tuple[Dataset, Dataset]:
+        """Create train and validation datasets."""
         permutation_keys = self.config.get("permutation_keys", ["tra_trb_peptide_mhc_one"])
         if isinstance(permutation_keys, str):
             permutation_keys = [permutation_keys]
 
-        self.train_dataset = TCRSeq2SeqDataset(
+        train_dataset = TCRSeq2SeqDataset(
             data_path=self.config["data_path"],
             permutation_keys=permutation_keys,
-            task=task,
+            task=self.task,
             split="train",
             local_rank=self.local_rank,
         )
 
-        self.collator = Seq2SeqCollator(
+        val_dataset = TCRSeq2SeqDataset(
+            data_path=self.config["data_path"],
+            permutation_keys=permutation_keys,
+            task=self.task,
+            split="val",
+            local_rank=self.local_rank,
+        )
+
+        return train_dataset, val_dataset
+
+    def _create_collator(self) -> Seq2SeqCollator:
+        """Create seq2seq data collator."""
+        # Ensure tokenizer is set up
+        if self.tokenizer is None:
+            model_name = self.config.get("model_name", "facebook/esm2_t33_650M_UR50D")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        return Seq2SeqCollator(
             tokenizer=self.tokenizer,
             max_encoder_length=self.config.get("max_encoder_length", 1024),
             max_decoder_length=self.config.get("max_decoder_length", 350),
         )
 
-        # Samplers
-        if self.is_distributed:
-            train_sampler = DistributedSampler(self.train_dataset, shuffle=True, drop_last=True)
-        else:
-            train_sampler = None
-
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=self.config.get("batch_size", 16),
-            sampler=train_sampler,
-            shuffle=(train_sampler is None),
-            num_workers=self.config.get("num_workers", 4),
-            collate_fn=self.collator,
-            pin_memory=True,
-            drop_last=True,
+    def _compute_loss(
+        self,
+        model: nn.Module,
+        batch: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Compute seq2seq loss for a batch."""
+        outputs = model(
+            encoder_input_ids=batch["encoder_input_ids"],
+            encoder_attention_mask=batch["encoder_attention_mask"],
+            decoder_input_ids=batch["decoder_input_ids"],
+            decoder_attention_mask=batch["decoder_attention_mask"],
+            labels=batch["labels"],
         )
+        return {"loss": outputs["loss"]}
 
-        self._log(f"Train dataset size: {len(self.train_dataset)}")
-        self._log(f"Train loader batches: {len(self.train_loader)}")
+    def setup_data(self, include_val: bool = True) -> None:
+        """
+        Setup data with seq2seq-specific evaluator.
 
+        Overrides base class to add GenerationEvaluator.
+        """
+        # Call base class setup
+        super().setup_data(include_val)
+
+        # Setup seq2seq-specific evaluator
         if include_val:
-            self.val_dataset = TCRSeq2SeqDataset(
-                data_path=self.config["data_path"],
-                permutation_keys=permutation_keys,
-                task=task,
-                split="val",
-                local_rank=self.local_rank,
-            )
-
-            val_sampler = DistributedSampler(self.val_dataset, shuffle=False) if self.is_distributed else None
-
-            self.val_loader = DataLoader(
-                self.val_dataset,
-                batch_size=self.config.get("batch_size", 16),
-                sampler=val_sampler,
-                num_workers=self.config.get("num_workers", 4),
-                collate_fn=self.collator,
-                pin_memory=True,
-            )
-
-            self._log(f"Val dataset size: {len(self.val_dataset)}")
-            self._log(f"Val loader batches: {len(self.val_loader)}")
-
-            # Setup evaluator with detailed metrics
             self.evaluator = GenerationEvaluator(
                 self.tokenizer,
                 compute_detailed_metrics=self.config.get("compute_detailed_metrics", True),
             )
 
+    # Keep legacy method name for backward compatibility
+    def _setup_data(self, include_val: bool = True):
+        """Legacy method name - calls setup_data."""
+        self.setup_data(include_val)
+
     def _setup_optimizer(self, lr: Optional[float] = None):
-        """Initialize optimizer with AdamW."""
-        learning_rate = lr or self.config.get("learning_rate", 1e-4)
-
-        self.optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=learning_rate,
-            weight_decay=self.config.get("weight_decay", 0.01),
-        )
-
-        self._log(f"Optimizer: AdamW, lr={learning_rate}, weight_decay={self.config.get('weight_decay', 0.01)}")
+        """Legacy method - calls setup_optimizer."""
+        self.setup_optimizer(lr)
 
     def _setup_scheduler(self, num_training_steps: int):
-        """Initialize cosine learning rate scheduler with warmup."""
-        warmup_ratio = self.config.get("warmup_ratio", 0.1)
-        warmup_steps = int(num_training_steps * warmup_ratio)
-
-        def lr_lambda(step: int):
-            if step < warmup_steps:
-                return float(step) / float(max(1, warmup_steps))
-            progress = float(step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
-            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
-        self._log(f"Scheduler: Cosine with {warmup_steps} warmup steps ({warmup_ratio*100:.0f}%)")
+        """Legacy method - calls setup_scheduler."""
+        self.setup_scheduler(num_training_steps)
 
     def overfit_single_batch(self):
         """
@@ -1983,7 +1938,7 @@ class TCRSeq2SeqTrainer:
         for step in range(num_steps):
             self.optimizer.zero_grad()
 
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
+            with self.backend.autocast_context(self.backend.get_model_dtype()):
                 outputs = self.model(
                     encoder_input_ids=encoder_ids,
                     encoder_attention_mask=encoder_mask,
@@ -2000,7 +1955,7 @@ class TCRSeq2SeqTrainer:
                 max_norm=self.config.get("max_grad_norm", 1.0)
             )
 
-            self.optimizer.step()
+            self.backend.optimizer_step(self.optimizer, self.model)
 
             if step == 0:
                 initial_loss = loss.item()
@@ -2133,7 +2088,7 @@ class TCRSeq2SeqTrainer:
                 decoder_mask = batch["decoder_attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                with autocast(device_type="cuda", dtype=torch.bfloat16):
+                with self.backend.autocast_context(self.backend.get_model_dtype()):
                     outputs = self.model(
                         encoder_input_ids=encoder_ids,
                         encoder_attention_mask=encoder_mask,
@@ -2157,7 +2112,7 @@ class TCRSeq2SeqTrainer:
                         max_norm=max_grad_norm
                     )
 
-                    self.optimizer.step()
+                    self.backend.optimizer_step(self.optimizer, self.model)
                     self.scheduler.step()
                     self.optimizer.zero_grad()
                     self.global_step += 1
@@ -2311,6 +2266,11 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # Backend
+    parser.add_argument("--backend", type=str, default="auto",
+                        choices=["auto", "cuda", "xla", "neuron", "trainium"],
+                        help="Training backend: auto (detect), cuda (NVIDIA GPU), xla/neuron/trainium (AWS Trainium)")
+
     # Data
     parser.add_argument("--data_path", type=str, required=True,
                         help="Path to directory containing parquet files")
@@ -2418,15 +2378,17 @@ def main():
     args = parse_args()
     config = vars(args)
 
-    # Create trainer
-    trainer = TCRSeq2SeqTrainer(config)
-    trainer._setup_model()
+    # Get backend from config (auto-detected if not specified)
+    backend = get_backend(config.get("backend", "auto"))
+
+    # Create trainer with backend
+    trainer = TCRSeq2SeqTrainer(config, backend=backend)
 
     if args.overfit_check:
-        trainer._setup_data(include_val=False)
+        # Use overfit check from base trainer
         trainer.overfit_single_batch()
     else:
-        trainer._setup_data(include_val=True)
+        # Use full training loop
         trainer.train()
 
     # Cleanup distributed
