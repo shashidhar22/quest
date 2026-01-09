@@ -4,30 +4,79 @@
 # This file is automatically detected and installed by SageMaker before training.
 #
 # IMPORTANT: SageMaker containers have pre-installed packages that may conflict.
-# We use explicit versions with --upgrade behavior to override pre-installed versions.
+# We use latest versions which will override pre-installed versions if newer.
 #
 # NOTE: SageMaker PyTorch containers already include:
 #   - torch (version controlled by framework_version in launch script)
 #   - numpy, scipy, pandas
 #   - boto3, s3fs (for S3 access)
 #   - tqdm, scikit-learn
+#
+# For Trainium/Neuron containers, the following are pre-installed:
+#   - torch-xla, torch-neuronx
+#   - neuronx-distributed, neuronx-cc
 # =============================================================================
 
-# Hugging Face ecosystem - latest versions
-transformers                 # Latest version
-accelerate                   # Latest version
-peft                         # Latest version
-datasets                     # Latest version
-tokenizers                   # Latest version
+# =============================================================================
+# Hugging Face Ecosystem
+# =============================================================================
+transformers                 # Language model architectures
+accelerate                   # Distributed training utilities
+peft                         # LoRA, QLoRA, and other PEFT methods
+datasets                     # Dataset loading and processing
+tokenizers                   # Fast tokenization
 evaluate                     # Model evaluation metrics
+huggingface-hub              # Model/dataset hub access
+safetensors                  # Safe tensor serialization
 
-# Monitoring
+# =============================================================================
+# Monitoring & Logging
+# =============================================================================
 wandb                        # Experiment tracking
+tensorboard                  # Training visualization
 
-# Performance optimizations
-flash-attn                   # Flash Attention 2 (may already be in SageMaker container)
-bitsandbytes                 # For 8-bit/4-bit quantization (QLoRA)
+# =============================================================================
+# Performance Optimizations (CUDA only)
+# =============================================================================
+# Flash Attention 2 - significantly speeds up attention computation
+# NOTE: Only works on CUDA (NVIDIA GPUs), not on Trainium
+# The Neuron backend uses eager attention instead
+# IMPORTANT: flash-attn requires CUDA and will fail on Trainium instances.
+# It's typically pre-installed in SageMaker GPU containers.
+# Uncomment only if needed and running on CUDA:
+# flash-attn                 # Flash Attention 2 (CUDA only)
 
-# Tokenizer dependencies
-sentencepiece                # Tokenization (required by some transformers)
+# Quantization for memory-efficient training (QLoRA)
+# NOTE: bitsandbytes requires CUDA and may fail on Trainium
+# bitsandbytes               # 8-bit/4-bit quantization (CUDA only)
+
+# =============================================================================
+# Tokenizer Dependencies
+# =============================================================================
+sentencepiece                # Required by some tokenizers (T5, ALBERT, etc.)
 protobuf>=3.20.0,<5.0.0      # Protocol buffers (required by sentencepiece)
+
+# =============================================================================
+# Contrastive Learning
+# =============================================================================
+pytorch-metric-learning      # Loss functions and miners for contrastive learning
+
+# =============================================================================
+# Data Processing
+# =============================================================================
+pyarrow                      # Parquet file support
+pandas                       # DataFrame operations
+
+# =============================================================================
+# NOTE: Trainium/Neuron-specific packages
+# =============================================================================
+# These are PRE-INSTALLED in the Neuron container and should NOT be listed here.
+# Listing them would cause version conflicts or installation failures.
+#
+# Pre-installed in Neuron container:
+#   - torch-xla                 # XLA backend for PyTorch
+#   - torch-neuronx             # Neuron-optimized PyTorch
+#   - neuronx-distributed       # Distributed training on Neuron
+#   - neuronx-cc                # Neuron compiler
+#   - libneuronxla              # XLA runtime
+# =============================================================================

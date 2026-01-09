@@ -1,3 +1,13 @@
+# =============================================================================
+# Quest - TCR/MHC Training and Fine-tuning Dependencies
+# =============================================================================
+# This file contains all dependencies for local development, training,
+# fine-tuning, and supervised fine-tuning (SFT) of protein language models.
+#
+# For AWS Trainium/Inferentia instances, additional packages are pre-installed
+# in the Neuron container (torch-xla, neuronx-distributed, etc.)
+# =============================================================================
+
 # Core data processing
 pandas>=2.3.3
 numpy>=2.3.4
@@ -31,21 +41,55 @@ tqdm>=4.67.1
 # TCR sequence stitching (full-length reconstruction)
 stitchr>=1.3.1
 
-# Deep Learning frameworks
+# =============================================================================
+# Deep Learning Frameworks
+# =============================================================================
 torch>=2.9.0
 transformers>=4.57.1
 tokenizers>=0.22.1
 safetensors>=0.6.2
 accelerate>=1.11.0
+
+# Parameter-efficient fine-tuning (LoRA, QLoRA)
 peft>=0.17.1
 bitsandbytes>=0.43.0
 
-# Hugging Face ecosystem
+# Flash Attention 2 (CUDA only - improves training speed)
+# Install separately: pip install flash-attn --no-build-isolation
+# flash-attn>=2.5.0
+
+# =============================================================================
+# Hugging Face Ecosystem
+# =============================================================================
 huggingface-hub>=0.36.0
 datasets>=4.4.1
 evaluate>=0.4.6
 
-# Additional utilities
+# Tokenization
+sentencepiece>=0.2.0
+protobuf>=3.20.0,<5.0.0
+
+# =============================================================================
+# Training Infrastructure
+# =============================================================================
+# Contrastive learning
+pytorch-metric-learning>=2.4.0
+
+# Gradient scaling and mixed precision
+# (included in torch, but ensure compatibility)
+
+# Distributed training utilities
+# torch.distributed is included in torch
+
+# =============================================================================
+# SageMaker Integration (optional, for launching remote jobs)
+# =============================================================================
+# sagemaker>=2.200.0
+# boto3>=1.34.0
+
+# =============================================================================
+# Additional Utilities
+# =============================================================================
 fsspec>=2025.10.0
 requests>=2.32.5
 filelock>=3.20.0
@@ -58,6 +102,7 @@ cramjam>=2.11.0
 
 # Monitoring and logging
 wandb>=0.22.3
+tensorboard>=2.15.0
 
 # Machine learning utilities
 scikit-learn>=1.6.0
@@ -69,6 +114,20 @@ h5py>=3.13.0
 matplotlib>=3.10.0
 seaborn>=0.13.0
 
+# =============================================================================
+# AWS Trainium/Neuron SDK (only on Trainium instances)
+# =============================================================================
+# These packages are pre-installed in the AWS Neuron container.
+# Do NOT install on CUDA machines - they are XLA-specific.
+#
+# torch-neuronx>=2.1        # Neuron-optimized PyTorch
+# neuronx-distributed       # Distributed training on Neuron
+# neuronx-cc                # Neuron compiler
+# torch-xla                 # XLA backend for PyTorch
+# =============================================================================
+
+# =============================================================================
 # Testing (optional)
+# =============================================================================
 # pytest>=7.3.0
 # pytest-cov>=4.1.0
