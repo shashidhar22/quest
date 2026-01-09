@@ -1144,6 +1144,7 @@ class NativeESMTrainer:
             print(f"Resumed from step {self.global_step}, epoch {checkpoint['epoch']}")
 
         return checkpoint["epoch"]
+    
 
     def _save_final_model(self):
         """Save final model."""
