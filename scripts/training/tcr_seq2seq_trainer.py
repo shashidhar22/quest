@@ -33,6 +33,7 @@ Usage:
 """
 
 import argparse
+import copy
 import glob
 import math
 import os
@@ -259,6 +260,160 @@ class PositionalEncoding(nn.Module):
 
 
 # =============================================================================
+# Custom Decoder Layer with Self-Attention Dropout (Phase 8: Cross-Attention Forcing)
+# =============================================================================
+
+
+class SelfAttnDropoutDecoderLayer(nn.Module):
+    """
+    Custom TransformerDecoderLayer with optional self-attention dropout.
+
+    During training, randomly skips self-attention to force the model to rely
+    on cross-attention for information from the encoder. This addresses mode
+    collapse where the decoder ignores encoder context.
+
+    Uses Pre-LN (norm_first=True) architecture for stability.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        batch_first: bool = True,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+
+        # Self-attention
+        self.self_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=batch_first
+        )
+
+        # Cross-attention
+        self.multihead_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=batch_first
+        )
+
+        # FFN
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        # Layer norms (Pre-LN style)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        # Activation
+        self.activation = F.gelu if activation == "gelu" else F.relu
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+        self_attn_drop_prob: float = 0.0,
+    ) -> torch.Tensor:
+        """
+        Forward pass with optional self-attention dropout.
+
+        Args:
+            tgt: Target sequence (batch, seq_len, d_model)
+            memory: Encoder output (batch, enc_len, d_model)
+            tgt_mask: Causal mask for self-attention
+            memory_mask: Mask for cross-attention (usually None)
+            tgt_key_padding_mask: Padding mask for target
+            memory_key_padding_mask: Padding mask for encoder output
+            self_attn_drop_prob: Probability of skipping self-attention (0-1)
+
+        Returns:
+            Output tensor (batch, seq_len, d_model)
+        """
+        # Pre-LN Self-Attention (with optional dropout)
+        if self.training and self_attn_drop_prob > 0 and torch.rand(1).item() < self_attn_drop_prob:
+            # Skip self-attention entirely - use residual only
+            # This forces the model to rely on cross-attention for context
+            x = tgt
+        else:
+            # Normal self-attention path
+            x2 = self.norm1(tgt)
+            x2, _ = self.self_attn(
+                x2, x2, x2,
+                attn_mask=tgt_mask,
+                key_padding_mask=tgt_key_padding_mask,
+                need_weights=False,
+            )
+            x = tgt + self.dropout1(x2)
+
+        # Pre-LN Cross-Attention (always active - this is what we want to force)
+        x2 = self.norm2(x)
+        x2, _ = self.multihead_attn(
+            x2, memory, memory,
+            attn_mask=memory_mask,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,
+        )
+        x = x + self.dropout2(x2)
+
+        # Pre-LN FFN
+        x2 = self.norm3(x)
+        x2 = self.linear2(self.dropout(self.activation(self.linear1(x2))))
+        x = x + self.dropout3(x2)
+
+        return x
+
+
+class SelfAttnDropoutDecoder(nn.Module):
+    """
+    Transformer decoder with self-attention dropout support.
+
+    Wraps multiple SelfAttnDropoutDecoderLayer modules.
+    """
+
+    def __init__(self, decoder_layer: SelfAttnDropoutDecoderLayer, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            copy.deepcopy(decoder_layer) for _ in range(num_layers)
+        ])
+        self.num_layers = num_layers
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+        self_attn_drop_prob: float = 0.0,
+    ) -> torch.Tensor:
+        """Forward through all decoder layers."""
+        output = tgt
+        for layer in self.layers:
+            output = layer(
+                output, memory,
+                tgt_mask=tgt_mask,
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                self_attn_drop_prob=self_attn_drop_prob,
+            )
+        return output
+
+
+# =============================================================================
 # Model: TCRSeq2SeqModel
 # =============================================================================
 
@@ -289,8 +444,20 @@ class TCRSeq2SeqModel(nn.Module):
         dropout: float = 0.1,
         attn_implementation: Optional[str] = "auto",
         torch_dtype: torch.dtype = torch.bfloat16,
+        decoder_warm_start: bool = False,
+        # Self-attention dropout schedule for cross-attention forcing (Phase 8)
+        self_attn_drop_initial: float = 0.0,
+        self_attn_drop_final: float = 0.0,
+        self_attn_drop_anneal_epochs: int = 3,
     ):
         super().__init__()
+
+        # Store self-attention dropout schedule parameters
+        self.self_attn_drop_initial = self_attn_drop_initial
+        self.self_attn_drop_final = self_attn_drop_final
+        self.self_attn_drop_anneal_epochs = self_attn_drop_anneal_epochs
+        self.use_custom_decoder = self_attn_drop_initial > 0 or self_attn_drop_final > 0
+        self.current_epoch = 0  # Updated by trainer
 
         # Load ESM2 encoder with appropriate attention implementation
         # attn_implementation: "flash_attention_2" for CUDA, "eager" or None for XLA/Trainium
@@ -332,19 +499,38 @@ class TCRSeq2SeqModel(nn.Module):
         )
 
         # Transformer decoder layers
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=decoder_dim,
-            nhead=decoder_heads,
-            dim_feedforward=decoder_ffn_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,  # Pre-LN for better training stability
-        )
-        self.decoder = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=decoder_layers,
-        )
+        # Use custom decoder with self-attention dropout if enabled (Phase 8)
+        if self.use_custom_decoder:
+            print(f"[Cross-Attn Forcing] Using custom decoder with self-attention dropout")
+            print(f"  Initial dropout: {self_attn_drop_initial}, Final: {self_attn_drop_final}")
+            print(f"  Anneal epochs: {self_attn_drop_anneal_epochs}")
+            decoder_layer = SelfAttnDropoutDecoderLayer(
+                d_model=decoder_dim,
+                nhead=decoder_heads,
+                dim_feedforward=decoder_ffn_dim,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+            )
+            self.decoder = SelfAttnDropoutDecoder(
+                decoder_layer,
+                num_layers=decoder_layers,
+            )
+        else:
+            # Standard PyTorch decoder
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=decoder_dim,
+                nhead=decoder_heads,
+                dim_feedforward=decoder_ffn_dim,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,  # Pre-LN for better training stability
+            )
+            self.decoder = nn.TransformerDecoder(
+                decoder_layer,
+                num_layers=decoder_layers,
+            )
 
         # Output projection tied to decoder embeddings (weight tying)
         # This anchors output predictions in ESM2's learned token space
@@ -359,6 +545,127 @@ class TCRSeq2SeqModel(nn.Module):
         self.decoder_pos_encoding = self.decoder_pos_encoding.to(torch_dtype)
         self.decoder = self.decoder.to(torch_dtype)
         self.output_norm = self.output_norm.to(torch_dtype)
+
+        # Initialize decoder from encoder weights if requested (warm-start)
+        if decoder_warm_start:
+            self._initialize_decoder_from_encoder()
+
+    def _initialize_decoder_from_encoder(self) -> None:
+        """
+        Initialize decoder transformer layers from pre-trained ESM2 encoder.
+
+        This addresses mode collapse by giving the decoder a head start with
+        weights that already understand the encoder's representation space.
+
+        Copies:
+        - Self-attention Q, K, V weights (concatenated for PyTorch format)
+        - Self-attention output projection
+        - FFN layers (linear1, linear2)
+        - Layer norms (attention and FFN)
+
+        Keeps random:
+        - Cross-attention weights (multihead_attn) - no encoder equivalent
+        - Cross-attention layer norm (norm2)
+        """
+        # Get number of layers to copy (min of encoder and decoder layers)
+        num_encoder_layers = len(self.encoder.encoder.layer)
+        num_decoder_layers = len(self.decoder.layers)
+        num_layers_to_copy = min(num_encoder_layers, num_decoder_layers)
+
+        print(f"[Warm-Start] Initializing {num_layers_to_copy} decoder layers from ESM2 encoder...")
+
+        for i in range(num_layers_to_copy):
+            enc_layer = self.encoder.encoder.layer[i]
+            dec_layer = self.decoder.layers[i]
+
+            # ================================================
+            # 1. Self-Attention Q, K, V -> in_proj_weight
+            # ================================================
+            # ESM2 has separate Q, K, V weights
+            # PyTorch decoder expects concatenated [Q; K; V]
+            q_weight = enc_layer.attention.self.query.weight.data  # (1280, 1280)
+            k_weight = enc_layer.attention.self.key.weight.data
+            v_weight = enc_layer.attention.self.value.weight.data
+
+            # Concatenate: in_proj_weight is (3*embed_dim, embed_dim)
+            in_proj_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
+            dec_layer.self_attn.in_proj_weight.data.copy_(in_proj_weight)
+
+            # Biases (if present)
+            if enc_layer.attention.self.query.bias is not None:
+                q_bias = enc_layer.attention.self.query.bias.data
+                k_bias = enc_layer.attention.self.key.bias.data
+                v_bias = enc_layer.attention.self.value.bias.data
+                in_proj_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+                dec_layer.self_attn.in_proj_bias.data.copy_(in_proj_bias)
+
+            # ================================================
+            # 2. Self-Attention Output Projection
+            # ================================================
+            dec_layer.self_attn.out_proj.weight.data.copy_(
+                enc_layer.attention.output.dense.weight.data
+            )
+            if enc_layer.attention.output.dense.bias is not None:
+                dec_layer.self_attn.out_proj.bias.data.copy_(
+                    enc_layer.attention.output.dense.bias.data
+                )
+
+            # ================================================
+            # 3. FFN Layers
+            # ================================================
+            # ESM2: intermediate.dense -> linear1, output.dense -> linear2
+            dec_layer.linear1.weight.data.copy_(enc_layer.intermediate.dense.weight.data)
+            dec_layer.linear2.weight.data.copy_(enc_layer.output.dense.weight.data)
+
+            if enc_layer.intermediate.dense.bias is not None:
+                dec_layer.linear1.bias.data.copy_(enc_layer.intermediate.dense.bias.data)
+            if enc_layer.output.dense.bias is not None:
+                dec_layer.linear2.bias.data.copy_(enc_layer.output.dense.bias.data)
+
+            # ================================================
+            # 4. Layer Norms
+            # ================================================
+            # norm1 = self-attention LN (maps to ESM2 attention.LayerNorm)
+            # norm2 = cross-attention LN (keep random - no encoder equivalent)
+            # norm3 = FFN LN (maps to ESM2 LayerNorm)
+
+            dec_layer.norm1.weight.data.copy_(enc_layer.attention.LayerNorm.weight.data)
+            dec_layer.norm1.bias.data.copy_(enc_layer.attention.LayerNorm.bias.data)
+
+            dec_layer.norm3.weight.data.copy_(enc_layer.LayerNorm.weight.data)
+            dec_layer.norm3.bias.data.copy_(enc_layer.LayerNorm.bias.data)
+
+            # NOTE: norm2 (cross-attention) and multihead_attn stay randomly initialized
+            # This is intentional - cross-attention has no encoder equivalent
+
+        print(f"[Warm-Start] Complete. Copied self-attention, FFN, and layer norms.")
+        print(f"[Warm-Start] Cross-attention layers remain randomly initialized.")
+
+    def get_self_attn_drop_prob(self) -> float:
+        """
+        Get self-attention dropout probability based on current epoch (annealed schedule).
+
+        Schedule:
+        - Epochs 0 to (anneal_epochs - 1): Use initial_prob (high dropout)
+        - Epochs >= anneal_epochs: Use final_prob (low dropout)
+
+        This forces the model to rely on cross-attention early in training,
+        then allows self-attention to refine syntax later.
+        """
+        if not self.use_custom_decoder:
+            return 0.0
+
+        if self.current_epoch < self.self_attn_drop_anneal_epochs:
+            return self.self_attn_drop_initial
+        else:
+            return self.self_attn_drop_final
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set current epoch for dropout schedule."""
+        self.current_epoch = epoch
+        if self.use_custom_decoder:
+            prob = self.get_self_attn_drop_prob()
+            print(f"[Cross-Attn Forcing] Epoch {epoch}: self-attn dropout = {prob:.2f}")
 
     def _generate_causal_mask(
         self,
@@ -444,13 +751,25 @@ class TCRSeq2SeqModel(nn.Module):
         memory_key_padding_mask = (1.0 - encoder_attention_mask.to(dtype)) * -10000.0
 
         # Run decoder with cross-attention
-        decoder_output = self.decoder(
-            tgt=decoder_emb,
-            memory=encoder_hidden,
-            tgt_mask=causal_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask,
-        )
+        if self.use_custom_decoder:
+            # Custom decoder with self-attention dropout
+            decoder_output = self.decoder(
+                tgt=decoder_emb,
+                memory=encoder_hidden,
+                tgt_mask=causal_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                self_attn_drop_prob=self.get_self_attn_drop_prob(),
+            )
+        else:
+            # Standard PyTorch decoder
+            decoder_output = self.decoder(
+                tgt=decoder_emb,
+                memory=encoder_hidden,
+                tgt_mask=causal_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+            )
 
         # Project to vocabulary
         decoder_output = self.output_norm(decoder_output)
@@ -1650,6 +1969,386 @@ class PositionWiseAnalyzer:
 
 
 # =============================================================================
+# CDR Region Weighting (ANARCI-based)
+# =============================================================================
+
+
+# Preset configurations for CDR region weighting
+CDR_WEIGHT_PRESETS = {
+    "uniform": {"cdr1": 1.0, "cdr2": 1.0, "cdr3": 1.0, "framework": 1.0},
+    "cdr3_focused": {"cdr1": 2.0, "cdr2": 2.0, "cdr3": 4.0, "framework": 1.0},
+    "all_cdr_equal": {"cdr1": 3.0, "cdr2": 3.0, "cdr3": 3.0, "framework": 1.0},
+    "extreme_cdr3": {"cdr1": 1.5, "cdr2": 1.5, "cdr3": 8.0, "framework": 0.5},
+}
+
+
+# Optional: ANARCI for CDR annotation
+try:
+    from anarci import anarci as run_anarci
+    ANARCI_AVAILABLE = True
+except ImportError:
+    ANARCI_AVAILABLE = False
+
+
+def get_cdr_positions_anarci(sequence: str, chain_type: str = "B") -> Optional[Dict[str, Tuple[int, int]]]:
+    """
+    Get CDR region positions using ANARCI IMGT numbering.
+
+    Args:
+        sequence: Full TCR sequence
+        chain_type: 'A' for alpha, 'B' for beta
+
+    Returns:
+        Dict mapping region names to (start, end) positions, or None if annotation fails
+    """
+    if not ANARCI_AVAILABLE:
+        return None
+
+    try:
+        # Run ANARCI with IMGT scheme
+        results = run_anarci([("seq", sequence)], scheme="imgt", allowed_species=["human"])
+
+        if results[0][0] is None:
+            return None
+
+        # Extract numbering
+        numbering = results[0][0][0][0]  # First hit, first domain
+
+        # IMGT CDR definitions for TCRs:
+        # CDR1: positions 27-38 (IMGT)
+        # CDR2: positions 56-65 (IMGT)
+        # CDR3: positions 105-117 (IMGT) + insertions
+
+        cdr_positions = {
+            'cdr1': None,
+            'cdr2': None,
+            'cdr3': None,
+        }
+
+        # Map IMGT positions to sequence positions
+        seq_pos = 0
+        cdr1_start, cdr1_end = None, None
+        cdr2_start, cdr2_end = None, None
+        cdr3_start, cdr3_end = None, None
+
+        for (imgt_pos, insertion), aa in numbering:
+            if aa == '-':
+                continue
+
+            # Track CDR1 (IMGT 27-38)
+            if 27 <= imgt_pos <= 38:
+                if cdr1_start is None:
+                    cdr1_start = seq_pos
+                cdr1_end = seq_pos + 1
+
+            # Track CDR2 (IMGT 56-65)
+            elif 56 <= imgt_pos <= 65:
+                if cdr2_start is None:
+                    cdr2_start = seq_pos
+                cdr2_end = seq_pos + 1
+
+            # Track CDR3 (IMGT 105-117 + insertions)
+            elif imgt_pos >= 105 and imgt_pos <= 117:
+                if cdr3_start is None:
+                    cdr3_start = seq_pos
+                cdr3_end = seq_pos + 1
+            elif insertion and cdr3_start is not None:
+                # CDR3 insertions
+                cdr3_end = seq_pos + 1
+
+            seq_pos += 1
+
+        if cdr1_start is not None:
+            cdr_positions['cdr1'] = (cdr1_start, cdr1_end)
+        if cdr2_start is not None:
+            cdr_positions['cdr2'] = (cdr2_start, cdr2_end)
+        if cdr3_start is not None:
+            cdr_positions['cdr3'] = (cdr3_start, cdr3_end)
+
+        return cdr_positions
+
+    except Exception:
+        return None
+
+
+class CDRAnnotationCache:
+    """
+    Thread-safe cache for CDR annotations to avoid re-running ANARCI.
+    """
+
+    def __init__(self, max_size: int = 10000):
+        self._cache: Dict[str, Optional[Dict[str, Tuple[int, int]]]] = {}
+        self._max_size = max_size
+        import threading
+        self._lock = threading.Lock()
+
+    def get_or_compute(self, sequence: str, chain_type: str = "B") -> Optional[Dict[str, Tuple[int, int]]]:
+        """Get CDR positions from cache or compute if not cached."""
+        cache_key = f"{chain_type}:{sequence[:50]}"  # Use prefix for key
+
+        with self._lock:
+            if cache_key in self._cache:
+                return self._cache[cache_key]
+
+        # Compute outside lock
+        positions = get_cdr_positions_anarci(sequence, chain_type)
+
+        with self._lock:
+            if len(self._cache) < self._max_size:
+                self._cache[cache_key] = positions
+
+        return positions
+
+
+# Global CDR annotation cache
+_cdr_cache = CDRAnnotationCache()
+
+
+def build_cdr_position_weights(
+    seq_len: int,
+    cdr_annotations: Optional[Dict[str, Tuple[int, int]]],
+    cdr1_weight: float = 2.0,
+    cdr2_weight: float = 2.0,
+    cdr3_weight: float = 4.0,
+    framework_weight: float = 1.0,
+    device: torch.device = None,
+) -> torch.Tensor:
+    """
+    Build per-position weights based on CDR annotations.
+
+    Args:
+        seq_len: Sequence length
+        cdr_annotations: Dict with 'cdr1', 'cdr2', 'cdr3' -> (start, end) tuples
+        cdr1_weight: Weight for CDR1 region
+        cdr2_weight: Weight for CDR2 region
+        cdr3_weight: Weight for CDR3 region (most important!)
+        framework_weight: Weight for framework regions
+        device: Target device
+
+    Returns:
+        Tensor of shape (seq_len,) with per-position weights
+    """
+    weights = torch.full((seq_len,), framework_weight, device=device)
+
+    if cdr_annotations is None:
+        return weights
+
+    # Apply CDR-specific weights
+    for region, weight in [('cdr1', cdr1_weight), ('cdr2', cdr2_weight), ('cdr3', cdr3_weight)]:
+        if region in cdr_annotations and cdr_annotations[region] is not None:
+            start, end = cdr_annotations[region]
+            if start is not None and end is not None and start < seq_len and end <= seq_len:
+                weights[start:end] = weight
+
+    return weights
+
+
+# =============================================================================
+# BLOSUM62 Soft Loss
+# =============================================================================
+
+
+class BLOSUM62SoftLoss(nn.Module):
+    """
+    Soft cross-entropy loss weighted by BLOSUM62 biological similarity.
+
+    Instead of treating all errors equally, penalize biologically dissimilar
+    substitutions more:
+    - Predicting L when target is I (similar hydrophobic) -> small penalty
+    - Predicting K when target is D (opposite charge) -> large penalty
+
+    Args:
+        tokenizer: ESM2 tokenizer
+        temperature: Temperature for softmax normalization of BLOSUM scores
+        alpha: Mixing weight - (1-alpha)*CE + alpha*BLOSUM_KL
+    """
+
+    def __init__(self, tokenizer, temperature: float = 1.0, alpha: float = 0.1):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.temperature = temperature
+        self.alpha = alpha
+
+        # Build BLOSUM62 soft target matrix
+        self.register_buffer("blosum_targets", self._build_blosum_soft_targets())
+
+    def _build_blosum_soft_targets(self) -> torch.Tensor:
+        """Convert BLOSUM62 to soft probability targets."""
+        vocab_size = self.tokenizer.vocab_size
+
+        # Initialize with uniform (for non-AA tokens)
+        soft_targets = torch.zeros(vocab_size, vocab_size)
+
+        # Map amino acids to token IDs
+        aa_to_id = {}
+        for aa in AMINO_ACIDS:
+            tokens = self.tokenizer.encode(aa, add_special_tokens=False)
+            if tokens:
+                aa_to_id[aa] = tokens[0]
+
+        # Fill in BLOSUM62 scores for AA pairs
+        for aa1, aa1_id in aa_to_id.items():
+            for aa2, aa2_id in aa_to_id.items():
+                score = BLOSUM62.get(aa1, {}).get(aa2, -4)
+                soft_targets[aa1_id, aa2_id] = score
+
+        # Normalize rows to sum to 1 (softmax over BLOSUM scores)
+        # Only for rows corresponding to amino acids
+        for aa, aa_id in aa_to_id.items():
+            row = soft_targets[aa_id]
+            # Apply softmax only to AA positions
+            aa_indices = list(aa_to_id.values())
+            aa_scores = row[aa_indices]
+            aa_probs = F.softmax(aa_scores / self.temperature, dim=0)
+            for i, idx in enumerate(aa_indices):
+                soft_targets[aa_id, idx] = aa_probs[i]
+
+        return soft_targets
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Compute BLOSUM-weighted soft loss.
+
+        Args:
+            logits: (batch, seq_len, vocab_size)
+            labels: (batch, seq_len) hard labels
+
+        Returns:
+            Combined loss scalar
+        """
+        batch_size, seq_len, vocab_size = logits.shape
+        device = logits.device
+
+        # Standard cross-entropy (hard targets)
+        ce_loss = F.cross_entropy(
+            logits.view(-1, vocab_size),
+            labels.view(-1),
+            ignore_index=-100,
+            reduction='none'
+        )
+
+        # BLOSUM soft targets
+        valid_mask = (labels != -100).float()
+        valid_labels = labels.clone()
+        valid_labels[~(labels != -100)] = 0
+
+        # Look up soft targets for each label
+        soft_targets = self.blosum_targets.to(device)[valid_labels]  # (batch, seq_len, vocab_size)
+
+        # KL divergence from predicted distribution to BLOSUM soft targets
+        log_probs = F.log_softmax(logits, dim=-1)
+        kl_loss = F.kl_div(
+            log_probs.view(-1, vocab_size),
+            soft_targets.view(-1, vocab_size),
+            reduction='none'
+        ).sum(dim=-1)
+
+        # Mask invalid positions
+        flat_mask = valid_mask.view(-1)
+        kl_loss = kl_loss * flat_mask
+        ce_loss = ce_loss * flat_mask
+
+        # Combine losses
+        n_valid = flat_mask.sum().clamp(min=1)
+        total_loss = (1 - self.alpha) * (ce_loss.sum() / n_valid) + self.alpha * (kl_loss.sum() / n_valid)
+
+        return total_loss
+
+
+# =============================================================================
+# Sequence Alignment Utilities
+# =============================================================================
+
+
+# Optional: Biopython for alignment
+try:
+    from Bio import pairwise2
+    from Bio.Align import substitution_matrices
+    BIOPYTHON_AVAILABLE = True
+except ImportError:
+    BIOPYTHON_AVAILABLE = False
+
+
+def aligned_sequence_metrics(generated: str, reference: str) -> Dict[str, float]:
+    """
+    Compute metrics on properly aligned sequences using Biopython.
+
+    Uses Needleman-Wunsch global alignment with BLOSUM62 scoring.
+
+    Args:
+        generated: Generated sequence
+        reference: Reference sequence
+
+    Returns:
+        Dict with alignment-based metrics
+    """
+    if not BIOPYTHON_AVAILABLE:
+        # Fallback to simple position-wise comparison
+        return {
+            "identity_aligned": sequence_identity(generated, reference),
+            "blosum_score": blosum62_similarity(generated, reference),
+            "alignment_available": False,
+        }
+
+    if not generated or not reference:
+        return {
+            "identity_aligned": 0.0,
+            "blosum_score": 0.0,
+            "alignment_available": True,
+        }
+
+    try:
+        # Load BLOSUM62 for alignment scoring
+        blosum62_matrix = substitution_matrices.load("BLOSUM62")
+
+        # Global alignment (Needleman-Wunsch style)
+        alignments = pairwise2.align.globalds(
+            generated, reference,
+            blosum62_matrix,
+            -10,   # Gap open penalty
+            -0.5,  # Gap extend penalty
+        )
+
+        if not alignments:
+            return {
+                "identity_aligned": 0.0,
+                "blosum_score": 0.0,
+                "alignment_available": True,
+            }
+
+        best_alignment = alignments[0]
+        aligned_gen, aligned_ref, score, begin, end = best_alignment
+
+        # Compute identity on aligned sequences
+        matches = sum(1 for a, b in zip(aligned_gen, aligned_ref)
+                      if a == b and a != '-')
+        non_gap_positions = sum(1 for a, b in zip(aligned_gen, aligned_ref)
+                                 if a != '-' or b != '-')
+        identity = matches / max(non_gap_positions, 1)
+
+        # Gap statistics
+        gen_gaps = aligned_gen.count('-')
+        ref_gaps = aligned_ref.count('-')
+
+        return {
+            "identity_aligned": identity,
+            "blosum_score": score,
+            "blosum_per_position": score / max(len(aligned_gen), 1),
+            "alignment_length": len(aligned_gen),
+            "gen_gaps": gen_gaps,
+            "ref_gaps": ref_gaps,
+            "alignment_available": True,
+        }
+
+    except Exception:
+        return {
+            "identity_aligned": sequence_identity(generated, reference),
+            "blosum_score": blosum62_similarity(generated, reference),
+            "alignment_available": False,
+        }
+
+
+# =============================================================================
 # Evaluator: GenerationEvaluator
 # =============================================================================
 
@@ -1945,6 +2644,12 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
         # Evaluator will be set up during data setup
         self.evaluator = None
 
+        # BLOSUM loss function (initialized after tokenizer is set up)
+        self.blosum_loss_fn = None
+
+        # CDR annotation cache
+        self.cdr_cache = CDRAnnotationCache()
+
     def _create_model(self) -> nn.Module:
         """Create TCRSeq2SeqModel with backend-appropriate settings."""
         model_name = self.config.get("model_name", "facebook/esm2_t33_650M_UR50D")
@@ -1967,6 +2672,10 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
             decoder_dim=self.config.get("decoder_dim", 1280),
             decoder_ffn_dim=self.config.get("decoder_ffn_dim", 5120),
             dropout=self.config.get("dropout", 0.1),
+            decoder_warm_start=self.config.get("decoder_warm_start", False),
+            self_attn_drop_initial=self.config.get("self_attn_drop_initial", 0.0),
+            self_attn_drop_final=self.config.get("self_attn_drop_final", 0.0),
+            self_attn_drop_anneal_epochs=self.config.get("self_attn_drop_anneal_epochs", 3),
             **load_kwargs,
         )
 
@@ -2046,7 +2755,16 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
         model: nn.Module,
         batch: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Compute seq2seq loss for a batch."""
+        """
+        Compute biologically-informed loss for seq2seq training.
+
+        Loss components (all configurable):
+        1. CDR-weighted CE: Weight CDR3 > CDR1/2 > Framework via ANARCI positions
+        2. BLOSUM62 soft loss: Penalize biologically dissimilar substitutions more
+        3. Auxiliary losses: Identity, length consistency
+
+        For PEPTIDE task, CDR weighting is disabled (peptides don't have CDR regions).
+        """
         outputs = model(
             encoder_input_ids=batch["encoder_input_ids"],
             encoder_attention_mask=batch["encoder_attention_mask"],
@@ -2054,13 +2772,245 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
             decoder_attention_mask=batch["decoder_attention_mask"],
             labels=batch["labels"],
         )
-        return {"loss": outputs["loss"]}
+
+        logits = outputs["logits"]  # (batch, seq_len, vocab_size)
+        labels = batch["labels"]     # (batch, seq_len)
+        batch_size, seq_len, vocab_size = logits.shape
+
+        # =====================================================
+        # COMPONENT 1: CDR-Weighted Cross-Entropy Loss
+        # Only for TCR generation (ALPHA/BETA), not PEPTIDE
+        # =====================================================
+        use_cdr_weighting = (
+            self.config.get("use_cdr_weighting", False) and
+            self.task != GenerationTask.PEPTIDE  # Peptides don't have CDR regions
+        )
+
+        if use_cdr_weighting:
+            # Get CDR annotations from batch (if available from collator)
+            # If not in batch, compute on-the-fly from labels using ANARCI (cached)
+            cdr_annotations = batch.get("cdr_annotations")
+            if cdr_annotations is None and ANARCI_AVAILABLE:
+                cdr_annotations = self._get_cdr_annotations_from_labels(labels)
+
+            # Ensure cdr_annotations is a list (default to all None if not available)
+            if cdr_annotations is None:
+                cdr_annotations = [None] * batch_size
+
+            # Build per-position weights for each sequence in batch
+            position_weights = torch.ones(batch_size, seq_len, device=self.device)
+
+            for b in range(batch_size):
+                annot = cdr_annotations[b] if b < len(cdr_annotations) else None
+                if annot is not None:
+                    weights_b = build_cdr_position_weights(
+                        seq_len=seq_len,
+                        cdr_annotations=annot,
+                        cdr1_weight=self.config.get("cdr1_weight", 2.0),
+                        cdr2_weight=self.config.get("cdr2_weight", 2.0),
+                        cdr3_weight=self.config.get("cdr3_weight", 4.0),
+                        framework_weight=self.config.get("framework_weight", 1.0),
+                        device=self.device,
+                    )
+                    position_weights[b] = weights_b
+
+            # Weighted cross-entropy per position
+            ce_per_position = F.cross_entropy(
+                logits.view(-1, vocab_size),
+                labels.view(-1),
+                ignore_index=-100,
+                reduction='none'
+            ).view(batch_size, seq_len)
+
+            valid_mask = (labels != -100).float()
+            weighted_sum = (ce_per_position * position_weights * valid_mask).sum()
+            weight_sum = (position_weights * valid_mask).sum().clamp(min=1)
+            weighted_ce = weighted_sum / weight_sum
+        else:
+            # Standard CE loss (used for PEPTIDE task or when CDR weighting disabled)
+            weighted_ce = F.cross_entropy(
+                logits.view(-1, vocab_size),
+                labels.view(-1),
+                ignore_index=-100,
+            )
+
+        # =====================================================
+        # COMPONENT 2: BLOSUM62 Soft Loss
+        # Penalize biologically dissimilar substitutions more
+        # =====================================================
+        blosum_loss = torch.tensor(0.0, device=self.device)
+        blosum_alpha = self.config.get("blosum_alpha", 0.0)
+
+        if self.config.get("use_blosum_loss", False) and blosum_alpha > 0:
+            if hasattr(self, 'blosum_loss_fn') and self.blosum_loss_fn is not None:
+                blosum_loss = self.blosum_loss_fn(logits, labels)
+
+        # =====================================================
+        # COMPONENT 3: Auxiliary Losses (identity, length)
+        # CRITICAL: Must be differentiable - no argmax!
+        # =====================================================
+        aux_loss = torch.tensor(0.0, device=self.device)
+
+        if self.config.get("use_auxiliary_losses", False):
+            # Differentiable soft identity loss using softmax probabilities
+            # (argmax breaks gradients - we use probability of correct label instead)
+            probs = F.softmax(logits, dim=-1)  # (batch, seq_len, vocab_size)
+
+            # Handle padding: replace -100 with 0 for gather, then mask later
+            valid_mask = (labels != -100).float()
+            n_valid = valid_mask.sum().clamp(min=1)
+            labels_clamped = labels.clamp(min=0)  # Replace -100 with 0 for indexing
+
+            # Get probability assigned to correct label at each position
+            target_probs = probs.gather(2, labels_clamped.unsqueeze(2)).squeeze(2)  # (batch, seq_len)
+
+            # Soft identity: mean probability of correct label (masked)
+            soft_identity = (target_probs * valid_mask).sum() / n_valid
+            identity_loss = 1.0 - soft_identity  # Minimize this = maximize target prob
+
+            # Differentiable length consistency loss using expected EOS position
+            # Use softmax to compute expected EOS position (soft argmax)
+            eos_id = self.tokenizer.eos_token_id if self.tokenizer else 2
+            eos_probs = probs[:, :, eos_id]  # (batch, seq_len) - prob of EOS at each position
+
+            # Position indices
+            positions = torch.arange(seq_len, device=self.device, dtype=torch.float).unsqueeze(0)  # (1, seq_len)
+
+            # Expected EOS position = sum(position * EOS_prob) / sum(EOS_prob)
+            # Add small epsilon to avoid division by zero
+            eos_prob_sum = eos_probs.sum(dim=1, keepdim=True).clamp(min=1e-6)
+            pred_expected_eos = (positions * eos_probs).sum(dim=1) / eos_prob_sum.squeeze(1)
+
+            # Label EOS position (non-differentiable, used as target)
+            label_eos_pos = torch.where(
+                labels == eos_id,
+                torch.arange(seq_len, device=self.device).unsqueeze(0).expand(batch_size, -1),
+                torch.full((batch_size, seq_len), seq_len, device=self.device)
+            ).min(dim=1).values.float()
+
+            length_loss = F.l1_loss(pred_expected_eos, label_eos_pos)
+
+            aux_loss = (
+                self.config.get("aux_identity_weight", 0.05) * identity_loss +
+                self.config.get("aux_length_weight", 0.02) * length_loss
+            )
+
+        # =====================================================
+        # COMBINE ALL LOSSES
+        # =====================================================
+        # Main loss: (1 - blosum_alpha) * CDR_weighted_CE + blosum_alpha * BLOSUM_loss
+        if blosum_alpha > 0:
+            main_loss = (1.0 - blosum_alpha) * weighted_ce + blosum_alpha * blosum_loss
+        else:
+            main_loss = weighted_ce
+
+        # Add auxiliary losses
+        total_loss = main_loss + aux_loss
+
+        return {
+            "loss": total_loss,
+            "ce_loss": weighted_ce.detach(),
+            "blosum_loss": blosum_loss.detach() if isinstance(blosum_loss, torch.Tensor) else torch.tensor(0.0),
+            "aux_loss": aux_loss.detach() if isinstance(aux_loss, torch.Tensor) else torch.tensor(0.0),
+        }
+
+    def _compute_stopping_metric(self, val_metrics: Dict[str, float]) -> float:
+        """
+        Compute composite early stopping metric from biological metrics.
+
+        Lower is better. Combines:
+        - Loss (lower is better)
+        - Identity (higher is better -> invert)
+        - Position accuracy (higher is better -> invert)
+        - Hydrophobicity correlation (higher is better -> invert)
+
+        Returns:
+            Composite metric (lower is better)
+        """
+        # Get weights from config
+        loss_weight = self.config.get("stopping_loss_weight", 0.4)
+        identity_weight = self.config.get("stopping_identity_weight", 0.3)
+        position_weight = self.config.get("stopping_position_weight", 0.2)
+        hydro_weight = self.config.get("stopping_hydro_weight", 0.1)
+
+        # Normalize weights
+        total_weight = loss_weight + identity_weight + position_weight + hydro_weight
+        loss_weight /= total_weight
+        identity_weight /= total_weight
+        position_weight /= total_weight
+        hydro_weight /= total_weight
+
+        # Get metrics (with defaults)
+        loss = val_metrics.get("eval_loss", 1.0)
+        identity = val_metrics.get("identity_mean", 0.0)
+        position_acc = val_metrics.get("mean_position_accuracy", 0.0)
+        hydro_corr = val_metrics.get("hydrophobicity_corr_mean", 0.0)
+
+        # Compute composite (lower is better)
+        # For metrics where higher is better, use (1 - metric)
+        composite = (
+            loss_weight * loss +
+            identity_weight * (1.0 - identity) +
+            position_weight * (1.0 - position_acc) +
+            hydro_weight * (1.0 - (hydro_corr + 1.0) / 2.0)  # Normalize hydro_corr from [-1,1] to [0,1]
+        )
+
+        return composite
+
+    def _get_cdr_annotations_from_labels(
+        self,
+        labels: torch.Tensor
+    ) -> List[Optional[Dict[str, Tuple[int, int]]]]:
+        """
+        Compute CDR annotations from label tokens using ANARCI.
+
+        Decodes labels to sequences and uses cached ANARCI annotation.
+
+        Args:
+            labels: (batch, seq_len) label tensor
+
+        Returns:
+            List of CDR annotation dicts, one per batch item
+        """
+        if not ANARCI_AVAILABLE or self.tokenizer is None:
+            return [None] * labels.shape[0]
+
+        annotations = []
+        for b in range(labels.shape[0]):
+            # Get valid tokens (not -100 padding)
+            valid_tokens = labels[b][labels[b] != -100].tolist()
+            if len(valid_tokens) < 10:  # Too short for meaningful annotation
+                annotations.append(None)
+                continue
+
+            # Decode to sequence
+            try:
+                sequence = self.tokenizer.decode(valid_tokens, skip_special_tokens=True)
+                sequence = sequence.replace(" ", "")  # Remove spaces
+
+                if len(sequence) < 50:  # Too short for full TCR
+                    annotations.append(None)
+                    continue
+
+                # Determine chain type from task
+                chain_type = "A" if self.task == GenerationTask.ALPHA else "B"
+
+                # Get CDR positions (cached)
+                cdr_pos = self.cdr_cache.get_or_compute(sequence, chain_type)
+                annotations.append(cdr_pos)
+
+            except Exception:
+                annotations.append(None)
+
+        return annotations
 
     def setup_data(self, include_val: bool = True) -> None:
         """
-        Setup data with seq2seq-specific evaluator.
+        Setup data with seq2seq-specific evaluator and biological loss functions.
 
-        Overrides base class to add GenerationEvaluator.
+        Overrides base class to add:
+        - GenerationEvaluator for comprehensive metrics
+        - BLOSUM62SoftLoss for biological similarity-aware training
         """
         # Call base class setup
         super().setup_data(include_val)
@@ -2071,6 +3021,29 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
                 self.tokenizer,
                 compute_detailed_metrics=self.config.get("compute_detailed_metrics", True),
             )
+
+        # Setup BLOSUM loss function if enabled
+        if self.config.get("use_blosum_loss", False) and self.tokenizer is not None:
+            self.blosum_loss_fn = BLOSUM62SoftLoss(
+                tokenizer=self.tokenizer,
+                temperature=self.config.get("blosum_temperature", 1.0),
+                alpha=self.config.get("blosum_alpha", 0.1),
+            )
+            # Move to device
+            if hasattr(self, 'device'):
+                self.blosum_loss_fn = self.blosum_loss_fn.to(self.device)
+            self._log(f"Initialized BLOSUM62SoftLoss (alpha={self.config.get('blosum_alpha', 0.1)})")
+
+        # Log CDR weighting configuration
+        if self.config.get("use_cdr_weighting", False):
+            if self.task == GenerationTask.PEPTIDE:
+                self._log("Note: CDR weighting disabled for PEPTIDE task (peptides have no CDR regions)")
+            else:
+                self._log(f"CDR weighting enabled: CDR3={self.config.get('cdr3_weight', 4.0)}, "
+                         f"CDR1/2={self.config.get('cdr1_weight', 2.0)}/{self.config.get('cdr2_weight', 2.0)}, "
+                         f"Framework={self.config.get('framework_weight', 1.0)}")
+                if not ANARCI_AVAILABLE:
+                    self._log("Warning: ANARCI not available - CDR positions will use fallback (uniform weights)")
 
     # Keep legacy method name for backward compatibility
     def _setup_data(self, include_val: bool = True):
@@ -2254,6 +3227,7 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
                 project=self.config.get("wandb_project", "tcr-seq2seq"),
                 name=self.config.get("wandb_run_name"),
                 config=self.config,
+                settings=wandb.Settings(init_timeout=300),  # 5 min timeout for slow connections
             )
 
         self.model.train()
@@ -2265,6 +3239,9 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
             self._log(f"\n{'='*60}")
             self._log(f"Epoch {epoch + 1}/{num_epochs}")
             self._log(f"{'='*60}")
+
+            # Update self-attention dropout schedule for cross-attention forcing
+            self.model.set_epoch(epoch)
 
             epoch_loss = 0.0
             epoch_steps = 0
@@ -2396,14 +3373,28 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
                                 if isinstance(v, (int, float))
                             } | {"eval/global_step": self.global_step})
 
-                        # Check for improvement
-                        is_best = val_metrics["eval_loss"] < self.best_val_loss
-                        if is_best:
-                            self.best_val_loss = val_metrics["eval_loss"]
-                            patience_counter = 0
+                        # Check for improvement using biological metrics if enabled
+                        if self.config.get("use_biological_stopping", False):
+                            # Compute composite stopping metric (lower is better)
+                            stopping_metric = self._compute_stopping_metric(val_metrics)
+                            is_best = stopping_metric < getattr(self, 'best_stopping_metric', float('inf'))
+                            if is_best:
+                                self.best_stopping_metric = stopping_metric
+                                self.best_val_loss = val_metrics["eval_loss"]
+                                patience_counter = 0
+                                self._log(f"New best composite metric: {stopping_metric:.4f}")
+                            else:
+                                patience_counter += 1
+                                self._log(f"No improvement (composite={stopping_metric:.4f}). Patience: {patience_counter}/{patience}")
                         else:
-                            patience_counter += 1
-                            self._log(f"No improvement. Patience: {patience_counter}/{patience}")
+                            # Standard: only check loss
+                            is_best = val_metrics["eval_loss"] < self.best_val_loss
+                            if is_best:
+                                self.best_val_loss = val_metrics["eval_loss"]
+                                patience_counter = 0
+                            else:
+                                patience_counter += 1
+                                self._log(f"No improvement. Patience: {patience_counter}/{patience}")
 
                         self._save_checkpoint(epoch, self.global_step, val_metrics, is_best=is_best)
 
@@ -2497,6 +3488,16 @@ def parse_args():
                         help="Decoder FFN intermediate dimension")
     parser.add_argument("--dropout", type=float, default=0.1,
                         help="Dropout rate")
+    parser.add_argument("--decoder_warm_start", action="store_true",
+                        help="Initialize decoder self-attention and FFN from pre-trained encoder weights (fixes mode collapse)")
+
+    # Cross-attention forcing (Phase 8 - fixes mode collapse when decoder ignores encoder)
+    parser.add_argument("--self_attn_drop_initial", type=float, default=0.0,
+                        help="Initial self-attention dropout probability (e.g., 0.5 to force cross-attention usage)")
+    parser.add_argument("--self_attn_drop_final", type=float, default=0.0,
+                        help="Final self-attention dropout probability after annealing (e.g., 0.1)")
+    parser.add_argument("--self_attn_drop_anneal_epochs", type=int, default=3,
+                        help="Number of epochs before annealing from initial to final dropout")
 
     # LoRA
     parser.add_argument("--use_lora", action="store_true",
@@ -2563,6 +3564,54 @@ def parse_args():
     parser.add_argument("--compute_detailed_metrics", action="store_true", default=True,
                         help="Compute advanced sequence metrics (BLOSUM62, position accuracy, etc.)")
 
+    # ==========================================================================
+    # Biological Loss Configuration
+    # ==========================================================================
+
+    # CDR Region Weighting (for ALPHA/BETA tasks only, not PEPTIDE)
+    parser.add_argument("--use_cdr_weighting", action="store_true",
+                        help="Enable CDR region-weighted loss (requires ANARCI). "
+                             "Weights CDR3 > CDR1/2 > Framework regions.")
+    parser.add_argument("--cdr_weight_preset", type=str, default=None,
+                        choices=["uniform", "cdr3_focused", "all_cdr_equal", "extreme_cdr3"],
+                        help="Preset CDR weight configuration. Overrides individual weights if set.")
+    parser.add_argument("--cdr1_weight", type=float, default=2.0,
+                        help="Loss weight for CDR1 region")
+    parser.add_argument("--cdr2_weight", type=float, default=2.0,
+                        help="Loss weight for CDR2 region")
+    parser.add_argument("--cdr3_weight", type=float, default=4.0,
+                        help="Loss weight for CDR3 region (most important for specificity)")
+    parser.add_argument("--framework_weight", type=float, default=1.0,
+                        help="Loss weight for framework regions (conserved)")
+
+    # BLOSUM62 Soft Loss
+    parser.add_argument("--use_blosum_loss", action="store_true",
+                        help="Enable BLOSUM62 soft loss (penalize biologically dissimilar substitutions more)")
+    parser.add_argument("--blosum_alpha", type=float, default=0.1,
+                        help="BLOSUM loss mixing weight: (1-alpha)*CE + alpha*BLOSUM_KL")
+    parser.add_argument("--blosum_temperature", type=float, default=1.0,
+                        help="Temperature for BLOSUM score softmax normalization")
+
+    # Auxiliary Losses
+    parser.add_argument("--use_auxiliary_losses", action="store_true",
+                        help="Enable auxiliary losses (identity, length consistency)")
+    parser.add_argument("--aux_identity_weight", type=float, default=0.05,
+                        help="Weight for soft sequence identity auxiliary loss")
+    parser.add_argument("--aux_length_weight", type=float, default=0.02,
+                        help="Weight for length consistency auxiliary loss")
+
+    # Multi-objective Early Stopping
+    parser.add_argument("--use_biological_stopping", action="store_true",
+                        help="Use biological metrics for early stopping (not just loss)")
+    parser.add_argument("--stopping_loss_weight", type=float, default=0.4,
+                        help="Weight for loss in early stopping composite metric")
+    parser.add_argument("--stopping_identity_weight", type=float, default=0.3,
+                        help="Weight for identity in early stopping composite metric")
+    parser.add_argument("--stopping_position_weight", type=float, default=0.2,
+                        help="Weight for position accuracy in early stopping composite metric")
+    parser.add_argument("--stopping_hydro_weight", type=float, default=0.1,
+                        help="Weight for hydrophobicity correlation in early stopping")
+
     return parser.parse_args()
 
 
@@ -2574,6 +3623,17 @@ def parse_args():
 def main():
     args = parse_args()
     config = vars(args)
+
+    # Apply CDR weight preset if specified
+    if config.get("cdr_weight_preset"):
+        preset_name = config["cdr_weight_preset"]
+        if preset_name in CDR_WEIGHT_PRESETS:
+            preset = CDR_WEIGHT_PRESETS[preset_name]
+            config["cdr1_weight"] = preset["cdr1"]
+            config["cdr2_weight"] = preset["cdr2"]
+            config["cdr3_weight"] = preset["cdr3"]
+            config["framework_weight"] = preset["framework"]
+            print(f"Applied CDR weight preset '{preset_name}': {preset}")
 
     # Get backend from config (auto-detected if not specified)
     backend = get_backend(config.get("backend", "auto"))
