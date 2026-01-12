@@ -101,6 +101,131 @@ FIELDS = ["tra", "trb", "peptide", "mhc_one", "mhc_two"]
 
 
 # =============================================================================
+# Permutation Key Utilities
+# =============================================================================
+
+
+def permutation_key_has_fields(pkey: str, required_fields: List[str], any_of: List[str] = None) -> bool:
+    """
+    Check if a permutation key contains required fields.
+
+    Args:
+        pkey: Permutation key string (e.g., 'tra_trb_peptide_mhc_one')
+        required_fields: List of field names that must ALL be present
+        any_of: List of field names where at least ONE must be present (optional)
+
+    Returns:
+        True if all required fields are present (and at least one of any_of if specified)
+    """
+    pkey_lower = pkey.lower()
+    words = pkey_lower.replace('_', ' ').split()
+
+    # Check all required fields are present
+    for field in required_fields:
+        if field in ('tra', 'trb'):
+            # Exact word match to avoid 'tra' matching 'trav'
+            if field not in words:
+                return False
+        else:
+            # Substring match for peptide, mhc_one, mhc_two
+            if field not in pkey_lower:
+                return False
+
+    # Check at least one of any_of is present
+    if any_of:
+        found_any = False
+        for field in any_of:
+            if field in ('tra', 'trb'):
+                if field in words:
+                    found_any = True
+                    break
+            elif field in pkey_lower:
+                found_any = True
+                break
+        if not found_any:
+            return False
+
+    return True
+
+
+def get_required_fields_for_task(task: "GenerationTask") -> Tuple[List[str], List[str]]:
+    """
+    Get required fields for a generation task.
+
+    Args:
+        task: GenerationTask enum value
+
+    Returns:
+        Tuple of (required_fields, any_of_fields)
+    """
+    if task == GenerationTask.ALPHA:
+        # ALPHA: need tra (target) + peptide + mhc_one; trb optional
+        return ['tra', 'peptide', 'mhc_one'], []
+    elif task == GenerationTask.BETA:
+        # BETA: need trb (target) + peptide + mhc_one; tra optional
+        return ['trb', 'peptide', 'mhc_one'], []
+    elif task == GenerationTask.PEPTIDE:
+        # PEPTIDE: need peptide (target) + mhc_one + at least one TCR
+        return ['peptide', 'mhc_one'], ['tra', 'trb']
+    else:
+        return ['tra', 'trb', 'peptide', 'mhc_one'], []
+
+
+def discover_permutation_keys(data_path: str, task: "GenerationTask", is_main: bool = True) -> List[str]:
+    """
+    Discover all permutation keys from parquet files and filter by task requirements.
+
+    Args:
+        data_path: Path to directory containing parquet files
+        task: Generation task (determines required fields)
+        is_main: Whether this is the main process (for logging)
+
+    Returns:
+        List of matching permutation keys
+    """
+    import pyarrow.parquet as pq
+
+    # Get required fields for this task
+    required_fields, any_of_fields = get_required_fields_for_task(task)
+
+    # Scan parquet files to find unique permutation keys
+    parquet_files = sorted(glob.glob(os.path.join(data_path, "*.parquet")))
+    if not parquet_files:
+        raise ValueError(f"No parquet files found in {data_path}")
+
+    all_keys = set()
+    for pf in parquet_files[:10]:  # Sample first 10 files for speed
+        try:
+            table = pq.read_table(pf, columns=['permutation_key'])
+            if 'permutation_key' in table.column_names:
+                keys = table['permutation_key'].to_pylist()
+                all_keys.update(k for k in keys if k)
+        except Exception:
+            continue
+
+    # Filter keys by required fields
+    matching_keys = [
+        key for key in all_keys
+        if permutation_key_has_fields(key, required_fields, any_of_fields)
+    ]
+
+    if is_main:
+        print(f"Discovered {len(all_keys)} unique permutation keys")
+        print(f"Selected {len(matching_keys)} keys for {task.value} task")
+        if matching_keys:
+            print(f"  Examples: {matching_keys[:5]}")
+
+    if not matching_keys:
+        raise ValueError(
+            f"No permutation keys found matching {task.value} requirements. "
+            f"Need keys containing: {required_fields}" +
+            (f" and at least one of: {any_of_fields}" if any_of_fields else "")
+        )
+
+    return sorted(matching_keys)
+
+
+# =============================================================================
 # Positional Encoding
 # =============================================================================
 
@@ -228,6 +353,12 @@ class TCRSeq2SeqModel(nn.Module):
 
         # Layer norm before output projection
         self.output_norm = nn.LayerNorm(decoder_dim)
+
+        # Convert decoder components to same dtype as encoder for consistency
+        # (encoder is loaded with torch_dtype, decoder is created in float32 by default)
+        self.decoder_pos_encoding = self.decoder_pos_encoding.to(torch_dtype)
+        self.decoder = self.decoder.to(torch_dtype)
+        self.output_norm = self.output_norm.to(torch_dtype)
 
     def _generate_causal_mask(
         self,
@@ -406,7 +537,8 @@ class TCRSeq2SeqDataset(Dataset):
 
     Args:
         data_path: Path to directory containing parquet files
-        permutation_keys: List of permutation keys to filter sequences
+        permutation_keys: List of permutation keys to filter sequences.
+            If None, auto-discovers keys matching task requirements.
         task: Generation task (ALPHA, BETA, or PEPTIDE)
         split: One of 'train', 'val', or 'test'
         train_ratio: Fraction of data for training
@@ -421,7 +553,7 @@ class TCRSeq2SeqDataset(Dataset):
     def __init__(
         self,
         data_path: str,
-        permutation_keys: List[str],
+        permutation_keys: Optional[List[str]],
         task: GenerationTask,
         split: str = "train",
         train_ratio: float = 0.8,
@@ -432,6 +564,10 @@ class TCRSeq2SeqDataset(Dataset):
         self.task = task
         self.split = split
         is_main = local_rank == 0
+
+        # Auto-discover permutation keys if not provided
+        if permutation_keys is None or permutation_keys == ["auto"]:
+            permutation_keys = discover_permutation_keys(data_path, task, is_main)
 
         # Create cache key
         cache_key = f"{data_path}:{','.join(sorted(permutation_keys))}"
@@ -563,40 +699,37 @@ class TCRSeq2SeqDataset(Dataset):
         """
         Check if record has required fields for the generation task.
 
+        Relaxed validation:
+        - ALPHA: tra (target) + peptide + mhc_one required; trb optional
+        - BETA: trb (target) + peptide + mhc_one required; tra optional
+        - PEPTIDE: peptide (target) + mhc_one + at least one TCR required
+
         Args:
             record: Dict with tra, trb, peptide, mhc_one, mhc_two
 
         Returns:
-            True if record has all required fields for the task
+            True if record has required fields for the task
         """
         # Helper to check if a field is non-empty and valid
         def is_valid(val: str) -> bool:
             return bool(val) and val not in ("", "NA", "None")
 
+        # Common requirement: peptide and mhc_one
+        if not is_valid(record.get("peptide", "")) or not is_valid(record.get("mhc_one", "")):
+            return False
+
         if self.task == GenerationTask.ALPHA:
-            # Need: trb, peptide, mhc_one, and tra (target)
-            return (
-                is_valid(record["trb"]) and
-                is_valid(record["peptide"]) and
-                is_valid(record["mhc_one"]) and
-                is_valid(record["tra"])
-            )
+            # Need tra (target); trb optional for context
+            return is_valid(record.get("tra", ""))
+
         elif self.task == GenerationTask.BETA:
-            # Need: tra, peptide, mhc_one, and trb (target)
-            return (
-                is_valid(record["tra"]) and
-                is_valid(record["peptide"]) and
-                is_valid(record["mhc_one"]) and
-                is_valid(record["trb"])
-            )
+            # Need trb (target); tra optional for context
+            return is_valid(record.get("trb", ""))
+
         elif self.task == GenerationTask.PEPTIDE:
-            # Need: tra, trb, mhc_one, and peptide (target)
-            return (
-                is_valid(record["tra"]) and
-                is_valid(record["trb"]) and
-                is_valid(record["mhc_one"]) and
-                is_valid(record["peptide"])
-            )
+            # Need at least one TCR chain for context
+            return is_valid(record.get("tra", "")) or is_valid(record.get("trb", ""))
+
         return False
 
     def __len__(self) -> int:
@@ -605,6 +738,8 @@ class TCRSeq2SeqDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """
         Get encoder context sequences and decoder target.
+
+        Handles optional TCR chains - only includes present chains in encoder context.
 
         Returns:
             dict with:
@@ -618,22 +753,33 @@ class TCRSeq2SeqDataset(Dataset):
         mhc_class = "II" if record.get("mhc_two", "") else "I"
 
         if self.task == GenerationTask.ALPHA:
-            # Encoder: Beta + Peptide + MHC
-            encoder_context = [record["trb"], record["peptide"], record["mhc_one"]]
+            # Encoder context: [trb if present] + peptide + mhc
+            encoder_context = []
+            if record.get("trb"):
+                encoder_context.append(record["trb"])
+            encoder_context.extend([record["peptide"], record["mhc_one"]])
             if mhc_class == "II" and record.get("mhc_two"):
                 encoder_context.append(record["mhc_two"])
             decoder_target = record["tra"]
 
         elif self.task == GenerationTask.BETA:
-            # Encoder: Alpha + Peptide + MHC
-            encoder_context = [record["tra"], record["peptide"], record["mhc_one"]]
+            # Encoder context: [tra if present] + peptide + mhc
+            encoder_context = []
+            if record.get("tra"):
+                encoder_context.append(record["tra"])
+            encoder_context.extend([record["peptide"], record["mhc_one"]])
             if mhc_class == "II" and record.get("mhc_two"):
                 encoder_context.append(record["mhc_two"])
             decoder_target = record["trb"]
 
         elif self.task == GenerationTask.PEPTIDE:
-            # Encoder: Alpha + Beta + MHC
-            encoder_context = [record["tra"], record["trb"], record["mhc_one"]]
+            # Encoder context: available TCRs + mhc
+            encoder_context = []
+            if record.get("tra"):
+                encoder_context.append(record["tra"])
+            if record.get("trb"):
+                encoder_context.append(record["trb"])
+            encoder_context.append(record["mhc_one"])
             if mhc_class == "II" and record.get("mhc_two"):
                 encoder_context.append(record["mhc_two"])
             decoder_target = record["peptide"]
@@ -1854,9 +2000,13 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
 
     def _create_datasets(self) -> Tuple[Dataset, Dataset]:
         """Create train and validation datasets."""
-        permutation_keys = self.config.get("permutation_keys", ["tra_trb_peptide_mhc_one"])
+        # Get permutation keys from config (can be None for auto-discovery)
+        permutation_keys = self.config.get("permutation_keys")
         if isinstance(permutation_keys, str):
             permutation_keys = [permutation_keys]
+        # Handle empty list from nargs="*" as None for auto-discovery
+        if permutation_keys is not None and len(permutation_keys) == 0:
+            permutation_keys = None
 
         train_dataset = TCRSeq2SeqDataset(
             data_path=self.config["data_path"],
@@ -2325,9 +2475,10 @@ def parse_args():
     parser.add_argument("--task", type=str, default="ALPHA",
                         choices=["ALPHA", "BETA", "PEPTIDE"],
                         help="Generation task")
-    parser.add_argument("--permutation_keys", type=str, nargs="+",
-                        default=["tra_trb_peptide_mhc_one"],
-                        help="Permutation keys to filter sequences")
+    parser.add_argument("--permutation_keys", type=str, nargs="*",
+                        default=None,
+                        help="Permutation keys to filter sequences. "
+                             "If not specified, auto-discovers keys matching task requirements.")
     parser.add_argument("--max_encoder_length", type=int, default=512,
                         help="Maximum encoder sequence length (512 for trn1.2xlarge, 1024 for larger instances)")
     parser.add_argument("--max_decoder_length", type=int, default=256,
