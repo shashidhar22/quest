@@ -3,11 +3,10 @@ import torch
 
 from torch.nn.utils.rnn import pad_sequence
 
-# from quest.constants import PAD_TOKEN_ID  # Unused, remove
 
-
-def is_main_process(self: object) -> bool:
-        return (not self.is_distributed) or (self.is_distributed and self.global_rank == 0)
+def is_main_process(is_distributed: bool, global_rank: int) -> bool:
+    """Check if current process is the main process."""
+    return (not is_distributed) or (is_distributed and global_rank == 0)
 
 def collate_tf(batch, pad_token_id):
     """
@@ -77,33 +76,3 @@ def collate_fn(batch, pad_token_id):
     attention_mask = (padded_inputs != pad_token_id)
     return padded_inputs, padded_targets, attention_mask
 
-def log_metrics(total_loss, total_correct, total_samples, stage, epoch):
-    total_loss_tensor = torch.tensor(total_loss, device="cuda")
-    total_correct_tensor = torch.tensor(total_correct, device="cuda")
-    total_samples_tensor = torch.tensor(total_samples, device="cuda")
-
-    # dist.reduce(total_loss_tensor, dst=0) # This line was removed as per the edit hint.
-    # dist.reduce(total_correct_tensor, dst=0) # This line was removed as per the edit hint.
-    # dist.reduce(total_samples_tensor, dst=0) # This line was removed as per the edit hint.
-
-    if is_main_process():
-        avg_loss = total_loss_tensor.item() / total_samples_tensor.item()
-        avg_accuracy = total_correct_tensor.item() / total_samples_tensor.item()
-        log_data = {f"{stage}_loss": avg_loss, f"{stage}_accuracy": avg_accuracy}
-        if epoch is not None:
-            log_data["epoch"] = epoch
-        # wandb.log(log_data) # This line was removed as per the edit hint.
-
-def broadcast_config(config):
-    config_str = json.dumps(dict(config)) # This line was removed as per the edit hint.
-    config_len = torch.tensor(len(config_str), dtype=torch.int, device="cuda") # This line was removed as per the edit hint.
-
-    # dist.broadcast(config_len, src=0) # This line was removed as per the edit hint.
-    buffer = torch.empty(config_len.item(), dtype=torch.uint8, device="cuda") # This line was removed as per the edit hint.
-
-    # if dist.get_rank() == 0: # This line was removed as per the edit hint.
-    #     buffer[:] = torch.tensor(list(config_str.encode()), dtype=torch.uint8) # This line was removed as per the edit hint.
-
-    # dist.broadcast(buffer, src=0) # This line was removed as per the edit hint.
-    config_str = "".join(map(chr, buffer.cpu().tolist())) # This line was removed as per the edit hint.
-    return json.loads(config_str) # This line was removed as per the edit hint.

@@ -302,6 +302,23 @@ class BaseTCRTrainer(ABC):
         self._log(f"Total params: {total_params:,}")
         self._log(f"Trainable params: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
 
+    def _get_optimal_num_workers(self) -> int:
+        """
+        Get optimal num_workers based on backend.
+
+        For XLA/Trainium:
+        - Use fewer workers to leave CPU for graph compilation
+        - MpDeviceLoader handles prefetching efficiently
+
+        For CUDA:
+        - Use configured workers for CPU preprocessing
+        """
+        default = self.config.get("num_workers", 4)
+        if self.backend.name == "xla":
+            # trn1.2xlarge has 8 vCPUs; limit workers to leave CPU for XLA
+            return min(default, 2)
+        return default
+
     def setup_data(self, include_val: bool = True) -> None:
         """
         Setup datasets and dataloaders.
@@ -338,12 +355,13 @@ class BaseTCRTrainer(ABC):
             val_sampler = None
 
         # Create train dataloader
+        num_workers = self._get_optimal_num_workers()
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.config.get("batch_size", 16),
             sampler=train_sampler,
             shuffle=(train_sampler is None),
-            num_workers=self.config.get("num_workers", 4),
+            num_workers=num_workers,
             collate_fn=self.collator,
             pin_memory=True,
             drop_last=True,
@@ -363,7 +381,7 @@ class BaseTCRTrainer(ABC):
                 self.val_dataset,
                 batch_size=self.config.get("batch_size", 16),
                 sampler=val_sampler,
-                num_workers=self.config.get("num_workers", 4),
+                num_workers=num_workers,
                 collate_fn=self.collator,
                 pin_memory=True,
             )

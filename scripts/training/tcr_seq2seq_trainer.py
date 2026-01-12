@@ -36,7 +36,14 @@ import argparse
 import glob
 import math
 import os
+import sys
 from datetime import datetime, timedelta
+
+# Add project root to path for direct script execution
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -53,8 +60,12 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 # Backend abstraction for hardware-agnostic training
-from .backends import AcceleratorBackend, get_backend
-from .base_trainer import BaseTCRTrainer
+try:
+    from .backends import AcceleratorBackend, get_backend
+    from .base_trainer import BaseTCRTrainer
+except ImportError:
+    from scripts.training.backends import AcceleratorBackend, get_backend
+    from scripts.training.base_trainer import BaseTCRTrainer
 
 # Optional: LoRA support
 try:
@@ -118,7 +129,7 @@ class PositionalEncoding(nn.Module):
             (batch_size, seq_len, d_model) with positional encoding added
         """
         seq_len = x.size(1)
-        x = x + self.pe[:seq_len].unsqueeze(0)
+        x = x + self.pe[:seq_len].unsqueeze(0).to(x.dtype)
         return self.dropout(x)
 
 
@@ -151,7 +162,7 @@ class TCRSeq2SeqModel(nn.Module):
         decoder_dim: int = 1280,
         decoder_ffn_dim: int = 5120,
         dropout: float = 0.1,
-        attn_implementation: Optional[str] = "flash_attention_2",
+        attn_implementation: Optional[str] = "auto",
         torch_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -159,7 +170,15 @@ class TCRSeq2SeqModel(nn.Module):
         # Load ESM2 encoder with appropriate attention implementation
         # attn_implementation: "flash_attention_2" for CUDA, "eager" or None for XLA/Trainium
         encoder_kwargs = {"torch_dtype": torch_dtype}
-        if attn_implementation:
+
+        # Try flash_attention_2 first, fall back to eager if not available
+        if attn_implementation == "auto":
+            try:
+                import flash_attn
+                encoder_kwargs["attn_implementation"] = "flash_attention_2"
+            except ImportError:
+                encoder_kwargs["attn_implementation"] = "eager"
+        elif attn_implementation:
             encoder_kwargs["attn_implementation"] = attn_implementation
 
         self.encoder = AutoModel.from_pretrained(
@@ -213,16 +232,22 @@ class TCRSeq2SeqModel(nn.Module):
     def _generate_causal_mask(
         self,
         seq_len: int,
-        device: torch.device
+        device: torch.device,
+        dtype: torch.dtype = torch.float32
     ) -> torch.Tensor:
         """
         Generate causal attention mask for decoder.
 
+        XLA/Trainium Fix: Use additive float mask with -1e4 instead of -inf or bool.
+        Using -inf causes NaN gradients on Trainium due to bfloat16 handling.
+
         Returns:
-            Boolean mask of shape (seq_len, seq_len) where True = block attention
+            Float mask of shape (seq_len, seq_len) where 0.0 = attend, -1e4 = block
         """
+        # Create upper triangle with large negative number (block attention)
+        # Use -1e4 because it zeros out softmax in bfloat16 but avoids NaN gradients
         mask = torch.triu(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
+            torch.full((seq_len, seq_len), -10000.0, device=device, dtype=dtype),
             diagonal=1
         )
         return mask
@@ -272,19 +297,20 @@ class TCRSeq2SeqModel(nn.Module):
 
         # Embed decoder inputs (shared with encoder)
         decoder_emb = self.decoder_embed(decoder_input_ids)  # (batch, dec_len, dim)
-        decoder_emb = self.decoder_pos_encoding(decoder_emb.float())
+        decoder_emb = self.decoder_pos_encoding(decoder_emb)
 
-        # Convert to bfloat16 to match encoder
-        decoder_emb = decoder_emb.to(encoder_hidden.dtype)
+        # Get dtype for masks (XLA/Trainium compatibility)
+        dtype = decoder_emb.dtype
 
-        # Causal mask for autoregressive decoding
-        causal_mask = self._generate_causal_mask(dec_len, device)
+        # Causal mask for autoregressive decoding (additive float mask)
+        causal_mask = self._generate_causal_mask(dec_len, device, dtype=dtype)
 
-        # Padding mask for decoder (True = ignore)
-        tgt_key_padding_mask = (decoder_attention_mask == 0)
-
-        # Padding mask for encoder memory (True = ignore)
-        memory_key_padding_mask = (encoder_attention_mask == 0)
+        # XLA/Trainium Fix: Convert boolean padding masks to additive float masks
+        # Using -1e4 instead of -inf to avoid NaN gradients in bfloat16
+        # HF attention_mask: 1 = attend, 0 = ignore
+        # Additive mask: 0.0 = attend, -1e4 = ignore
+        tgt_key_padding_mask = (1.0 - decoder_attention_mask.to(dtype)) * -10000.0
+        memory_key_padding_mask = (1.0 - encoder_attention_mask.to(dtype)) * -10000.0
 
         # Run decoder with cross-attention
         decoder_output = self.decoder(
@@ -296,7 +322,7 @@ class TCRSeq2SeqModel(nn.Module):
         )
 
         # Project to vocabulary
-        decoder_output = self.output_norm(decoder_output.float())
+        decoder_output = self.output_norm(decoder_output)
         logits = self.output_proj(decoder_output)
 
         return logits
@@ -515,14 +541,19 @@ class TCRSeq2SeqDataset(Dataset):
         parts = sequence.split(" ")
         record = {"tra": "", "trb": "", "peptide": "", "mhc_one": "", "mhc_two": ""}
 
-        # Parse permutation key to determine field order
-        fields_in_key = []
+        # Find position of each field in the permutation key to determine order
+        field_positions = []
         for field in FIELDS:
-            if field in perm_key:
-                fields_in_key.append(field)
+            pos = perm_key.find(field)
+            if pos != -1:
+                field_positions.append((pos, field))
 
-        # Assign parts to fields
-        for i, field in enumerate(fields_in_key):
+        # Sort by position in key string to get actual order
+        field_positions.sort()
+        fields_in_order = [field for _, field in field_positions]
+
+        # Assign parts to fields in correct order
+        for i, field in enumerate(fields_in_order):
             if i < len(parts):
                 record[field] = parts[i]
 
@@ -1809,12 +1840,15 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
                 param.requires_grad = False
             self._log("Encoder frozen (no LoRA)")
 
-        # Enable gradient checkpointing for encoder
+        # Enable gradient checkpointing for encoder (not supported on XLA/Trainium)
         if self.config.get("gradient_checkpointing", True):
-            model.encoder.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-            self._log("Gradient checkpointing enabled")
+            if self.backend.name == "xla":
+                self._log("Gradient checkpointing disabled (not supported on XLA/Trainium)")
+            else:
+                model.encoder.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+                self._log("Gradient checkpointing enabled")
 
         return model
 
@@ -1907,6 +1941,12 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
 
         This should drive loss to near zero and demonstrate the model can learn.
         """
+        # Setup model and data if not already done
+        if self.model is None:
+            self.setup_model()
+        if self.train_loader is None:
+            self.setup_data(include_val=False)
+
         self._log("\n" + "=" * 60)
         self._log("SINGLE BATCH OVERFIT CHECK")
         self._log("=" * 60)
@@ -1914,7 +1954,7 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
         self._log("=" * 60 + "\n")
 
         num_steps = self.config.get("overfit_steps", 500)
-        lr = self.config.get("overfit_lr", self.config.get("learning_rate", 1e-4))
+        lr = self.config.get("overfit_lr") or self.config.get("learning_rate") or 1e-4
 
         self._setup_optimizer(lr=lr)
         self.model.train()
@@ -2022,6 +2062,12 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
 
     def train(self):
         """Full training loop with validation, checkpointing, and early stopping."""
+        # Setup model and data if not already done
+        if self.model is None:
+            self.setup_model()
+        if self.train_loader is None:
+            self.setup_data(include_val=True)
+
         self._log("\n" + "=" * 60)
         self._log("STARTING FULL TRAINING")
         self._log("=" * 60 + "\n")
@@ -2282,21 +2328,21 @@ def parse_args():
     parser.add_argument("--permutation_keys", type=str, nargs="+",
                         default=["tra_trb_peptide_mhc_one"],
                         help="Permutation keys to filter sequences")
-    parser.add_argument("--max_encoder_length", type=int, default=1024,
-                        help="Maximum encoder sequence length")
-    parser.add_argument("--max_decoder_length", type=int, default=350,
-                        help="Maximum decoder sequence length")
+    parser.add_argument("--max_encoder_length", type=int, default=512,
+                        help="Maximum encoder sequence length (512 for trn1.2xlarge, 1024 for larger instances)")
+    parser.add_argument("--max_decoder_length", type=int, default=256,
+                        help="Maximum decoder sequence length (256 for trn1.2xlarge, 350 for larger instances)")
 
-    # Model
-    parser.add_argument("--model_name", type=str, default="facebook/esm2_t33_650M_UR50D",
-                        help="Pretrained ESM2 model name")
-    parser.add_argument("--decoder_layers", type=int, default=6,
+    # Model (default to smallest ESM2 for trn1.2xlarge memory constraints)
+    parser.add_argument("--model_name", type=str, default="facebook/esm2_t6_8M_UR50D",
+                        help="Pretrained ESM2 model name (esm2_t6_8M for trn1.2xlarge, esm2_t33_650M for larger instances)")
+    parser.add_argument("--decoder_layers", type=int, default=4,
                         help="Number of decoder transformer layers")
-    parser.add_argument("--decoder_heads", type=int, default=20,
-                        help="Number of decoder attention heads")
-    parser.add_argument("--decoder_dim", type=int, default=1280,
-                        help="Decoder hidden dimension (must match ESM2)")
-    parser.add_argument("--decoder_ffn_dim", type=int, default=5120,
+    parser.add_argument("--decoder_heads", type=int, default=4,
+                        help="Number of decoder attention heads (4 for ESM2-8M, 20 for ESM2-650M)")
+    parser.add_argument("--decoder_dim", type=int, default=320,
+                        help="Decoder hidden dimension (320 for ESM2-8M, 1280 for ESM2-650M)")
+    parser.add_argument("--decoder_ffn_dim", type=int, default=1280,
                         help="Decoder FFN intermediate dimension")
     parser.add_argument("--dropout", type=float, default=0.1,
                         help="Dropout rate")
@@ -2313,19 +2359,19 @@ def parse_args():
     parser.add_argument("--freeze_encoder", action="store_true", default=True,
                         help="Freeze encoder if not using LoRA")
 
-    # Training
-    parser.add_argument("--batch_size", type=int, default=16,
-                        help="Batch size per device")
+    # Training (defaults optimized for trn1.2xlarge with ESM2-8M)
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Batch size per device (8 for trn1.2xlarge with ESM2-8M)")
     parser.add_argument("--learning_rate", type=float, default=1e-4,
                         help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01,
                         help="Weight decay")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="Number of data loader workers")
+    parser.add_argument("--num_workers", type=int, default=2,
+                        help="Number of data loader workers (2 for trn1.2xlarge to leave CPU for XLA compilation)")
     parser.add_argument("--num_epochs", type=int, default=10,
                         help="Number of training epochs")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
-                        help="Gradient accumulation steps")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
+                        help="Gradient accumulation steps (4 with batch_size=8 for effective batch=32)")
     parser.add_argument("--warmup_ratio", type=float, default=0.1,
                         help="Warmup ratio")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,

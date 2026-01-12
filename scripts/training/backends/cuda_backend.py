@@ -80,8 +80,12 @@ class CUDABackend(AcceleratorBackend):
         return torch.device("cpu")
 
     def get_attention_implementation(self) -> Optional[str]:
-        """Return Flash Attention 2 for CUDA."""
-        return "flash_attention_2"
+        """Return Flash Attention 2 for CUDA if available, else eager."""
+        try:
+            import flash_attn
+            return "flash_attention_2"
+        except ImportError:
+            return "eager"
 
     def get_model_dtype(self) -> torch.dtype:
         """Return bfloat16 for modern GPUs."""

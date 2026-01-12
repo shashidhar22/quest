@@ -89,7 +89,22 @@ class NeuronBackend(AcceleratorBackend):
         """
         # Set Neuron-specific environment variables
         os.environ.setdefault("XLA_USE_BF16", "1")
-        os.environ.setdefault("NEURON_CC_FLAGS", "--model-type transformer")
+
+        # Enhanced compiler flags for transformer training
+        os.environ.setdefault(
+            "NEURON_CC_FLAGS",
+            "--model-type transformer --distribution-strategy llm-training"
+        )
+
+        # XLA Compilation Cache (critical for fast restarts)
+        os.environ.setdefault("NEURON_COMPILE_CACHE_URL", "/var/tmp/neuron-compile-cache")
+
+        # Performance optimizations
+        os.environ.setdefault("NEURON_FUSE_SOFTMAX", "1")  # Fuse softmax into attention
+        os.environ.setdefault("NEURON_RT_STOCHASTIC_ROUNDING_EN", "1")  # Better BF16 training
+
+        # Memory management for trn1.2xlarge (32GB HBM)
+        os.environ.setdefault("NEURON_NUM_RECENT_MODELS_TO_KEEP", "2")
 
         # XLA distributed initialization
         import torch.distributed as dist
@@ -119,12 +134,13 @@ class NeuronBackend(AcceleratorBackend):
 
     def get_model_dtype(self) -> torch.dtype:
         """
-        Return bfloat16 for Trainium.
+        Return float32 for Trainium model loading.
 
-        Note: Trainium handles dtype via XLA_USE_BF16 environment
-        variable rather than explicit dtype casting.
+        Note: Trainium handles dtype conversion via XLA_USE_BF16 environment
+        variable. Loading models in bfloat16 explicitly can cause NaN issues
+        when combined with XLA's automatic casting.
         """
-        return torch.bfloat16
+        return torch.float32
 
     def wrap_model_distributed(
         self,
