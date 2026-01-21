@@ -3241,7 +3241,8 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
             self._log(f"{'='*60}")
 
             # Update self-attention dropout schedule for cross-attention forcing
-            self.model.set_epoch(epoch)
+            model_to_update = self.model.module if self.is_distributed else self.model
+            model_to_update.set_epoch(epoch)
 
             epoch_loss = 0.0
             epoch_steps = 0
