@@ -66,7 +66,10 @@ from scripts.training.tcr_seq2seq_trainer import (
     greedy_decode,
     SelfAttnDropoutDecoderLayer,
     SelfAttnDropoutDecoder,
+    apply_lora_to_encoder,
 )
+
+from scripts.benchmark.benchmark_metrics import compute_all_unified_metrics
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -76,47 +79,50 @@ warnings.filterwarnings('ignore')
 # =============================================================================
 
 SFT_TASK_CONFIGS = {
+    # =========================================================================
+    # PEPTIDE PREDICTION TASKS (predict peptide from TCR + MHC context)
+    # =========================================================================
     "tra_peptide_mhc_one": {
         "mhc_class": "class_one",
-        "sft_task": GenerationTask.ALPHA,  # Generate tra from peptide + mhc
-        "target_col": "tra",
-        "context_cols": ["peptide", "mhc_one"],
-        "description": "Generate TRA from peptide + MHC-I",
+        "sft_task": GenerationTask.PEPTIDE,
+        "target_col": "peptide",
+        "context_cols": ["tra", "mhc_one"],
+        "description": "Generate peptide from TRA + MHC-I",
     },
     "trb_peptide_mhc_one": {
         "mhc_class": "class_one",
-        "sft_task": GenerationTask.BETA,  # Generate trb from peptide + mhc
-        "target_col": "trb",
-        "context_cols": ["peptide", "mhc_one"],
-        "description": "Generate TRB from peptide + MHC-I",
+        "sft_task": GenerationTask.PEPTIDE,
+        "target_col": "peptide",
+        "context_cols": ["trb", "mhc_one"],
+        "description": "Generate peptide from TRB + MHC-I",
     },
     "tra_trb_peptide_mhc_one": {
         "mhc_class": "class_one",
-        "sft_task": GenerationTask.ALPHA,  # Generate tra from trb + peptide + mhc
-        "target_col": "tra",
-        "context_cols": ["trb", "peptide", "mhc_one"],
-        "description": "Generate TRA from TRB + peptide + MHC-I",
+        "sft_task": GenerationTask.PEPTIDE,
+        "target_col": "peptide",
+        "context_cols": ["tra", "trb", "mhc_one"],
+        "description": "Generate peptide from TRA + TRB + MHC-I",
     },
     "tra_peptide_mhc_two": {
         "mhc_class": "class_two",
-        "sft_task": GenerationTask.ALPHA,
-        "target_col": "tra",
-        "context_cols": ["peptide", "mhc_one", "mhc_two"],
-        "description": "Generate TRA from peptide + MHC-II",
+        "sft_task": GenerationTask.PEPTIDE,
+        "target_col": "peptide",
+        "context_cols": ["tra", "mhc_one", "mhc_two"],
+        "description": "Generate peptide from TRA + MHC-II",
     },
     "trb_peptide_mhc_two": {
         "mhc_class": "class_two",
-        "sft_task": GenerationTask.BETA,
-        "target_col": "trb",
-        "context_cols": ["peptide", "mhc_one", "mhc_two"],
-        "description": "Generate TRB from peptide + MHC-II",
+        "sft_task": GenerationTask.PEPTIDE,
+        "target_col": "peptide",
+        "context_cols": ["trb", "mhc_one", "mhc_two"],
+        "description": "Generate peptide from TRB + MHC-II",
     },
     "tra_trb_peptide_mhc_two": {
         "mhc_class": "class_two",
-        "sft_task": GenerationTask.ALPHA,
-        "target_col": "tra",
-        "context_cols": ["trb", "peptide", "mhc_one", "mhc_two"],
-        "description": "Generate TRA from TRB + peptide + MHC-II",
+        "sft_task": GenerationTask.PEPTIDE,
+        "target_col": "peptide",
+        "context_cols": ["tra", "trb", "mhc_one", "mhc_two"],
+        "description": "Generate peptide from TRA + TRB + MHC-II",
     },
 }
 
@@ -184,14 +190,16 @@ def load_sft_model(
     print(f"Loading checkpoint from: {checkpoint_file}")
 
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_file, map_location="cpu")
+    checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
 
     print(f"  Checkpoint from epoch {checkpoint.get('epoch', 'N/A')}, "
           f"step {checkpoint.get('global_step', 'N/A')}")
     if "metrics" in checkpoint:
         metrics = checkpoint["metrics"]
-        print(f"  Metrics: loss={metrics.get('eval_loss', 'N/A'):.4f}")
+        eval_loss = metrics.get('eval_loss', None)
+        if eval_loss is not None:
+            print(f"  Metrics: loss={eval_loss:.4f}")
 
     # Determine attention implementation
     attn_impl = "auto"
@@ -213,6 +221,11 @@ def load_sft_model(
         self_attn_drop_final=0.0,
     )
 
+    # Apply LoRA if the model was trained with it
+    if config.get("use_lora", False):
+        print(f"  Applying LoRA (r={config.get('lora_r', 16)}, alpha={config.get('lora_alpha', 32)})")
+        model = apply_lora_to_encoder(model, config)
+
     # Load weights
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
@@ -227,6 +240,8 @@ def load_sft_model(
     print(f"  Encoder: {config.get('model_name', 'facebook/esm2_t33_650M_UR50D')}")
     print(f"  Decoder: {config.get('decoder_layers', 6)} layers, "
           f"{config.get('decoder_heads', 20)} heads")
+    if config.get("use_lora", False):
+        print(f"  LoRA: r={config.get('lora_r', 16)}, alpha={config.get('lora_alpha', 32)}")
 
     return model, tokenizer, config
 
@@ -691,6 +706,320 @@ def compute_perplexity(
     return perplexity
 
 
+@torch.no_grad()
+def compute_per_sample_log_likelihood(
+    model: TCRSeq2SeqModel,
+    dataloader: DataLoader,
+    device: str = "cuda",
+) -> Dict[str, Any]:
+    """
+    Compute per-sample log-likelihood via teacher-forced forward pass.
+
+    For each sample, feeds the true target to the decoder and computes:
+      - nll_per_token: mean NLL per token (lower = better)
+      - log_prob_total: -sum(NLL) = total log P(target|context)
+      - perplexity: exp(nll_per_token)
+
+    Args:
+        model: TCRSeq2SeqModel
+        dataloader: DataLoader with evaluation data
+        device: Device
+
+    Returns:
+        Dictionary with:
+          - per_sample: list of dicts with nll_per_token, log_prob_total, perplexity
+          - aggregate: dict with mean/std of each metric and corpus perplexity
+    """
+    model.eval()
+    per_sample_results = []
+    total_nll = 0.0
+    total_tokens = 0
+
+    for batch in dataloader:
+        encoder_ids = batch["encoder_input_ids"].to(device)
+        encoder_mask = batch["encoder_attention_mask"].to(device)
+        decoder_ids = batch["decoder_input_ids"].to(device)
+        decoder_mask = batch["decoder_attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        # Forward pass to get logits
+        encoder_hidden = model.encode(encoder_ids, encoder_mask)
+        logits = model.decode(decoder_ids, decoder_mask, encoder_hidden, encoder_mask)
+
+        # logits: (batch, dec_len, vocab_size), labels: (batch, dec_len)
+        batch_size, dec_len, vocab_size = logits.shape
+
+        # Compute per-token cross entropy (no reduction)
+        # Reshape for F.cross_entropy: (batch*dec_len, vocab) vs (batch*dec_len,)
+        loss_per_token = F.cross_entropy(
+            logits.reshape(-1, vocab_size),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction='none',
+        )  # (batch * dec_len,)
+        loss_per_token = loss_per_token.reshape(batch_size, dec_len)
+
+        # Mask: valid tokens where labels != -100
+        valid_mask = (labels != -100).float()  # (batch, dec_len)
+        num_valid_tokens = valid_mask.sum(dim=1)  # (batch,)
+
+        # Per-sample NLL sum and mean
+        nll_sum = (loss_per_token * valid_mask).sum(dim=1)  # (batch,)
+        nll_mean = nll_sum / num_valid_tokens.clamp(min=1)  # (batch,)
+
+        for i in range(batch_size):
+            ntok = int(num_valid_tokens[i].item())
+            if ntok == 0:
+                continue
+            nll_tok = float(nll_mean[i].item())
+            nll_total = float(nll_sum[i].item())
+            ppl = math.exp(min(nll_tok, 100))
+            per_sample_results.append({
+                "nll_per_token": nll_tok,
+                "log_prob_total": -nll_total,
+                "perplexity": ppl,
+                "num_tokens": ntok,
+            })
+            total_nll += nll_total
+            total_tokens += ntok
+
+    # Aggregate metrics
+    nll_per_token_vals = [r["nll_per_token"] for r in per_sample_results]
+    log_prob_vals = [r["log_prob_total"] for r in per_sample_results]
+    ppl_vals = [r["perplexity"] for r in per_sample_results]
+
+    corpus_ppl = math.exp(min(total_nll / total_tokens, 100)) if total_tokens > 0 else float('inf')
+
+    aggregate = {
+        "perplexity": corpus_ppl,
+        "mean_nll_per_token": float(np.mean(nll_per_token_vals)),
+        "std_nll_per_token": float(np.std(nll_per_token_vals)),
+        "mean_log_prob_total": float(np.mean(log_prob_vals)),
+        "std_log_prob_total": float(np.std(log_prob_vals)),
+        "mean_perplexity_per_sample": float(np.mean(ppl_vals)),
+        "std_perplexity_per_sample": float(np.std(ppl_vals)),
+    }
+
+    return {"per_sample": per_sample_results, "aggregate": aggregate}
+
+
+@torch.no_grad()
+def score_candidate_peptides(
+    model: TCRSeq2SeqModel,
+    encoder_hidden: torch.Tensor,
+    encoder_mask: torch.Tensor,
+    candidate_decoder_ids: torch.Tensor,
+    candidate_decoder_masks: torch.Tensor,
+    candidate_labels: torch.Tensor,
+    batch_size: int = 16,
+) -> np.ndarray:
+    """
+    Score a set of candidate peptides against a single encoded context.
+
+    Args:
+        model: TCRSeq2SeqModel (eval mode)
+        encoder_hidden: (1, enc_len, dim) encoder hidden states for one sample
+        encoder_mask: (1, enc_len) encoder attention mask for one sample
+        candidate_decoder_ids: (num_candidates, max_dec_len) decoder input ids for all candidates
+        candidate_decoder_masks: (num_candidates, max_dec_len) decoder attention masks
+        candidate_labels: (num_candidates, max_dec_len) labels for all candidates
+        batch_size: Number of candidates to score in each forward pass
+
+    Returns:
+        log_probs: (num_candidates,) log P(candidate | context) for each candidate
+    """
+    num_candidates = candidate_decoder_ids.size(0)
+    device = encoder_hidden.device
+    log_probs = np.zeros(num_candidates, dtype=np.float64)
+
+    for start_idx in range(0, num_candidates, batch_size):
+        end_idx = min(start_idx + batch_size, num_candidates)
+        bs = end_idx - start_idx
+
+        # Expand encoder hidden to batch of candidates
+        enc_hidden_batch = encoder_hidden.expand(bs, -1, -1)  # (bs, enc_len, dim)
+        enc_mask_batch = encoder_mask.expand(bs, -1)  # (bs, enc_len)
+
+        dec_ids_batch = candidate_decoder_ids[start_idx:end_idx].to(device)
+        dec_mask_batch = candidate_decoder_masks[start_idx:end_idx].to(device)
+        labels_batch = candidate_labels[start_idx:end_idx].to(device)
+
+        # Forward pass through decoder
+        logits = model.decode(dec_ids_batch, dec_mask_batch, enc_hidden_batch, enc_mask_batch)
+
+        # Compute per-token log probabilities
+        _, dec_len, vocab_size = logits.shape
+        loss_per_token = F.cross_entropy(
+            logits.reshape(-1, vocab_size),
+            labels_batch.reshape(-1),
+            ignore_index=-100,
+            reduction='none',
+        ).reshape(bs, dec_len)
+
+        valid_mask = (labels_batch != -100).float()
+        # log P = -sum(NLL over valid tokens)
+        nll_sum = (loss_per_token * valid_mask).sum(dim=1)  # (bs,)
+        log_probs[start_idx:end_idx] = -nll_sum.cpu().numpy()
+
+    return log_probs
+
+
+@torch.no_grad()
+def compute_retrieval_metrics(
+    model: TCRSeq2SeqModel,
+    dataset: SFTEvalDataset,
+    tokenizer,
+    device: str = "cuda",
+    batch_size: int = 16,
+    max_encoder_length: int = 1024,
+    max_decoder_length: int = 350,
+) -> Dict[str, Any]:
+    """
+    Compute retrieval metrics by ranking all unique peptides per query.
+
+    For each test sample (TCR + MHC context), ranks all unique peptides in the
+    split by generation likelihood and measures where the true peptide falls.
+
+    Args:
+        model: TCRSeq2SeqModel
+        dataset: SFTEvalDataset instance
+        tokenizer: ESM2 tokenizer
+        device: Device
+        batch_size: Batch size for scoring candidates
+        max_encoder_length: Max encoder sequence length
+        max_decoder_length: Max decoder sequence length
+
+    Returns:
+        Dictionary with:
+          - per_sample: list of dicts with true_peptide_rank, true_peptide_log_prob
+          - aggregate: dict with retrieval metrics (hit@1, hit@5, recall@10, mrr, etc.)
+    """
+    model.eval()
+    target_col = dataset.task_config["target_col"]
+
+    # Collect all unique peptides in the split
+    all_targets = dataset.df[target_col].tolist()
+    unique_peptides = sorted(set(all_targets))
+    num_candidates = len(unique_peptides)
+    print(f"    Retrieval: {len(all_targets)} samples, {num_candidates} unique candidates")
+
+    # Pre-tokenize all candidate peptides
+    bos_id = tokenizer.cls_token_id if tokenizer.cls_token_id is not None else tokenizer.bos_token_id
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
+
+    # For each candidate: decoder_input_ids = [BOS] + tokens, labels = tokens + [EOS]
+    candidate_token_lists = []
+    for pep in unique_peptides:
+        # Tokenize the peptide (space-separated amino acids for ESM tokenizer)
+        spaced_pep = " ".join(list(pep))
+        tokens = tokenizer.encode(spaced_pep, add_special_tokens=False)
+        candidate_token_lists.append(tokens)
+
+    # Determine max decoder length for candidates
+    max_cand_len = min(max(len(t) for t in candidate_token_lists) + 1, max_decoder_length)  # +1 for BOS/EOS
+
+    # Build padded tensors for decoder inputs and labels
+    candidate_decoder_ids = torch.full((num_candidates, max_cand_len), pad_id, dtype=torch.long)
+    candidate_decoder_masks = torch.zeros((num_candidates, max_cand_len), dtype=torch.long)
+    candidate_labels = torch.full((num_candidates, max_cand_len), -100, dtype=torch.long)
+
+    for i, tokens in enumerate(candidate_token_lists):
+        # decoder_input_ids: [BOS, tok1, tok2, ..., tokN]
+        dec_ids = [bos_id] + tokens
+        dec_len = min(len(dec_ids), max_cand_len)
+        candidate_decoder_ids[i, :dec_len] = torch.tensor(dec_ids[:dec_len], dtype=torch.long)
+        candidate_decoder_masks[i, :dec_len] = 1
+
+        # labels: [tok1, tok2, ..., tokN, EOS]
+        lab = tokens + [eos_id]
+        lab_len = min(len(lab), max_cand_len)
+        candidate_labels[i, :lab_len] = torch.tensor(lab[:lab_len], dtype=torch.long)
+
+    # Build a mapping from peptide string to index in unique_peptides
+    peptide_to_idx = {pep: idx for idx, pep in enumerate(unique_peptides)}
+
+    # Collator for encoding single samples
+    collator = Seq2SeqCollator(
+        tokenizer=tokenizer,
+        max_encoder_length=max_encoder_length,
+        max_decoder_length=max_decoder_length,
+    )
+
+    per_sample_results = []
+    score_matrix_rows = []
+    true_indices_list = []
+    sample_peptide_list = []
+
+    for sample_idx in tqdm(range(len(dataset)), desc="    Retrieval scoring"):
+        sample = dataset[sample_idx]
+        true_peptide = sample["decoder_target"]
+
+        if true_peptide not in peptide_to_idx:
+            continue
+
+        true_idx = peptide_to_idx[true_peptide]
+
+        # Encode the context for this sample
+        batch = collator([sample])
+        encoder_ids = batch["encoder_input_ids"].to(device)
+        encoder_mask = batch["encoder_attention_mask"].to(device)
+
+        encoder_hidden = model.encode(encoder_ids, encoder_mask)  # (1, enc_len, dim)
+
+        # Score all candidates against this context
+        log_probs = score_candidate_peptides(
+            model=model,
+            encoder_hidden=encoder_hidden,
+            encoder_mask=encoder_mask,
+            candidate_decoder_ids=candidate_decoder_ids,
+            candidate_decoder_masks=candidate_decoder_masks,
+            candidate_labels=candidate_labels,
+            batch_size=batch_size,
+        )
+
+        # Rank candidates by log-likelihood (descending = highest first)
+        sorted_indices = np.argsort(-log_probs)
+        rank = int(np.where(sorted_indices == true_idx)[0][0]) + 1  # 1-indexed
+
+        per_sample_results.append({
+            "true_peptide_rank": rank,
+            "true_peptide_log_prob": float(log_probs[true_idx]),
+        })
+        score_matrix_rows.append(log_probs)
+        true_indices_list.append(true_idx)
+        sample_peptide_list.append(true_peptide)
+
+    # Build score matrix for unified metrics
+    if len(score_matrix_rows) > 0:
+        score_matrix = np.array(score_matrix_rows)
+        true_indices_arr = np.array(true_indices_list)
+        sample_peptides_arr = np.array(sample_peptide_list)
+
+        # Compute all unified metrics using shared module
+        unified = compute_all_unified_metrics(
+            scores=score_matrix,
+            true_indices=true_indices_arr,
+            sample_peptides=sample_peptides_arr,
+            candidate_peptides=unique_peptides,
+            n_bootstrap=1000,
+            min_samples_per_peptide=5,
+            seed=42,
+        )
+    else:
+        unified = {
+            "retrieval_hit_at_1": 0.0,
+            "retrieval_hit_at_5": 0.0,
+            "retrieval_recall_at_10": 0.0,
+            "retrieval_mrr": 0.0,
+            "retrieval_mean_rank": float('inf'),
+            "retrieval_median_rank": float('inf'),
+            "retrieval_num_candidates": num_candidates,
+        }
+
+    return {"per_sample": per_sample_results, "unified_metrics": unified}
+
+
 # =============================================================================
 # Main Evaluation Loop
 # =============================================================================
@@ -759,17 +1088,37 @@ def evaluate_on_split(
     # Get reference sequences from dataframe
     all_references = df[target_col].tolist()
 
-    # Compute metrics
+    # Compute generation metrics
     metrics = compute_generation_metrics(all_generated, all_references)
 
-    # Compute perplexity
-    perplexity = compute_perplexity(model, dataloader, device)
-    metrics["perplexity"] = perplexity
+    # Compute per-sample log-likelihood (replaces old compute_perplexity)
+    ll_results = compute_per_sample_log_likelihood(model, dataloader, device)
+    metrics.update(ll_results["aggregate"])
 
     print(f"    Exact match: {metrics['exact_match_rate']:.4f}")
     print(f"    Sequence identity: {metrics['mean_sequence_identity']:.4f}")
     print(f"    BLOSUM similarity: {metrics['mean_blosum_similarity']:.4f}")
-    print(f"    Perplexity: {perplexity:.2f}")
+    print(f"    Perplexity: {metrics['perplexity']:.2f}")
+    print(f"    Mean NLL/token: {metrics['mean_nll_per_token']:.4f}")
+
+    # Compute retrieval metrics
+    dataset = SFTEvalDataset(parquet_path, task_config)
+    retrieval_results = compute_retrieval_metrics(
+        model=model,
+        dataset=dataset,
+        tokenizer=tokenizer,
+        device=device,
+        batch_size=batch_size,
+    )
+    unified = retrieval_results["unified_metrics"]
+    per_epitope_all = unified.pop("per_epitope_all", [])
+    metrics.update(unified)
+
+    print(f"    Retrieval Hit@1: {metrics['retrieval_hit_at_1']:.4f}")
+    print(f"    Retrieval MRR: {metrics['retrieval_mrr']:.4f}")
+    print(f"    Retrieval Mean Rank: {metrics['retrieval_mean_rank']:.2f}")
+    if metrics.get("per_peptide_auc_mean") is not None:
+        print(f"    Per-peptide AUC: {metrics['per_peptide_auc_mean']:.4f}")
 
     # Save predictions
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -787,7 +1136,26 @@ def evaluate_on_split(
             for g, r in zip(all_generated, all_references)
         ],
     })
+
+    # Add per-sample likelihood columns
+    ll_per_sample = ll_results["per_sample"]
+    if len(ll_per_sample) == len(pred_df):
+        pred_df["nll_per_token"] = [r["nll_per_token"] for r in ll_per_sample]
+        pred_df["log_prob_total"] = [r["log_prob_total"] for r in ll_per_sample]
+        pred_df["perplexity"] = [r["perplexity"] for r in ll_per_sample]
+
+    # Add retrieval columns
+    retrieval_per_sample = retrieval_results["per_sample"]
+    if len(retrieval_per_sample) == len(pred_df):
+        pred_df["true_peptide_rank"] = [r["true_peptide_rank"] for r in retrieval_per_sample]
+        pred_df["true_peptide_log_prob"] = [r["true_peptide_log_prob"] for r in retrieval_per_sample]
+
     pred_df.to_csv(output_dir / "predictions.csv", index=False)
+
+    # Save per-epitope breakdown CSV
+    if per_epitope_all:
+        epitope_df = pd.DataFrame(per_epitope_all)
+        epitope_df.to_csv(output_dir / "per_epitope_breakdown.csv", index=False)
 
     # Save metrics
     with open(output_dir / "metrics.json", "w") as f:

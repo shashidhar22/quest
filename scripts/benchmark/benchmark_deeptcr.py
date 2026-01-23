@@ -28,6 +28,13 @@ from sklearn.metrics import (
     top_k_accuracy_score,
 )
 
+# Add project root to path
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from scripts.benchmark.benchmark_metrics import compute_all_unified_metrics
+
 # Add DeepTCR to path
 sys.path.insert(0, '/home/sravisha/tcrbench_tools/DeepTCR')
 
@@ -485,24 +492,60 @@ def train_and_evaluate(
             metrics["n_known_labels"] = int(len(y_true_labels_known))
             metrics["n_unknown_labels"] = int((~known_mask).sum())
 
+            # Compute unified retrieval metrics
+            # y_prob_known is (n_samples, n_classes) — use directly as scores
+            candidate_peptides = list(dtcr.lb.classes_)
+            sample_peptides = np.array(y_true_labels_known)
+
+            unified = compute_all_unified_metrics(
+                scores=y_prob_known,
+                true_indices=y_true,
+                sample_peptides=sample_peptides,
+                candidate_peptides=candidate_peptides,
+                n_bootstrap=1000,
+                min_samples_per_peptide=5,
+                seed=42,
+            )
+
+            # Extract per_epitope_all before merging
+            per_epitope_all = unified.pop("per_epitope_all", [])
+            metrics.update(unified)
+
             results["test_results"][split_name] = metrics
 
             print(f"    Top-1 Accuracy: {metrics['top1_accuracy']:.4f}")
             print(f"    Macro F1: {metrics['macro_f1']:.4f}")
             if metrics.get('auc_roc_ovr'):
                 print(f"    AUC-ROC: {metrics['auc_roc_ovr']:.4f}")
+            print(f"    Retrieval Hit@1: {metrics['retrieval_hit_at_1']:.4f}")
+            print(f"    Retrieval MRR: {metrics['retrieval_mrr']:.4f}")
+            if metrics.get("per_peptide_auc_mean") is not None:
+                print(f"    Per-peptide AUC: {metrics['per_peptide_auc_mean']:.4f}")
+
+            # Save per-epitope breakdown CSV
+            split_pred_dir = os.path.join(task_output_dir, "predictions")
+            if per_epitope_all:
+                epitope_df = pd.DataFrame(per_epitope_all)
+                epitope_df.to_csv(
+                    os.path.join(split_pred_dir, f"{split_name}_per_epitope_breakdown.csv"),
+                    index=False,
+                )
+
+            # Compute per-sample ranks for predictions CSV
+            ranks = np.zeros(len(y_true), dtype=int)
+            for i in range(len(y_true)):
+                sorted_indices = np.argsort(-y_prob_known[i])
+                ranks[i] = int(np.where(sorted_indices == y_true[i])[0][0]) + 1
 
             # Save predictions
             pred_df = pd.DataFrame({
-                "true_label": y_true_labels,
-                "known_label": known_mask,
-                "predicted_label": [
-                    dtcr.lb.classes_[np.argmax(y_prob[i])] if known_mask[i] else None
-                    for i in range(len(y_true_labels))
+                "true_peptide": y_true_labels_known,
+                "predicted_peptide": [
+                    dtcr.lb.classes_[y_pred[i]] for i in range(len(y_pred))
                 ],
-                "predicted_prob": [
-                    float(np.max(y_prob[i])) for i in range(len(y_true_labels))
-                ],
+                "true_peptide_rank": ranks,
+                "true_peptide_score": y_prob_known[np.arange(len(y_true)), y_true],
+                "predicted_prob": y_prob_known.max(axis=1),
             })
             pred_path = os.path.join(
                 task_output_dir, "predictions", f"{split_name}_predictions.csv"

@@ -52,6 +52,13 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
 
+# Add project root to path
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from scripts.benchmark.benchmark_metrics import compute_all_unified_metrics
+
 # Optional: wandb integration
 try:
     import wandb
@@ -507,6 +514,82 @@ def train_model(
     return model
 
 
+def compute_retrieval_scores_tcrbert(
+    model: nn.Module,
+    positive_df: pd.DataFrame,
+    device: str,
+    batch_size: int = 64,
+    seed: int = 42,
+) -> Dict:
+    """
+    Compute retrieval score matrix for TCR-BERT.
+
+    TCR-BERT takes (TRA, TRB) as input and outputs P(binds). Since it does
+    NOT condition on peptide, all candidate peptides get the same binding
+    score for a given TCR. This results in chance-level retrieval performance,
+    which is the expected behavior for models that don't condition on peptide.
+
+    For each positive sample, the score for each candidate peptide is
+    P(binds | TCR) + small random noise (for tie-breaking).
+
+    Args:
+        model: TCR-BERT model
+        positive_df: DataFrame with positive samples (tra, trb, peptide)
+        device: Device string
+        batch_size: Batch size
+        seed: Random seed for tie-breaking noise
+
+    Returns:
+        Dict with score_matrix, true_indices, sample_peptides, candidate_peptides
+    """
+    rng = np.random.default_rng(seed)
+
+    unique_peptides = sorted(positive_df["peptide"].unique())
+    peptide_to_idx = {pep: idx for idx, pep in enumerate(unique_peptides)}
+    n_candidates = len(unique_peptides)
+    n_samples = len(positive_df)
+
+    logger.info(f"    Retrieval scoring: {n_samples} samples x {n_candidates} candidates")
+
+    # Get binding probabilities for all positive samples
+    # Since TCR-BERT doesn't condition on peptide, we only need one forward pass per sample
+    pos_dataset = create_dataset(
+        positive_df.assign(binder=1), skorch_mode=True
+    )
+    pos_loader = DataLoader(
+        pos_dataset, batch_size=batch_size, shuffle=False, num_workers=4
+    )
+
+    model.eval()
+    all_probs = []
+    with torch.no_grad():
+        for batch in pos_loader:
+            inputs, labels = batch
+            tcr_a = inputs["tcr_a"].to(device)
+            tcr_b = inputs["tcr_b"].to(device)
+            logits = model(tcr_a, tcr_b)
+            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+            all_probs.extend(probs)
+
+    binding_probs = np.array(all_probs)
+
+    # Build score matrix: each row has same binding prob for all candidates
+    # Add tiny random noise for tie-breaking (doesn't affect per-peptide AUC)
+    noise = rng.normal(0, 1e-10, size=(n_samples, n_candidates))
+    score_matrix = binding_probs[:, np.newaxis] + noise
+
+    # True indices
+    true_indices = np.array([peptide_to_idx[pep] for pep in positive_df["peptide"]])
+    sample_peptides = positive_df["peptide"].values
+
+    return {
+        "score_matrix": score_matrix,
+        "true_indices": true_indices,
+        "sample_peptides": sample_peptides,
+        "candidate_peptides": unique_peptides,
+    }
+
+
 def run_benchmark(
     data_dir: str,
     task_config: Dict,
@@ -677,7 +760,7 @@ def run_benchmark(
             num_workers=4,
         )
 
-        # Evaluate
+        # Evaluate per-peptide AUC (binary binding discrimination)
         results = evaluate_per_peptide(
             model,
             test_dataloader,
@@ -685,8 +768,42 @@ def run_benchmark(
             device_str,
         )
 
+        # Compute unified retrieval metrics
+        logger.info(f"  Computing retrieval metrics for {split}...")
+        retrieval_data = compute_retrieval_scores_tcrbert(
+            model, test_df, device_str, batch_size=batch_size, seed=42
+        )
+
+        unified = compute_all_unified_metrics(
+            scores=retrieval_data["score_matrix"],
+            true_indices=retrieval_data["true_indices"],
+            sample_peptides=retrieval_data["sample_peptides"],
+            candidate_peptides=retrieval_data["candidate_peptides"],
+            n_bootstrap=1000,
+            min_samples_per_peptide=5,
+            seed=42,
+        )
+
+        per_epitope_all = unified.pop("per_epitope_all", [])
+        results.update(unified)
+
+        logger.info(
+            f"{split}: Mean AUC = {results['mean_auc']:.4f} over {results['n_peptides_evaluated']} peptides, "
+            f"Retrieval Hit@1 = {results['retrieval_hit_at_1']:.4f}, "
+            f"MRR = {results['retrieval_mrr']:.4f}"
+        )
+
+        # Save per-epitope breakdown CSV
+        if per_epitope_all:
+            split_output_dir = os.path.join(output_dir, split)
+            os.makedirs(split_output_dir, exist_ok=True)
+            epitope_df = pd.DataFrame(per_epitope_all)
+            epitope_df.to_csv(
+                os.path.join(split_output_dir, "per_epitope_breakdown.csv"),
+                index=False,
+            )
+
         all_results[split] = results
-        logger.info(f"{split}: Mean AUC = {results['mean_auc']:.4f} over {results['n_peptides_evaluated']} peptides")
 
         if use_wandb and WANDB_AVAILABLE:
             wandb.log({f"{split}_auc": results["mean_auc"]})

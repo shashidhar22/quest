@@ -22,6 +22,13 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
+# Add project root to path
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from scripts.benchmark.benchmark_metrics import compute_all_unified_metrics
+
 # Add TULIP-TCR to path
 TULIP_ROOT = "/home/sravisha/tcrbench_tools/TULIP-TCR"
 sys.path.insert(0, TULIP_ROOT)
@@ -610,6 +617,87 @@ def compute_tulip_metrics(
     }
 
 
+def compute_retrieval_scores_tulip(
+    model,
+    positive_df: pd.DataFrame,
+    tokenizer,
+    mhctok,
+    device: torch.device,
+    batch_size: int = 100,
+) -> Dict:
+    """
+    Compute retrieval score matrix for TULIP.
+
+    For each positive sample, scores the sample's TCR against ALL unique
+    peptides in the test split to build a (n_samples, n_candidates) matrix.
+
+    Args:
+        model: TULIP model
+        positive_df: DataFrame with positive samples (CDR3a, CDR3b, peptide, MHC)
+        tokenizer: Amino acid tokenizer
+        mhctok: MHC tokenizer
+        device: PyTorch device
+        batch_size: Batch size for scoring
+
+    Returns:
+        Dict with score_matrix, true_indices, sample_peptides, candidate_peptides
+    """
+    from src.multiTrans import TCRDataset, get_logscore
+
+    unique_peptides = sorted(positive_df["peptide"].unique())
+    peptide_to_idx = {pep: idx for idx, pep in enumerate(unique_peptides)}
+    n_candidates = len(unique_peptides)
+    n_samples = len(positive_df)
+
+    print(f"    Retrieval scoring: {n_samples} samples x {n_candidates} candidates")
+
+    # Build a DataFrame with all (sample_TCR, candidate_peptide) pairs
+    retrieval_rows = []
+    true_indices = []
+    sample_peptides = []
+
+    for idx in range(n_samples):
+        row = positive_df.iloc[idx]
+        true_peptide = row["peptide"]
+
+        if true_peptide not in peptide_to_idx:
+            continue
+
+        true_indices.append(peptide_to_idx[true_peptide])
+        sample_peptides.append(true_peptide)
+
+        for pep in unique_peptides:
+            retrieval_rows.append({
+                "CDR3a": row["CDR3a"],
+                "CDR3b": row["CDR3b"],
+                "peptide": pep,
+                "MHC": row["MHC"],
+                "binder": 1 if pep == true_peptide else 0,
+            })
+
+    if len(true_indices) == 0:
+        return None
+
+    n_valid = len(true_indices)
+    retrieval_df = pd.DataFrame(retrieval_rows)
+
+    # Score all pairs
+    dataset = TCRDataset.from_pandas(retrieval_df, tokenizer, device, mhctok=mhctok)
+    scores = get_logscore(dataset, model, ignore_index=tokenizer.pad_token_id)
+    # TULIP: higher log-likelihood = better binding, negate NLL
+    scores = np.array([-s for s in scores])
+
+    # Reshape into (n_valid, n_candidates)
+    score_matrix = scores.reshape(n_valid, n_candidates)
+
+    return {
+        "score_matrix": score_matrix,
+        "true_indices": np.array(true_indices),
+        "sample_peptides": np.array(sample_peptides),
+        "candidate_peptides": unique_peptides,
+    }
+
+
 def run_benchmark(
     task_name: str,
     data_dir: str,
@@ -851,10 +939,43 @@ def run_benchmark(
             eval_results["scores"], eval_results["binders"], eval_results["peptides"]
         )
 
-        results["test_results"][split_name] = metrics
-
         print(f"    Mean AUC-ROC: {metrics['mean_auc_roc']:.4f}" if metrics['mean_auc_roc'] else "    Mean AUC-ROC: N/A")
         print(f"    Peptides evaluated: {metrics['num_peptides_evaluated']}/{metrics['num_peptides_total']}")
+
+        # Compute unified retrieval metrics
+        print(f"    Computing retrieval metrics...")
+        retrieval_data = compute_retrieval_scores_tulip(
+            model, positive_df, tokenizer, mhctok, device, batch_size=batch_size
+        )
+
+        if retrieval_data is not None:
+            unified = compute_all_unified_metrics(
+                scores=retrieval_data["score_matrix"],
+                true_indices=retrieval_data["true_indices"],
+                sample_peptides=retrieval_data["sample_peptides"],
+                candidate_peptides=retrieval_data["candidate_peptides"],
+                n_bootstrap=1000,
+                min_samples_per_peptide=5,
+                seed=42,
+            )
+
+            per_epitope_all = unified.pop("per_epitope_all", [])
+            metrics.update(unified)
+
+            print(f"    Retrieval Hit@1: {metrics['retrieval_hit_at_1']:.4f}")
+            print(f"    Retrieval MRR: {metrics['retrieval_mrr']:.4f}")
+            if metrics.get("per_peptide_auc_mean") is not None:
+                print(f"    Per-peptide AUC (unified): {metrics['per_peptide_auc_mean']:.4f}")
+
+            # Save per-epitope breakdown CSV
+            if per_epitope_all:
+                epitope_df = pd.DataFrame(per_epitope_all)
+                epitope_df.to_csv(
+                    os.path.join(task_output_dir, "predictions", f"{split_name}_per_epitope_breakdown.csv"),
+                    index=False,
+                )
+
+        results["test_results"][split_name] = metrics
 
         # Save predictions
         pred_df = pd.DataFrame({
@@ -865,6 +986,26 @@ def run_benchmark(
             "binder": eval_results["binders"],
             "score": eval_results["scores"],
         })
+
+        # Add retrieval columns for positive samples
+        if retrieval_data is not None:
+            # Build a mapping from positive sample index to retrieval rank
+            pos_mask = test_df["binder"] == 1
+            retrieval_ranks = np.zeros(len(test_df), dtype=float)
+            retrieval_ranks[:] = np.nan
+
+            score_matrix = retrieval_data["score_matrix"]
+            true_idx_arr = retrieval_data["true_indices"]
+            pos_idx = 0
+            for i in range(len(test_df)):
+                if pos_mask.iloc[i] and pos_idx < len(true_idx_arr):
+                    sorted_indices = np.argsort(-score_matrix[pos_idx])
+                    rank = int(np.where(sorted_indices == true_idx_arr[pos_idx])[0][0]) + 1
+                    retrieval_ranks[i] = rank
+                    pos_idx += 1
+
+            pred_df["true_peptide_rank"] = retrieval_ranks
+
         pred_path = os.path.join(task_output_dir, "predictions", f"{split_name}_predictions.csv")
         pred_df.to_csv(pred_path, index=False)
 

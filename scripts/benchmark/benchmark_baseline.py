@@ -10,6 +10,7 @@ These serve as comparison baselines against more sophisticated models.
 import argparse
 import json
 import os
+import sys
 import warnings
 from copy import deepcopy
 from datetime import datetime
@@ -30,6 +31,13 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import DataLoader, Dataset
+
+# Add project root to path
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from scripts.benchmark.benchmark_metrics import compute_all_unified_metrics
 
 warnings.filterwarnings("ignore")
 
@@ -819,12 +827,35 @@ def train_and_evaluate(
         metrics["n_known_labels"] = int(len(test_dataset))
         metrics["n_unknown_labels"] = int(len(test_df) - len(test_dataset))
 
+        # Compute unified retrieval metrics
+        # y_prob is (n_samples, n_classes) — use directly as retrieval scores
+        candidate_peptides = list(label_encoder.classes_)
+        sample_peptides = np.array(label_encoder.inverse_transform(y_true))
+
+        unified = compute_all_unified_metrics(
+            scores=y_prob,
+            true_indices=y_true,
+            sample_peptides=sample_peptides,
+            candidate_peptides=candidate_peptides,
+            n_bootstrap=1000,
+            min_samples_per_peptide=5,
+            seed=42,
+        )
+
+        # Extract per_epitope_all before merging (not JSON-serializable inline)
+        per_epitope_all = unified.pop("per_epitope_all", [])
+        metrics.update(unified)
+
         results["test_results"][split_name] = metrics
 
         print(f"    Top-1 Accuracy: {metrics['top1_accuracy']:.4f}")
         print(f"    Macro F1: {metrics['macro_f1']:.4f}")
         if metrics.get("auc_roc_ovr"):
             print(f"    AUC-ROC: {metrics['auc_roc_ovr']:.4f}")
+        print(f"    Retrieval Hit@1: {metrics['retrieval_hit_at_1']:.4f}")
+        print(f"    Retrieval MRR: {metrics['retrieval_mrr']:.4f}")
+        if metrics.get("per_peptide_auc_mean") is not None:
+            print(f"    Per-peptide AUC: {metrics['per_peptide_auc_mean']:.4f}")
 
         # Save predictions
         split_output_dir = os.path.join(task_output_dir, split_name)
@@ -835,13 +866,27 @@ def train_and_evaluate(
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
 
+        # Save per-epitope breakdown CSV
+        if per_epitope_all:
+            epitope_df = pd.DataFrame(per_epitope_all)
+            epitope_df.to_csv(
+                os.path.join(split_output_dir, "per_epitope_breakdown.csv"),
+                index=False,
+            )
+
+        # Compute per-sample ranks for predictions CSV
+        ranks = np.zeros(len(y_true), dtype=int)
+        for i in range(len(y_true)):
+            sorted_indices = np.argsort(-y_prob[i])
+            ranks[i] = int(np.where(sorted_indices == y_true[i])[0][0]) + 1
+
         # Save predictions
         pred_df = pd.DataFrame(
             {
-                "true_label_idx": y_true,
-                "true_label": label_encoder.inverse_transform(y_true),
-                "predicted_label_idx": y_pred,
-                "predicted_label": label_encoder.inverse_transform(y_pred),
+                "true_peptide": label_encoder.inverse_transform(y_true),
+                "predicted_peptide": label_encoder.inverse_transform(y_pred),
+                "true_peptide_rank": ranks,
+                "true_peptide_score": y_prob[np.arange(len(y_true)), y_true],
                 "predicted_prob": y_prob.max(axis=1),
             }
         )
