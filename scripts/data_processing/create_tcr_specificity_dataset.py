@@ -1063,6 +1063,14 @@ def verify_hierarchical_splits(splits: Dict, mhc_id_cols: List[str] = None) -> b
         if overlap:
             errors.append(f"test_unseen_tcr_seen_epitope has {len(overlap)} TCR clusters overlapping with train")
 
+    # Check val: no TCR cluster overlap with train (peptide clusters may overlap, which is expected)
+    val_df = splits.get('val', pd.DataFrame())
+    if len(val_df) > 0 and 'tcr_cluster' in val_df.columns:
+        val_tcr_clusters = set(val_df['tcr_cluster'].unique())
+        overlap = val_tcr_clusters & train_tcr_clusters
+        if overlap:
+            errors.append(f"val has {len(overlap)} TCR clusters overlapping with train")
+
     if errors:
         for error in errors:
             print(f"    ERROR: {error}")

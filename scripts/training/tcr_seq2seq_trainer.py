@@ -842,6 +842,157 @@ def apply_lora_to_encoder(model: TCRSeq2SeqModel, config: dict) -> TCRSeq2SeqMod
     return model
 
 
+def load_encoder_checkpoint(
+    model: TCRSeq2SeqModel,
+    checkpoint_path: str,
+    strict: bool = False,
+    verbose: bool = True,
+) -> TCRSeq2SeqModel:
+    """
+    Load pre-trained encoder weights from a checkpoint file.
+
+    Supports checkpoints from:
+    - MLM pre-training (ESM2 + LoRA fine-tuned)
+    - Previous seq2seq training runs
+
+    The function handles different checkpoint formats:
+    - Full checkpoint with 'model_state_dict' key
+    - Direct state dict
+
+    Args:
+        model: TCRSeq2SeqModel with encoder (optionally with LoRA applied)
+        checkpoint_path: Path to checkpoint .pt file
+        strict: If True, raise error on missing/unexpected keys
+        verbose: If True, print loading details
+
+    Returns:
+        Model with loaded encoder weights
+    """
+    import re
+
+    if verbose:
+        print(f"Loading encoder checkpoint from: {checkpoint_path}")
+
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    # Extract state dict
+    if isinstance(checkpoint, dict):
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+            if verbose and "config" in checkpoint:
+                ckpt_config = checkpoint["config"]
+                print(f"  Checkpoint config: model={ckpt_config.get('model_name', 'unknown')}, "
+                      f"lora_r={ckpt_config.get('lora_r', 'N/A')}")
+        elif "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        else:
+            # Assume it's a direct state dict
+            state_dict = checkpoint
+    else:
+        raise ValueError(f"Unexpected checkpoint format: {type(checkpoint)}")
+
+    # Get current encoder state dict for reference
+    encoder_state_dict = model.encoder.state_dict()
+    encoder_keys = set(encoder_state_dict.keys())
+
+    # Try to match checkpoint keys to encoder keys
+    # The checkpoint might have different prefixes depending on how it was saved
+    matched_keys = []
+    unmatched_ckpt_keys = []
+
+    # Build a mapping from checkpoint keys to encoder keys
+    key_mapping = {}
+
+    for ckpt_key in state_dict.keys():
+        # Direct match
+        if ckpt_key in encoder_keys:
+            key_mapping[ckpt_key] = ckpt_key
+            matched_keys.append(ckpt_key)
+            continue
+
+        # Try removing common prefixes
+        # e.g., "base_model.model.encoder..." -> "base_model.model..."
+        # or "encoder.base_model.model..." -> "base_model.model..."
+        modified_key = ckpt_key
+
+        # Remove leading "encoder." if present (from seq2seq checkpoint)
+        if modified_key.startswith("encoder."):
+            modified_key = modified_key[len("encoder."):]
+            if modified_key in encoder_keys:
+                key_mapping[ckpt_key] = modified_key
+                matched_keys.append(ckpt_key)
+                continue
+
+        # Handle EsmForMaskedLM vs EsmModel prefix difference:
+        # Foundation model (EsmForMaskedLM): base_model.model.esm.encoder.layer...
+        # SFT encoder (EsmModel):            base_model.model.encoder.layer...
+        if "base_model.model.esm." in modified_key:
+            modified_key = modified_key.replace("base_model.model.esm.", "base_model.model.")
+            if modified_key in encoder_keys:
+                key_mapping[ckpt_key] = modified_key
+                matched_keys.append(ckpt_key)
+                continue
+
+        # Also handle without base_model prefix:
+        # Foundation: esm.encoder.layer... -> encoder.layer...
+        if modified_key.startswith("esm."):
+            modified_key = modified_key[len("esm."):]
+            if modified_key in encoder_keys:
+                key_mapping[ckpt_key] = modified_key
+                matched_keys.append(ckpt_key)
+                continue
+
+        # The checkpoint key is already in the right format
+        # (standalone PEFT model saves as base_model.model.*)
+        if modified_key in encoder_keys:
+            key_mapping[ckpt_key] = modified_key
+            matched_keys.append(ckpt_key)
+            continue
+
+        unmatched_ckpt_keys.append(ckpt_key)
+
+    # Load matched weights
+    new_state_dict = {}
+    for ckpt_key, encoder_key in key_mapping.items():
+        new_state_dict[encoder_key] = state_dict[ckpt_key]
+
+    # Check for missing encoder keys
+    loaded_keys = set(new_state_dict.keys())
+    missing_keys = encoder_keys - loaded_keys
+
+    if verbose:
+        print(f"  Matched {len(matched_keys)} / {len(state_dict)} checkpoint keys")
+        print(f"  Loading {len(new_state_dict)} weights into encoder")
+        if missing_keys:
+            # Filter out expected missing keys (e.g., new LoRA adapters)
+            important_missing = [k for k in missing_keys if "lora" not in k.lower()]
+            if important_missing:
+                print(f"  Missing (non-LoRA) keys: {len(important_missing)}")
+                if len(important_missing) <= 5:
+                    for k in important_missing:
+                        print(f"    - {k}")
+        if unmatched_ckpt_keys:
+            print(f"  Unmatched checkpoint keys: {len(unmatched_ckpt_keys)}")
+
+    # Load the state dict
+    load_result = model.encoder.load_state_dict(new_state_dict, strict=strict)
+
+    if verbose:
+        if load_result.missing_keys:
+            lora_missing = [k for k in load_result.missing_keys if "lora" in k.lower()]
+            other_missing = [k for k in load_result.missing_keys if "lora" not in k.lower()]
+            if lora_missing:
+                print(f"  LoRA layers initialized fresh: {len(lora_missing)}")
+            if other_missing:
+                print(f"  Other missing keys: {len(other_missing)}")
+        if load_result.unexpected_keys:
+            print(f"  Unexpected keys (ignored): {len(load_result.unexpected_keys)}")
+        print("  Encoder checkpoint loaded successfully!")
+
+    return model
+
+
 # =============================================================================
 # Dataset: TCRSeq2SeqDataset
 # =============================================================================
@@ -2689,6 +2840,18 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
                 if self._is_main_process():
                     model.encoder.print_trainable_parameters()
 
+        # Load pre-trained encoder checkpoint if provided (for SFT on custom models)
+        encoder_checkpoint = self.config.get("encoder_checkpoint")
+        if encoder_checkpoint:
+            self._log(f"Loading encoder checkpoint: {encoder_checkpoint}")
+            model = load_encoder_checkpoint(
+                model,
+                encoder_checkpoint,
+                strict=False,
+                verbose=self._is_main_process(),
+            )
+            self._log("Encoder checkpoint loaded for SFT")
+
         # Freeze encoder if not using LoRA
         if not self.config.get("use_lora", False) and self.config.get("freeze_encoder", True):
             for param in model.encoder.parameters():
@@ -3511,6 +3674,12 @@ def parse_args():
                         help="LoRA dropout")
     parser.add_argument("--freeze_encoder", action="store_true", default=True,
                         help="Freeze encoder if not using LoRA")
+
+    # Custom encoder checkpoint (for SFT on pre-trained models)
+    parser.add_argument("--encoder_checkpoint", type=str, default=None,
+                        help="Path to pre-trained encoder checkpoint (.pt file). "
+                             "Use this to fine-tune a custom pre-trained model (e.g., MLM-pretrained ESM2+LoRA). "
+                             "The checkpoint should contain 'model_state_dict' with encoder weights.")
 
     # Training (defaults optimized for trn1.2xlarge with ESM2-8M)
     parser.add_argument("--batch_size", type=int, default=8,
