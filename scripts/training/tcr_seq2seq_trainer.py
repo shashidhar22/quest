@@ -461,7 +461,7 @@ class TCRSeq2SeqModel(nn.Module):
 
         # Load ESM2 encoder with appropriate attention implementation
         # attn_implementation: "flash_attention_2" for CUDA, "eager" or None for XLA/Trainium
-        encoder_kwargs = {"torch_dtype": torch_dtype}
+        encoder_kwargs = {"dtype": torch_dtype}
 
         # Try flash_attention_2 first, fall back to eager if not available
         if attn_implementation == "auto":
@@ -473,10 +473,15 @@ class TCRSeq2SeqModel(nn.Module):
         elif attn_implementation:
             encoder_kwargs["attn_implementation"] = attn_implementation
 
+        import logging as _logging
+        _hf_logger = _logging.getLogger("transformers.modeling_utils")
+        _prev_level = _hf_logger.level
+        _hf_logger.setLevel(_logging.ERROR)
         self.encoder = AutoModel.from_pretrained(
             encoder_model_name,
             **encoder_kwargs,
         )
+        _hf_logger.setLevel(_prev_level)
 
         # Get encoder config
         self.encoder_dim = self.encoder.config.hidden_size
@@ -2851,6 +2856,20 @@ class TCRSeq2SeqTrainer(BaseTCRTrainer):
                 verbose=self._is_main_process(),
             )
             self._log("Encoder checkpoint loaded for SFT")
+
+            # Merge foundation LoRA into base weights, then apply fresh LoRA for SFT.
+            # This "bakes in" the foundation's learned representations and gives SFT
+            # a fresh set of LoRA adapters to learn the generation task.
+            if self.config.get("use_lora", False) and PEFT_AVAILABLE:
+                self._log("Merging foundation LoRA into base weights...")
+                model.encoder = model.encoder.merge_and_unload()
+                # Remove residual PEFT metadata so re-application doesn't warn
+                if hasattr(model.encoder, "peft_config"):
+                    delattr(model.encoder, "peft_config")
+                self._log("Applying fresh LoRA for SFT")
+                model = apply_lora_to_encoder(model, self.config)
+                if self._is_main_process():
+                    model.encoder.print_trainable_parameters()
 
         # Freeze encoder if not using LoRA
         if not self.config.get("use_lora", False) and self.config.get("freeze_encoder", True):

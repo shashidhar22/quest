@@ -194,7 +194,7 @@ class PeptideMHCSeq2SeqModel(nn.Module):
         super().__init__()
 
         # Load ESM2 encoder
-        encoder_kwargs = {"torch_dtype": torch_dtype}
+        encoder_kwargs = {"dtype": torch_dtype}
 
         if attn_implementation == "auto":
             try:
@@ -205,10 +205,15 @@ class PeptideMHCSeq2SeqModel(nn.Module):
         elif attn_implementation:
             encoder_kwargs["attn_implementation"] = attn_implementation
 
+        import logging as _logging
+        _hf_logger = _logging.getLogger("transformers.modeling_utils")
+        _prev_level = _hf_logger.level
+        _hf_logger.setLevel(_logging.ERROR)
         self.encoder = AutoModel.from_pretrained(
             encoder_model_name,
             **encoder_kwargs,
         )
+        _hf_logger.setLevel(_prev_level)
 
         # Get encoder config
         self.encoder_dim = self.encoder.config.hidden_size
