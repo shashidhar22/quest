@@ -48,6 +48,14 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+
+# TCR stitching for full-length sequences
+try:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from parsers.tcr_stitcher import add_full_tcr_sequences
+    STITCHER_AVAILABLE = True
+except ImportError:
+    STITCHER_AVAILABLE = False
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
@@ -284,6 +292,15 @@ class SFTEvalDataset(Dataset):
             if old_col in df.columns and new_col not in df.columns:
                 df = df.rename(columns={old_col: new_col})
 
+        # Stitch full-length TCR sequences from CDR3 + gene annotations
+        if STITCHER_AVAILABLE:
+            has_gene_cols = any(col in df.columns for col in ["trav_gene", "trbv_gene"])
+            if has_gene_cols:
+                df = add_full_tcr_sequences(df, species="HUMAN")
+                tra_stitched = (df["tra_full"].notna() & (df["tra_full"] != "")).sum() if "tra_full" in df.columns else 0
+                trb_stitched = (df["trb_full"].notna() & (df["trb_full"] != "")).sum() if "trb_full" in df.columns else 0
+                print(f"  TCR stitching: {tra_stitched}/{len(df)} TRA, {trb_stitched}/{len(df)} TRB full-length")
+
         # Filter rows with required columns
         required_cols = self.task_config["context_cols"] + [self.task_config["target_col"]]
         for col in required_cols:
@@ -307,10 +324,17 @@ class SFTEvalDataset(Dataset):
         """
         row = self.df.iloc[idx]
 
-        # Build encoder context in order
+        # Build encoder context in order, preferring full-length TCR sequences
         encoder_context = []
         for col in self.task_config["context_cols"]:
             if col in self.df.columns and pd.notna(row.get(col)):
+                # Prefer full-length stitched TCR over CDR3
+                full_col = f"{col}_full"
+                if col in ("tra", "trb") and full_col in self.df.columns:
+                    full_val = row.get(full_col)
+                    if pd.notna(full_val) and full_val:
+                        encoder_context.append(str(full_val))
+                        continue
                 encoder_context.append(str(row[col]))
 
         # Get target

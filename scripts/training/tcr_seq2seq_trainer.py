@@ -82,6 +82,13 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+# Optional: TCR stitching for full-length sequences
+try:
+    from parsers.tcr_stitcher import TCRStitcher
+    STITCHER_AVAILABLE = True
+except ImportError:
+    STITCHER_AVAILABLE = False
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -1092,6 +1099,10 @@ class TCRSeq2SeqDataset(Dataset):
                                 "mhc_one": row.get("mhc_one", ""),
                                 "mhc_two": row.get("mhc_two", ""),
                             }
+                            # Include gene annotations for TCR stitching
+                            for gene_col in ["trav_gene", "traj_gene", "trbv_gene", "trbj_gene"]:
+                                if gene_col in df.columns:
+                                    record[gene_col] = row.get(gene_col, "")
                         else:
                             # Parse from concatenated sequence column
                             # Format: "TRA TRB PEPTIDE MHC_ONE MHC_TWO" (space-separated)
@@ -1113,6 +1124,30 @@ class TCRSeq2SeqDataset(Dataset):
 
             if is_main:
                 print(f"Loaded {len(all_data):,} records")
+
+            # Stitch full-length TCR sequences from CDR3 + gene annotations
+            if STITCHER_AVAILABLE:
+                import pandas as pd
+                has_genes = any(r.get("trbv_gene") or r.get("trav_gene") for r in all_data[:100])
+                if has_genes:
+                    if is_main:
+                        print("Stitching full-length TCR sequences...")
+                    stitch_df = pd.DataFrame(all_data)
+                    stitcher = TCRStitcher(species="HUMAN")
+                    stitch_df = stitcher.process_dataframe(stitch_df)
+                    # Update records with full-length sequences
+                    for i, row in stitch_df.iterrows():
+                        tra_full = row.get("tra_full", "")
+                        trb_full = row.get("trb_full", "")
+                        if tra_full:
+                            all_data[i]["tra_full"] = tra_full
+                        if trb_full:
+                            all_data[i]["trb_full"] = trb_full
+                    tra_count = sum(1 for r in all_data if r.get("tra_full"))
+                    trb_count = sum(1 for r in all_data if r.get("trb_full"))
+                    if is_main:
+                        print(f"  TCR stitching: {tra_count}/{len(all_data)} TRA, "
+                              f"{trb_count}/{len(all_data)} TRB full-length")
 
             TCRSeq2SeqDataset._cache[cache_key] = all_data
 
@@ -1215,6 +1250,7 @@ class TCRSeq2SeqDataset(Dataset):
         Get encoder context sequences and decoder target.
 
         Handles optional TCR chains - only includes present chains in encoder context.
+        Prefers full-length stitched TCR sequences over CDR3 when available.
 
         Returns:
             dict with:
@@ -1224,36 +1260,41 @@ class TCRSeq2SeqDataset(Dataset):
         """
         record = self.data[idx]
 
+        # Helper: get full-length TCR if available, otherwise CDR3
+        def get_tcr(chain: str) -> str:
+            full = record.get(f"{chain}_full", "")
+            return full if full else record.get(chain, "")
+
         # Determine MHC class
         mhc_class = "II" if record.get("mhc_two", "") else "I"
 
         if self.task == GenerationTask.ALPHA:
             # Encoder context: [trb if present] + peptide + mhc
             encoder_context = []
-            if record.get("trb"):
-                encoder_context.append(record["trb"])
+            if record.get("trb") or record.get("trb_full"):
+                encoder_context.append(get_tcr("trb"))
             encoder_context.extend([record["peptide"], record["mhc_one"]])
             if mhc_class == "II" and record.get("mhc_two"):
                 encoder_context.append(record["mhc_two"])
-            decoder_target = record["tra"]
+            decoder_target = get_tcr("tra")
 
         elif self.task == GenerationTask.BETA:
             # Encoder context: [tra if present] + peptide + mhc
             encoder_context = []
-            if record.get("tra"):
-                encoder_context.append(record["tra"])
+            if record.get("tra") or record.get("tra_full"):
+                encoder_context.append(get_tcr("tra"))
             encoder_context.extend([record["peptide"], record["mhc_one"]])
             if mhc_class == "II" and record.get("mhc_two"):
                 encoder_context.append(record["mhc_two"])
-            decoder_target = record["trb"]
+            decoder_target = get_tcr("trb")
 
         elif self.task == GenerationTask.PEPTIDE:
             # Encoder context: available TCRs + mhc
             encoder_context = []
-            if record.get("tra"):
-                encoder_context.append(record["tra"])
-            if record.get("trb"):
-                encoder_context.append(record["trb"])
+            if record.get("tra") or record.get("tra_full"):
+                encoder_context.append(get_tcr("tra"))
+            if record.get("trb") or record.get("trb_full"):
+                encoder_context.append(get_tcr("trb"))
             encoder_context.append(record["mhc_one"])
             if mhc_class == "II" and record.get("mhc_two"):
                 encoder_context.append(record["mhc_two"])

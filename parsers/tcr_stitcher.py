@@ -48,14 +48,12 @@ try:
     TCRCONVERT_AVAILABLE = True
 except ImportError:
     TCRCONVERT_AVAILABLE = False
-    logger.warning("tcrconvert not available. Install with: pip install tcrconvert")
 
 try:
     import tidytcells.tr as tr
     TIDYTCELLS_AVAILABLE = True
 except ImportError:
     TIDYTCELLS_AVAILABLE = False
-    logger.warning("tidytcells not available. Install with: pip install tidytcells")
 
 
 class TCRStitcher:
@@ -71,14 +69,18 @@ class TCRStitcher:
     def __init__(self, species: str = "HUMAN"):
         """
         Initialize TCR stitcher.
-        
+
         Args:
             species: Species for stitching (default: "HUMAN")
         """
         self.species = species.upper()
         self.enabled = STITCHR_AVAILABLE
         self.use_imgt_formatter = IMGT_FORMATTER_AVAILABLE
-        
+
+        # Suppress noisy tidytcells warnings
+        if TIDYTCELLS_AVAILABLE:
+            logging.getLogger('tidytcells').setLevel(logging.ERROR)
+
         if not self.enabled:
             logger.warning("TCR stitching disabled. Missing: stitchr")
         else:
@@ -182,7 +184,7 @@ class TCRStitcher:
         Returns:
             Normalized gene name or None if invalid
         """
-        if not gene or pd.isna(gene) or gene == '':
+        if not gene or pd.isna(gene) or gene == '' or gene.upper() in ('NA', 'NAN', 'NONE', 'NULL'):
             return None
 
         try:
@@ -198,8 +200,11 @@ class TCRStitcher:
             # PRIORITY 1: Try tidytcells (NEW)
             if TIDYTCELLS_AVAILABLE:
                 try:
-                    # Try with allele precision first
-                    normalized = tr.standardize(gene, precision='allele')
+                    # Suppress tidytcells print output
+                    import io
+                    import contextlib
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        normalized = tr.standardize(gene, precision='allele')
                     if normalized:
                         if gene != normalized:
                             logger.debug(f"tidytcells: {gene} -> {normalized}")
@@ -208,7 +213,8 @@ class TCRStitcher:
                     # Try without allele (gene-level only)
                     try:
                         gene_base = gene.split('*')[0] if '*' in gene else gene
-                        normalized = tr.standardize(gene_base, precision='gene')
+                        with contextlib.redirect_stderr(io.StringIO()):
+                            normalized = tr.standardize(gene_base, precision='gene')
                         if normalized:
                             # Re-add allele if original had one
                             if '*' in gene:
