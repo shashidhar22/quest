@@ -29,8 +29,13 @@ if _project_root not in sys.path:
 
 from scripts.benchmark.benchmark_metrics import compute_all_unified_metrics
 
-# Add TULIP-TCR to path
-TULIP_ROOT = "/home/sravisha/tcrbench_tools/TULIP-TCR"
+# TULIP-TCR path must be set via TULIP_ROOT environment variable or --tulip_root argument
+# Before running, export the path: export TULIP_ROOT=/path/to/TULIP-TCR
+TULIP_ROOT = os.environ.get("TULIP_ROOT", "/home/sravisha/tcrbench_tools/TULIP-TCR")
+if not os.path.isdir(TULIP_ROOT):
+    print(f"WARNING: TULIP_ROOT directory not found: {TULIP_ROOT}")
+    print("Please set the TULIP_ROOT environment variable before running:")
+    print("  export TULIP_ROOT=/path/to/TULIP-TCR")
 sys.path.insert(0, TULIP_ROOT)
 
 # Suppress warnings
