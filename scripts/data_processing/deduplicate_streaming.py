@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 # Import TCR stitcher
 try:
-    from parsers.tcr_stitcher import TCRStitcher
+    from quest.parsers.tcr_stitcher import TCRStitcher
     STITCHER_AVAILABLE = True
 except ImportError:
     STITCHER_AVAILABLE = False

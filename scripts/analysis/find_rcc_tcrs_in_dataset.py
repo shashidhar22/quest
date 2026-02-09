@@ -29,7 +29,7 @@ import os
 
 # Add project root to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from parsers.tcr_stitcher import TCRStitcher
+from quest.parsers.tcr_stitcher import TCRStitcher
 
 def load_rcc_sequences(csv_path):
     """Load RCC TCR sequences and generate full-length sequences using stitcher."""

@@ -3,7 +3,7 @@
 Test script for x2gd.16xlarge - processes 10% of data with high parallelization
 """
 
-from parsers.streaming_parser_complete import StreamingParserComplete
+from quest.parsers.streaming_parser import StreamingParserComplete
 import logging
 import time
 from datetime import datetime

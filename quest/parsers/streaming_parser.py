@@ -1298,3 +1298,51 @@ class StreamingParserComplete:
             return self.parse_file_streaming(file_path, format_type, format_name, delimiter)
         except Exception as e:
             raise RuntimeError(f"Error processing {file_path}: {e}")
+
+
+def merge_parquet_partitions(
+    input_dir: "Path",
+    output_file: "Path",
+    compression: str = 'snappy'
+) -> int:
+    """
+    Merge multiple Parquet partition files into a single file.
+    Uses PyArrow for memory-efficient streaming merge.
+
+    Args:
+        input_dir: Directory containing .parquet files
+        output_file: Output merged parquet file
+        compression: Compression codec
+
+    Returns:
+        Total number of rows
+    """
+    import pyarrow.parquet as pq
+    from pathlib import Path
+
+    input_dir = Path(input_dir)
+    output_file = Path(output_file)
+    parquet_files = list(input_dir.glob("*.parquet"))
+
+    if not parquet_files:
+        logger.warning(f"No parquet files found in {input_dir}")
+        return 0
+
+    logger.info(f"Merging {len(parquet_files)} parquet files -> {output_file}")
+
+    first_table = pq.read_table(parquet_files[0])
+    schema = first_table.schema
+
+    total_rows = 0
+
+    with pq.ParquetWriter(output_file, schema, compression=compression) as writer:
+        for pf in parquet_files:
+            table = pq.read_table(pf)
+            writer.write_table(table)
+            total_rows += len(table)
+
+            if len(parquet_files) % 100 == 0:
+                logger.info(f"  Merged {total_rows:,} rows...")
+
+    logger.info(f"Merged {total_rows:,} total rows")
+    return total_rows

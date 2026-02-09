@@ -11,7 +11,7 @@ Tests:
 
 import sys
 import pandas as pd
-from parsers.tcr_stitcher import TCRStitcher, STITCHR_AVAILABLE
+from quest.parsers.tcr_stitcher import TCRStitcher, STITCHR_AVAILABLE
 
 def test_initialization():
     """Test TCRStitcher initialization."""

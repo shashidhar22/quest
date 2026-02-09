@@ -552,12 +552,10 @@ def main():
     print("\n✅ Pre-masking complete!")
     print(f"\nDataset saved to: {args.output_dataset}")
     print("\nYou can now use this pre-masked dataset for fast training:")
-    print(f"  python scripts/training/fine_tune.py \\")
-    print(f"    --dataset_path {args.output_dataset} \\")
-    print(f"    --model_path Rostlab/prot_bert \\")
-    print(f"    --mode {args.mode} \\")
-    print(f"    --output_dir ./checkpoints \\")
-    print(f"    --use_pre_masked  # Add this flag!")
+    print(f"  python scripts/training/esm_native_trainer.py \\")
+    print(f"    --dataset {args.output_dataset} \\")
+    print(f"    --model facebook/esm2_t33_650M_UR50D \\")
+    print(f"    --output_dir ./checkpoints")
 
 
 if __name__ == "__main__":

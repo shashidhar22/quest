@@ -4,7 +4,7 @@ Quick test to verify tqdm progress bar works with the parser
 """
 
 import sys
-from parsers.streaming_parser_complete import StreamingParserComplete
+from quest.parsers.streaming_parser import StreamingParserComplete
 import logging
 from pathlib import Path
 

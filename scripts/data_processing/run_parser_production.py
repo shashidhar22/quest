@@ -26,8 +26,8 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from parsers.streaming_parser_complete import StreamingParserComplete
-from parsers.airr_database_parser import DatabaseParser
+from quest.parsers.streaming_parser import StreamingParserComplete
+from quest.parsers.airr.database_parser import DatabaseParser
 import logging
 import time
 from datetime import datetime

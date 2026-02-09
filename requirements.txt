@@ -40,7 +40,7 @@ tqdm>=4.67.1
 
 # TCR sequence stitching (full-length reconstruction)
 stitchr>=1.3.1
-
+tidytcells>=2.2.0
 # =============================================================================
 # Deep Learning Frameworks
 # =============================================================================

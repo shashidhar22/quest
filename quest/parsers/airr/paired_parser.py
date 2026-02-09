@@ -3,7 +3,7 @@ import pandas as pd
 from itertools import product
 from collections import OrderedDict
 
-from .utils import (
+from ..utils import (
     parse_junction_aa,
     standardize_sequence,
     format_combined_tcell,

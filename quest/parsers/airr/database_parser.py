@@ -12,7 +12,7 @@ import gc
 import os
 from typing import Optional, Tuple
 from tqdm import tqdm
-from .utils import (
+from ..utils import (
     parse_imgt_four_digit,
     transform_mhc_restriction,
     get_mhc_sequence
@@ -482,8 +482,8 @@ class DatabaseParser:
                 sequence_table['mhc_restriction'], 
                 fasta_dict=self.hla_dictionary)
         except AttributeError:
-            breakpoint()
-        
+            pass
+
         sequence_table['mhc_restriction_two'] = transform_mhc_restriction(
             sequence_table['mhc_restriction_two'], 
             fasta_dict=self.hla_dictionary)

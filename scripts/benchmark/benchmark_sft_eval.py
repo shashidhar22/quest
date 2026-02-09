@@ -52,7 +52,7 @@ import torch.nn.functional as F
 # TCR stitching for full-length sequences
 try:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from parsers.tcr_stitcher import add_full_tcr_sequences
+    from quest.parsers.tcr_stitcher import add_full_tcr_sequences
     STITCHER_AVAILABLE = True
 except ImportError:
     STITCHER_AVAILABLE = False

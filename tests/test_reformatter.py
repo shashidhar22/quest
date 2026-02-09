@@ -10,7 +10,7 @@ import pandas as pd
 import tempfile
 import shutil
 from pathlib import Path
-from parsers.streaming_parser import StreamingParser
+from quest.parsers.streaming_parser import StreamingParserComplete as StreamingParser
 import logging
 
 logging.basicConfig(level=logging.INFO)

@@ -107,7 +107,7 @@ def test_stitcher_class():
     print("="*80)
     
     try:
-        from parsers.tcr_stitcher import TCRStitcher, STITCHR_AVAILABLE
+        from quest.parsers.tcr_stitcher import TCRStitcher, STITCHR_AVAILABLE
         
         print(f"STITCHR_AVAILABLE flag: {STITCHR_AVAILABLE}")
         
@@ -139,7 +139,7 @@ def test_gene_normalization():
     print("="*80)
     
     try:
-        from parsers.tcr_stitcher import TCRStitcher
+        from quest.parsers.tcr_stitcher import TCRStitcher
         
         stitcher = TCRStitcher()
         if not stitcher.enabled:
@@ -196,7 +196,7 @@ def test_basic_stitching():
     print("="*80)
     
     try:
-        from parsers.tcr_stitcher import TCRStitcher
+        from quest.parsers.tcr_stitcher import TCRStitcher
         
         stitcher = TCRStitcher()
         if not stitcher.enabled:
@@ -280,7 +280,7 @@ def test_paired_stitching():
     print("="*80)
     
     try:
-        from parsers.tcr_stitcher import TCRStitcher
+        from quest.parsers.tcr_stitcher import TCRStitcher
         
         stitcher = TCRStitcher()
         if not stitcher.enabled:
@@ -336,7 +336,7 @@ def test_dataframe_processing():
     print("="*80)
     
     try:
-        from parsers.tcr_stitcher import TCRStitcher
+        from quest.parsers.tcr_stitcher import TCRStitcher
         
         stitcher = TCRStitcher()
         if not stitcher.enabled:
@@ -401,7 +401,7 @@ def test_parser_integration():
     print("="*80)
     
     try:
-        from parsers.streaming_parser_complete import StreamingParserComplete
+        from quest.parsers.streaming_parser import StreamingParserComplete
         
         # Get config path relative to project root
         project_root = Path(__file__).parent.parent.parent
@@ -477,7 +477,7 @@ def test_edge_cases():
     print("="*80)
     
     try:
-        from parsers.tcr_stitcher import TCRStitcher
+        from quest.parsers.tcr_stitcher import TCRStitcher
         
         stitcher = TCRStitcher()
         if not stitcher.enabled:

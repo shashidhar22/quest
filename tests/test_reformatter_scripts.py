@@ -10,7 +10,7 @@ import pandas as pd
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from parsers.streaming_parser import StreamingParser
+from quest.parsers.streaming_parser import StreamingParserComplete as StreamingParser
 
 
 def get_test_data_dir():

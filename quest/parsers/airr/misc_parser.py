@@ -6,7 +6,7 @@ import pandas as pd
 from itertools import product
 from collections import OrderedDict
 
-from .utils import standardize_sequence, standardize_mri
+from ..utils import standardize_sequence, standardize_mri
 
 
 class MiscFileParser:

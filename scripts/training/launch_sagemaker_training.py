@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Launch SageMaker training job for fine_tune.py
+Launch SageMaker training job for esm_fine_tune.py
 
 This script provides a convenient command-line interface to launch AWS SageMaker
 training jobs for fine-tuning protein language models on TCR/MHC data.
@@ -182,10 +182,10 @@ def main():
     )
     infra_group.add_argument(
         '--entry-script',
-        default='fine_tune.py',
-        choices=['fine_tune.py', 'esm_fine_tune.py'],
-        help='Training script to use. fine_tune.py: full-featured with multiple modes. '
-             'esm_fine_tune.py: efficient MLM-only for ESM2 models (recommended for pure MLM).'
+        default='esm_fine_tune.py',
+        choices=['esm_fine_tune.py', 'esm_native_trainer.py'],
+        help='Training script to use. esm_fine_tune.py: Accelerate-based MLM fine-tuning. '
+             'esm_native_trainer.py: native PyTorch MLM fine-tuning with DDP.'
     )
     infra_group.add_argument(
         '--fast-file', action='store_true',
@@ -218,7 +218,7 @@ def main():
     )
 
     # =========================================================================
-    # Model & Dataset Arguments (passed to fine_tune.py)
+    # Model & Dataset Arguments
     # =========================================================================
     model_group = parser.add_argument_group('Model Configuration')
     model_group.add_argument(
@@ -234,7 +234,7 @@ def main():
     )
 
     # =========================================================================
-    # Training Hyperparameters (passed to fine_tune.py)
+    # Training Hyperparameters
     # =========================================================================
     train_group = parser.add_argument_group('Training Hyperparameters')
     train_group.add_argument('--num-epochs', type=int, default=3,
@@ -375,7 +375,7 @@ def main():
 
         if args.tokenize_on_fly:
             print("\nERROR: esm_fine_tune.py does not support on-the-fly tokenization.")
-            print("Use fine_tune.py or pre-tokenize your dataset.")
+            print("Pre-tokenize your dataset first.")
             sys.exit(1)
 
     # =========================================================================
@@ -457,7 +457,7 @@ def main():
         print(f"  Gradient Checkpointing: {args.gradient_checkpointing}")
 
     else:
-        # fine_tune.py (original behavior)
+        # esm_native_trainer.py fallback
         hyperparameters = {
             'mode': args.mode,
             'model_path': args.model_path,
@@ -476,7 +476,7 @@ def main():
             hyperparameters['raw_data_dir'] = '/opt/ml/input/data/training'
             hyperparameters['tokenizer_type'] = args.tokenizer_type
             hyperparameters['tokenization_max_length'] = args.tokenization_max_length
-            # Only pass num_workers if explicitly set (otherwise auto-detect in fine_tune.py)
+            # Only pass num_workers if explicitly set
             if args.tokenization_num_workers is not None:
                 hyperparameters['tokenization_num_workers'] = args.tokenization_num_workers
             hyperparameters['tokenization_batch_size'] = args.tokenization_batch_size

@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 import yaml
 
-from parsers.streaming_parser import StreamingParser, merge_parquet_partitions
+from quest.parsers.streaming_parser import StreamingParserComplete as StreamingParser, merge_parquet_partitions
 
 
 def setup_logging(verbose=False):

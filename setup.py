@@ -46,7 +46,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/shashidhar22/quest",
-    packages=find_packages(include=["quest", "quest.*", "parsers", "parsers.*", "scripts", "scripts.*"]),
+    packages=find_packages(include=["quest", "quest.*", "scripts", "scripts.*"]),
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",

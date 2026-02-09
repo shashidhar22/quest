@@ -20,7 +20,7 @@ import sys
 
 # Import format_to_imgt from same package
 try:
-    from parsers.format_to_imgt import standardize_to_imgt
+    from quest.parsers.format_to_imgt import standardize_to_imgt
     IMGT_FORMATTER_AVAILABLE = True
 except ImportError:
     try:

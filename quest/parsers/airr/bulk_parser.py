@@ -7,7 +7,7 @@ from collections import OrderedDict
 
 # If these come from another module, just import them.
 # Otherwise, define them here or adapt as needed.
-from .utils import standardize_sequence, standardize_mri
+from ..utils import standardize_sequence, standardize_mri
 
 
 class BulkFileParser:
