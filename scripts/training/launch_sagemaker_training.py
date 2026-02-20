@@ -331,6 +331,28 @@ def main():
     )
 
     # =========================================================================
+    # Tensor Parallelism (Trainium only)
+    # =========================================================================
+    tp_group = parser.add_argument_group('Tensor Parallelism (Trainium only)')
+    tp_group.add_argument(
+        '--tensor-parallel-size', type=int, default=1,
+        help='Tensor parallelism degree (default: 1, no TP). '
+             'Shards model layers across this many Trainium chips. '
+             'ESM2 compatible values: 1, 2, 4, 5, 10, 20 (TP=8 auto-pads heads). '
+             'Recommended for trn1.32xlarge: TP=2 DP=8, TP=4 DP=4, TP=8 DP=2.'
+    )
+    tp_group.add_argument(
+        '--pipeline-parallel-size', type=int, default=1,
+        help='Pipeline parallelism degree (default: 1, no PP). '
+             'Splits model stages across this many chips. Requires Trainium.'
+    )
+    tp_group.add_argument(
+        '--zero-1', action='store_true',
+        help='Enable ZeRO Stage 1 optimizer sharding across data-parallel ranks. '
+             'Reduces optimizer memory by DP factor. Requires Trainium with TP.'
+    )
+
+    # =========================================================================
     # Advanced
     # =========================================================================
     adv_group = parser.add_argument_group('Advanced')
@@ -366,6 +388,27 @@ def main():
         print("\nWARNING: --tokenizer-type specified without --tokenize-on-fly")
         print("Enabling --tokenize-on-fly automatically")
         args.tokenize_on_fly = True
+
+    # Validate tensor parallelism arguments
+    if args.tensor_parallel_size > 1:
+        if args.instance_type not in TRAINIUM_INSTANCE_TYPES:
+            print(f"\nERROR: --tensor-parallel-size > 1 requires a Trainium instance type.")
+            print(f"Current instance: {args.instance_type}")
+            print(f"Trainium instances: {', '.join(TRAINIUM_INSTANCE_TYPES)}")
+            sys.exit(1)
+
+        total_chips = 16 if '32xlarge' in args.instance_type else 1
+        dp_size = total_chips // (args.tensor_parallel_size * args.pipeline_parallel_size)
+        if dp_size < 1:
+            print(f"\nERROR: TP={args.tensor_parallel_size} x PP={args.pipeline_parallel_size} "
+                  f"exceeds total chips ({total_chips}).")
+            sys.exit(1)
+
+        print(f"\n  Tensor Parallelism: TP={args.tensor_parallel_size}, "
+              f"PP={args.pipeline_parallel_size}, DP={dp_size}")
+        if args.zero_1:
+            print(f"  ZeRO-1: enabled (optimizer sharded across {dp_size} DP ranks)")
+        print(f"  Recommended configs for trn1.32xlarge: TP=2 DP=8, TP=4 DP=4, TP=8 DP=2")
 
     # Validate esm_fine_tune.py compatibility
     if args.entry_script == 'esm_fine_tune.py':
@@ -540,6 +583,13 @@ def main():
         # Add backend for hardware-agnostic training
         hyperparameters['backend'] = detected_backend
 
+        # Add tensor parallelism parameters
+        if args.tensor_parallel_size > 1:
+            hyperparameters['tensor_parallel_size'] = args.tensor_parallel_size
+            hyperparameters['pipeline_parallel_size'] = args.pipeline_parallel_size
+        if args.zero_1:
+            hyperparameters['zero_1'] = ''
+
     # =========================================================================
     # Configure PyTorch Estimator
     # =========================================================================
@@ -630,6 +680,12 @@ def main():
     print(f"   Instance Type:    {args.instance_type}")
     print(f"   Instance Count:   {args.instance_count}")
     print(f"   Backend:          {detected_backend} {'(Trainium/XLA)' if is_trainium else '(NVIDIA/CUDA)'}")
+    if args.tensor_parallel_size > 1:
+        total_chips = 16 if '32xlarge' in args.instance_type else 1
+        dp_size = total_chips // (args.tensor_parallel_size * args.pipeline_parallel_size)
+        print(f"   Tensor Parallel:  TP={args.tensor_parallel_size}, PP={args.pipeline_parallel_size}, DP={dp_size}")
+        if args.zero_1:
+            print(f"   ZeRO-1:           enabled")
     print(f"   Volume Size:      {args.volume_size} GB")
     print(f"   Spot Training:    {args.spot_instances}")
     if args.spot_instances:

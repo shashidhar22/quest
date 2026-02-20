@@ -35,6 +35,9 @@ from .dual_encoder import TCRDualEncoder, MomentumEncoder, DistractorManager
 # Contrastive loss
 from .contrastive_loss import DistributedRobustInfoNCE, gather_embeddings
 
+# Tensor parallelism (lazy — requires neuronx_distributed at call time, not import time)
+from .tensor_parallel import apply_tensor_parallelism, get_tp_loss_fn, pad_model
+
 __all__ = [
     # Positional encoding
     "PositionalEncoding",
@@ -62,4 +65,8 @@ __all__ = [
     # Contrastive loss
     "DistributedRobustInfoNCE",
     "gather_embeddings",
+    # Tensor parallelism
+    "apply_tensor_parallelism",
+    "get_tp_loss_fn",
+    "pad_model",
 ]

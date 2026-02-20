@@ -1,5 +1,13 @@
 # config.py
 
+# NeuronX Distributed tensor/pipeline parallelism defaults
+NEURON_TP_CONFIG = {
+    "tensor_parallel_size": 1,
+    "pipeline_parallel_size": 1,
+    "zero_1": False,
+    "sequence_parallel": False,
+}
+
 SWEEP_CONFIG = {
     "method": "bayes",  # Bayesian optimization for hyperparameter tuning
     "metric": {"name": "val_loss", "goal": "minimize"},
