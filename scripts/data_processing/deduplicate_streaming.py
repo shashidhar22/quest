@@ -35,15 +35,19 @@ except ImportError:
 # Valid amino acids
 _valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
 
-# Mode configurations - use MHC IDs not full sequences for dedup!
+# Mode configurations
+# Standardized schema uses mhc_one/mhc_two for allele IDs (e.g., HLA-A*02:01),
+# not full protein sequences.  Both the legacy mhc_one_id columns and the new
+# mhc_one/mhc_two columns are accepted so the pipeline works with either
+# pre-standardized or standardized input.
 MODE_CONFIGS = {
     "tra": {"required": ["tra"], "optional": []},
     "trb": {"required": ["trb"], "optional": []},
     "tcr_pairing": {"required": ["tra", "trb"], "optional": []},
-    "mhc_binding": {"required": ["peptide"], "optional": ["mhc_one_id", "mhc_two_id"]},
-    "specificity": {"required": ["tra", "peptide"], "optional": ["mhc_one_id", "mhc_two_id"]},
-    "default": {"required": [], "optional": ["tra", "trb", "peptide", "mhc_one_id", "mhc_two_id"]},
-    "balanced": {"required": [], "optional": ["tra", "trb", "peptide", "mhc_one_id", "mhc_two_id"]},
+    "mhc_binding": {"required": ["peptide"], "optional": ["mhc_one", "mhc_two"]},
+    "specificity": {"required": ["tra", "peptide"], "optional": ["mhc_one", "mhc_two"]},
+    "default": {"required": [], "optional": ["tra", "trb", "peptide", "mhc_one", "mhc_two"]},
+    "balanced": {"required": [], "optional": ["tra", "trb", "peptide", "mhc_one", "mhc_two"]},
 }
 
 def is_valid_sequence(seq: Optional[str]) -> bool:
@@ -124,7 +128,9 @@ def process_single_parquet(args: tuple) -> tuple:
                     if k in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two', 'mhc_one_id', 'mhc_two_id',
                             'tra_full', 'trb_full',  # Full-length stitched TCR sequences
                             'trav_gene', 'traj_gene', 'trad_gene',  # TRA gene segments
-                            'trbv_gene', 'trbj_gene', 'trbd_gene']  # TRB gene segments
+                            'trbv_gene', 'trbj_gene', 'trbd_gene',  # TRB gene segments
+                            'binding', 'score',  # Binding/activity and confidence score
+                            'source', 'study_id']  # Standardized schema provenance
                 }
                 
                 # Normalize gene names using tidytcells (Priority 1) and stitch sequences
@@ -1072,6 +1078,8 @@ def main():
     parser.add_argument("--use-unix-sort", action="store_true", help="Use Unix sort instead of PyArrow sort (not recommended for large datasets)")
     parser.add_argument("--stitch-tcr", action="store_true", help="Generate full-length TCR sequences from CDR3 + gene segments using stitchr")
     parser.add_argument("--resume", action="store_true", help="Resume from existing intermediate files (chunk files, sorted files, etc.)")
+    parser.add_argument("--standardized-input", action="store_true",
+                        help="Input is from data/standardized/ (uses mhc_one/mhc_two allele IDs directly, no mhc_one_id mapping needed)")
 
     args = parser.parse_args()
     
