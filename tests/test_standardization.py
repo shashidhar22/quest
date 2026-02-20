@@ -1,0 +1,395 @@
+"""Unit tests for quest.data.standardization normalization functions."""
+
+import pandas as pd
+import pytest
+
+from quest.data.standardization import (
+    TARGET_COLUMNS,
+    _NORM_CACHE,
+    classify_mhc_class,
+    clear_norm_cache,
+    normalize_cdr3,
+    normalize_gene,
+    normalize_mhc_allele,
+    normalize_peptide,
+    split_mhc_to_alpha_beta,
+    standardize_dataframe,
+)
+
+
+# -----------------------------------------------------------------------
+# normalize_cdr3
+# -----------------------------------------------------------------------
+class TestNormalizeCdr3:
+    def test_valid_sequence(self):
+        assert normalize_cdr3("CASSLAPGATNEKLFF") == "CASSLAPGATNEKLFF"
+
+    def test_lowercase(self):
+        assert normalize_cdr3("casslapgatneklff") == "CASSLAPGATNEKLFF"
+
+    def test_whitespace(self):
+        assert normalize_cdr3("  CASS  ") == "CASS"  # stripped to 4 valid chars
+
+    def test_short_sequence(self):
+        assert normalize_cdr3("CA") == ""
+        assert normalize_cdr3("CAS") == ""
+
+    def test_exactly_4_chars(self):
+        assert normalize_cdr3("CASS") == "CASS"
+
+    def test_non_aa_chars(self):
+        assert normalize_cdr3("CASS#@!") == ""
+        assert normalize_cdr3("CASS123") == ""
+
+    def test_empty(self):
+        assert normalize_cdr3("") == ""
+        assert normalize_cdr3(None) == ""
+
+    def test_na_strings(self):
+        assert normalize_cdr3("NA") == ""
+        assert normalize_cdr3("nan") == ""
+        assert normalize_cdr3("None") == ""
+        assert normalize_cdr3("NULL") == ""
+
+    def test_float_nan(self):
+        import math
+
+        assert normalize_cdr3(float("nan")) == ""
+
+    def test_valid_long(self):
+        seq = "CASSLGQAYEQYF"
+        assert normalize_cdr3(seq) == seq
+
+
+# -----------------------------------------------------------------------
+# normalize_gene
+# -----------------------------------------------------------------------
+class TestNormalizeGene:
+    def test_standard_imgt(self):
+        result = normalize_gene("TRBV20-1*01")
+        assert result != ""
+        assert "TRBV20" in result
+
+    def test_tcr_prefix(self):
+        result = normalize_gene("TCRBV13-01")
+        assert result != ""
+        assert "TRBV" in result
+
+    def test_leading_zeros(self):
+        result = normalize_gene("TRBV06-05")
+        assert result != ""
+
+    def test_multiple_alleles(self):
+        result = normalize_gene("TRAV1-2,TRAV1-3")
+        assert result != ""
+        assert "TRAV1" in result
+
+    def test_semicolon_separated(self):
+        result = normalize_gene("TRBV20-1;TRBV20-2")
+        assert result != ""
+
+    def test_empty(self):
+        assert normalize_gene("") == ""
+        assert normalize_gene(None) == ""
+        assert normalize_gene("NA") == ""
+
+    def test_invalid(self):
+        assert normalize_gene("unknown_gene") == ""
+        assert normalize_gene("12345") == ""
+
+    def test_alpha_gene(self):
+        result = normalize_gene("TRAV1-2")
+        assert result != ""
+        assert "TRAV" in result
+
+    def test_d_gene(self):
+        result = normalize_gene("TRBD1")
+        assert result != ""
+
+    def test_j_gene(self):
+        result = normalize_gene("TRBJ2-1")
+        assert result != ""
+
+    def test_ig_genes_rejected(self):
+        """IG (BCR) genes must be rejected — only TCR genes allowed."""
+        assert normalize_gene("IGHV1-2") == ""
+        assert normalize_gene("IGKV1-5") == ""
+        assert normalize_gene("IGLV1-40") == ""
+        assert normalize_gene("IGHJ4") == ""
+        assert normalize_gene("IGKJ1") == ""
+        assert normalize_gene("IGHD3-10") == ""
+
+    def test_tcr_genes_accepted(self):
+        """TCR genes from all chains should be accepted."""
+        assert normalize_gene("TRAV1-2") != ""
+        assert normalize_gene("TRBV6-5") != ""
+        assert normalize_gene("TRBJ2-1") != ""
+        assert normalize_gene("TRBD1") != ""
+        assert normalize_gene("TRAJ33") != ""
+        assert normalize_gene("TRDV1") != ""
+        assert normalize_gene("TRGV9") != ""
+
+
+# -----------------------------------------------------------------------
+# normalize_mhc_allele
+# -----------------------------------------------------------------------
+class TestNormalizeMhcAllele:
+    def test_standard_hla(self):
+        assert normalize_mhc_allele("HLA-A*02:01") == "HLA-A*02:01"
+
+    def test_compact_format(self):
+        result = normalize_mhc_allele("A0201")
+        assert result != ""
+        assert "02" in result and "01" in result
+
+    def test_missing_prefix(self):
+        result = normalize_mhc_allele("A*02:01")
+        assert result != ""
+        assert "HLA" in result or "A*02:01" in result
+
+    def test_class_ii(self):
+        result = normalize_mhc_allele("HLA-DRB1*04:01")
+        assert result != ""
+        assert "DRB1" in result
+
+    def test_empty(self):
+        assert normalize_mhc_allele("") == ""
+        assert normalize_mhc_allele(None) == ""
+        assert normalize_mhc_allele("NA") == ""
+
+    def test_non_allele_text(self):
+        assert normalize_mhc_allele("class I") == ""
+        assert normalize_mhc_allele("See reference for details") == ""
+
+    def test_mouse_mhc(self):
+        result = normalize_mhc_allele("H-2Kb")
+        # Should normalize or return empty
+        assert isinstance(result, str)
+
+
+# -----------------------------------------------------------------------
+# classify_mhc_class
+# -----------------------------------------------------------------------
+class TestClassifyMhcClass:
+    def test_class_i_hla_a(self):
+        assert classify_mhc_class("HLA-A*02:01") == "I"
+
+    def test_class_i_hla_b(self):
+        assert classify_mhc_class("HLA-B*07:02") == "I"
+
+    def test_class_i_hla_c(self):
+        assert classify_mhc_class("HLA-C*07:01") == "I"
+
+    def test_class_ii_drb(self):
+        assert classify_mhc_class("HLA-DRB1*04:01") == "II"
+
+    def test_class_ii_dqb(self):
+        assert classify_mhc_class("HLA-DQB1*06:02") == "II"
+
+    def test_class_ii_dpb(self):
+        assert classify_mhc_class("HLA-DPB1*04:01") == "II"
+
+    def test_empty(self):
+        assert classify_mhc_class("") == ""
+
+    def test_mouse_class_i(self):
+        assert classify_mhc_class("H-2Kb") == "I"
+
+    def test_mouse_class_ii(self):
+        assert classify_mhc_class("H-2IAb") == "II"
+
+
+# -----------------------------------------------------------------------
+# split_mhc_to_alpha_beta
+# -----------------------------------------------------------------------
+class TestSplitMhc:
+    def test_class_i(self):
+        m1, m2 = split_mhc_to_alpha_beta("HLA-A*02:01")
+        assert m1 != ""
+        assert m2 == ""
+
+    def test_class_ii_beta(self):
+        m1, m2 = split_mhc_to_alpha_beta("HLA-DRB1*04:01")
+        assert m2 != ""  # Beta chain goes to mhc_two
+
+    def test_slash_separated(self):
+        m1, m2 = split_mhc_to_alpha_beta("HLA-DQA1*01:02/HLA-DQB1*06:02")
+        assert m1 != "" or m2 != ""
+
+    def test_empty(self):
+        m1, m2 = split_mhc_to_alpha_beta("")
+        assert m1 == ""
+        assert m2 == ""
+
+    def test_none(self):
+        m1, m2 = split_mhc_to_alpha_beta(None)
+        assert m1 == ""
+        assert m2 == ""
+
+
+# -----------------------------------------------------------------------
+# normalize_peptide
+# -----------------------------------------------------------------------
+class TestNormalizePeptide:
+    def test_valid_peptide(self):
+        assert normalize_peptide("GILGFVFTL") == "GILGFVFTL"
+
+    def test_lowercase(self):
+        assert normalize_peptide("gilgfvftl") == "GILGFVFTL"
+
+    def test_whitespace(self):
+        assert normalize_peptide("  GILGFVFTL  ") == "GILGFVFTL"
+
+    def test_empty(self):
+        assert normalize_peptide("") == ""
+        assert normalize_peptide(None) == ""
+
+    def test_na_strings(self):
+        assert normalize_peptide("NA") == ""
+        assert normalize_peptide("nan") == ""
+
+    def test_non_sequence_text(self):
+        assert normalize_peptide("See reference for details") == ""
+
+    def test_long_text(self):
+        assert normalize_peptide("A" * 101) == ""
+
+    def test_single_aa(self):
+        assert normalize_peptide("A") == "A"
+
+
+# -----------------------------------------------------------------------
+# standardize_dataframe
+# -----------------------------------------------------------------------
+class TestStandardizeDataframe:
+    def test_basic_mapping(self):
+        df = pd.DataFrame(
+            {
+                "cdr3a": ["CASSTLGQAYEQYF"],
+                "cdr3b": ["CASSLAPGATNEKLFF"],
+                "epitope": ["GILGFVFTL"],
+                "mhc": ["HLA-A*02:01"],
+            }
+        )
+        column_map = {
+            "cdr3a": "tra",
+            "cdr3b": "trb",
+            "epitope": "peptide",
+            "mhc": "mhc_one",
+        }
+        result, dropped = standardize_dataframe(df, column_map, source="test")
+        assert list(result.columns) == TARGET_COLUMNS
+        assert len(result) == 1
+        assert result.iloc[0]["source"] == "test"
+
+    def test_missing_columns_filled(self):
+        df = pd.DataFrame({"cdr3b": ["CASSLAPGATNEKLFF"]})
+        column_map = {"cdr3b": "trb"}
+        result, dropped = standardize_dataframe(df, column_map, source="test")
+        assert list(result.columns) == TARGET_COLUMNS
+        assert result.iloc[0]["tra"] == ""
+        assert result.iloc[0]["trav_gene"] == ""
+
+    def test_no_valid_field_dropped(self):
+        df = pd.DataFrame({"other": ["some_value"]})
+        column_map = {}
+        result, dropped = standardize_dataframe(df, column_map, source="test")
+        assert len(result) == 0
+        assert len(dropped) == 1
+        assert dropped.iloc[0]["reason"] == "no_valid_field"
+
+    def test_invalid_cdr3_logged(self):
+        df = pd.DataFrame(
+            {
+                "cdr3b": ["CASS#@!"],
+                "epitope": ["GILGFVFTL"],
+            }
+        )
+        column_map = {"cdr3b": "trb", "epitope": "peptide"}
+        result, dropped = standardize_dataframe(df, column_map, source="test")
+        # Row kept because peptide is valid
+        assert len(result) == 1
+        assert result.iloc[0]["trb"] == ""
+        # But CDR3 issue is logged
+        cdr3_drops = dropped[dropped["field"] == "trb"]
+        assert len(cdr3_drops) >= 1
+
+    def test_study_id(self):
+        df = pd.DataFrame({"cdr3b": ["CASSLAPGATNEKLFF"]})
+        column_map = {"cdr3b": "trb"}
+        result, dropped = standardize_dataframe(
+            df, column_map, source="test", study_id="study1"
+        )
+        assert result.iloc[0]["study_id"] == "study1"
+
+    def test_all_types_string(self):
+        df = pd.DataFrame(
+            {
+                "cdr3b": ["CASSLAPGATNEKLFF"],
+                "peptide": ["GILGFVFTL"],
+            }
+        )
+        column_map = {"cdr3b": "trb", "peptide": "peptide"}
+        result, dropped = standardize_dataframe(df, column_map, source="test")
+        for col in TARGET_COLUMNS:
+            # pandas 3.x uses StringDtype by default; accept any string-like dtype
+            assert pd.api.types.is_string_dtype(result[col])
+
+    def test_unique_then_map_high_duplication(self):
+        """Verify unique-then-map produces identical results with high duplication."""
+        # 1000 rows with only 3 unique genes — exercises the lookup dict path
+        genes = ["TRBV6-5", "TRBV20-1", "TRBJ2-1"] * 333 + ["TRBV6-5"]
+        cdr3s = ["CASSLAPGATNEKLFF", "CASSLGQAYEQYF", "CASSDRGQAYEQYF"] * 333 + [
+            "CASSLAPGATNEKLFF"
+        ]
+        df = pd.DataFrame(
+            {
+                "cdr3b": cdr3s,
+                "vb": genes,
+                "peptide": ["GILGFVFTL"] * 1000,
+            }
+        )
+        column_map = {"cdr3b": "trb", "vb": "trbv_gene", "peptide": "peptide"}
+        result, dropped = standardize_dataframe(df, column_map, source="test")
+        assert len(result) == 1000
+        # All 3 unique genes should normalize to valid TRBV/TRBJ names
+        unique_genes = result["trbv_gene"].unique()
+        assert len(unique_genes) == 3
+        for g in unique_genes:
+            assert g.startswith("TR"), f"Gene not normalized: {g}"
+
+    def test_global_cache_reuse_across_calls(self):
+        """Global normalization cache should be populated on first call and
+        reused on subsequent calls, producing identical results."""
+        clear_norm_cache()
+
+        df = pd.DataFrame(
+            {
+                "cdr3b": ["CASSLAPGATNEKLFF", "CASSLGQAYEQYF"],
+                "vb": ["TRBV6-5", "TRBV20-1"],
+                "peptide": ["GILGFVFTL", "NLVPMVATV"],
+                "mhc": ["HLA-A*02:01", "HLA-B*07:02"],
+            }
+        )
+        column_map = {
+            "cdr3b": "trb",
+            "vb": "trbv_gene",
+            "peptide": "peptide",
+            "mhc": "mhc_one",
+        }
+
+        # First call — populates the cache
+        result1, _ = standardize_dataframe(df, column_map, source="test")
+        assert len(_NORM_CACHE) > 0, "Cache should be populated after first call"
+        cache_snapshot = {k: dict(v) for k, v in _NORM_CACHE.items()}
+
+        # Second call — should reuse cached values and produce identical output
+        result2, _ = standardize_dataframe(df, column_map, source="test")
+        pd.testing.assert_frame_equal(result1, result2)
+
+        # Cache should not have grown (same unique values)
+        for key in cache_snapshot:
+            assert cache_snapshot[key] == dict(_NORM_CACHE[key])
+
+        clear_norm_cache()
+        assert len(_NORM_CACHE) == 0, "Cache should be empty after clear"
