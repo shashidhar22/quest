@@ -286,8 +286,8 @@ class BaseTCRTrainer(ABC):
         # Move to device
         self.model.to(self.device)
 
-        # Wrap for distributed training
-        if self.is_distributed and self.backend.name == "cuda":
+        # Wrap for distributed training (CUDA uses DDP, XLA uses move_model_to_device for TP)
+        if self.is_distributed:
             self.model = self.backend.wrap_model_distributed(
                 self.model,
                 self.local_rank,
@@ -344,12 +344,30 @@ class BaseTCRTrainer(ABC):
 
         # Setup samplers for distributed training
         if self.is_distributed:
-            train_sampler = DistributedSampler(
-                self.train_dataset, shuffle=True, drop_last=True
-            )
-            val_sampler = DistributedSampler(
-                self.val_dataset, shuffle=False
-            ) if self.val_dataset else None
+            # Use TP-aware DP rank/world size when tensor parallelism is active
+            if hasattr(self.backend, 'get_data_parallel_world_size'):
+                dp_world_size = self.backend.get_data_parallel_world_size()
+                dp_rank = self.backend.get_data_parallel_rank()
+                train_sampler = DistributedSampler(
+                    self.train_dataset,
+                    num_replicas=dp_world_size,
+                    rank=dp_rank,
+                    shuffle=True,
+                    drop_last=True,
+                )
+                val_sampler = DistributedSampler(
+                    self.val_dataset,
+                    num_replicas=dp_world_size,
+                    rank=dp_rank,
+                    shuffle=False,
+                ) if self.val_dataset else None
+            else:
+                train_sampler = DistributedSampler(
+                    self.train_dataset, shuffle=True, drop_last=True
+                )
+                val_sampler = DistributedSampler(
+                    self.val_dataset, shuffle=False
+                ) if self.val_dataset else None
         else:
             train_sampler = None
             val_sampler = None
@@ -715,11 +733,14 @@ class BaseTCRTrainer(ABC):
 
                 # Gradient accumulation
                 if (batch_idx + 1) % grad_accum_steps == 0:
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        max_norm=max_grad_norm
-                    )
+                    # Gradient clipping (delegate to backend for TP-aware clipping)
+                    if hasattr(self.backend, 'clip_grad_norm'):
+                        self.backend.clip_grad_norm(self.model, max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            max_norm=max_grad_norm
+                        )
 
                     # Optimizer step (backend-specific)
                     self._optimizer_step()
@@ -861,10 +882,14 @@ class BaseTCRTrainer(ABC):
             loss = outputs["loss"]
             loss.backward()
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                max_norm=self.config.get("max_grad_norm", 1.0)
-            )
+            max_grad_norm = self.config.get("max_grad_norm", 1.0)
+            if hasattr(self.backend, 'clip_grad_norm'):
+                grad_norm = self.backend.clip_grad_norm(self.model, max_grad_norm)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=max_grad_norm
+                )
 
             self._optimizer_step()
 

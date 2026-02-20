@@ -36,7 +36,11 @@ from typing import Optional
 from .base import AcceleratorBackend
 
 
-def get_backend(backend_type: str = "auto") -> AcceleratorBackend:
+def get_backend(
+    backend_type: str = "auto",
+    tp_degree: int = 1,
+    pp_degree: int = 1,
+) -> AcceleratorBackend:
     """
     Factory function to get the appropriate accelerator backend.
 
@@ -45,6 +49,10 @@ def get_backend(backend_type: str = "auto") -> AcceleratorBackend:
             - 'auto': Auto-detect based on available hardware (XLA first, then CUDA)
             - 'cuda': NVIDIA GPU backend with NCCL
             - 'xla', 'neuron', 'trainium': AWS Trainium backend with XLA
+        tp_degree: Tensor parallelism degree (only used for Neuron backend).
+            1 = no TP (default). Values > 1 require neuronx_distributed.
+        pp_degree: Pipeline parallelism degree (only used for Neuron backend).
+            1 = no PP (default).
 
     Returns:
         AcceleratorBackend instance for the specified/detected hardware
@@ -62,7 +70,7 @@ def get_backend(backend_type: str = "auto") -> AcceleratorBackend:
         # Try XLA first (Trainium), then CUDA
         try:
             from .neuron_backend import NeuronBackend
-            return NeuronBackend()
+            return NeuronBackend(tp_degree=tp_degree, pp_degree=pp_degree)
         except ImportError:
             pass
 
@@ -80,7 +88,7 @@ def get_backend(backend_type: str = "auto") -> AcceleratorBackend:
 
     elif backend_type in ("xla", "neuron", "trainium"):
         from .neuron_backend import NeuronBackend
-        return NeuronBackend()
+        return NeuronBackend(tp_degree=tp_degree, pp_degree=pp_degree)
 
     else:
         raise ValueError(
