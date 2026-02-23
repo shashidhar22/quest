@@ -25,6 +25,21 @@ from scripts.data_processing.standardize._base import BaseStandardizer
 class McpasStandardizer(BaseStandardizer):
     name = "mcpas"
 
+    # Antigen identification methods that indicate experimentally validated
+    # TCR-epitope specificity (tetramer staining, in vitro stimulation assays)
+    _VALIDATED_METHODS = {
+        "tetramer",
+        "tetramer staining",
+        "dextramer",
+        "multimer",
+        "stimulation",
+        "in vitro stimulation",
+        "elispot",
+        "cytotoxicity",
+        "ics",
+        "intracellular cytokine staining",
+    }
+
     def get_column_map(self) -> dict:
         return {
             "CDR3.alpha.aa": "tra",
@@ -70,9 +85,22 @@ class McpasStandardizer(BaseStandardizer):
         df["mhc_one"] = mhc_one
         df["mhc_two"] = mhc_two
 
+        # Derive binding label from antigen identification method.
+        # Records with validated methods (tetramer, stimulation, etc.)
+        # get binding="pos". Others are left empty so downstream can
+        # treat them as MLM-only (weaker evidence).
+        method_col = "Antigen.identification.method"
+        if method_col in df.columns:
+            method_lower = df[method_col].fillna("").astype(str).str.strip().str.lower()
+            df["_binding"] = ""
+            is_validated = method_lower.isin(self._VALIDATED_METHODS)
+            df.loc[is_validated, "_binding"] = "pos"
+
         column_map = self.get_column_map()
         column_map["mhc_one"] = "mhc_one"
         column_map["mhc_two"] = "mhc_two"
+        if "_binding" in df.columns:
+            column_map["_binding"] = "binding"
 
         result, dropped = standardize_dataframe(
             df, column_map, source=self.name

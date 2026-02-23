@@ -48,6 +48,7 @@ MODE_CONFIGS = {
     "specificity": {"required": ["tra", "peptide"], "optional": ["mhc_one", "mhc_two"]},
     "default": {"required": [], "optional": ["tra", "trb", "peptide", "mhc_one", "mhc_two"]},
     "balanced": {"required": [], "optional": ["tra", "trb", "peptide", "mhc_one", "mhc_two"]},
+    "mlm": {"required": [], "optional": ["tra", "trb", "peptide", "mhc_one", "mhc_two"]},
 }
 
 def is_valid_sequence(seq: Optional[str]) -> bool:
@@ -118,6 +119,13 @@ def process_single_parquet(args: tuple) -> tuple:
         
         for _, row in df.iterrows():
             row_dict = row.to_dict()
+
+            # Filter negative binding for MLM mode
+            if mode == "mlm":
+                binding_val = str(row_dict.get("binding", "")).strip().lower()
+                if binding_val == "neg":
+                    continue
+
             dedup_key = create_dedup_key(row_dict, mode)
             
             if dedup_key:  # Valid row

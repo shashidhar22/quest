@@ -73,7 +73,7 @@ class BatmanStandardizer(BaseStandardizer):
             "_trbd_gene": "trbd_gene",
             "_trbj_gene": "trbj_gene",
             "index_peptide": "peptide",
-            "peptide_activity": "binding",
+            "peptide_activity": "score",
         }
 
     def load_and_standardize(self) -> Iterator[tuple[pd.DataFrame, pd.DataFrame]]:
@@ -121,9 +121,21 @@ class BatmanStandardizer(BaseStandardizer):
         df["mhc_one"] = mhc_one
         df["mhc_two"] = mhc_two
 
+        # Derive categorical binding from continuous peptide_activity score
+        # Strong activation (>=0.5): "pos", Weak (0.1-0.5): "pos",
+        # No activation (<0.1): "neg"
+        if "peptide_activity" in df.columns:
+            activity = pd.to_numeric(df["peptide_activity"], errors="coerce")
+            df["_binding"] = ""
+            df.loc[activity >= 0.1, "_binding"] = "pos"
+            df.loc[activity < 0.1, "_binding"] = "neg"
+            # Leave as empty where activity is NaN (non-numeric)
+
         column_map = self.get_column_map()
         column_map["mhc_one"] = "mhc_one"
         column_map["mhc_two"] = "mhc_two"
+        if "_binding" in df.columns:
+            column_map["_binding"] = "binding"
 
         result, dropped = standardize_dataframe(
             df, column_map, source=self.name

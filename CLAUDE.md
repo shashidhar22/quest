@@ -262,10 +262,10 @@ The 15 `TARGET_COLUMNS` from `quest/data/standardization.py`:
 |--------------|---------------------|
 | Experimentally validated TCR-pMHC binding (assay, tetramer, MIRA) | Expand each record into individual chains (tra, trb) and all multi-molecule interaction permutations (e.g., tra_trb, tra_peptide, tra_trb_peptide_mhc_one) as separate training records; all records used for MLM, interactions additionally used for contrastive/cross-encoder/seq2seq training |
 | Quality-scored with threshold (e.g., VDJdb score) | Records >= threshold: expand into individual chains and all interaction permutations (same as experimentally validated, all used for MLM and interaction training); lower scores: use individual chains for MLM only |
-| Computational predictions (no experimental TCR-pMHC binding) | Use each chain separately for MLM pre-training; do NOT treat as paired binding data |
+| Experimental pMHC binding data, no TCR (e.g., NetMHCpan training data, IEDB mhc_bind/mhc_ligand) | Use for peptide-MHC modeling only (pMHC seq2seq, contrastive pMHC learning); do NOT use for TCR interaction training |
 | Bulk repertoire (TCR-only, no epitope) | Use for MLM and TCR-only training modes (tra, trb, full_tra, full_trb) |
 | Mixed source with labeled subsets | Split by label; apply appropriate strategy to each subset |
-| Unknown or ambiguous | Consult team via task list; do not integrate until resolved |
+| Multi-source aggregation with experimentally validated data (e.g., TRAIT) | Same as experimentally validated; verify cross-source dedup catches overlap with individually integrated sources |
 
 ### Example Team Spawning Prompts
 

@@ -710,7 +710,7 @@ class TestTCROnlyGeneFiltering:
 # Binding & Score columns
 # -----------------------------------------------------------------------
 class TestBindingScoreColumns:
-    def test_batman_binding_populated(self, tmp_path):
+    def test_batman_score_and_binding_populated(self, tmp_path):
         from scripts.data_processing.standardize.batman import BatmanStandardizer
 
         source_dir = tmp_path / "source"
@@ -751,8 +751,10 @@ class TestBindingScoreColumns:
         result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
         assert "binding" in result.columns
         assert "score" in result.columns
-        assert list(result["binding"]) == ["37", "126"]
-        assert all(result["score"] == "")
+        # score now contains the numeric peptide_activity values
+        assert list(result["score"]) == ["37", "126"]
+        # binding derived from threshold: both >= 0.1 → "pos"
+        assert list(result["binding"]) == ["pos", "pos"]
 
     def test_vdjdb_score_populated(self, tmp_path):
         from scripts.data_processing.standardize.vdjdb import VdjdbStandardizer
@@ -1016,6 +1018,379 @@ class TestAdcStandardizer:
         assert standardizer._get_column_map_for_locus("TRB") is not None
         assert standardizer._get_column_map_for_locus("TRD") is None
         assert standardizer._get_column_map_for_locus("TRG") is None
+
+
+# -----------------------------------------------------------------------
+# BATMAN score/binding audit changes
+# -----------------------------------------------------------------------
+class TestBatmanScoreBinding:
+    def test_score_is_numeric_binding_is_categorical(self, tmp_path):
+        """BATMAN should map peptide_activity to score and derive binding."""
+        from scripts.data_processing.standardize.batman import BatmanStandardizer
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        df = pd.DataFrame(
+            {
+                "tcr": ["TCR1", "TCR2", "TCR3"],
+                "va": ["", "", ""],
+                "vb": ["", "", ""],
+                "cdr3a": ["CAVRDSNYQLIW", "CAVKDSNYQLIW", "CAVMDSNYQLIW"],
+                "cdr3b": ["CASSLAPGATNEKLFF", "CASSLGQAYEQYF", "CASSLAPNEKLFF"],
+                "trav": ["1-2", "12-1", "1-2"],
+                "traj": ["33", "49", "33"],
+                "trbv": ["6-5", "20-1", "6-5"],
+                "trbd": ["", "", ""],
+                "trbj": ["2-1", "1-2", "2-1"],
+                "assay": ["SPR", "tetramer", "SPR"],
+                "tcr_source_organism": ["human", "human", "human"],
+                "index_peptide": ["GILGFVFTL", "NLVPMVATV", "GILGFVFTL"],
+                "mhc": ["HLA-A*02:01", "HLA-A*02:01", "HLA-A*02:01"],
+                "pmid": ["12345", "67890", "11111"],
+                "peptide_type": ["viral", "viral", "viral"],
+                "peptide": ["GILGFVFTL", "NLVPMVATV", "GILGFVFTL"],
+                # Strong activation, weak activation, no activation
+                "peptide_activity": ["0.8", "0.3", "0.05"],
+            }
+        )
+        df.to_excel(
+            source_dir / "TCR_pMHCI_mutational_scan_database.xlsx",
+            index=False,
+        )
+
+        output_dir = tmp_path / "output"
+        standardizer = BatmanStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        standardizer.run(force=True)
+
+        result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
+        # score should contain the numeric peptide_activity values
+        assert list(result["score"]) == ["0.8", "0.3", "0.05"]
+        # binding should be derived: pos (>=0.1) or neg (<0.1)
+        assert list(result["binding"]) == ["pos", "pos", "neg"]
+
+
+# -----------------------------------------------------------------------
+# McPAS identification method parsing
+# -----------------------------------------------------------------------
+class TestMcpasIdentificationMethod:
+    def test_tetramer_gets_pos_binding(self, tmp_path):
+        """McPAS records with tetramer method should get binding='pos'."""
+        from scripts.data_processing.standardize.mcpas import McpasStandardizer
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        df = pd.DataFrame(
+            {
+                "CDR3.beta.aa": [
+                    "CASSLAPGATNEKLFF",
+                    "CASSLGQAYEQYF",
+                    "CASSDRGYTFGSGANVLTF",
+                ],
+                "TRBV": ["TRBV6-5", "TRBV20-1", "TRBV6-5"],
+                "TRBJ": ["TRBJ2-1", "TRBJ1-2", "TRBJ2-1"],
+                "Epitope.peptide": ["GILGFVFTL", "NLVPMVATV", "KLVALGINAV"],
+                "MHC": ["HLA-A*02:01", "HLA-A*02:01", "HLA-A*02:01"],
+                "Species": ["Human", "Human", "Human"],
+                "Antigen.identification.method": [
+                    "tetramer",
+                    "stimulation",
+                    "",
+                ],
+            }
+        )
+        df.to_csv(source_dir / "McPAS-TCR.csv", index=False)
+
+        output_dir = tmp_path / "output"
+        standardizer = McpasStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        standardizer.run(force=True)
+
+        result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
+        assert len(result) == 3
+        # Tetramer and stimulation should get "pos"
+        assert result.iloc[0]["binding"] == "pos"
+        assert result.iloc[1]["binding"] == "pos"
+        # Empty method should leave binding empty
+        assert result.iloc[2]["binding"] == ""
+
+    def test_no_method_column_still_works(self, tmp_path):
+        """McPAS should work even without Antigen.identification.method column."""
+        from scripts.data_processing.standardize.mcpas import McpasStandardizer
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        df = pd.DataFrame(
+            {
+                "CDR3.beta.aa": ["CASSLAPGATNEKLFF"],
+                "TRBV": ["TRBV6-5"],
+                "TRBJ": ["TRBJ2-1"],
+                "Epitope.peptide": ["GILGFVFTL"],
+                "MHC": ["HLA-A*02:01"],
+                "Species": ["Human"],
+            }
+        )
+        df.to_csv(source_dir / "McPAS-TCR.csv", index=False)
+
+        output_dir = tmp_path / "output"
+        standardizer = McpasStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["status"] == "completed"
+        assert summary["rows"] == 1
+
+
+# -----------------------------------------------------------------------
+# IEDB pMHC standardizer
+# -----------------------------------------------------------------------
+class TestIedbPmhcStandardizer:
+    def test_mhc_ligand_csv(self, tmp_path):
+        """IEDB pMHC should load mhc_ligand CSV with multi-level headers."""
+        from scripts.data_processing.standardize.iedb_pmhc import (
+            IedbPmhcStandardizer,
+        )
+
+        source_dir = tmp_path / "source"
+        ligand_dir = source_dir / "mhc_ligand"
+        ligand_dir.mkdir(parents=True)
+        # Create empty full_database dir so source_checksums works
+        (source_dir / "full_database").mkdir(parents=True)
+
+        # Multi-level header CSV like CEDAR/IEDB exports
+        groups = ["Epitope", "", "MHC", "", "Host"]
+        fields = ["Name", "IRI", "Allele Names", "Other", "Organism Source"]
+        data = [
+            ["GILGFVFTL", "", "HLA-A*02:01", "", "Homo sapiens"],
+            ["NLVPMVATV", "", "HLA-A*02:01", "", "Homo sapiens"],
+            ["SIINFEKL", "", "H-2Kb", "", "Mus musculus"],
+        ]
+        _write_multilevel_csv(
+            ligand_dir / "mhc_ligand_full_v3.csv", groups, fields, data,
+        )
+
+        output_dir = tmp_path / "output"
+        standardizer = IedbPmhcStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["status"] == "completed"
+        # Mouse record should be filtered out by MHC normalization
+        # (H-2Kb is non-human)
+        assert summary["rows"] == 2
+        _verify_output(output_dir)
+
+        result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
+        # All records should have source=iedb_pmhc
+        assert all(result["source"] == "iedb_pmhc")
+        # All records should be positive (eluted ligands)
+        assert all(result["binding"] == "pos")
+        # No TCR data
+        assert all(result["tra"] == "")
+        assert all(result["trb"] == "")
+        # Peptides should be present
+        assert set(result["peptide"]) == {"GILGFVFTL", "NLVPMVATV"}
+
+    def test_empty_sources_graceful(self, tmp_path):
+        """IEDB pMHC should handle missing/empty data gracefully."""
+        from scripts.data_processing.standardize.iedb_pmhc import (
+            IedbPmhcStandardizer,
+        )
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+
+        output_dir = tmp_path / "output"
+        standardizer = IedbPmhcStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        # Should complete with 0 rows (no data found)
+        assert summary["rows"] == 0
+
+    def test_mysql_dump_parsing(self, tmp_path):
+        """IEDB pMHC should parse mhc_bind from MySQL dump."""
+        from scripts.data_processing.standardize.iedb_pmhc import (
+            _load_mhc_bind_from_mysql,
+        )
+        import gzip
+
+        source_dir = tmp_path / "source"
+        db_dir = source_dir / "full_database"
+        db_dir.mkdir(parents=True)
+
+        # Create a minimal MySQL dump with mhc_bind, curated_epitope, epitope
+        lines = [
+            # epitope table: col_0=epitope_id, col_1=description
+            "INSERT INTO `epitope` VALUES ('100','GILGFVFTL','','','','','','','','');",
+            "INSERT INTO `epitope` VALUES ('200','NLVPMVATV','','','','','','','','');",
+            # curated_epitope: col_0=curated_epitope_id, ..., col_6=epitope_id
+            "INSERT INTO `curated_epitope` VALUES ('1','','','','','','100','','');",
+            "INSERT INTO `curated_epitope` VALUES ('2','','','','','','200','','');",
+            # mhc_bind: id, ref_id, curated_epi_id, location, type_id,
+            #           char_value, num_value, inequality, comments,
+            #           restriction_id, allele_name, complex_id
+            "INSERT INTO `mhc_bind` VALUES ('1','1','1','','','Positive','50','','','','HLA-A*02:01','');",
+            "INSERT INTO `mhc_bind` VALUES ('2','1','2','','','Negative','5000','','','','HLA-A*02:01','');",
+        ]
+
+        sql_gz_path = db_dir / "iedb_public.sql.gz"
+        with gzip.open(sql_gz_path, "wb") as f:
+            for line in lines:
+                f.write((line + "\n").encode("utf-8"))
+
+        result = _load_mhc_bind_from_mysql(sql_gz_path)
+        assert len(result) == 2
+
+        pos_row = result[result["binding"] == "pos"]
+        assert len(pos_row) == 1
+        assert pos_row.iloc[0]["peptide"] == "GILGFVFTL"
+        assert pos_row.iloc[0]["score"] == "50"
+
+        neg_row = result[result["binding"] == "neg"]
+        assert len(neg_row) == 1
+        assert neg_row.iloc[0]["peptide"] == "NLVPMVATV"
+
+
+# -----------------------------------------------------------------------
+# CEDAR pMHC standardizer
+# -----------------------------------------------------------------------
+class TestCedarPmhcStandardizer:
+    def test_mhc_ligand_csv(self, tmp_path):
+        """CEDAR pMHC should load mhc_ligand CSV."""
+        from scripts.data_processing.standardize.cedar_pmhc import (
+            CedarPmhcStandardizer,
+        )
+
+        source_dir = tmp_path / "source"
+        ligand_dir = source_dir / "mhc_ligand"
+        ligand_dir.mkdir(parents=True)
+
+        groups = ["Epitope", "", "MHC", "Host"]
+        fields = ["Name", "IRI", "Allele Names", "Organism Source"]
+        data = [
+            ["GILGFVFTL", "", "HLA-A*02:01", "Homo sapiens"],
+            ["NLVPMVATV", "", "HLA-B*07:02", "Homo sapiens"],
+        ]
+        _write_multilevel_csv(
+            ligand_dir / "mhc_ligand_full_v3.csv", groups, fields, data,
+        )
+
+        output_dir = tmp_path / "output"
+        standardizer = CedarPmhcStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["status"] == "completed"
+        assert summary["rows"] == 2
+        _verify_output(output_dir)
+
+        result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
+        assert all(result["source"] == "cedar_pmhc")
+        assert all(result["binding"] == "pos")
+        assert all(result["tra"] == "")
+        assert all(result["trb"] == "")
+
+    def test_empty_csv_graceful(self, tmp_path):
+        """CEDAR pMHC should handle empty CSV gracefully."""
+        from scripts.data_processing.standardize.cedar_pmhc import (
+            CedarPmhcStandardizer,
+        )
+
+        source_dir = tmp_path / "source"
+        ligand_dir = source_dir / "mhc_ligand"
+        ligand_dir.mkdir(parents=True)
+        # Create 0-byte file
+        (ligand_dir / "mhc_ligand_full_v3.csv").touch()
+
+        output_dir = tmp_path / "output"
+        standardizer = CedarPmhcStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["rows"] == 0
+
+    def test_missing_file_graceful(self, tmp_path):
+        """CEDAR pMHC should handle missing file gracefully."""
+        from scripts.data_processing.standardize.cedar_pmhc import (
+            CedarPmhcStandardizer,
+        )
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+
+        output_dir = tmp_path / "output"
+        standardizer = CedarPmhcStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["rows"] == 0
+
+    def test_api_format_csv(self, tmp_path):
+        """CEDAR pMHC should handle flat API CSV format (__ delimited headers)."""
+        from scripts.data_processing.standardize.cedar_pmhc import (
+            CedarPmhcStandardizer,
+        )
+
+        source_dir = tmp_path / "source"
+        ligand_dir = source_dir / "mhc_ligand"
+        ligand_dir.mkdir(parents=True)
+
+        # API format: single-row flat headers with __ delimiters
+        df = pd.DataFrame(
+            {
+                "epitope__name": ["GILGFVFTL", "NLVPMVATV", "SIINFEKL", "KLEDLERDL"],
+                "epitope__object_type": [
+                    "Linear peptide",
+                    "Linear peptide",
+                    "Linear peptide",
+                    "Linear peptide",
+                ],
+                "mhc_restriction__name": [
+                    "HLA-A*02:01",
+                    "HLA-B*07:02",
+                    "H-2Kb",
+                    "HLA-A*02:01",
+                ],
+                "host__name": [
+                    "Homo sapiens (human)",
+                    "Homo sapiens (human)",
+                    "Mus musculus (house mouse)",
+                    "Homo sapiens (human)",
+                ],
+                "assay__qualitative_measurement": [
+                    "Positive-High",
+                    "Positive-Low",
+                    "Positive",
+                    "Negative",
+                ],
+            }
+        )
+        df.to_csv(ligand_dir / "mhc_ligand_full_v3.csv", index=False)
+
+        output_dir = tmp_path / "output"
+        standardizer = CedarPmhcStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["status"] == "completed"
+        # Mouse record filtered out, 3 human records remain
+        # (2 positive + 1 negative — all pass standardization)
+        assert summary["rows"] >= 2
+        _verify_output(output_dir)
+
+        result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
+        assert all(result["source"] == "cedar_pmhc")
+        # Check binding labels: positive -> pos, negative -> neg
+        pos_rows = result[result["binding"] == "pos"]
+        neg_rows = result[result["binding"] == "neg"]
+        assert len(pos_rows) >= 2
+        assert len(neg_rows) >= 1
+        # No TCR data
+        assert all(result["tra"] == "")
+        assert all(result["trb"] == "")
 
 
 # -----------------------------------------------------------------------

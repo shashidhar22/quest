@@ -31,6 +31,8 @@ from scripts.data_processing.standardize.mcpas import McpasStandardizer
 from scripts.data_processing.standardize.vdjdb import VdjdbStandardizer
 from scripts.data_processing.standardize.cedar import CedarStandardizer
 from scripts.data_processing.standardize.iedb import IedbStandardizer
+from scripts.data_processing.standardize.iedb_pmhc import IedbPmhcStandardizer
+from scripts.data_processing.standardize.cedar_pmhc import CedarPmhcStandardizer
 from scripts.data_processing.standardize.immunecode import ImmunecodeStandardizer
 from scripts.data_processing.standardize.trait import TraitStandardizer
 from scripts.data_processing.standardize.ots import OtsStandardizer
@@ -56,6 +58,8 @@ SMALL_DBS = {
     "vdjdb": (VdjdbStandardizer, "vdjdb"),
     "cedar": (CedarStandardizer, "CEDAR"),
     "iedb": (IedbStandardizer, "IEDB"),
+    "iedb_pmhc": (IedbPmhcStandardizer, "IEDB"),
+    "cedar_pmhc": (CedarPmhcStandardizer, "CEDAR"),
 }
 
 # Large databases (run sequentially — memory-intensive streaming)
