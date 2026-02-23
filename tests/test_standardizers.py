@@ -763,20 +763,20 @@ class TestBindingScoreColumns:
         source_dir.mkdir()
         df = pd.DataFrame(
             {
-                "cdr3.alpha": ["CAVRDSNYQLIW", ""],
-                "v.alpha": ["TRAV1-2", ""],
-                "j.alpha": ["TRAJ33", ""],
-                "cdr3.beta": ["CASSLAPGATNEKLFF", "CASSLGQAYEQYF"],
-                "v.beta": ["TRBV6-5", "TRBV20-1"],
-                "d.beta": ["", ""],
-                "j.beta": ["TRBJ2-1", "TRBJ1-2"],
-                "species": ["HomoSapiens", "HomoSapiens"],
-                "mhc.a": ["HLA-A*02:01", "HLA-A*02:01"],
-                "mhc.b": ["B2M", "B2M"],
-                "mhc.class": ["MHCI", "MHCI"],
-                "antigen.epitope": ["GILGFVFTL", "NLVPMVATV"],
-                "vdjdb.score": ["3", "1"],
-                "meta.study.id": ["study1", "study2"],
+                "cdr3.alpha": ["CAVRDSNYQLIW", "", "CAVKDSNYQLIW"],
+                "v.alpha": ["TRAV1-2", "", "TRAV12-1"],
+                "j.alpha": ["TRAJ33", "", "TRAJ49"],
+                "cdr3.beta": ["CASSLAPGATNEKLFF", "CASSLGQAYEQYF", "CASSDRGYTFGSGANVLTF"],
+                "v.beta": ["TRBV6-5", "TRBV20-1", "TRBV6-5"],
+                "d.beta": ["", "", ""],
+                "j.beta": ["TRBJ2-1", "TRBJ1-2", "TRBJ2-1"],
+                "species": ["HomoSapiens", "HomoSapiens", "HomoSapiens"],
+                "mhc.a": ["HLA-A*02:01", "HLA-A*02:01", "HLA-A*02:01"],
+                "mhc.b": ["B2M", "B2M", "B2M"],
+                "mhc.class": ["MHCI", "MHCI", "MHCI"],
+                "antigen.epitope": ["GILGFVFTL", "NLVPMVATV", "KLVALGINAV"],
+                "vdjdb.score": ["3", "1", "0"],
+                "meta.study.id": ["study1", "study2", "study3"],
             }
         )
         df.to_csv(source_dir / "vdjdb_full.txt", sep="\t", index=False)
@@ -787,11 +787,31 @@ class TestBindingScoreColumns:
         )
         standardizer.run(force=True)
 
-        result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
+        # Read all parquet files (multiple yields produce multiple parts)
+        all_parts = sorted(output_dir.glob("*.parquet"))
+        result = pd.concat(
+            [pq.read_table(p).to_pandas() for p in all_parts], ignore_index=True,
+        )
         assert "score" in result.columns
         assert "binding" in result.columns
-        assert list(result["score"]) == ["3", "1"]
-        assert all(result["binding"] == "")
+
+        # High-score rows should retain all fields
+        high_score = result[result["score"].isin(["3", "1"])]
+        assert len(high_score) == 2
+        assert all(high_score["peptide"] != "")
+
+        # Score-0 rows should be split into TCR-only and pMHC-only
+        score_zero = result[result["score"] == "0"]
+        # TCR-only row has no peptide/MHC, pMHC-only row has no TCR
+        tcr_only = score_zero[(score_zero["tra"] != "") | (score_zero["trb"] != "")]
+        pmhc_only = score_zero[(score_zero["peptide"] != "") | (score_zero["mhc_one"] != "")]
+        assert len(tcr_only) >= 1
+        assert len(pmhc_only) >= 1
+        # TCR-only should have empty peptide
+        assert all(tcr_only["peptide"] == "")
+        # pMHC-only should have empty TCR
+        assert all(pmhc_only["tra"] == "")
+        assert all(pmhc_only["trb"] == "")
 
     def test_trait_binding_from_filename(self, tmp_path):
         """TRAIT extracts pos/neg binder status from filename."""
@@ -959,6 +979,194 @@ class TestVdjdbStudyId:
 
         result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
         assert list(result["study_id"]) == ["PMID:111", "PMID:333"]
+
+
+# -----------------------------------------------------------------------
+# VDJdb score-based row splitting
+# -----------------------------------------------------------------------
+class TestVdjdbScoreSplitting:
+    def test_score_zero_split_into_tcr_and_pmhc(self, tmp_path):
+        """Score-0 row with TCR+peptide+MHC produces TCR-only + pMHC-only rows."""
+        from scripts.data_processing.standardize.vdjdb import VdjdbStandardizer
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        df = pd.DataFrame(
+            {
+                "cdr3.alpha": ["CAVRDSNYQLIW"],
+                "v.alpha": ["TRAV1-2"],
+                "j.alpha": ["TRAJ33"],
+                "cdr3.beta": ["CASSLAPGATNEKLFF"],
+                "v.beta": ["TRBV6-5"],
+                "d.beta": [""],
+                "j.beta": ["TRBJ2-1"],
+                "species": ["HomoSapiens"],
+                "mhc.a": ["HLA-A*02:01"],
+                "mhc.b": ["B2M"],
+                "mhc.class": ["MHCI"],
+                "antigen.epitope": ["GILGFVFTL"],
+                "vdjdb.score": ["0"],
+                "meta.study.id": ["study1"],
+            }
+        )
+        df.to_csv(source_dir / "vdjdb_full.txt", sep="\t", index=False)
+
+        output_dir = tmp_path / "output"
+        standardizer = VdjdbStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["status"] == "completed"
+
+        all_parts = sorted(output_dir.glob("*.parquet"))
+        result = pd.concat(
+            [pq.read_table(p).to_pandas() for p in all_parts], ignore_index=True,
+        )
+        # Should produce 2 rows: TCR-only + pMHC-only
+        assert len(result) == 2
+
+        # TCR-only row: has CDR3 but no peptide/MHC
+        tcr_row = result[(result["tra"] != "") | (result["trb"] != "")]
+        assert len(tcr_row) == 1
+        assert tcr_row.iloc[0]["tra"] == "CAVRDSNYQLIW"
+        assert tcr_row.iloc[0]["trb"] == "CASSLAPGATNEKLFF"
+        assert tcr_row.iloc[0]["peptide"] == ""
+        assert tcr_row.iloc[0]["mhc_one"] == ""
+
+        # pMHC-only row: has peptide/MHC but no CDR3
+        pmhc_row = result[(result["peptide"] != "") | (result["mhc_one"] != "")]
+        assert len(pmhc_row) == 1
+        assert pmhc_row.iloc[0]["peptide"] == "GILGFVFTL"
+        assert pmhc_row.iloc[0]["mhc_one"] == "HLA-A*02:01"
+        assert pmhc_row.iloc[0]["tra"] == ""
+        assert pmhc_row.iloc[0]["trb"] == ""
+
+    def test_score_one_keeps_all_fields(self, tmp_path):
+        """Score-1 row keeps all fields intact (full interaction training)."""
+        from scripts.data_processing.standardize.vdjdb import VdjdbStandardizer
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        df = pd.DataFrame(
+            {
+                "cdr3.alpha": ["CAVRDSNYQLIW"],
+                "v.alpha": ["TRAV1-2"],
+                "j.alpha": ["TRAJ33"],
+                "cdr3.beta": ["CASSLAPGATNEKLFF"],
+                "v.beta": ["TRBV6-5"],
+                "d.beta": [""],
+                "j.beta": ["TRBJ2-1"],
+                "species": ["HomoSapiens"],
+                "mhc.a": ["HLA-A*02:01"],
+                "mhc.b": ["B2M"],
+                "mhc.class": ["MHCI"],
+                "antigen.epitope": ["GILGFVFTL"],
+                "vdjdb.score": ["1"],
+                "meta.study.id": ["study1"],
+            }
+        )
+        df.to_csv(source_dir / "vdjdb_full.txt", sep="\t", index=False)
+
+        output_dir = tmp_path / "output"
+        standardizer = VdjdbStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["status"] == "completed"
+        assert summary["rows"] == 1
+
+        result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
+        assert len(result) == 1
+        row = result.iloc[0]
+        assert row["tra"] == "CAVRDSNYQLIW"
+        assert row["trb"] == "CASSLAPGATNEKLFF"
+        assert row["peptide"] == "GILGFVFTL"
+        assert row["mhc_one"] == "HLA-A*02:01"
+        assert row["score"] == "1"
+
+    def test_missing_score_treated_as_trusted(self, tmp_path):
+        """Row without vdjdb.score column is treated as score>=1 (full row)."""
+        from scripts.data_processing.standardize.vdjdb import VdjdbStandardizer
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        df = pd.DataFrame(
+            {
+                "cdr3.alpha": ["CAVRDSNYQLIW"],
+                "v.alpha": ["TRAV1-2"],
+                "j.alpha": ["TRAJ33"],
+                "cdr3.beta": ["CASSLAPGATNEKLFF"],
+                "v.beta": ["TRBV6-5"],
+                "d.beta": [""],
+                "j.beta": ["TRBJ2-1"],
+                "species": ["HomoSapiens"],
+                "mhc.a": ["HLA-A*02:01"],
+                "mhc.b": ["B2M"],
+                "mhc.class": ["MHCI"],
+                "antigen.epitope": ["GILGFVFTL"],
+                "meta.study.id": ["study1"],
+            }
+        )
+        df.to_csv(source_dir / "vdjdb_full.txt", sep="\t", index=False)
+
+        output_dir = tmp_path / "output"
+        standardizer = VdjdbStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["status"] == "completed"
+        assert summary["rows"] == 1
+
+        result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
+        assert len(result) == 1
+        row = result.iloc[0]
+        # All fields should be present (treated as full row)
+        assert row["tra"] == "CAVRDSNYQLIW"
+        assert row["trb"] == "CASSLAPGATNEKLFF"
+        assert row["peptide"] == "GILGFVFTL"
+        assert row["mhc_one"] == "HLA-A*02:01"
+
+    def test_score_zero_tcr_only_when_no_peptide(self, tmp_path):
+        """Score-0 row with TCR but no peptide/MHC → only TCR-only row emitted."""
+        from scripts.data_processing.standardize.vdjdb import VdjdbStandardizer
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        df = pd.DataFrame(
+            {
+                "cdr3.alpha": [""],
+                "v.alpha": [""],
+                "j.alpha": [""],
+                "cdr3.beta": ["CASSLAPGATNEKLFF"],
+                "v.beta": ["TRBV6-5"],
+                "d.beta": [""],
+                "j.beta": ["TRBJ2-1"],
+                "species": ["HomoSapiens"],
+                "mhc.a": [""],
+                "mhc.b": [""],
+                "mhc.class": [""],
+                "antigen.epitope": [""],
+                "vdjdb.score": ["0"],
+                "meta.study.id": ["study1"],
+            }
+        )
+        df.to_csv(source_dir / "vdjdb_full.txt", sep="\t", index=False)
+
+        output_dir = tmp_path / "output"
+        standardizer = VdjdbStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["status"] == "completed"
+        # Only TCR-only row, no pMHC row (no peptide/MHC data)
+        assert summary["rows"] == 1
+
+        result = pq.read_table(output_dir / "part_0000.parquet").to_pandas()
+        assert len(result) == 1
+        row = result.iloc[0]
+        assert row["trb"] == "CASSLAPGATNEKLFF"
+        assert row["peptide"] == ""
+        assert row["mhc_one"] == ""
 
 
 # -----------------------------------------------------------------------
