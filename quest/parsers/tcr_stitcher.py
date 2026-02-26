@@ -76,6 +76,7 @@ class TCRStitcher:
         self.species = species.upper()
         self.enabled = STITCHR_AVAILABLE
         self.use_imgt_formatter = IMGT_FORMATTER_AVAILABLE
+        self._gene_cache: dict[tuple[str, str], str | None] = {}
 
         # Suppress noisy tidytcells warnings
         if TIDYTCELLS_AVAILABLE:
@@ -187,6 +188,11 @@ class TCRStitcher:
         if not gene or pd.isna(gene) or gene == '' or gene.upper() in ('NA', 'NAN', 'NONE', 'NULL'):
             return None
 
+        # Check cache
+        cache_key = (str(gene).strip(), chain)
+        if cache_key in self._gene_cache:
+            return self._gene_cache[cache_key]
+
         try:
             # Clean up gene name
             gene = str(gene).strip()
@@ -208,6 +214,7 @@ class TCRStitcher:
                     if normalized:
                         if gene != normalized:
                             logger.debug(f"tidytcells: {gene} -> {normalized}")
+                        self._gene_cache[cache_key] = normalized
                         return normalized
                 except Exception:
                     # Try without allele (gene-level only)
@@ -221,6 +228,7 @@ class TCRStitcher:
                                 allele = gene.split('*')[1]
                                 normalized = f"{normalized}*{allele}"
                             logger.debug(f"tidytcells (no allele): {gene} -> {normalized}")
+                            self._gene_cache[cache_key] = normalized
                             return normalized
                     except Exception as e:
                         logger.debug(f"tidytcells failed for {gene}: {e}")
@@ -231,6 +239,7 @@ class TCRStitcher:
                 if imgt_gene:
                     if gene != imgt_gene:
                         logger.debug(f"IMGT format: {gene} -> {imgt_gene}")
+                    self._gene_cache[cache_key] = imgt_gene
                     return imgt_gene
 
             # PRIORITY 3: Fallback to tcrconvert (EXISTING)
@@ -238,6 +247,7 @@ class TCRStitcher:
                 imgt_gene = self.convert_to_imgt(gene, chain)
                 if imgt_gene:
                     logger.debug(f"tcrconvert: {gene} -> {imgt_gene}")
+                    self._gene_cache[cache_key] = imgt_gene
                     return imgt_gene
 
             # PRIORITY 4: Manual normalization (EXISTING)
@@ -249,10 +259,12 @@ class TCRStitcher:
             gene = re.sub(r'([TRAV|TRBV|TRAJ|TRBJ|TRAD|TRBD])0*(\d+)-0*(\d+)', r'\1\2-\3', gene)
 
             logger.debug(f"Manual normalization: {gene}")
+            self._gene_cache[cache_key] = gene
             return gene
 
         except Exception as e:
             logger.debug(f"Gene normalization failed for {gene}: {e}")
+            self._gene_cache[cache_key] = None
             return None
     
     def stitch_tcr(
@@ -261,33 +273,39 @@ class TCRStitcher:
         v_gene: str,
         j_gene: str,
         chain: str,
-        c_gene: Optional[str] = None
+        c_gene: Optional[str] = None,
+        skip_normalize: bool = False
     ) -> Optional[str]:
         """
         Generate full-length TCR sequence using stitchr.
-        
+
         Args:
             cdr3: CDR3 amino acid sequence
             v_gene: V gene name (will be normalized to IMGT format)
             j_gene: J gene name (will be normalized to IMGT format)
             chain: 'TRA' or 'TRB'
             c_gene: Optional constant region gene (auto-selected if None)
-        
+            skip_normalize: If True, use v_gene/j_gene directly without re-normalizing
+
         Returns:
             Full-length TCR amino acid sequence or None if stitching fails
         """
         if not STITCHR_AVAILABLE or not all([cdr3, v_gene, j_gene]):
             return None
-        
+
         try:
             # Clean inputs
             cdr3 = str(cdr3).strip()
             v_gene = str(v_gene).strip()
             j_gene = str(j_gene).strip()
-            
-            # Normalize gene names to IMGT format
-            norm_v_gene = self.normalize_gene_name(v_gene, chain)
-            norm_j_gene = self.normalize_gene_name(j_gene, chain)
+
+            # Normalize gene names to IMGT format (unless already normalized)
+            if skip_normalize:
+                norm_v_gene = v_gene
+                norm_j_gene = j_gene
+            else:
+                norm_v_gene = self.normalize_gene_name(v_gene, chain)
+                norm_j_gene = self.normalize_gene_name(j_gene, chain)
             
             if not norm_v_gene or not norm_j_gene:
                 return None

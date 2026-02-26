@@ -5,6 +5,7 @@ Three-stage pipeline: molecule dedup → permutation generation → permutation 
 """
 
 import argparse
+import hashlib
 import heapq
 import json
 import os
@@ -89,37 +90,19 @@ def process_single_parquet(args: tuple) -> tuple:
     """
     Process a single parquet file and return (lines, count).
     This runs in a separate process for parallelization.
-    
-    If --stitch-tcr flag is enabled, will attempt to generate full-length
-    TCR sequences from CDR3 + gene segments using stitchr.
+
+    Extraction only: reads rows, creates dedup keys, and writes molecule data.
+    TCR stitching is deferred to the write phase (write_parquet_output).
     """
-    pf, mode, stitch_tcr = args
+    pf, mode, _stitch_tcr_unused = args
     lines = []
     valid_count = 0
-    stitch_success_count = 0
-    stitch_attempt_count = 0
-    
-    # Initialize stitcher if needed (once per process)
-    stitcher = None
-    gene_norm_failures = {'trav': 0, 'traj': 0, 'trbv': 0, 'trbj': 0}
 
-    if stitch_tcr and STITCHER_AVAILABLE:
-        try:
-            stitcher = TCRStitcher(species="HUMAN")
-            # Suppress tidytcells warnings for cleaner output
-            import logging
-            logging.getLogger('tidytcells').setLevel(logging.ERROR)
-        except Exception as e:
-            print(f"Warning: Failed to initialize TCRStitcher in process: {e}")
-            stitcher = None
-    
     try:
         table = pq.read_table(pf)
         df = table.to_pandas()
-        
-        for _, row in df.iterrows():
-            row_dict = row.to_dict()
 
+        for row_dict in df.to_dict('records'):
             # Filter negative binding for MLM mode
             if mode == "mlm":
                 binding_val = str(row_dict.get("binding", "")).strip().lower()
@@ -127,7 +110,7 @@ def process_single_parquet(args: tuple) -> tuple:
                     continue
 
             dedup_key = create_dedup_key(row_dict, mode)
-            
+
             if dedup_key:  # Valid row
                 # Keep molecule columns (chains, peptide, MHC sequences and IDs)
                 # Also keep full-length stitched sequences and gene annotations
@@ -140,99 +123,15 @@ def process_single_parquet(args: tuple) -> tuple:
                             'binding', 'score',  # Binding/activity and confidence score
                             'source', 'study_id']  # Standardized schema provenance
                 }
-                
-                # Normalize gene names using tidytcells (Priority 1) and stitch sequences
-                if stitcher is not None:
-                    try:
-                        # Process TRA: normalize genes, then stitch if needed
-                        if 'tra' in molecule_data and molecule_data.get('tra'):
-                            # Normalize TRA genes using tidytcells (via TCRStitcher)
-                            trav = molecule_data.get('trav_gene')
-                            traj = molecule_data.get('traj_gene')
 
-                            if trav:
-                                norm_trav = stitcher.normalize_gene_name(trav, 'TRA')
-                                if norm_trav:
-                                    molecule_data['trav_gene'] = norm_trav
-                                else:
-                                    gene_norm_failures['trav'] += 1
-
-                            if traj:
-                                norm_traj = stitcher.normalize_gene_name(traj, 'TRA')
-                                if norm_traj:
-                                    molecule_data['traj_gene'] = norm_traj
-                                else:
-                                    gene_norm_failures['traj'] += 1
-
-                            # Stitch TRA if we have CDR3 + genes but no full-length sequence
-                            if ('tra_full' not in molecule_data or not molecule_data.get('tra_full')):
-                                stitch_attempt_count += 1
-                                tra_full = stitcher.stitch_tcr(
-                                    cdr3=molecule_data.get('tra'),
-                                    v_gene=molecule_data.get('trav_gene'),
-                                    j_gene=molecule_data.get('traj_gene'),
-                                    chain='TRA'
-                                )
-                                if tra_full:
-                                    molecule_data['tra_full'] = tra_full
-                                    stitch_success_count += 1
-
-                        # Process TRB: normalize genes, then stitch if needed
-                        if 'trb' in molecule_data and molecule_data.get('trb'):
-                            # Normalize TRB genes using tidytcells (via TCRStitcher)
-                            trbv = molecule_data.get('trbv_gene')
-                            trbj = molecule_data.get('trbj_gene')
-
-                            if trbv:
-                                norm_trbv = stitcher.normalize_gene_name(trbv, 'TRB')
-                                if norm_trbv:
-                                    molecule_data['trbv_gene'] = norm_trbv
-                                else:
-                                    gene_norm_failures['trbv'] += 1
-
-                            if trbj:
-                                norm_trbj = stitcher.normalize_gene_name(trbj, 'TRB')
-                                if norm_trbj:
-                                    molecule_data['trbj_gene'] = norm_trbj
-                                else:
-                                    gene_norm_failures['trbj'] += 1
-
-                            # Stitch TRB if we have CDR3 + genes but no full-length sequence
-                            if ('trb_full' not in molecule_data or not molecule_data.get('trb_full')):
-                                stitch_attempt_count += 1
-                                trb_full = stitcher.stitch_tcr(
-                                    cdr3=molecule_data.get('trb'),
-                                    v_gene=molecule_data.get('trbv_gene'),
-                                    j_gene=molecule_data.get('trbj_gene'),
-                                    chain='TRB'
-                                )
-                                if trb_full:
-                                    molecule_data['trb_full'] = trb_full
-                                    stitch_success_count += 1
-                    except Exception as e:
-                        # Don't fail the whole file for stitching errors
-                        pass
-                
                 lines.append(f"{dedup_key}\t{json.dumps(molecule_data)}\n")
                 valid_count += 1
     except Exception as e:
         print(f"Warning: Failed to read {pf}: {e}")
         import traceback
         print(f"Traceback: {traceback.format_exc()}")
-    
-    # Print stitching stats for this file (only if we tried stitching)
-    if stitch_tcr and stitch_attempt_count > 0:
-        success_rate = (stitch_success_count / stitch_attempt_count * 100) if stitch_attempt_count > 0 else 0
-        print(f"Stitching stats for {pf}: {stitch_success_count}/{stitch_attempt_count} ({success_rate:.1f}%)")
 
-        # Print gene normalization summary
-        total_failures = sum(gene_norm_failures.values())
-        if total_failures > 0:
-            print(f"  Gene normalization failures: {total_failures} " +
-                  f"(TRAV: {gene_norm_failures['trav']}, TRAJ: {gene_norm_failures['traj']}, " +
-                  f"TRBV: {gene_norm_failures['trbv']}, TRBJ: {gene_norm_failures['trbj']})")
-
-    return lines, valid_count, gene_norm_failures
+    return lines, valid_count, {}
 
 def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str, num_workers: int = None, stitch_tcr: bool = False) -> int:
     """
@@ -245,33 +144,18 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
     valid_count = 0
     
     print(f"   ℹ️  Using {num_workers} parallel workers")
-    if stitch_tcr:
-        print(f"   ℹ️  TCR stitching ENABLED - will generate full-length sequences from CDR3 + gene segments")
-    
-    with open(temp_file, 'w', buffering=8*1024*1024) as out:  # 8MB write buffer
-        total_gene_failures = {'trav': 0, 'traj': 0, 'trbv': 0, 'trbj': 0}
 
+    with open(temp_file, 'w', buffering=8*1024*1024) as out:  # 8MB write buffer
         with Pool(num_workers) as pool:
             # Process files in parallel
             args_list = [(pf, mode, stitch_tcr) for pf in parquet_files]
 
             with tqdm(desc="Extracting parquet files", unit=" files", total=len(parquet_files)) as pbar:
-                for lines, count, gene_failures in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
+                for lines, count, _gene_failures in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
                     # Write all lines from this file
                     out.writelines(lines)
                     valid_count += count
-                    # Aggregate gene normalization failures
-                    for gene_type in total_gene_failures:
-                        total_gene_failures[gene_type] += gene_failures.get(gene_type, 0)
                     pbar.update(1)
-
-        # Print final gene normalization summary
-        if stitch_tcr and sum(total_gene_failures.values()) > 0:
-            print(f"\n📊 Gene Normalization Summary:")
-            print(f"   Total failures: {sum(total_gene_failures.values())}")
-            for gene_type, count in total_gene_failures.items():
-                if count > 0:
-                    print(f"     {gene_type.upper()}: {count:,} malformed gene names")
 
     return valid_count
 
@@ -285,23 +169,17 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
         num_workers = cpu_count()  # Use all cores for maximum throughput
 
     print(f"   ℹ️  Using {num_workers} parallel workers (streaming extract)")
-    if stitch_tcr:
-        print(f"   ℹ️  TCR stitching ENABLED - will generate full-length sequences from CDR3 + gene segments")
 
     chunk_files: List[Path] = []
     current_chunk: List[str] = []
     chunk_idx = 0
     valid_count = 0
 
-    total_gene_failures = {'trav': 0, 'traj': 0, 'trbv': 0, 'trbj': 0}
     args_list = [(pf, mode, stitch_tcr) for pf in parquet_files]
     with Pool(num_workers) as pool:
         with tqdm(desc="Extracting + chunking", unit=" files", total=len(parquet_files)) as pbar:
-            for lines, count, gene_failures in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
+            for lines, count, _gene_failures in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
                 valid_count += count
-                # Aggregate gene normalization failures
-                for gene_type in total_gene_failures:
-                    total_gene_failures[gene_type] += gene_failures.get(gene_type, 0)
                 # Append lines and spill when needed
                 if lines:
                     current_chunk.extend(lines)
@@ -327,14 +205,6 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
         chunk_idx += 1
 
     print(f"   ℹ️  Created {len(chunk_files)} sorted chunk files (streamed)")
-
-    # Print final gene normalization summary
-    if stitch_tcr and sum(total_gene_failures.values()) > 0:
-        print(f"\n📊 Gene Normalization Summary:")
-        print(f"   Total failures: {sum(total_gene_failures.values())}")
-        for gene_type, count in total_gene_failures.items():
-            if count > 0:
-                print(f"     {gene_type.upper()}: {count:,} malformed gene names")
 
     return chunk_files, valid_count
 
@@ -906,32 +776,228 @@ def detect_resume_state(work_dir: Path) -> dict:
     return state
 
 
-def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Path, batch_size: int = 1000000):
+def _stitch_row(row_dict: dict, stitcher, stitch_cache: dict) -> None:
+    """Stitch TCR sequences for a row, using cache for repeated combos."""
+    for chain, cdr3_key, v_key, j_key, full_key in [
+        ('TRA', 'tra', 'trav_gene', 'traj_gene', 'tra_full'),
+        ('TRB', 'trb', 'trbv_gene', 'trbj_gene', 'trb_full'),
+    ]:
+        cdr3 = row_dict.get(cdr3_key, '')
+        v_gene = row_dict.get(v_key, '')
+        j_gene = row_dict.get(j_key, '')
+        if not (cdr3 and v_gene and j_gene):
+            continue
+        if row_dict.get(full_key):
+            continue
+
+        cache_key = (cdr3, v_gene, j_gene, chain)
+        if cache_key not in stitch_cache:
+            norm_v = stitcher.normalize_gene_name(v_gene, chain)
+            norm_j = stitcher.normalize_gene_name(j_gene, chain)
+            result = None
+            if norm_v and norm_j:
+                result = stitcher.stitch_tcr(
+                    cdr3=cdr3, v_gene=norm_v, j_gene=norm_j,
+                    chain=chain, skip_normalize=True
+                )
+            stitch_cache[cache_key] = result
+
+        result = stitch_cache[cache_key]
+        if result:
+            row_dict[full_key] = result
+
+
+def _stitch_file_chunk(args: tuple) -> tuple:
+    """
+    Worker: read a byte-range chunk of the deduped file, stitch, write results to TSV.
+    Returns (num_processed, num_stitched, output_path).
+    """
+    deduped_path, start_offset, end_offset, output_path = args
+    stitcher = TCRStitcher(species="HUMAN")
+    num_processed = 0
+    num_stitched = 0
+
+    with open(deduped_path, 'r') as infile, open(output_path, 'w', buffering=8*1024*1024) as out:
+        infile.seek(start_offset)
+        if start_offset > 0:
+            infile.readline()  # skip partial line
+
+        while infile.tell() < end_offset:
+            line = infile.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+
+            row_dict = json.loads(line)
+            num_processed += 1
+
+            for chain, cdr3_key, v_key, j_key, full_key in [
+                ('TRA', 'tra', 'trav_gene', 'traj_gene', 'tra_full'),
+                ('TRB', 'trb', 'trbv_gene', 'trbj_gene', 'trb_full'),
+            ]:
+                cdr3 = row_dict.get(cdr3_key, '')
+                v_gene = row_dict.get(v_key, '')
+                j_gene = row_dict.get(j_key, '')
+                if not (cdr3 and v_gene and j_gene):
+                    continue
+                if row_dict.get(full_key):
+                    continue
+
+                norm_v = stitcher.normalize_gene_name(v_gene, chain)
+                norm_j = stitcher.normalize_gene_name(j_gene, chain)
+                if not (norm_v and norm_j):
+                    continue
+
+                result = stitcher.stitch_tcr(
+                    cdr3=cdr3, v_gene=norm_v, j_gene=norm_j,
+                    chain=chain, skip_normalize=True
+                )
+                if result:
+                    md5_hex = hashlib.md5(
+                        f"{cdr3}|{v_gene}|{j_gene}|{chain}".encode()
+                    ).hexdigest()
+                    out.write(f"{md5_hex}\t{result}\n")
+                    num_stitched += 1
+
+    return num_processed, num_stitched, str(output_path)
+
+
+def pre_stitch_deduped_file(deduped_file: Path, tmp_dir: Path,
+                            num_workers: int = None) -> dict:
+    """
+    Parallel pre-stitch of deduped file. Returns compact dict[bytes, bytes].
+
+    Partitions the deduped file into byte-range chunks, dispatches parallel
+    workers that each write stitch results to per-worker TSV files, then
+    reads those TSVs into a compact dict (md5 digest -> ASCII sequence bytes).
+    """
+    if num_workers is None:
+        num_workers = min(cpu_count(), 64)
+
+    file_size = deduped_file.stat().st_size
+    if file_size == 0:
+        print("   No data to stitch (empty deduped file)")
+        return {}
+
+    chunk_size = max(1, file_size // num_workers)
+
+    # Build (start, end) byte offsets for each worker
+    args_list = []
+    for i in range(num_workers):
+        start = i * chunk_size
+        end = min((i + 1) * chunk_size, file_size)
+        if start >= file_size:
+            break
+        out_path = tmp_dir / f"stitch_worker_{i:04d}.tsv"
+        args_list.append((str(deduped_file), start, end, str(out_path)))
+
+    # Phase 1: Parallel stitching to per-worker files
+    total_processed = 0
+    total_stitched = 0
+    output_files = []
+    with Pool(len(args_list)) as pool:
+        for n_proc, n_stitch, out_path in tqdm(
+            pool.imap_unordered(_stitch_file_chunk, args_list),
+            total=len(args_list), desc="Pre-stitching chunks", unit=" chunks"
+        ):
+            total_processed += n_proc
+            total_stitched += n_stitch
+            output_files.append(Path(out_path))
+
+    print(f"   Processed {total_processed:,} molecules, stitched {total_stitched:,} chains")
+
+    # Phase 2: Load worker files into compact dict
+    print(f"   Loading stitch results into compact cache...")
+    stitch_cache = {}  # bytes(md5) -> bytes(sequence)
+    for f in tqdm(output_files, desc="Loading stitch files", unit=" files"):
+        if not f.exists():
+            continue
+        with open(f, 'r', buffering=8*1024*1024) as fh:
+            for line in fh:
+                parts = line.strip().split('\t', 1)
+                if len(parts) == 2:
+                    md5_key = bytes.fromhex(parts[0])
+                    if md5_key not in stitch_cache:  # first occurrence wins
+                        stitch_cache[md5_key] = parts[1].encode('ascii')
+        f.unlink()  # free disk immediately
+
+    print(f"   Cache: {len(stitch_cache):,} unique combos")
+    return stitch_cache
+
+
+def _lookup_stitch(row_dict: dict, stitch_cache: dict) -> None:
+    """Look up pre-stitched sequences from compact cache (md5 bytes -> seq bytes)."""
+    for chain, cdr3_key, v_key, j_key, full_key in [
+        ('TRA', 'tra', 'trav_gene', 'traj_gene', 'tra_full'),
+        ('TRB', 'trb', 'trbv_gene', 'trbj_gene', 'trb_full'),
+    ]:
+        cdr3 = row_dict.get(cdr3_key, '')
+        v_gene = row_dict.get(v_key, '')
+        j_gene = row_dict.get(j_key, '')
+        if not (cdr3 and v_gene and j_gene):
+            continue
+        if row_dict.get(full_key):
+            continue
+
+        md5_key = hashlib.md5(f"{cdr3}|{v_gene}|{j_gene}|{chain}".encode()).digest()
+        result = stitch_cache.get(md5_key)
+        if result:
+            row_dict[full_key] = result.decode('ascii')
+
+
+def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Path,
+                         batch_size: int = 1000000, stitch_tcr: bool = False,
+                         pre_stitch_cache: dict = None):
     """
     Convert deduplicated text file to two parquet outputs:
     1. CDR3 version (tra/trb) - permutation_key, concatenated_sequence (all rows)
     2. Full-length version (tra_full/trb_full) - permutation_key, concatenated_sequence
-    
+
     FILTERING: The full-length output only includes rows where at least one full-length
     TCR sequence (tra_full or trb_full) exists. Rows with only CDR3 data are excluded.
-    
+
     IMPORTANT: Permutation keys in the full-length output only include fields where
     the full-length version actually exists:
     - permutation_key='tra' means tra_full exists
     - permutation_key='tra_trb' means both tra_full and trb_full exist
     - permutation_key='peptide' means only peptide (no TCR full-length)
-    
+
     This allows users to filter for rows with specific full-length molecules.
+
+    Args:
+        pre_stitch_cache: Compact dict[bytes, bytes] from pre_stitch_deduped_file().
+            When provided, uses fast md5 lookup instead of inline stitching.
+            When None and stitch_tcr=True, falls back to inline stitching.
     """
     print(f"\n📊 Writing parquet outputs...")
-    
+
+    # Determine stitching strategy
+    stitcher = None
+    inline_stitch_cache: dict = {}
+    if pre_stitch_cache is not None:
+        print(f"   Using pre-stitch cache ({len(pre_stitch_cache):,} entries)")
+    elif stitch_tcr and STITCHER_AVAILABLE:
+        # Fallback: inline stitching (e.g., when resuming without deduped file)
+        try:
+            stitcher = TCRStitcher(species="HUMAN")
+            import logging as _logging
+            _logging.getLogger('tidytcells').setLevel(_logging.ERROR)
+            print(f"   TCR stitching ENABLED (inline fallback) - will generate full-length sequences")
+        except Exception as e:
+            print(f"Warning: Failed to initialize TCRStitcher: {e}")
+            stitcher = None
+
     output_dir.mkdir(exist_ok=True, parents=True)
     output_dir_full.mkdir(exist_ok=True, parents=True)
-    
+
     batch_num = 0
     batch_data_cdr3 = []
     batch_data_full = []
-    
+    stitch_attempts = 0
+    stitch_hits = 0
+
     with open(input_file, 'r') as f:
         with tqdm(desc="Writing parquet", unit=" rows", unit_scale=True) as pbar:
             for line in f:
@@ -955,6 +1021,17 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
                             present_fields.append(field)
                     old_perm_key = "_".join(present_fields) if present_fields else "empty"
                 
+                # Stitch TCR sequences: pre-stitch cache (fast) or inline fallback
+                if pre_stitch_cache is not None:
+                    _lookup_stitch(row_dict, pre_stitch_cache)
+                    stitch_attempts += 1
+                elif stitcher is not None:
+                    cache_size_before = len(inline_stitch_cache)
+                    _stitch_row(row_dict, stitcher, inline_stitch_cache)
+                    stitch_attempts += 1
+                    if len(inline_stitch_cache) == cache_size_before:
+                        stitch_hits += 1
+
                 # Parse old permutation key to get field order and sequences
                 field_order, sequences_dict = parse_permutation_key(old_perm_key)
                 
@@ -1067,6 +1144,20 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
     print(f"   CDR3: {output_dir} ({cdr3_files} files)")
     print(f"   Full: {output_dir_full} ({full_files} files, filtered for full-length TCR sequences)")
 
+    # Print stitch statistics
+    if pre_stitch_cache is not None and stitch_attempts > 0:
+        print(f"\n   Stitch statistics (pre-stitch cache):")
+        print(f"   Rows processed: {stitch_attempts:,}")
+        print(f"   Cache entries: {len(pre_stitch_cache):,} unique combos")
+    elif stitcher is not None and stitch_attempts > 0:
+        cache_hit_rate = (stitch_hits / stitch_attempts * 100) if stitch_attempts > 0 else 0
+        stitch_successes = sum(1 for v in inline_stitch_cache.values() if v is not None)
+        print(f"\n   Stitch statistics (inline fallback):")
+        print(f"   Rows processed: {stitch_attempts:,}")
+        print(f"   Cache entries: {len(inline_stitch_cache):,} unique (cdr3, v, j, chain) combos")
+        print(f"   Cache hit rate: {cache_hit_rate:.1f}%")
+        print(f"   Successful stitches: {stitch_successes:,}/{len(inline_stitch_cache):,} unique combos")
+
 def main():
     parser = argparse.ArgumentParser(description="Streaming deduplication with external sort")
     parser.add_argument("--path", nargs='+', required=True, help="Input parquet directories")
@@ -1118,6 +1209,8 @@ def main():
         all_files.extend(glob.glob(f"{path}/**/*.parquet", recursive=True))
 
     print(f"📁 Found {len(all_files):,} parquet files")
+    if args.stitch_tcr:
+        print(f"   ℹ️  TCR stitching will run post-dedup during output writing (cached)")
 
     if args.sample:
         import random
@@ -1215,7 +1308,19 @@ def main():
         unique_count = stream_deduplicate(sorted_file, deduped_file)
         print(f"✓ Found {unique_count:,} unique molecules")
         sorted_file.unlink()
-    
+
+    # Pre-stitch if enabled (between dedup and permutations)
+    stitch_cache = None
+    if args.stitch_tcr and STITCHER_AVAILABLE:
+        # Only run pre-stitch if the deduped file exists (not resuming past it)
+        if deduped_file.exists():
+            print(f"\n{'='*60}")
+            print(f"PRE-STITCHING ({unique_count:,} deduplicated molecules)")
+            print(f"{'='*60}")
+            stitch_cache = pre_stitch_deduped_file(deduped_file, work_dir, args.num_workers)
+        else:
+            print(f"\n   Pre-stitch skipped (deduped file not available, will use inline fallback)")
+
     # Stage 2: Permutation generation (if requested)
     if not args.no_permutations:
         perm_file = work_dir / "permutations.txt"
@@ -1236,7 +1341,8 @@ def main():
             print(f"{'='*60}")
 
             perm_count = generate_permutations(deduped_file, perm_file, args.mode, args.max_permutations, args.num_workers)
-            print(f"✓ Generated {perm_count:,} permutations ({perm_count/unique_count:.1f}x expansion)")
+            expansion = perm_count / unique_count if unique_count > 0 else 0
+            print(f"✓ Generated {perm_count:,} permutations ({expansion:.1f}x expansion)")
             deduped_file.unlink()
 
         # Stage 3: Permutation deduplication (optional)
@@ -1288,7 +1394,8 @@ def main():
     else:
         output_dir_full = Path(str(output_dir) + "_full")
     
-    write_parquet_output(final_file, output_dir, output_dir_full)
+    write_parquet_output(final_file, output_dir, output_dir_full,
+                         stitch_tcr=args.stitch_tcr, pre_stitch_cache=stitch_cache)
     final_file.unlink()
     
     # Summary
