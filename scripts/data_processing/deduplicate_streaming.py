@@ -955,14 +955,17 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
     1. CDR3 version (tra/trb) - permutation_key, concatenated_sequence (all rows)
     2. Full-length version (tra_full/trb_full) - permutation_key, concatenated_sequence
 
-    FILTERING: The full-length output only includes rows where at least one full-length
-    TCR sequence (tra_full or trb_full) exists. Rows with only CDR3 data are excluded.
+    FILTERING: The full-length output includes rows where at least one valid sequence
+    part exists. For TCR fields (tra/trb), this requires the full-length stitched
+    version (tra_full/trb_full). For non-TCR fields (peptide, mhc_one, mhc_two),
+    the regular value is used as-is. Rows with no valid fields at all are excluded.
 
     IMPORTANT: Permutation keys in the full-length output only include fields where
     the full-length version actually exists:
     - permutation_key='tra' means tra_full exists
     - permutation_key='tra_trb' means both tra_full and trb_full exist
     - permutation_key='peptide' means only peptide (no TCR full-length)
+    - permutation_key='peptide_mhc_one' means peptide + MHC-I (pMHC record)
 
     This allows users to filter for rows with specific full-length molecules.
 
@@ -1093,17 +1096,10 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
                 seq_full = " ".join(seq_parts_full)
                 perm_key_full = "_".join(actual_fields_full) if actual_fields_full else "empty"
                 
-                # Filter: Only include in full output if we have at least one full-length TCR sequence
-                # Check if tra_full or trb_full actually exists in the row
-                has_full_tcr = ('tra_full' in row_dict and row_dict.get('tra_full') and 
-                               str(row_dict['tra_full']) != 'nan' and str(row_dict['tra_full']) != '' and 
-                               not isinstance(row_dict['tra_full'], float)) or \
-                              ('trb_full' in row_dict and row_dict.get('trb_full') and 
-                               str(row_dict['trb_full']) != 'nan' and str(row_dict['trb_full']) != '' and 
-                               not isinstance(row_dict['trb_full'], float))
-                
-                # Only add to full output if we have at least one full-length TCR sequence
-                if has_full_tcr:
+                # Include in full output if we have any valid sequence parts.
+                # For TCR fields, this requires the full-length stitched version (tra_full/trb_full).
+                # For non-TCR fields (peptide, mhc_one, mhc_two), the regular value is used as-is.
+                if actual_fields_full:
                     batch_data_full.append({
                         'permutation_key': perm_key_full,
                         'sequence': seq_full
