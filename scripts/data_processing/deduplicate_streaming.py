@@ -94,7 +94,7 @@ def process_single_parquet(args: tuple) -> tuple:
     Extraction only: reads rows, creates dedup keys, and writes molecule data.
     TCR stitching is deferred to the write phase (write_parquet_output).
     """
-    pf, mode, _stitch_tcr_unused = args
+    pf, mode, _stitch_tcr_unused, exclude_vdjdb_score_zero = args
     lines = []
     valid_count = 0
 
@@ -107,6 +107,13 @@ def process_single_parquet(args: tuple) -> tuple:
             if mode == "mlm":
                 binding_val = str(row_dict.get("binding", "")).strip().lower()
                 if binding_val == "neg":
+                    continue
+
+            # Exclude VDJdb score-0 records when flag is set
+            if exclude_vdjdb_score_zero:
+                source_val = str(row_dict.get("source", "")).strip().lower()
+                score_val = str(row_dict.get("score", "")).strip()
+                if source_val == "vdjdb" and score_val == "0":
                     continue
 
             dedup_key = create_dedup_key(row_dict, mode)
@@ -133,7 +140,7 @@ def process_single_parquet(args: tuple) -> tuple:
 
     return lines, valid_count, {}
 
-def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str, num_workers: int = None, stitch_tcr: bool = False) -> int:
+def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str, num_workers: int = None, stitch_tcr: bool = False, exclude_vdjdb_score_zero: bool = False) -> int:
     """
     Extract parquet files to temp file with dedup keys (parallelized).
     Returns number of valid rows extracted.
@@ -148,7 +155,7 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
     with open(temp_file, 'w', buffering=8*1024*1024) as out:  # 8MB write buffer
         with Pool(num_workers) as pool:
             # Process files in parallel
-            args_list = [(pf, mode, stitch_tcr) for pf in parquet_files]
+            args_list = [(pf, mode, stitch_tcr, exclude_vdjdb_score_zero) for pf in parquet_files]
 
             with tqdm(desc="Extracting parquet files", unit=" files", total=len(parquet_files)) as pbar:
                 for lines, count, _gene_failures in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
@@ -160,7 +167,8 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
     return valid_count
 
 def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, mode: str,
-                                     chunk_size: int, num_workers: int = None, stitch_tcr: bool = False) -> tuple[List[Path], int]:
+                                     chunk_size: int, num_workers: int = None, stitch_tcr: bool = False,
+                                     exclude_vdjdb_score_zero: bool = False) -> tuple[List[Path], int]:
     """
     Stream-extract parquet rows and directly build sorted chunk files without creating
     a giant intermediate extract file. Returns (chunk_files, valid_count).
@@ -175,7 +183,7 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
     chunk_idx = 0
     valid_count = 0
 
-    args_list = [(pf, mode, stitch_tcr) for pf in parquet_files]
+    args_list = [(pf, mode, stitch_tcr, exclude_vdjdb_score_zero) for pf in parquet_files]
     with Pool(num_workers) as pool:
         with tqdm(desc="Extracting + chunking", unit=" files", total=len(parquet_files)) as pbar:
             for lines, count, _gene_failures in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
@@ -273,14 +281,16 @@ def merge_sorted_files(chunk_files: List[Path], output_file: Path, temp_dir: Pat
     os.replace(chunk_files[0], output_file)
 
 def extract_and_sort_streaming(parquet_files: List[str], sorted_file: Path, temp_dir: Path, mode: str,
-                               num_workers: int, chunk_size: int, max_open_files: int, stitch_tcr: bool = False) -> tuple[int, float]:
+                               num_workers: int, chunk_size: int, max_open_files: int, stitch_tcr: bool = False,
+                               exclude_vdjdb_score_zero: bool = False) -> tuple[int, float]:
     """
     End-to-end streaming extract + chunked sort + multi-pass merge into sorted_file.
     Returns (valid_count, elapsed_seconds).
     """
     start = time.time()
     chunk_files, valid_count = extract_and_create_sorted_chunks(
-        parquet_files, temp_dir, mode, chunk_size, num_workers, stitch_tcr
+        parquet_files, temp_dir, mode, chunk_size, num_workers, stitch_tcr,
+        exclude_vdjdb_score_zero
     )
     merge_sorted_files(chunk_files, sorted_file, temp_dir, max_open_files=max_open_files)
     return valid_count, time.time() - start
@@ -761,16 +771,10 @@ def detect_resume_state(work_dir: Path) -> dict:
     if chunk_files:
         state['stage'] = 'chunks'
         state['chunk_files'] = chunk_files
-        # Try to estimate valid_count from chunk files
-        total_lines = 0
-        for chunk in chunk_files[:5]:  # Sample first 5 chunks
-            with open(chunk, 'r') as f:
-                total_lines += sum(1 for _ in f)
-        if len(chunk_files) <= 5:
-            state['valid_count'] = total_lines
-        else:
-            # Estimate based on sample
-            state['valid_count'] = int(total_lines * len(chunk_files) / 5)
+        # Estimate valid_count from file sizes (avoid slow line counting on large files)
+        total_bytes = sum(f.stat().st_size for f in chunk_files)
+        # Estimate ~100 bytes per line (typical for dedup key lines)
+        state['valid_count'] = int(total_bytes / 100)
         return state
 
     return state
@@ -995,7 +999,14 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
     output_dir.mkdir(exist_ok=True, parents=True)
     output_dir_full.mkdir(exist_ok=True, parents=True)
 
+    # Clear any existing parquet files to prevent stale file contamination
+    for old_file in output_dir.glob('*.parquet'):
+        old_file.unlink()
+    for old_file in output_dir_full.glob('*.parquet'):
+        old_file.unlink()
+
     batch_num = 0
+    batch_num_full = 0
     batch_data_cdr3 = []
     batch_data_full = []
     stitch_attempts = 0
@@ -1117,8 +1128,9 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
                 # Write full-length batch if ready (independent counter)
                 if len(batch_data_full) >= batch_size:
                     table_full = pa.Table.from_pylist(batch_data_full)
-                    output_file_full = output_dir_full / f"batch_{len(list(output_dir_full.glob('*.parquet'))):06d}.parquet"
+                    output_file_full = output_dir_full / f"batch_{batch_num_full:06d}.parquet"
                     pq.write_table(table_full, output_file_full)
+                    batch_num_full += 1
                     batch_data_full = []
             
             # Write remaining CDR3 data
@@ -1131,7 +1143,7 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
             # Write remaining full-length data
             if batch_data_full:
                 table_full = pa.Table.from_pylist(batch_data_full)
-                output_file_full = output_dir_full / f"batch_{len(list(output_dir_full.glob('*.parquet'))):06d}.parquet"
+                output_file_full = output_dir_full / f"batch_{batch_num_full:06d}.parquet"
                 pq.write_table(table_full, output_file_full)
     
     cdr3_files = len(list(output_dir.glob('*.parquet')))
@@ -1175,6 +1187,8 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume from existing intermediate files (chunk files, sorted files, etc.)")
     parser.add_argument("--standardized-input", action="store_true",
                         help="Input is from data/standardized/ (uses mhc_one/mhc_two allele IDs directly, no mhc_one_id mapping needed)")
+    parser.add_argument("--exclude-vdjdb-score-zero", action="store_true",
+                        help="Exclude VDJdb score-0 records (source='vdjdb' AND score='0')")
 
     args = parser.parse_args()
     
@@ -1207,6 +1221,8 @@ def main():
     print(f"📁 Found {len(all_files):,} parquet files")
     if args.stitch_tcr:
         print(f"   ℹ️  TCR stitching will run post-dedup during output writing (cached)")
+    if args.exclude_vdjdb_score_zero:
+        print(f"   ℹ️  Excluding VDJdb score-0 records")
 
     if args.sample:
         import random
@@ -1278,7 +1294,7 @@ def main():
                 # Traditional: extract → external sort
                 extract_file = work_dir / "extract.txt"
                 print("\n📊 Step 1/3: Extracting and tagging molecules...")
-                valid_count = extract_parquet_to_temp(all_files, extract_file, args.mode, args.num_workers, args.stitch_tcr)
+                valid_count = extract_parquet_to_temp(all_files, extract_file, args.mode, args.num_workers, args.stitch_tcr, args.exclude_vdjdb_score_zero)
                 size_gb = extract_file.stat().st_size / (1024**3)
                 print(f"✓ Extracted {valid_count:,} valid molecules ({size_gb:.2f} GB)")
 
@@ -1292,7 +1308,8 @@ def main():
                 valid_count, sort_time = extract_and_sort_streaming(
                     all_files, sorted_file, work_dir, args.mode,
                     args.num_workers if args.num_workers else cpu_count(),
-                    args.sort_chunk_size, args.sort_max_open_files, args.stitch_tcr
+                    args.sort_chunk_size, args.sort_max_open_files, args.stitch_tcr,
+                    args.exclude_vdjdb_score_zero
                 )
                 print(f"✓ Streamed extract+sort in {sort_time:.1f}s ({sort_time/60:.1f} min)")
 

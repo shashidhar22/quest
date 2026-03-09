@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-ESM-2 tokenizer with stratified train/val/test splitting.
+ESM tokenizer with stratified train/val/test splitting.
+Supports ESM2 (via HuggingFace transformers) and ESM-C (via EvolutionaryScale esm package).
 Optimized for parallel processing on multi-core systems (e.g., x2gd.16xlarge with 64 vCPUs).
 
 Two-phase approach:
@@ -10,11 +11,13 @@ Two-phase approach:
 
 import argparse
 import glob
+import json
 import os
+import warnings
 from collections import Counter
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -22,16 +25,56 @@ from datasets import Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
+# Try to import ESM-C tokenizer from EvolutionaryScale esm package
+try:
+    from esm.tokenization import EsmSequenceTokenizer
+    HAS_ESMC = True
+except ImportError:
+    HAS_ESMC = False
+
 
 # Global lookup table for vectorized tokenization (initialized in workers)
 WORKER_LUT = None
 WORKER_CLS_ID = None
 WORKER_EOS_ID = None
 WORKER_MAX_LENGTH = None
+WORKER_SEP_CHAR = None
 
 
-def build_ascii_lookup_table(tokenizer) -> np.ndarray:
-    """Build a 256-entry ASCII to token ID lookup table for vectorized tokenization."""
+def load_tokenizer(model_type: str, model_name: str) -> Tuple:
+    """Load tokenizer and return (tokenizer, default_separator_char).
+
+    Args:
+        model_type: "esm2" or "esmc"
+        model_name: HuggingFace model name (used for esm2 only)
+
+    Returns:
+        (tokenizer, default_separator_char)
+    """
+    if model_type == "esm2":
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        return tokenizer, "-"
+    elif model_type == "esmc":
+        if not HAS_ESMC:
+            raise ImportError(
+                "ESM-C tokenizer requires the esm package. "
+                "Install with: pip install esm"
+            )
+        tokenizer = EsmSequenceTokenizer()
+        return tokenizer, "|"
+    else:
+        raise ValueError(f"Unknown model_type: {model_type!r}. Must be 'esm2' or 'esmc'.")
+
+
+def build_ascii_lookup_table(
+    tokenizer, separator: Optional[str] = None
+) -> np.ndarray:
+    """Build a 256-entry ASCII to token ID lookup table for vectorized tokenization.
+
+    Args:
+        tokenizer: ESM tokenizer instance
+        separator: Optional separator character to validate against the vocab
+    """
     unk_token_id = tokenizer.unk_token_id
     lut = np.full(256, unk_token_id, dtype=np.int32)
 
@@ -39,15 +82,36 @@ def build_ascii_lookup_table(tokenizer) -> np.ndarray:
         if len(token) == 1:  # Single character tokens (amino acids)
             lut[ord(token)] = idx
 
+    if separator is not None:
+        sep_id = int(lut[ord(separator)])
+        if sep_id == unk_token_id:
+            raise ValueError(
+                f"Separator character {separator!r} (ord={ord(separator)}) maps to UNK "
+                f"(token_id={unk_token_id}). Choose a separator that exists in the "
+                f"tokenizer vocabulary."
+            )
+        # Warn if the separator is a standard amino acid
+        amino_acids = set("ACDEFGHIKLMNPQRSTVWY")
+        if separator in amino_acids:
+            warnings.warn(
+                f"Separator {separator!r} is a standard amino acid. This may cause "
+                f"ambiguity between molecule boundaries and real residues.",
+                stacklevel=2,
+            )
+
     return lut
 
 
 def tokenize_sequence_vectorized(seq: str) -> Tuple[List[int], List[int]]:
     """Tokenize a single sequence using numpy lookup table.
 
-    Uses global WORKER_LUT, WORKER_CLS_ID, WORKER_EOS_ID, WORKER_MAX_LENGTH
-    initialized by init_worker().
+    Uses global WORKER_LUT, WORKER_CLS_ID, WORKER_EOS_ID, WORKER_MAX_LENGTH,
+    WORKER_SEP_CHAR initialized by init_worker().
     """
+    # Replace spaces (molecule boundaries) with the separator character
+    if WORKER_SEP_CHAR is not None:
+        seq = seq.replace(' ', WORKER_SEP_CHAR)
+
     max_seq_len = WORKER_MAX_LENGTH - 2
 
     # Truncate if needed
@@ -153,13 +217,16 @@ def compute_global_split_assignments(
     return file_splits, train_counts, val_counts, test_counts
 
 
-def init_worker(lut: np.ndarray, cls_id: int, eos_id: int, max_length: int):
-    """Initialize worker process with lookup table and token IDs."""
-    global WORKER_LUT, WORKER_CLS_ID, WORKER_EOS_ID, WORKER_MAX_LENGTH
+def init_worker(
+    lut: np.ndarray, cls_id: int, eos_id: int, max_length: int, sep_char: str
+):
+    """Initialize worker process with lookup table, token IDs, and separator."""
+    global WORKER_LUT, WORKER_CLS_ID, WORKER_EOS_ID, WORKER_MAX_LENGTH, WORKER_SEP_CHAR
     WORKER_LUT = lut
     WORKER_CLS_ID = cls_id
     WORKER_EOS_ID = eos_id
     WORKER_MAX_LENGTH = max_length
+    WORKER_SEP_CHAR = sep_char
 
 
 def process_file_worker(args: Tuple) -> Dict:
@@ -242,6 +309,8 @@ def process_and_split_parallel(
     test_ratio: float = 0.1,
     num_workers: int = None,
     seed: int = 42,
+    model_type: str = "esm2",
+    separator: Optional[str] = None,
 ):
     """
     Main entry point for parallel tokenization with stratified splitting.
@@ -249,32 +318,45 @@ def process_and_split_parallel(
     Two-phase approach:
     1. Scan all files to compute global stratified split assignments
     2. Parallel tokenization with pre-assigned splits
+
+    Args:
+        model_type: "esm2" or "esmc"
+        separator: Single ASCII character used to replace spaces (molecule
+            boundaries) before tokenization. If None, uses the model default
+            ("-" for ESM2, "|" for ESM-C).
     """
     if num_workers is None:
         num_workers = cpu_count()
 
+    # Load tokenizer and resolve separator
+    tokenizer, default_sep = load_tokenizer(model_type, model_name)
+    sep_char = separator if separator is not None else default_sep
+
     print("=" * 70)
-    print("ESM-2 PARALLEL TOKENIZER")
+    print("ESM PARALLEL TOKENIZER")
     print("=" * 70)
     print(f"Input directory:  {input_dir}")
     print(f"Output directory: {output_dir}")
-    print(f"Model:            {model_name}")
+    print(f"Model type:       {model_type}")
+    if model_type == "esm2":
+        print(f"Model:            {model_name}")
+    print(f"Separator:        {sep_char!r}")
     print(f"Max length:       {max_length}")
     print(f"Split ratios:     train={train_ratio:.0%}, val={val_ratio:.0%}, test={test_ratio:.0%}")
     print(f"Workers:          {num_workers}")
     print(f"Seed:             {seed}")
     print("=" * 70)
 
-    # Load tokenizer and build lookup table
-    print(f"\nLoading tokenizer: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    lut = build_ascii_lookup_table(tokenizer)
+    # Build lookup table (validates separator against vocab)
+    print(f"\nLoading tokenizer: {model_type}")
+    lut = build_ascii_lookup_table(tokenizer, separator=sep_char)
     cls_token_id = tokenizer.cls_token_id
     eos_token_id = tokenizer.eos_token_id
 
-    vocab_size = np.sum(lut != tokenizer.unk_token_id)
-    print(f"  Vocab size: {vocab_size} amino acids")
+    vocab_size = int(np.sum(lut != tokenizer.unk_token_id))
+    print(f"  Vocab size: {vocab_size} tokens (single-char)")
     print(f"  CLS={cls_token_id}, EOS={eos_token_id}, UNK={tokenizer.unk_token_id}")
+    print(f"  Separator {sep_char!r} -> token_id={int(lut[ord(sep_char)])}")
 
     # Find input files
     file_paths = sorted(glob.glob(os.path.join(input_dir, "*.parquet")))
@@ -322,7 +404,7 @@ def process_and_split_parallel(
     with Pool(
         num_workers,
         initializer=init_worker,
-        initargs=(lut, cls_token_id, eos_token_id, max_length)
+        initargs=(lut, cls_token_id, eos_token_id, max_length, sep_char)
     ) as pool:
         with tqdm(total=len(worker_args), desc="Tokenizing files") as pbar:
             for result in pool.imap_unordered(process_file_worker, worker_args):
@@ -364,6 +446,29 @@ def process_and_split_parallel(
         for k, c in sorted(val_counts.items(), key=lambda x: -x[1]):
             print(f"  {k:<30} {c:>12,} ({c/t*100:5.1f}%)")
 
+    # Save tokenizer metadata
+    tokenizer_config = {
+        "model_type": model_type,
+        "model_name": model_name if model_type == "esm2" else "esmc",
+        "separator_token": sep_char,
+        "separator_token_id": int(lut[ord(sep_char)]),
+        "cls_token_id": cls_token_id,
+        "eos_token_id": eos_token_id,
+        "unk_token_id": int(tokenizer.unk_token_id),
+        "max_length": max_length,
+        "vocab_size": vocab_size,
+        "seed": seed,
+        "split_ratios": {
+            "train": train_ratio,
+            "val": val_ratio,
+            "test": test_ratio,
+        },
+    }
+    config_path = Path(output_dir) / "tokenizer_config.json"
+    with open(config_path, "w") as f:
+        json.dump(tokenizer_config, f, indent=2)
+    print(f"\nTokenizer config saved to: {config_path}")
+
     print(f"\nOutput saved to: {output_dir}")
     print(f"  Train shards:      {train_dir}")
     print(f"  Validation shards: {val_dir}")
@@ -372,13 +477,20 @@ def process_and_split_parallel(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Parallel tokenization with stratified train/val/test splitting"
+        description="Parallel ESM tokenization with stratified train/val/test splitting"
     )
     parser.add_argument("--input-dir", type=str,
                         default="/home/ubuntu/quest/data/deduplicated/full/foundation")
     parser.add_argument("--output-dir", type=str,
                         default="/home/ubuntu/quest/data/tokenized/full/foundation_stratified")
-    parser.add_argument("--model", type=str, default="facebook/esm2_t12_35M_UR50D")
+    parser.add_argument("--model-type", type=str, default="esm2",
+                        choices=["esm2", "esmc"],
+                        help="Model family: esm2 (HuggingFace) or esmc (EvolutionaryScale)")
+    parser.add_argument("--model", type=str, default="facebook/esm2_t12_35M_UR50D",
+                        help="HuggingFace model name (only used for esm2)")
+    parser.add_argument("--separator", type=str, default=None,
+                        help="Single ASCII character to replace spaces (molecule boundaries). "
+                             "Default: '-' for esm2, '|' for esmc")
     parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
@@ -392,6 +504,16 @@ def main():
     if abs(args.train_ratio + args.val_ratio + args.test_ratio - 1.0) > 0.001:
         parser.error("Ratios must sum to 1.0")
 
+    if args.separator is not None and len(args.separator) != 1:
+        parser.error("--separator must be a single ASCII character")
+
+    if args.model_type == "esmc" and args.model != "facebook/esm2_t12_35M_UR50D":
+        warnings.warn(
+            f"--model {args.model!r} is ignored when --model-type is 'esmc'. "
+            "ESM-C uses its built-in tokenizer.",
+            stacklevel=2,
+        )
+
     process_and_split_parallel(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
@@ -402,6 +524,8 @@ def main():
         test_ratio=args.test_ratio,
         num_workers=args.num_workers,
         seed=args.seed,
+        model_type=args.model_type,
+        separator=args.separator,
     )
 
 
