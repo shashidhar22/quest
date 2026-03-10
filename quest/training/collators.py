@@ -40,6 +40,7 @@ class DataCollatorForMLMWithPacking:
         tokenizer,
         max_seq_length: int = 1024,
         mlm_probability: float = 0.15,
+        separator_token_id: int | None = None,
     ):
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
@@ -56,6 +57,8 @@ class DataCollatorForMLMWithPacking:
             tokenizer.sep_token_id,
             tokenizer.unk_token_id,
         ]
+        if separator_token_id is not None:
+            special_ids.append(separator_token_id)
         special_ids = [x for x in special_ids if x is not None]
         self.special_token_ids = torch.tensor(special_ids, dtype=torch.long)
 
@@ -137,7 +140,13 @@ class DataCollatorForMLMDynamic:
     More efficient than packing when sequences have similar lengths.
     """
 
-    def __init__(self, tokenizer, mlm_probability: float = 0.15, pad_to_multiple_of: int = 8):
+    def __init__(
+        self,
+        tokenizer,
+        mlm_probability: float = 0.15,
+        pad_to_multiple_of: int = 8,
+        separator_token_id: int | None = None,
+    ):
         self.tokenizer = tokenizer
         self.mlm_probability = mlm_probability
         self.pad_token_id = tokenizer.pad_token_id
@@ -152,6 +161,8 @@ class DataCollatorForMLMDynamic:
             tokenizer.sep_token_id,
             tokenizer.unk_token_id,
         ]
+        if separator_token_id is not None:
+            special_ids.append(separator_token_id)
         self.special_token_ids = torch.tensor([x for x in special_ids if x is not None], dtype=torch.long)
 
     def __call__(self, examples):
@@ -230,6 +241,7 @@ class DataCollatorForMLMWithVarlen:
         tokenizer,
         max_seq_length: int = 1024,
         mlm_probability: float = 0.15,
+        separator_token_id: int | None = None,
     ):
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
@@ -246,6 +258,8 @@ class DataCollatorForMLMWithVarlen:
             tokenizer.sep_token_id,
             tokenizer.unk_token_id,
         ]
+        if separator_token_id is not None:
+            special_ids.append(separator_token_id)
         self.special_token_ids = torch.tensor(
             [x for x in special_ids if x is not None], dtype=torch.long
         )

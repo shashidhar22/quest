@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-Native PyTorch ESM2 MLM Fine-tuning with DDP.
-Optimized for p4d.24xlarge (8x A100 40GB).
+Native PyTorch ESM-C MLM Fine-tuning with DDP.
 
-This script provides a pure PyTorch training loop without HuggingFace Trainer
-overhead, while maintaining all the features: LoRA, Flash Attention 2,
-gradient checkpointing, checkpointing, and early stopping.
+ESM-C (EvolutionaryScale) uses a different API from ESM2 (HuggingFace).
+Key differences:
+- Loaded via esm.models.esmc.ESMC, not AutoModelForMaskedLM
+- Forward takes sequence_tokens + sequence_id, not input_ids + attention_mask + labels
+- Returns ESMCOutput with .sequence_logits (no built-in loss)
+- No gradient checkpointing support
+- LoRA targets: layernorm_qkv.1, out_proj, ffn.1, ffn.3
 
 Usage:
-    torchrun --nproc_per_node=8 esm_native_trainer.py \
+    torchrun --nproc_per_node=8 esmc_native_trainer.py \
         --dataset_path /path/to/data \
         --output_dir ./output
 
 Features:
 - Pure PyTorch DDP (no HuggingFace Trainer overhead)
 - LoRA via PEFT
-- Flash Attention 2
-- Gradient checkpointing
+- Manual cross-entropy loss computation
 - BF16 mixed precision
 - Checkpointing and early stopping
 - Optimized DataCollator with pure tensor operations
@@ -28,23 +30,32 @@ import glob
 import math
 import os
 from datetime import timedelta
+
+import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+from datasets import concatenate_datasets, load_from_disk
+from esm.models.esmc import ESMC
+from esm.tokenization import EsmSequenceTokenizer
+from peft import LoraConfig, TaskType, get_peft_model
+from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.amp import GradScaler, autocast
-from datasets import load_from_disk, concatenate_datasets
-from peft import LoraConfig, TaskType, get_peft_model
-from transformers import AutoModelForMaskedLM, AutoTokenizer
 from tqdm import tqdm
-import numpy as np
-import wandb
 
-from quest.training.samplers import LengthBucketSampler, DistributedLengthBucketSampler
-from quest.training.collators import DataCollatorForMLMDynamic, DataCollatorForMLMWithVarlen
+import wandb
 from quest.training.callbacks import EarlyStopping
+from quest.training.collators import DataCollatorForMLMDynamic, DataCollatorForMLMWithVarlen
+from quest.training.samplers import (
+    DistributedLengthBucketSampler,
+    LengthBucketSampler,
+)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# ESM-C separator token: '|' (pipe, ID 31)
+ESMC_SEPARATOR_TOKEN_ID = 31
 
 
 class DataCollatorForMLMWithPacking:
@@ -56,7 +67,7 @@ class DataCollatorForMLMWithPacking:
     def __init__(
         self,
         tokenizer,
-        max_seq_length: int = 1024,
+        max_seq_length: int = 2048,
         mlm_probability: float = 0.15,
         separator_token_id: int | None = None,
     ):
@@ -152,16 +163,16 @@ class DataCollatorForMLMWithPacking:
         return input_ids, labels
 
 
-class NativeESMTrainer:
+class NativeESMCTrainer:
     """
-    Native PyTorch trainer for ESM2 MLM fine-tuning.
+    Native PyTorch trainer for ESM-C MLM fine-tuning.
 
-    Key features:
-    - DDP for multi-GPU training
-    - LoRA for efficient fine-tuning
-    - Flash Attention 2
-    - Gradient checkpointing
-    - BF16 mixed precision
+    Key differences from ESM2 trainer:
+    - Uses ESMC.from_pretrained() instead of AutoModelForMaskedLM
+    - Forward pass uses sequence_tokens + sequence_id
+    - Loss computed manually (cross-entropy on sequence_logits)
+    - No gradient checkpointing (not supported by TransformerStack)
+    - LoRA targets are ESM-C specific modules
     """
 
     def __init__(self, config: dict):
@@ -178,7 +189,7 @@ class NativeESMTrainer:
             dist.init_process_group(
                 backend="nccl",
                 init_method="env://",
-                timeout=timedelta(minutes=30)
+                timeout=timedelta(minutes=30),
             )
             self.device = torch.device(f"cuda:{self.local_rank}")
         else:
@@ -197,19 +208,23 @@ class NativeESMTrainer:
 
         # Training state
         self.scaler = GradScaler() if config.get("use_amp", True) else None
-        self.early_stopping = EarlyStopping(
-            patience=config.get("early_stopping_patience", 5),
-            min_delta=config.get("early_stopping_threshold", 0.0)
-        ) if config.get("early_stopping", True) else None
+        self.early_stopping = (
+            EarlyStopping(
+                patience=config.get("early_stopping_patience", 5),
+                min_delta=config.get("early_stopping_threshold", 0.0),
+            )
+            if config.get("early_stopping", True)
+            else None
+        )
 
         self.global_step = 0
-        self.best_val_loss = float('inf')
+        self.best_val_loss = float("inf")
 
         # Setup wandb (main process only)
         self.use_wandb = config.get("report_to") == "wandb" and self._is_main_process()
         if self.use_wandb:
             wandb.init(
-                project=config.get("wandb_project", "esm-finetuning"),
+                project=config.get("wandb_project", "esmc-finetuning"),
                 name=config.get("wandb_run_name"),
                 config=config,
             )
@@ -218,52 +233,34 @@ class NativeESMTrainer:
         return self.global_rank == 0
 
     def _setup_model(self):
-        """Initialize model with LoRA and Flash Attention 2."""
-        model_name = self.config["model_name"]
+        """Initialize ESM-C model with LoRA."""
+        model_name = self.config.get("model_name", "esmc_600m")
 
         if self._is_main_process():
-            print(f"Loading model: {model_name}")
+            print(f"Loading ESM-C model: {model_name}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.unk_token
+        self.tokenizer = EsmSequenceTokenizer()
 
-        # Choose attention implementation
-        # varlen uses 4D mask which requires SDPA (FA2 doesn't support arbitrary 4D masks)
-        use_varlen = self.config.get("use_varlen", False)
+        # ESMC.from_pretrained requires a torch.device, not a string
+        self.model = ESMC.from_pretrained(model_name, device=self.device)
 
-        if use_varlen:
-            # Use SDPA for 4D attention mask support
-            self.model = AutoModelForMaskedLM.from_pretrained(
-                model_name,
-                attn_implementation="sdpa",
-                dtype=torch.bfloat16,
+        if self._is_main_process():
+            print(f"ESM-C model loaded on {self.device}")
+
+        # ESMC doesn't have a HuggingFace-style .config attribute, but PEFT expects
+        # both .config.get() (for tie_word_embeddings) and .config.use_return_dict.
+        class _HFConfigShim(dict):
+            def __getattr__(self, name):
+                try:
+                    return self[name]
+                except KeyError:
+                    raise AttributeError(name)
+
+        if not hasattr(self.model, "config"):
+            self.model.config = _HFConfigShim(
+                use_return_dict=True,
+                tie_word_embeddings=False,
             )
-            if self._is_main_process():
-                print("✓ Using SDPA (for 4D block diagonal mask)")
-        else:
-            # Use Flash Attention 2 for standard attention
-            try:
-                self.model = AutoModelForMaskedLM.from_pretrained(
-                    model_name,
-                    attn_implementation="flash_attention_2",
-                    dtype=torch.bfloat16,
-                )
-                if self._is_main_process():
-                    print("✓ Using Flash Attention 2")
-            except Exception as e:
-                if self._is_main_process():
-                    print(f"Flash Attention 2 not available: {e}")
-                self.model = AutoModelForMaskedLM.from_pretrained(
-                    model_name,
-                    dtype=torch.bfloat16,
-                )
-
-        # Enable gradient checkpointing
-        if self.config.get("gradient_checkpointing", True):
-            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            if self._is_main_process():
-                print("✓ Gradient checkpointing enabled")
 
         # Apply LoRA
         if self.config.get("use_lora", True):
@@ -272,15 +269,14 @@ class NativeESMTrainer:
                 r=self.config.get("lora_r", 16),
                 lora_alpha=self.config.get("lora_alpha", 32),
                 lora_dropout=self.config.get("lora_dropout", 0.05),
-                target_modules=["query", "key", "value", "dense", "intermediate.dense", "output.dense"],
+                target_modules=["layernorm_qkv.1", "out_proj", "ffn.1", "ffn.3"],
                 bias="none",
             )
             self.model = get_peft_model(self.model, lora_config)
             if self._is_main_process():
                 self.model.print_trainable_parameters()
 
-        # Move to device and wrap with DDP
-        self.model = self.model.to(self.device)
+        # Wrap with DDP
         if self.is_distributed:
             self.model = DDP(
                 self.model,
@@ -294,27 +290,17 @@ class NativeESMTrainer:
                 print("Compiling model with torch.compile...")
             self.model = torch.compile(self.model, mode="reduce-overhead")
             if self._is_main_process():
-                print("✓ Model compiled")
+                print("Model compiled")
 
     def _setup_dataloaders(self):
         """Setup train and validation dataloaders."""
-        # Resolve train path
-        if self.config.get("train_path"):
-            train_path = self.config["train_path"]
-        elif self.config.get("dataset_path"):
-            train_path = os.path.join(self.config["dataset_path"], "train")
-        else:
-            raise ValueError("Must provide either --train_path or --dataset_path")
-
-        # Resolve val path
+        train_path = os.path.join(self.config["dataset_path"], "train")
         if self.config.get("val_path"):
             val_path = self.config["val_path"]
-        elif self.config.get("dataset_path"):
+        else:
             val_path = os.path.join(self.config["dataset_path"], "val")
             if not os.path.exists(val_path):
                 val_path = os.path.join(self.config["dataset_path"], "validation")
-        else:
-            raise ValueError("Must provide either --val_path or --dataset_path")
 
         self.train_dataset = self._load_dataset(train_path)
 
@@ -341,9 +327,9 @@ class NativeESMTrainer:
                 print("Using varlen collator (packing with proper block diagonal masking)")
             self.data_collator = DataCollatorForMLMWithVarlen(
                 tokenizer=self.tokenizer,
-                max_seq_length=self.config.get("max_seq_length", 1024),
+                max_seq_length=self.config.get("max_seq_length", 2048),
                 mlm_probability=self.config.get("mlm_probability", 0.15),
-                separator_token_id=30,  # ESM2 uses '-' (dash, ID 30) as separator
+                separator_token_id=ESMC_SEPARATOR_TOKEN_ID,
             )
         elif self.config.get("use_packing", False):
             if self._is_main_process():
@@ -351,9 +337,9 @@ class NativeESMTrainer:
                 print("         Consider using --use_varlen instead")
             self.data_collator = DataCollatorForMLMWithPacking(
                 tokenizer=self.tokenizer,
-                max_seq_length=self.config.get("max_seq_length", 1024),
+                max_seq_length=self.config.get("max_seq_length", 2048),
                 mlm_probability=self.config.get("mlm_probability", 0.15),
-                separator_token_id=30,  # ESM2 uses '-' (dash, ID 30) as separator
+                separator_token_id=ESMC_SEPARATOR_TOKEN_ID,
             )
         else:
             if self._is_main_process():
@@ -361,17 +347,21 @@ class NativeESMTrainer:
             self.data_collator = DataCollatorForMLMDynamic(
                 tokenizer=self.tokenizer,
                 mlm_probability=self.config.get("mlm_probability", 0.15),
-                separator_token_id=30,  # ESM2 uses '-' (dash, ID 30) as separator
+                separator_token_id=ESMC_SEPARATOR_TOKEN_ID,
             )
 
         # Samplers - use length bucketing to minimize padding waste
-        bucket_boundaries = self.config.get("bucket_boundaries", [128, 256, 384, 512, 768])
+        bucket_boundaries = self.config.get(
+            "bucket_boundaries", [128, 256, 512, 768, 1024, 1536]
+        )
 
-        if self.config.get("use_length_bucketing", True) and "length" in self.train_dataset.column_names:
+        if (
+            self.config.get("use_length_bucketing", True)
+            and "length" in self.train_dataset.column_names
+        ):
             if self._is_main_process():
                 print(f"Using length-bucketed sampling with boundaries: {bucket_boundaries}")
 
-            # Get lengths as numpy array for sampler
             train_lengths = np.array(self.train_dataset["length"])
 
             if self.is_distributed:
@@ -393,7 +383,6 @@ class NativeESMTrainer:
                     drop_last=True,
                 )
         else:
-            # Fallback to standard sampling
             if self._is_main_process():
                 print("Using standard random sampling (length bucketing disabled)")
             if self.is_distributed:
@@ -401,14 +390,13 @@ class NativeESMTrainer:
             else:
                 train_sampler = None
 
-        # DataLoaders optimized for p4d.24xlarge
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.config.get("batch_size", 16),
             sampler=train_sampler,
             shuffle=(train_sampler is None),
-            num_workers=min(8, os.cpu_count() or 4),
-            prefetch_factor=4,
+            num_workers=12,
+            prefetch_factor=8,
             pin_memory=True,
             persistent_workers=True,
             drop_last=True,
@@ -450,17 +438,16 @@ class NativeESMTrainer:
             if "length" not in dataset.column_names:
                 if self._is_main_process():
                     print(f"Computing sequence lengths for {path}...")
-                # Use efficient batched map with multiple processes
                 if "attention_mask" in dataset.column_names:
                     dataset = dataset.map(
                         lambda x: {"length": sum(x["attention_mask"])},
-                        num_proc=1,
+                        num_proc=min(8, os.cpu_count() or 1),
                         desc="Computing lengths",
                     )
                 else:
                     dataset = dataset.map(
                         lambda x: {"length": len(x["input_ids"])},
-                        num_proc=1,
+                        num_proc=min(8, os.cpu_count() or 1),
                         desc="Computing lengths",
                     )
 
@@ -490,6 +477,37 @@ class NativeESMTrainer:
             return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
 
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+
+    def _forward_and_loss(self, input_ids, attention_mask, labels):
+        """
+        Run ESM-C forward pass and compute cross-entropy loss.
+
+        ESM-C forward signature: sequence_tokens, sequence_id
+        - sequence_id: boolean mask (True = real token) for non-packed mode
+        - Returns ESMCOutput with .sequence_logits [B, L, vocab_size]
+        """
+        # Convert attention_mask (0/1 int) to boolean for sequence_id
+        sequence_id = attention_mask.bool()
+
+        # Bypass PEFT's forward wrapper (PeftModelForTokenClassification remaps
+        # kwargs to HF-style input_ids, which ESMC doesn't accept). The LoRA
+        # adapters are injected into the model's Linear modules, so calling
+        # the base model directly still routes through LoRA.
+        model = self.model.module if self.is_distributed else self.model
+        if hasattr(model, "base_model"):
+            # PEFT-wrapped model: call underlying ESMC directly
+            model = model.base_model.model
+        output = model(sequence_tokens=input_ids, sequence_id=sequence_id)
+        logits = output.sequence_logits  # [B, L, vocab_size]
+
+        # Compute MLM loss only on masked positions (labels != -100)
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            ignore_index=-100,
+        )
+
+        return loss, logits
 
     def train(self):
         """Main training loop."""
@@ -559,19 +577,10 @@ class NativeESMTrainer:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             labels = batch["labels"].to(self.device)
-            # Position IDs for varlen attention (resets for each packed sequence)
-            position_ids = batch.get("position_ids")
-            if position_ids is not None:
-                position_ids = position_ids.to(self.device)
 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    labels=labels,
-                )
-                loss = outputs.loss / grad_accum
+                loss, _ = self._forward_and_loss(input_ids, attention_mask, labels)
+                loss = loss / grad_accum
 
             if self.scaler:
                 self.scaler.scale(loss).backward()
@@ -660,21 +669,12 @@ class NativeESMTrainer:
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
-                # Position IDs for varlen attention
-                position_ids = batch.get("position_ids")
-                if position_ids is not None:
-                    position_ids = position_ids.to(self.device)
 
                 with autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        labels=labels,
-                    )
+                    loss, logits = self._forward_and_loss(input_ids, attention_mask, labels)
 
-                total_loss += outputs.loss.item()
-                predictions = outputs.logits.argmax(dim=-1)
+                total_loss += loss.item()
+                predictions = logits.argmax(dim=-1)
                 mask = labels != -100
                 total_correct += (predictions[mask] == labels[mask]).sum().item()
                 total_masked += mask.sum().item()
@@ -720,7 +720,7 @@ class NativeESMTrainer:
         if is_best:
             best_path = os.path.join(output_dir, "best_model.pt")
             torch.save(checkpoint, best_path)
-            print(f"✓ New best model (val_loss={self.best_val_loss:.4f})")
+            print(f"New best model (val_loss={self.best_val_loss:.4f})")
 
         # Cleanup old checkpoints (keep 5)
         checkpoints = sorted(glob.glob(os.path.join(output_dir, "checkpoint-step-*.pt")))
@@ -743,10 +743,9 @@ class NativeESMTrainer:
             print(f"Resumed from step {self.global_step}, epoch {checkpoint['epoch']}")
 
         return checkpoint["epoch"]
-    
 
     def _save_final_model(self):
-        """Save final model."""
+        """Save final model. Uses PEFT save_pretrained if LoRA, else torch.save."""
         if not self._is_main_process():
             return
 
@@ -754,31 +753,42 @@ class NativeESMTrainer:
         os.makedirs(final_dir, exist_ok=True)
 
         model_to_save = self.model.module if self.is_distributed else self.model
-        model_to_save.save_pretrained(final_dir)
+
+        if self.config.get("use_lora", True):
+            # PEFT handles saving LoRA adapters
+            model_to_save.save_pretrained(final_dir)
+        else:
+            # Save raw state dict for non-PEFT models
+            torch.save(model_to_save.state_dict(), os.path.join(final_dir, "model.pt"))
+
+        # Save tokenizer for convenience
         self.tokenizer.save_pretrained(final_dir)
 
-        print(f"\n✓ Final model saved to: {final_dir}")
+        print(f"\nFinal model saved to: {final_dir}")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Native PyTorch ESM2 MLM Fine-tuning")
+    parser = argparse.ArgumentParser(description="Native PyTorch ESM-C MLM Fine-tuning")
 
     # Required
-    parser.add_argument("--dataset_path", type=str, default=None,
-                        help="Parent directory containing train/ and val/ subdirs")
-    parser.add_argument("--train_path", type=str, default=None,
-                        help="Explicit training dataset path (overrides dataset_path/train)")
+    parser.add_argument("--dataset_path", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--val_path", type=str, default=None,
                         help="Explicit validation dataset path (overrides dataset_path/val)")
-    parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--val_splits", type=str, nargs="*", default=None,
                         help="Additional val split directory names relative to val parent, e.g. val_singles val_pairs")
 
     # Model
-    parser.add_argument("--model_name", type=str, default="facebook/esm2_t33_650M_UR50D")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="esmc_600m",
+        help="ESM-C model ID: 'esmc_600m' or 'esmc_300m'",
+    )
 
     # LoRA
     parser.add_argument("--use_lora", action="store_true", default=True)
+    parser.add_argument("--no_lora", action="store_false", dest="use_lora")
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -791,25 +801,48 @@ def parse_args():
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--mlm_probability", type=float, default=0.15)
-    parser.add_argument("--max_seq_length", type=int, default=1024)
-    parser.add_argument("--use_packing", action="store_true", default=False,
-                        help="Use sequence packing (WARNING: has cross-sequence attention bug)")
-    parser.add_argument("--use_varlen", action="store_true", default=False,
-                        help="Use varlen packing with proper block diagonal masking (recommended)")
-    parser.add_argument("--use_compile", action="store_true", default=False,
-                        help="Use torch.compile for potential speedup (~10-20%%)")
+    parser.add_argument("--max_seq_length", type=int, default=2048)
+    parser.add_argument(
+        "--use_packing",
+        action="store_true",
+        default=False,
+        help="Use sequence packing (WARNING: has cross-sequence attention bug)",
+    )
+    parser.add_argument(
+        "--use_varlen",
+        action="store_true",
+        default=False,
+        help="Use varlen packing with proper block diagonal masking (recommended)",
+    )
+    parser.add_argument(
+        "--use_compile",
+        action="store_true",
+        default=False,
+        help="Use torch.compile for potential speedup (~10-20%%)",
+    )
 
-    # Length bucketing (recommended over packing - avoids cross-attention issues)
-    parser.add_argument("--use_length_bucketing", action="store_true", default=True,
-                        help="Group similar-length sequences to minimize padding (recommended)")
-    parser.add_argument("--no_length_bucketing", action="store_false", dest="use_length_bucketing",
-                        help="Disable length bucketing, use random sampling")
-    parser.add_argument("--bucket_boundaries", type=int, nargs="+",
-                        default=[128, 256, 384, 512, 768],
-                        help="Length bucket boundaries (default: [128, 256, 384, 512, 768])")
+    # Length bucketing
+    parser.add_argument(
+        "--use_length_bucketing",
+        action="store_true",
+        default=True,
+        help="Group similar-length sequences to minimize padding (recommended)",
+    )
+    parser.add_argument(
+        "--no_length_bucketing",
+        action="store_false",
+        dest="use_length_bucketing",
+        help="Disable length bucketing, use random sampling",
+    )
+    parser.add_argument(
+        "--bucket_boundaries",
+        type=int,
+        nargs="+",
+        default=[128, 256, 512, 768, 1024, 1536],
+        help="Length bucket boundaries (default: [128, 256, 512, 768, 1024, 1536])",
+    )
 
     # Optimization
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--use_amp", action="store_true", default=True)
 
     # Logging & Checkpointing
@@ -827,7 +860,7 @@ def parse_args():
 
     # Wandb
     parser.add_argument("--report_to", type=str, default="wandb", choices=["wandb", "none"])
-    parser.add_argument("--wandb_project", type=str, default="esm-finetuning")
+    parser.add_argument("--wandb_project", type=str, default="esmc-finetuning")
     parser.add_argument("--wandb_run_name", type=str, default=None)
 
     return parser.parse_args()
@@ -837,7 +870,7 @@ def main():
     args = parse_args()
     config = vars(args)
 
-    trainer = NativeESMTrainer(config)
+    trainer = NativeESMCTrainer(config)
     trainer.train()
 
     # Cleanup distributed
