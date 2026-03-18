@@ -86,6 +86,40 @@ def create_dedup_key(row: Dict[str, Any], mode: str) -> str:
     
     return "|".join(parts)
 
+_TCR_FIELDS = {'tra', 'trb', 'tra_full', 'trb_full',
+               'trav_gene', 'traj_gene', 'trad_gene',
+               'trbv_gene', 'trbj_gene', 'trbd_gene'}
+_ANTIGEN_FIELDS = {'peptide', 'mhc_one', 'mhc_two', 'mhc_one_id', 'mhc_two_id'}
+
+
+def _emit_sub_row(row_dict: dict, keep_fields: set, mode: str) -> tuple:
+    """Build a dedup-key + JSON line for a subset of fields from row_dict.
+    Returns ("", "") if no valid sequences remain after filtering."""
+    sub_row = {}
+    for k, v in row_dict.items():
+        if k in keep_fields:
+            sub_row[k] = v
+        elif k in ('tra', 'trb', 'peptide', 'mhc_one', 'mhc_two'):
+            sub_row[k] = ""  # blank out excluded molecule fields
+        else:
+            sub_row[k] = v  # keep metadata (source, study_id, etc.)
+
+    key = create_dedup_key(sub_row, mode)
+    if not key:
+        return "", ""
+
+    molecule_data = {
+        k: v for k, v in sub_row.items()
+        if k in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two', 'mhc_one_id', 'mhc_two_id',
+                  'tra_full', 'trb_full',
+                  'trav_gene', 'traj_gene', 'trad_gene',
+                  'trbv_gene', 'trbj_gene', 'trbd_gene',
+                  'binding', 'score',
+                  'source', 'study_id']
+    }
+    return key, json.dumps(molecule_data)
+
+
 def process_single_parquet(args: tuple) -> tuple:
     """
     Process a single parquet file and return (lines, count).
@@ -107,6 +141,12 @@ def process_single_parquet(args: tuple) -> tuple:
             if mode == "mlm":
                 binding_val = str(row_dict.get("binding", "")).strip().lower()
                 if binding_val == "neg":
+                    # Salvage TCR-side and antigen-side as independent sub-rows
+                    for keep in (_TCR_FIELDS, _ANTIGEN_FIELDS):
+                        key, json_data = _emit_sub_row(row_dict, keep, mode)
+                        if key:
+                            lines.append(f"{key}\t{json_data}\n")
+                            valid_count += 1
                     continue
 
             # Exclude VDJdb score-0 records when flag is set
@@ -114,6 +154,12 @@ def process_single_parquet(args: tuple) -> tuple:
                 source_val = str(row_dict.get("source", "")).strip().lower()
                 score_val = str(row_dict.get("score", "")).strip()
                 if source_val == "vdjdb" and score_val == "0":
+                    # Salvage TCR-side and antigen-side as independent sub-rows
+                    for keep in (_TCR_FIELDS, _ANTIGEN_FIELDS):
+                        key, json_data = _emit_sub_row(row_dict, keep, mode)
+                        if key:
+                            lines.append(f"{key}\t{json_data}\n")
+                            valid_count += 1
                     continue
 
             dedup_key = create_dedup_key(row_dict, mode)
