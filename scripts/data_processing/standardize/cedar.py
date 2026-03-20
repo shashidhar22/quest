@@ -181,7 +181,7 @@ class CedarStandardizer(BaseStandardizer):
 
         column_map = self.get_column_map()
         result, dropped = standardize_dataframe(
-            merged, column_map, source=self.name
+            merged, column_map, source=self.name, stitch=self.stitch
         )
         yield result, dropped
 

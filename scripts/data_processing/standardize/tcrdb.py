@@ -126,6 +126,7 @@ class TcrdbStandardizer(BaseStandardizer):
                                 alpha_map,
                                 source=self.name,
                                 study_id=study_id,
+                                stitch=self.stitch,
                             )
                             yield result_a, dropped_a
 
@@ -137,6 +138,7 @@ class TcrdbStandardizer(BaseStandardizer):
                                 column_map,
                                 source=self.name,
                                 study_id=study_id,
+                                stitch=self.stitch,
                             )
                             yield result_b, dropped_b
                     else:
@@ -145,6 +147,7 @@ class TcrdbStandardizer(BaseStandardizer):
                             column_map,
                             source=self.name,
                             study_id=study_id,
+                            stitch=self.stitch,
                         )
                         yield result, dropped
             except Exception as e:

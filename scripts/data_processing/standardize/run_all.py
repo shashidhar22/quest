@@ -41,6 +41,8 @@ from scripts.data_processing.standardize.tcrdb import TcrdbStandardizer
 from scripts.data_processing.standardize.immuneaccess import ImmuneaccessStandardizer
 from scripts.data_processing.standardize.adc import AdcStandardizer
 from scripts.data_processing.standardize.studies import StudiesStandardizer
+from scripts.data_processing.standardize.imgthla import ImgthlaStandardizer
+from scripts.data_processing.standardize.rcc_atlas import RccAtlasStandardizer
 from quest.data.standardization import clear_norm_cache
 
 logger = logging.getLogger(__name__)
@@ -60,6 +62,8 @@ SMALL_DBS = {
     "iedb": (IedbStandardizer, "IEDB"),
     "iedb_pmhc": (IedbPmhcStandardizer, "IEDB"),
     "cedar_pmhc": (CedarPmhcStandardizer, "CEDAR"),
+    "imgthla": (ImgthlaStandardizer, "IMGTHLA"),
+    "rcc_atlas": (RccAtlasStandardizer, "RCC_ATLAS"),
 }
 
 # Large databases (run sequentially — memory-intensive streaming)
@@ -77,33 +81,33 @@ LARGE_DBS = {
 ALL_DBS = {**SMALL_DBS, **LARGE_DBS}
 
 
-def _run_single(db_name: str, db_dir: str, output_dir: str, force: bool) -> dict:
+def _run_single(db_name: str, db_dir: str, output_dir: str, force: bool, studies_dir: str = DEFAULT_STUDIES_DIR, stitch: bool = False) -> dict:
     """Run a single standardizer (used for parallel execution)."""
     warnings.filterwarnings("ignore")
     cls, subdir = ALL_DBS[db_name]
 
     if db_name == "studies":
-        source_dir = Path(DEFAULT_STUDIES_DIR)
+        source_dir = Path(studies_dir)
     else:
         source_dir = Path(db_dir) / subdir
 
     out_dir = Path(output_dir) / db_name
 
     try:
-        standardizer = cls(source_dir=source_dir, output_dir=out_dir)
+        standardizer = cls(source_dir=source_dir, output_dir=out_dir, stitch=stitch)
         return standardizer.run(force=force)
     except Exception as e:
         return {"status": "error", "name": db_name, "error": str(e)}
 
 
-def _verify_single(db_name: str, output_dir: str) -> dict:
+def _verify_single(db_name: str, output_dir: str, studies_dir: str = DEFAULT_STUDIES_DIR) -> dict:
     """Verify a single standardizer's output."""
     cls, subdir = ALL_DBS[db_name]
     out_dir = Path(output_dir) / db_name
 
     # Source dir doesn't matter for verify
     if db_name == "studies":
-        source_dir = Path(DEFAULT_STUDIES_DIR)
+        source_dir = Path(studies_dir)
     else:
         source_dir = Path(DEFAULT_DB_DIR) / subdir
 
@@ -150,6 +154,16 @@ def main():
         help="Base directory for standardized output",
     )
     parser.add_argument(
+        "--studies-dir",
+        default=DEFAULT_STUDIES_DIR,
+        help="Directory for study sources",
+    )
+    parser.add_argument(
+        "--stitch",
+        action="store_true",
+        help="Generate full-length TCR sequences via stitchr",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=8,
@@ -180,8 +194,10 @@ def main():
     if args.verify_only:
         print(f"\n{'DB':<15s} {'Rows':>12s} {'Files':>6s} {'Status':<10s}")
         print("-" * 50)
+        verify_results = []
         for db_name in dbs_to_run:
             result = _verify_single(db_name, args.output_dir)
+            verify_results.append(result)
             if "error" in result:
                 print(f"{db_name:<15s} {'':>12s} {'':>6s} {'ERROR':<10s}  {result['error']}")
             else:
@@ -189,6 +205,63 @@ def main():
                     f"{db_name:<15s} {result['total_rows']:>12,} "
                     f"{result['parquet_files']:>6d} {'OK':<10s}"
                 )
+
+        # Molecule combination catalog
+        combo_keys = [
+            'tra_only', 'trb_only', 'tra_trb', 'peptide_only',
+            'pep_mhcI', 'pep_mhcII', 'tcr_pep_mhcI', 'tcr_pep_mhcII',
+            'tcr_peptide', 'other',
+        ]
+        combo_labels = [
+            'tra', 'trb', 'tra+trb', 'pep',
+            'pep+mhcI', 'pep+mhcII', 'tcr+pep+mhcI', 'tcr+pep+mhcII',
+            'tcr+pep', 'other',
+        ]
+        col_w = 14  # column width for combo values
+
+        valid_results = [r for r in verify_results if "error" not in r and "combo_counts" in r]
+        if valid_results:
+            print(f"\nMolecule Combination Catalog")
+            header = f"{'DB':<15s}" + "".join(f"{l:>{col_w}s}" for l in combo_labels) + f"{'total':>{col_w}s}"
+            print(header)
+            print("-" * len(header))
+
+            totals = {k: 0 for k in combo_keys}
+            grand_total = 0
+
+            for r in sorted(valid_results, key=lambda x: x["name"]):
+                combos = r["combo_counts"]
+                row_total = sum(combos.values())
+                line = f"{r['name']:<15s}"
+                for k in combo_keys:
+                    v = combos[k]
+                    totals[k] += v
+                    line += f"{v:>{col_w},}"
+                line += f"{row_total:>{col_w},}"
+                grand_total += row_total
+                print(line)
+
+            print("-" * len(header))
+            line = f"{'TOTAL':<15s}"
+            for k in combo_keys:
+                line += f"{totals[k]:>{col_w},}"
+            line += f"{grand_total:>{col_w},}"
+            print(line)
+
+            # Unique molecule counts
+            unique_keys = ['tra', 'trb', 'peptide', 'mhc_one']
+            unique_labels = ['tra', 'trb', 'peptide', 'mhc_one']
+            print(f"\nUnique Molecule Counts")
+            u_header = f"{'DB':<15s}" + "".join(f"{l:>{col_w}s}" for l in unique_labels)
+            print(u_header)
+            print("-" * len(u_header))
+            for r in sorted(valid_results, key=lambda x: x["name"]):
+                uc = r.get("unique_counts", {})
+                line = f"{r['name']:<15s}"
+                for k in unique_keys:
+                    line += f"{uc.get(k, 0):>{col_w},}"
+                print(line)
+
         return
 
     # Run standardizers
@@ -215,7 +288,7 @@ def main():
         with ProcessPoolExecutor(max_workers=min(args.workers, len(small_dbs))) as pool:
             futures = {
                 pool.submit(
-                    _run_single, db_name, args.db_dir, args.output_dir, args.force
+                    _run_single, db_name, args.db_dir, args.output_dir, args.force, args.studies_dir, args.stitch
                 ): db_name
                 for db_name in small_dbs
             }
@@ -249,7 +322,7 @@ def main():
         for db_name in large_dbs:
             clear_norm_cache()  # Fresh cache per database to prevent cross-DB accumulation
             overall_pbar.set_postfix(phase=f"large DBs", current=db_name)
-            result = _run_single(db_name, args.db_dir, args.output_dir, args.force)
+            result = _run_single(db_name, args.db_dir, args.output_dir, args.force, args.studies_dir, args.stitch)
             results.append(result)
             status = result.get("status", "unknown")
             if status == "completed":

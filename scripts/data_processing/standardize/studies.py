@@ -397,7 +397,7 @@ class StudiesStandardizer(BaseStandardizer):
             if not col_map:
                 continue
             result, dropped = standardize_dataframe(
-                group, col_map, source=self.name, study_id=study_id,
+                group, col_map, source=self.name, study_id=study_id, stitch=self.stitch,
             )
             yield result, dropped
 
@@ -425,7 +425,7 @@ class StudiesStandardizer(BaseStandardizer):
                 # Use default map for empty locus; skip gamma-delta
                 if lv == "":
                     result, dropped = standardize_dataframe(
-                        group, default_col_map, source=self.name, study_id=study_id,
+                        group, default_col_map, source=self.name, study_id=study_id, stitch=self.stitch,
                     )
                     yield result, dropped
                 continue
@@ -434,7 +434,7 @@ class StudiesStandardizer(BaseStandardizer):
             if not col_map:
                 continue
             result, dropped = standardize_dataframe(
-                group, col_map, source=self.name, study_id=study_id,
+                group, col_map, source=self.name, study_id=study_id, stitch=self.stitch,
             )
             yield result, dropped
 
@@ -671,6 +671,7 @@ class StudiesStandardizer(BaseStandardizer):
                         col_map,
                         source=self.name,
                         study_id=study_id,
+                        stitch=self.stitch,
                     )
                     # Merge filter drop records into dropped_df
                     if drop_records:

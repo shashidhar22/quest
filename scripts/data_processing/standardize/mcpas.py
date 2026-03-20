@@ -103,7 +103,7 @@ class McpasStandardizer(BaseStandardizer):
             column_map["_binding"] = "binding"
 
         result, dropped = standardize_dataframe(
-            df, column_map, source=self.name
+            df, column_map, source=self.name, stitch=self.stitch
         )
         yield result, dropped
 

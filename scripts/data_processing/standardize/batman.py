@@ -72,7 +72,7 @@ class BatmanStandardizer(BaseStandardizer):
             "_trbv_gene": "trbv_gene",
             "_trbd_gene": "trbd_gene",
             "_trbj_gene": "trbj_gene",
-            "index_peptide": "peptide",
+            "peptide": "peptide",
             "peptide_activity": "score",
         }
 
@@ -138,7 +138,7 @@ class BatmanStandardizer(BaseStandardizer):
             column_map["_binding"] = "binding"
 
         result, dropped = standardize_dataframe(
-            df, column_map, source=self.name
+            df, column_map, source=self.name, stitch=self.stitch
         )
         yield result, dropped
 

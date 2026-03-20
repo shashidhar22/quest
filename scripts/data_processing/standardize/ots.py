@@ -63,7 +63,7 @@ class OtsStandardizer(BaseStandardizer):
                 ):
                     chunk = chunk.fillna("")
                     result, dropped = standardize_dataframe(
-                        chunk, column_map, source=self.name, study_id=study_id,
+                        chunk, column_map, source=self.name, study_id=study_id, stitch=self.stitch,
                     )
                     yield result, dropped
             except Exception as e:

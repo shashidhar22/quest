@@ -135,7 +135,7 @@ class TraitStandardizer(BaseStandardizer):
         merged = self._map_columns(df, meta)
         column_map = self.get_column_map()
         result, dropped = standardize_dataframe(
-            merged, column_map, source=self.name, study_id=study_id,
+            merged, column_map, source=self.name, study_id=study_id, stitch=self.stitch,
         )
         yield result, dropped
 

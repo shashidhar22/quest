@@ -18,9 +18,19 @@ import pyarrow.parquet as pq
 import pyarrow as pa
 from tqdm import tqdm
 import glob
-from itertools import permutations as iter_permutations
+from itertools import combinations, permutations as iter_permutations
 from multiprocessing import Pool, cpu_count
 from functools import partial
+
+# Fast JSON: use orjson if available (3-10x faster), fall back to stdlib json
+try:
+    import orjson
+    def _json_dumps(obj):
+        return orjson.dumps(obj).decode('utf-8')
+    _json_loads = orjson.loads
+except ImportError:
+    _json_dumps = json.dumps
+    _json_loads = json.loads
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -87,37 +97,48 @@ def create_dedup_key(row: Dict[str, Any], mode: str) -> str:
     return "|".join(parts)
 
 _TCR_FIELDS = {'tra', 'trb', 'tra_full', 'trb_full',
+               'tra_cdr1', 'tra_cdr2', 'tra_cdr3',
+               'trb_cdr1', 'trb_cdr2', 'trb_cdr3',
                'trav_gene', 'traj_gene', 'trad_gene',
                'trbv_gene', 'trbj_gene', 'trbd_gene'}
 _ANTIGEN_FIELDS = {'peptide', 'mhc_one', 'mhc_two', 'mhc_one_id', 'mhc_two_id'}
 
+# All molecule/metadata fields to retain from parquet rows
+MOLECULE_FIELDS = frozenset([
+    'tra', 'trb', 'peptide', 'mhc_one', 'mhc_two', 'mhc_one_id', 'mhc_two_id',
+    'tra_cdr1', 'tra_cdr2', 'tra_cdr3', 'tra_full',
+    'trb_cdr1', 'trb_cdr2', 'trb_cdr3', 'trb_full',
+    'trav_gene', 'traj_gene', 'trad_gene',
+    'trbv_gene', 'trbj_gene', 'trbd_gene',
+    'binding', 'score',
+    'source', 'study_id',
+])
+
+# The 5 core molecule fields used for dedup keys and permutations
+_DEDUP_KEY_FIELDS = ('tra', 'trb', 'peptide', 'mhc_one', 'mhc_two')
+
 
 def _emit_sub_row(row_dict: dict, keep_fields: set, mode: str) -> tuple:
     """Build a dedup-key + JSON line for a subset of fields from row_dict.
-    Returns ("", "") if no valid sequences remain after filtering."""
-    sub_row = {}
+    Returns ("", "") if no valid sequences remain after filtering.
+    Single-pass: builds dedup fields and molecule_data simultaneously."""
+    dedup_fields = {}
+    molecule_data = {}
     for k, v in row_dict.items():
-        if k in keep_fields:
-            sub_row[k] = v
-        elif k in ('tra', 'trb', 'peptide', 'mhc_one', 'mhc_two'):
-            sub_row[k] = ""  # blank out excluded molecule fields
-        else:
-            sub_row[k] = v  # keep metadata (source, study_id, etc.)
+        if k in _DEDUP_KEY_FIELDS:
+            if k in keep_fields:
+                dedup_fields[k] = v
+                molecule_data[k] = v
+            else:
+                dedup_fields[k] = ""
+                molecule_data[k] = ""
+        elif k in MOLECULE_FIELDS:
+            molecule_data[k] = v
 
-    key = create_dedup_key(sub_row, mode)
+    key = create_dedup_key(dedup_fields, mode)
     if not key:
         return "", ""
-
-    molecule_data = {
-        k: v for k, v in sub_row.items()
-        if k in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two', 'mhc_one_id', 'mhc_two_id',
-                  'tra_full', 'trb_full',
-                  'trav_gene', 'traj_gene', 'trad_gene',
-                  'trbv_gene', 'trbj_gene', 'trbd_gene',
-                  'binding', 'score',
-                  'source', 'study_id']
-    }
-    return key, json.dumps(molecule_data)
+    return key, _json_dumps(molecule_data)
 
 
 def process_single_parquet(args: tuple) -> tuple:
@@ -134,6 +155,10 @@ def process_single_parquet(args: tuple) -> tuple:
 
     try:
         table = pq.read_table(pf)
+        # Column-wise extraction: only pull needed columns, skip unused ones
+        needed = [c for c in table.column_names if c in MOLECULE_FIELDS]
+        if needed:
+            table = table.select(needed)
         df = table.to_pandas()
 
         for row_dict in df.to_dict('records'):
@@ -165,19 +190,8 @@ def process_single_parquet(args: tuple) -> tuple:
             dedup_key = create_dedup_key(row_dict, mode)
 
             if dedup_key:  # Valid row
-                # Keep molecule columns (chains, peptide, MHC sequences and IDs)
-                # Also keep full-length stitched sequences and gene annotations
-                molecule_data = {
-                    k: v for k, v in row_dict.items()
-                    if k in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two', 'mhc_one_id', 'mhc_two_id',
-                            'tra_full', 'trb_full',  # Full-length stitched TCR sequences
-                            'trav_gene', 'traj_gene', 'trad_gene',  # TRA gene segments
-                            'trbv_gene', 'trbj_gene', 'trbd_gene',  # TRB gene segments
-                            'binding', 'score',  # Binding/activity and confidence score
-                            'source', 'study_id']  # Standardized schema provenance
-                }
-
-                lines.append(f"{dedup_key}\t{json.dumps(molecule_data)}\n")
+                molecule_data = {k: v for k, v in row_dict.items() if k in MOLECULE_FIELDS}
+                lines.append(f"{dedup_key}\t{_json_dumps(molecule_data)}\n")
                 valid_count += 1
     except Exception as e:
         print(f"Warning: Failed to read {pf}: {e}")
@@ -491,93 +505,95 @@ def stream_deduplicate(input_file: Path, output_file: Path) -> int:
     """
     unique_count = 0
     prev_key = None
-    
+
     with open(input_file, 'r', buffering=8*1024*1024) as infile, open(output_file, 'w', buffering=8*1024*1024) as outfile:  # 8MB buffers
         with tqdm(desc="Deduplicating", unit=" rows", unit_scale=True) as pbar:
             for line in infile:
-                if not line.strip():
+                # Single rstrip instead of double strip(); find+slice instead of split
+                line = line.rstrip('\n')
+                if not line:
                     continue
-                
-                parts = line.strip().split('\t', 1)
-                if len(parts) != 2:
+
+                tab_pos = line.find('\t')
+                if tab_pos < 0:
                     continue
-                
-                key, data = parts
-                
+
+                key = line[:tab_pos]
+
                 if key != prev_key:
-                    outfile.write(f"{data}\n")
+                    outfile.write(line[tab_pos + 1:])
+                    outfile.write('\n')
                     unique_count += 1
                     prev_key = key
-                    
+
                     if unique_count % 100000 == 0:
                         pbar.update(100000)
-            
+
             pbar.update(unique_count % 100000)
-    
+
     return unique_count
 
 def process_molecule_batch(args: tuple) -> List[str]:
     """
     Process a batch of molecules and generate permutations.
     This runs in a separate process for parallelization.
+
+    Each item in the batch is a (line_idx, line) tuple. Output lines use
+    the line index instead of duplicating the full JSON payload, reducing
+    Stage 2+3 I/O by ~60-70%.
     """
-    lines, mode, max_perms = args
+    items, mode, max_perms = args
     output_lines = []
-    
-    for line in lines:
-        if not line.strip():
+
+    for line_idx, line in items:
+        line = line.rstrip('\n')
+        if not line:
             continue
-        
+
         # Parse line: could be "dedup_key\tjson" from stage 1 or just "json"
-        parts = line.strip().split('\t', 1)
-        if len(parts) == 2:
-            json_data = parts[1]  # Strip dedup key, keep only JSON
+        tab_pos = line.find('\t')
+        if tab_pos >= 0:
+            json_data = line[tab_pos + 1:]
         else:
-            json_data = parts[0]
-        
-        row_dict = json.loads(json_data)
-        
+            json_data = line
+
+        row_dict = _json_loads(json_data)
+
         # Get non-empty molecule fields
         molecule_values = []
-        for field in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']:
+        for field in _DEDUP_KEY_FIELDS:
             val = row_dict.get(field, "")
-            if val and val != "nan" and val != "":
+            if val and val != "nan":
                 molecule_values.append((field, val))
-        
+
         # Generate all permutations of all subset sizes
         # For 3 molecules [A, B, C], generate:
         # - Size 1: A, B, C
         # - Size 2: AB, BA, AC, CA, BC, CB
         # - Size 3: ABC, ACB, BAC, BCA, CAB, CBA
-        
-        if len(molecule_values) == 0:
-            # No valid fields - shouldn't happen but handle it
-            output_lines.append(f"empty\t{json_data}\n")
+
+        line_idx_str = str(line_idx)
+
+        if not molecule_values:
+            output_lines.append(f"empty\t{line_idx_str}\n")
         else:
             all_perms = []
-            
-            # Generate permutations for each subset size (1 to N)
+
             for subset_size in range(1, len(molecule_values) + 1):
-                # Get all combinations of this size
-                from itertools import combinations
                 for subset in combinations(molecule_values, subset_size):
-                    # Generate all permutations of this subset
                     for perm in iter_permutations(subset):
                         all_perms.append(perm)
-            
+
             # Apply max_perms limit if specified
             if max_perms and len(all_perms) > max_perms:
                 import random
                 all_perms = random.sample(all_perms, max_perms)
-            
-            # Create output lines for each permutation
+
+            # Emit perm_key + line index (not full JSON) for each permutation
             for perm in all_perms:
-                # Create permutation key for deduplication
-                perm_key = "|".join([f"{field}:{val}" for field, val in perm])
-                
-                # Write with permutation key and JSON only (not nested tabs!)
-                output_lines.append(f"{perm_key}\t{json_data}\n")
-    
+                perm_key = "|".join(f"{field}:{val}" for field, val in perm)
+                output_lines.append(f"{perm_key}\t{line_idx_str}\n")
+
     return output_lines
 
 def generate_permutations(input_file: Path, output_file: Path, mode: str, max_perms: Optional[int], num_workers: int = None) -> int:
@@ -608,13 +624,13 @@ def generate_permutations(input_file: Path, output_file: Path, mode: str, max_pe
     batch_size = 100000  # Process 100k molecules per batch
     perm_count = 0
 
-    # Generator function to yield batches without loading entire file
+    # Generator function to yield batches of (line_idx, line) tuples
     def batch_generator():
-        """Yield batches of lines from input file without loading all into memory."""
+        """Yield batches of (line_idx, line) from input file without loading all into memory."""
         with open(input_file, 'r', buffering=8*1024*1024) as infile:
             batch = []
-            for line in infile:
-                batch.append(line)
+            for line_idx, line in enumerate(infile):
+                batch.append((line_idx, line))
                 if len(batch) >= batch_size:
                     yield (batch, mode, max_perms)
                     batch = []
@@ -880,7 +896,7 @@ def _stitch_file_chunk(args: tuple) -> tuple:
             if not line:
                 continue
 
-            row_dict = json.loads(line)
+            row_dict = _json_loads(line)
             num_processed += 1
 
             for chain, cdr3_key, v_key, j_key, full_key in [
@@ -997,9 +1013,38 @@ def _lookup_stitch(row_dict: dict, stitch_cache: dict) -> None:
             row_dict[full_key] = result.decode('ascii')
 
 
+class LineIndexedFile:
+    """Random-access line reader backed by byte-offset index.
+
+    Builds a list of byte offsets for each line in the file on init,
+    then supports O(1) random access by line number via seek.
+    Memory: ~8 bytes per line (offset array).
+    """
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.offsets = []
+        with open(self.path, 'rb') as f:
+            offset = 0
+            for raw_line in f:
+                self.offsets.append(offset)
+                offset += len(raw_line)
+        self._fh = open(self.path, 'rb')
+
+    def __getitem__(self, idx):
+        self._fh.seek(self.offsets[idx])
+        return self._fh.readline().rstrip(b'\n').decode('utf-8')
+
+    def __len__(self):
+        return len(self.offsets)
+
+    def close(self):
+        self._fh.close()
+
+
 def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Path,
                          batch_size: int = 1000000, stitch_tcr: bool = False,
-                         pre_stitch_cache: dict = None):
+                         pre_stitch_cache: dict = None, deduped_file: Path = None):
     """
     Convert deduplicated text file to two parquet outputs:
     1. CDR3 version (tra/trb) - permutation_key, concatenated_sequence (all rows)
@@ -1025,6 +1070,13 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
             When None and stitch_tcr=True, falls back to inline stitching.
     """
     print(f"\n📊 Writing parquet outputs...")
+
+    # Load deduped file for index-based lookup (used when Stage 2 emits line indices)
+    mol_lookup = None
+    if deduped_file is not None and deduped_file.exists():
+        print(f"   Loading molecule index from {deduped_file}...")
+        mol_lookup = LineIndexedFile(deduped_file)
+        print(f"   Indexed {len(mol_lookup):,} molecules for random access")
 
     # Determine stitching strategy
     stitcher = None
@@ -1061,22 +1113,30 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
     with open(input_file, 'r') as f:
         with tqdm(desc="Writing parquet", unit=" rows", unit_scale=True) as pbar:
             for line in f:
-                if not line.strip():
+                # For permutations, the line is: perm_key\tline_idx (or perm_key\tjson for legacy)
+                # For molecules, the line is just: json (or line_idx if index mode)
+                line = line.rstrip('\n')
+                if not line:
                     continue
-                
-                # For permutations, the line is: perm_key\toriginal_json
-                # For molecules, the line is just: json
-                parts = line.strip().split('\t')
-                if len(parts) == 2:
-                    # Has permutation key (format: "tra:AAA|peptide:CCC|mhc_one:DDD")
-                    old_perm_key = parts[0]
-                    row_dict = json.loads(parts[1].strip())
+                tab_pos = line.find('\t')
+                if tab_pos >= 0:
+                    old_perm_key = line[:tab_pos]
+                    ref = line[tab_pos + 1:]
+                    # Resolve: ref is either a line index (integer) or JSON
+                    if mol_lookup is not None and ref.isdigit():
+                        row_dict = _json_loads(mol_lookup[int(ref)])
+                    else:
+                        row_dict = _json_loads(ref)
                 else:
-                    # No permutation key - shouldn't happen after stage 2/3, but handle it
-                    row_dict = json.loads(parts[0])
+                    ref = line
+                    # Resolve: ref is either a line index or JSON
+                    if mol_lookup is not None and ref.isdigit():
+                        row_dict = _json_loads(mol_lookup[int(ref)])
+                    else:
+                        row_dict = _json_loads(ref)
                     # Create a simple key from present fields
                     present_fields = []
-                    for field in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']:
+                    for field in _DEDUP_KEY_FIELDS:
                         if field in row_dict and row_dict[field]:
                             present_fields.append(field)
                     old_perm_key = "_".join(present_fields) if present_fields else "empty"
@@ -1211,6 +1271,10 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
         print(f"   Cache entries: {len(inline_stitch_cache):,} unique (cdr3, v, j, chain) combos")
         print(f"   Cache hit rate: {cache_hit_rate:.1f}%")
         print(f"   Successful stitches: {stitch_successes:,}/{len(inline_stitch_cache):,} unique combos")
+
+    # Close molecule lookup if used
+    if mol_lookup is not None:
+        mol_lookup.close()
 
 def main():
     parser = argparse.ArgumentParser(description="Streaming deduplication with external sort")
@@ -1402,7 +1466,7 @@ def main():
             perm_count = generate_permutations(deduped_file, perm_file, args.mode, args.max_permutations, args.num_workers)
             expansion = perm_count / unique_count if unique_count > 0 else 0
             print(f"✓ Generated {perm_count:,} permutations ({expansion:.1f}x expansion)")
-            deduped_file.unlink()
+            # Keep deduped_file alive — needed for index-based lookup in write_parquet_output
 
         # Stage 3: Permutation deduplication (optional)
         if args.keep_all_permutations:
@@ -1453,9 +1517,15 @@ def main():
     else:
         output_dir_full = Path(str(output_dir) + "_full")
     
+    # Pass deduped_file for index-based lookup when permutations were generated
+    lookup_file = deduped_file if (not args.no_permutations and deduped_file.exists()) else None
     write_parquet_output(final_file, output_dir, output_dir_full,
-                         stitch_tcr=args.stitch_tcr, pre_stitch_cache=stitch_cache)
+                         stitch_tcr=args.stitch_tcr, pre_stitch_cache=stitch_cache,
+                         deduped_file=lookup_file)
     final_file.unlink()
+    # Clean up deduped file now that output is written
+    if lookup_file is not None and lookup_file.exists():
+        lookup_file.unlink()
     
     # Summary
     print(f"\n{'='*60}")

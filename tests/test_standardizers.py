@@ -1,7 +1,7 @@
 """Integration tests for per-database standardizers.
 
 Each test creates minimal mock data matching the real schema, runs the
-standardizer, and verifies the output conforms to the 15-column schema.
+standardizer, and verifies the output conforms to the 23-column schema.
 """
 
 import os
@@ -52,6 +52,26 @@ def _verify_output(output_dir: Path):
                     assert val.startswith("TR"), (
                         f"Non-TCR gene in {col}: {val}"
                     )
+
+        # Validate CDR columns
+        for chain, cdr3_col in [("tra", "tra_cdr3"), ("trb", "trb_cdr3")]:
+            for i, row in df.iterrows():
+                # CDR3 should equal the chain column when both are non-empty
+                if row[chain] and row[cdr3_col]:
+                    assert row[cdr3_col] == row[chain], (
+                        f"Row {i}: {cdr3_col} ({row[cdr3_col]}) != {chain} ({row[chain]})"
+                    )
+
+        for col in ("tra_cdr1", "tra_cdr2", "trb_cdr1", "trb_cdr2"):
+            for val in df[col]:
+                if val:
+                    assert all(c in VALID_AA for c in val), (
+                        f"Invalid AA in {col}: {val}"
+                    )
+
+        # tra_full/trb_full should be empty in non-stitch mode
+        for col in ("tra_full", "trb_full"):
+            assert all(df[col] == ""), f"{col} should be empty in default mode"
 
         # Check source is set
         assert all(df["source"] != ""), "source column has empty values"
@@ -823,8 +843,8 @@ class TestBindingScoreColumns:
         meta_neg = _parse_trait_filename("A0201_GILGFVFTL_BMLF1_EBV_binder_neg.zip")
         assert meta_neg["binding"] == "neg"
 
-    def test_schema_has_15_columns(self):
-        assert len(TARGET_COLUMNS) == 15
+    def test_schema_has_23_columns(self):
+        assert len(TARGET_COLUMNS) == 23
         assert "binding" in TARGET_COLUMNS
         assert "score" in TARGET_COLUMNS
         # binding and score should come after mhc_two, before source
@@ -833,6 +853,10 @@ class TestBindingScoreColumns:
         binding_idx = TARGET_COLUMNS.index("binding")
         score_idx = TARGET_COLUMNS.index("score")
         assert mhc_two_idx < binding_idx < score_idx < source_idx
+        # CDR columns should be present
+        for col in ("tra_cdr1", "tra_cdr2", "tra_cdr3", "tra_full",
+                     "trb_cdr1", "trb_cdr2", "trb_cdr3", "trb_full"):
+            assert col in TARGET_COLUMNS
 
 
 # -----------------------------------------------------------------------
@@ -1766,3 +1790,188 @@ class TestTcrdbStandardizer:
         trb_rows = result[result["trb"] != ""]
         assert len(trb_rows) == 1
         assert trb_rows.iloc[0]["trb"] == "CASSLAPGATNEKLFF"
+
+
+# -----------------------------------------------------------------------
+# IEDB pMHC mhc_elution parsing
+# -----------------------------------------------------------------------
+class TestIedbPmhcElution:
+    def test_mhc_elution_parsed(self, tmp_path):
+        """mhc_elution records should be parsed from SQL dump with correct allele index."""
+        from scripts.data_processing.standardize.iedb_pmhc import IedbPmhcStandardizer
+
+        source_dir = tmp_path / "source"
+        full_db_dir = source_dir / "full_database"
+        full_db_dir.mkdir(parents=True)
+
+        import gzip
+
+        # Build a minimal SQL dump with epitope, curated_epitope, mhc_bind,
+        # and mhc_elution INSERT statements.
+        lines = []
+        # epitope table: id=1 -> GILGFVFTL, id=2 -> NLVPMVATV
+        lines.append(
+            "INSERT INTO `epitope` VALUES "
+            "(1,'GILGFVFTL','','','','','','',''),"
+            "(2,'NLVPMVATV','','','','','','','');"
+        )
+        # curated_epitope: curated_id=10 -> epitope_id=1, curated_id=20 -> epitope_id=2
+        lines.append(
+            "INSERT INTO `curated_epitope` VALUES "
+            "(10,'','','','','','1'),"
+            "(20,'','','','','','2');"
+        )
+        # mhc_bind: 12 columns, allele at index 10
+        lines.append(
+            "INSERT INTO `mhc_bind` VALUES "
+            "(1,1,10,'','','Positive','500','','',1,'HLA-A*02:01',1);"
+        )
+        # mhc_elution: 37 columns, allele at index 36
+        elution_fields = ["''"] * 37
+        elution_fields[0] = "1"
+        elution_fields[1] = "1"
+        elution_fields[2] = "20"
+        elution_fields[5] = "'Positive'"
+        elution_fields[36] = "'HLA-B*07:02'"
+        lines.append(
+            "INSERT INTO `mhc_elution` VALUES "
+            f"({','.join(elution_fields)});"
+        )
+
+        sql_content = "\n".join(lines)
+        with gzip.open(full_db_dir / "iedb_public.sql.gz", "wb") as f:
+            f.write(sql_content.encode("utf-8"))
+
+        # Also create empty mhc_ligand dir
+        (source_dir / "mhc_ligand").mkdir(parents=True)
+
+        output_dir = tmp_path / "output"
+        standardizer = IedbPmhcStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["status"] == "completed"
+        assert summary["rows"] == 2  # 1 bind + 1 elution
+
+        result = pd.concat(
+            [pq.read_table(p).to_pandas() for p in sorted(output_dir.glob("*.parquet"))],
+            ignore_index=True,
+        )
+        # Check the bind record
+        bind_rows = result[result["mhc_one"].str.contains("A", na=False)]
+        assert len(bind_rows) >= 1
+        assert bind_rows.iloc[0]["peptide"] == "GILGFVFTL"
+        assert bind_rows.iloc[0]["binding"] == "pos"
+
+        # Check the elution record
+        elution_rows = result[result["mhc_one"].str.contains("B", na=False)]
+        assert len(elution_rows) >= 1
+        assert elution_rows.iloc[0]["peptide"] == "NLVPMVATV"
+        assert elution_rows.iloc[0]["binding"] == "pos"
+
+    def test_extract_records_helper(self):
+        """Test _extract_records with known column indices."""
+        from scripts.data_processing.standardize.iedb_pmhc import _extract_records
+
+        curated_to_name = {"10": "GILGFVFTL"}
+
+        # mhc_bind: allele at index 10
+        bind_row = ("1", "1", "10", "", "", "Positive", "500", "", "", "1", "HLA-A*02:01", "1")
+        records = _extract_records([bind_row], curated_to_name, allele_idx=10)
+        assert len(records) == 1
+        assert records[0]["binding"] == "pos"
+        assert records[0]["score"] == "500"
+        assert records[0]["mhc_allele"] == "HLA-A*02:01"
+
+        # mhc_elution: allele at index 36, is_elution=True
+        elution_row = list([""] * 37)
+        elution_row[2] = "10"
+        elution_row[36] = "HLA-B*07:02"
+        elution_row = tuple(elution_row)
+        records = _extract_records([elution_row], curated_to_name, allele_idx=36, is_elution=True)
+        assert len(records) == 1
+        assert records[0]["binding"] == "pos"
+        assert records[0]["score"] == ""
+        assert records[0]["mhc_allele"] == "HLA-B*07:02"
+
+
+# -----------------------------------------------------------------------
+# IMGTHLA Standardizer
+# -----------------------------------------------------------------------
+class TestImgthlaStandardizer:
+    def test_end_to_end(self, tmp_path):
+        """Test IMGTHLA standardizer with mock FASTA data."""
+        from scripts.data_processing.standardize.imgthla import ImgthlaStandardizer
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir(parents=True)
+
+        fasta_content = (
+            ">HLA:HLA00001 A*01:01:01:01 365 bp\n"
+            "MAVMAPRTLLLLLSGALALTQTWAGSHSMRYFFTSVSRPGRGEPRFIAVGY\n"
+            "VDDTQFVRFDSDAASQKMEPRAPWIEQEGPEYWDQETRNMKAHSQTDRAN\n"
+            ">HLA:HLA00002 A*01:01:01:02N 200 bp\n"
+            "MAVMAPRTLLLLLSGALALTQTWAGSHSMRYFFTSVSRPGR\n"
+            ">HLA:HLA00100 B*07:02:01 365 bp\n"
+            "MRVTAPRTVLLLLWGAVALTETWAGSHSMRYFYTSVSRPGRGEPRFITVGY\n"
+            ">HLA:HLA10000 DRB1*04:01:01 365 bp\n"
+            "MVCLKLPGGSCMTALTVTLMVLSSPLALAGDTRPRFLWQLKFECHFFNGTERV\n"
+            ">HLA:HLA20000 DQA1*01:01:01 365 bp\n"
+            "MILNKALMLGALALTTVMSPCGGEDIVADHVASCGVNLYQFYGPSGQYTHE\n"
+        )
+        (source_dir / "hla_prot.fasta").write_text(fasta_content)
+
+        output_dir = tmp_path / "output"
+        standardizer = ImgthlaStandardizer(
+            source_dir=source_dir, output_dir=output_dir,
+        )
+        summary = standardizer.run(force=True)
+        assert summary["status"] == "completed"
+        # A*01:01 deduplicated, so: A*01:01, B*07:02, DRB1*04:01, DQA1*01:01 = 4
+        assert summary["rows"] == 4
+
+        result = pd.concat(
+            [pq.read_table(p).to_pandas() for p in sorted(output_dir.glob("*.parquet"))],
+            ignore_index=True,
+        )
+        assert list(result.columns) == TARGET_COLUMNS
+        assert all(result["source"] == "imgthla")
+        assert all(result["peptide"] == "")
+
+        # Class I: mhc_one has sequence
+        a_rows = result[result["study_id"] == "HLA-A*01:01"]
+        assert len(a_rows) == 1
+        assert a_rows.iloc[0]["mhc_one"] != ""
+        assert a_rows.iloc[0]["mhc_two"] == ""
+
+        # Class II beta: mhc_two has sequence
+        drb_rows = result[result["study_id"] == "HLA-DRB1*04:01"]
+        assert len(drb_rows) == 1
+        assert drb_rows.iloc[0]["mhc_one"] == ""
+        assert drb_rows.iloc[0]["mhc_two"] != ""
+
+        # Class II alpha: mhc_one has sequence
+        dqa_rows = result[result["study_id"] == "HLA-DQA1*01:01"]
+        assert len(dqa_rows) == 1
+        assert dqa_rows.iloc[0]["mhc_one"] != ""
+        assert dqa_rows.iloc[0]["mhc_two"] == ""
+
+    def test_allele_deduplication(self, tmp_path):
+        """Multiple full-length alleles for same 4-digit should be deduplicated."""
+        from scripts.data_processing.standardize.imgthla import _parse_hla_fasta
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir(parents=True)
+
+        fasta_content = (
+            ">HLA:HLA00001 A*01:01:01:01 365 bp\n"
+            "SHORTSEQ\n"
+            ">HLA:HLA00002 A*01:01:01:02 365 bp\n"
+            "LONGERLONGERSEQ\n"
+        )
+        (source_dir / "hla_prot.fasta").write_text(fasta_content)
+
+        records = _parse_hla_fasta(source_dir / "hla_prot.fasta")
+        assert len(records) == 1
+        assert records[0]["allele_name"] == "HLA-A*01:01"
+        assert records[0]["sequence"] == "LONGERLONGERSEQ"

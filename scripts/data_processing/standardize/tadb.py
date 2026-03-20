@@ -53,7 +53,7 @@ class TadbStandardizer(BaseStandardizer):
         column_map["mhc_two"] = "mhc_two"
 
         result, dropped = standardize_dataframe(
-            df, column_map, source=self.name
+            df, column_map, source=self.name, stitch=self.stitch
         )
         yield result, dropped
 

@@ -5,9 +5,11 @@ import pytest
 
 from quest.data.standardization import (
     TARGET_COLUMNS,
+    _CDR_LOOKUP_CACHE,
     _NORM_CACHE,
     classify_mhc_class,
     clear_norm_cache,
+    enrich_cdr_columns,
     normalize_cdr3,
     normalize_gene,
     normalize_mhc_allele,
@@ -393,3 +395,130 @@ class TestStandardizeDataframe:
 
         clear_norm_cache()
         assert len(_NORM_CACHE) == 0, "Cache should be empty after clear"
+
+
+# -----------------------------------------------------------------------
+# Schema
+# -----------------------------------------------------------------------
+class TestSchema:
+    def test_schema_has_23_columns(self):
+        assert len(TARGET_COLUMNS) == 23
+
+    def test_cdr_columns_present(self):
+        for col in (
+            "tra_cdr1", "tra_cdr2", "tra_cdr3", "tra_full",
+            "trb_cdr1", "trb_cdr2", "trb_cdr3", "trb_full",
+        ):
+            assert col in TARGET_COLUMNS
+
+    def test_column_ordering(self):
+        # Alpha chain columns grouped together
+        tra_idx = TARGET_COLUMNS.index("tra")
+        tra_full_idx = TARGET_COLUMNS.index("tra_full")
+        trb_idx = TARGET_COLUMNS.index("trb")
+        assert tra_idx < tra_full_idx < trb_idx
+
+        # Beta chain columns grouped together
+        trb_full_idx = TARGET_COLUMNS.index("trb_full")
+        peptide_idx = TARGET_COLUMNS.index("peptide")
+        assert trb_idx < trb_full_idx < peptide_idx
+
+
+# -----------------------------------------------------------------------
+# enrich_cdr_columns
+# -----------------------------------------------------------------------
+class TestEnrichCdrColumns:
+    def test_cdr3_copied_from_tra_trb(self):
+        clear_norm_cache()
+        df = pd.DataFrame({col: "" for col in TARGET_COLUMNS}, index=[0, 1])
+        df["tra"] = ["CAVRDSNYQLIW", ""]
+        df["trb"] = ["CASSLAPGATNEKLFF", "CASSLGQAYEQYF"]
+        df = enrich_cdr_columns(df)
+        assert df.iloc[0]["tra_cdr3"] == "CAVRDSNYQLIW"
+        assert df.iloc[0]["trb_cdr3"] == "CASSLAPGATNEKLFF"
+        assert df.iloc[1]["tra_cdr3"] == ""
+        assert df.iloc[1]["trb_cdr3"] == "CASSLGQAYEQYF"
+
+    def test_cdr1_cdr2_from_vgene(self):
+        clear_norm_cache()
+        try:
+            import tidytcells.tr as tr
+        except ImportError:
+            pytest.skip("tidytcells not available")
+
+        df = pd.DataFrame({col: "" for col in TARGET_COLUMNS}, index=[0])
+        df["tra"] = "CAVRDSNYQLIW"
+        df["trav_gene"] = "TRAV1-2*01"
+        df["trb"] = "CASSLAPGATNEKLFF"
+        df["trbv_gene"] = "TRBV6-5*01"
+        df = enrich_cdr_columns(df)
+
+        # CDR1/CDR2 should be populated
+        assert df.iloc[0]["tra_cdr1"] != ""
+        assert df.iloc[0]["tra_cdr2"] != ""
+        assert df.iloc[0]["trb_cdr1"] != ""
+        assert df.iloc[0]["trb_cdr2"] != ""
+        # All CDR values should be valid AA
+        for col in ("tra_cdr1", "tra_cdr2", "trb_cdr1", "trb_cdr2"):
+            val = df.iloc[0][col]
+            assert all(c in "ACDEFGHIKLMNPQRSTVWYX" for c in val), f"Invalid AA in {col}: {val}"
+
+    def test_vgene_without_allele_tries_star01(self):
+        clear_norm_cache()
+        try:
+            import tidytcells.tr as tr
+        except ImportError:
+            pytest.skip("tidytcells not available")
+
+        df = pd.DataFrame({col: "" for col in TARGET_COLUMNS}, index=[0])
+        df["trb"] = "CASSLAPGATNEKLFF"
+        df["trbv_gene"] = "TRBV6-5"
+        df = enrich_cdr_columns(df)
+        # Should still populate via *01 fallback
+        assert df.iloc[0]["trb_cdr1"] != ""
+        assert df.iloc[0]["trb_cdr2"] != ""
+
+    def test_empty_vgene_gives_empty_cdr12(self):
+        clear_norm_cache()
+        df = pd.DataFrame({col: "" for col in TARGET_COLUMNS}, index=[0])
+        df["tra"] = "CAVRDSNYQLIW"
+        df["trav_gene"] = ""
+        df = enrich_cdr_columns(df)
+        assert df.iloc[0]["tra_cdr1"] == ""
+        assert df.iloc[0]["tra_cdr2"] == ""
+        # CDR3 still populated
+        assert df.iloc[0]["tra_cdr3"] == "CAVRDSNYQLIW"
+
+    def test_full_columns_empty_without_stitch(self):
+        clear_norm_cache()
+        df = pd.DataFrame({col: "" for col in TARGET_COLUMNS}, index=[0])
+        df["tra"] = "CAVRDSNYQLIW"
+        df["trav_gene"] = "TRAV1-2*01"
+        df["traj_gene"] = "TRAJ33*01"
+        df = enrich_cdr_columns(df, stitch=False)
+        assert df.iloc[0]["tra_full"] == ""
+        assert df.iloc[0]["trb_full"] == ""
+
+    def test_empty_dataframe(self):
+        clear_norm_cache()
+        df = pd.DataFrame(columns=TARGET_COLUMNS)
+        result = enrich_cdr_columns(df)
+        assert list(result.columns) == TARGET_COLUMNS
+
+    def test_standardize_dataframe_includes_cdr_columns(self):
+        clear_norm_cache()
+        df = pd.DataFrame({
+            "cdr3b": ["CASSLAPGATNEKLFF"],
+            "vb": ["TRBV6-5*01"],
+            "peptide": ["GILGFVFTL"],
+        })
+        column_map = {"cdr3b": "trb", "vb": "trbv_gene", "peptide": "peptide"}
+        result, dropped = standardize_dataframe(df, column_map, source="test")
+        assert list(result.columns) == TARGET_COLUMNS
+        assert len(result) == 1
+        assert result.iloc[0]["trb_cdr3"] == "CASSLAPGATNEKLFF"
+
+    def test_clear_norm_cache_clears_cdr_cache(self):
+        _CDR_LOOKUP_CACHE["test_gene"] = {"cdr1": "AAA", "cdr2": "BBB"}
+        clear_norm_cache()
+        assert len(_CDR_LOOKUP_CACHE) == 0

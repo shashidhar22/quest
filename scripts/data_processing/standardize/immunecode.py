@@ -183,7 +183,7 @@ class ImmunecodeStandardizer(BaseStandardizer):
             merged["mhc_two"] = ""
 
             result, dropped = standardize_dataframe(
-                merged, column_map, source=self.name
+                merged, column_map, source=self.name, stitch=self.stitch
             )
             yield result, dropped
 
@@ -238,7 +238,7 @@ class ImmunecodeStandardizer(BaseStandardizer):
                     merged["trbd_gene"] = chunk["d_gene"]
 
                 result, dropped = standardize_dataframe(
-                    merged, column_map, source=self.name, study_id=study_id,
+                    merged, column_map, source=self.name, study_id=study_id, stitch=self.stitch,
                 )
                 if not result.empty:
                     yield result, dropped

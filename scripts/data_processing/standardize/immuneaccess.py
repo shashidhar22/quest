@@ -148,6 +148,7 @@ class ImmuneaccessStandardizer(BaseStandardizer):
                         column_map,
                         source=self.name,
                         study_id=study_id,
+                        stitch=self.stitch,
                     )
                     yield result, dropped
             except Exception as e:

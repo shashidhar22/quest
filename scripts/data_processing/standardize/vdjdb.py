@@ -103,7 +103,7 @@ class VdjdbStandardizer(BaseStandardizer):
         # Yield high-score rows with full column map (unchanged behavior)
         if not df_high.empty:
             result, dropped = standardize_dataframe(
-                df_high, self.COLUMN_MAP_FULL, source=self.name
+                df_high, self.COLUMN_MAP_FULL, source=self.name, stitch=self.stitch
             )
             yield result, dropped
 
@@ -116,7 +116,7 @@ class VdjdbStandardizer(BaseStandardizer):
             df_tcr = df_low[has_tcr].reset_index(drop=True)
             if not df_tcr.empty:
                 result_tcr, dropped_tcr = standardize_dataframe(
-                    df_tcr, self.COLUMN_MAP_TCR, source=self.name
+                    df_tcr, self.COLUMN_MAP_TCR, source=self.name, stitch=self.stitch
                 )
                 yield result_tcr, dropped_tcr
 
@@ -129,7 +129,7 @@ class VdjdbStandardizer(BaseStandardizer):
             df_pmhc = df_low[has_pmhc].reset_index(drop=True)
             if not df_pmhc.empty:
                 result_pmhc, dropped_pmhc = standardize_dataframe(
-                    df_pmhc, self.COLUMN_MAP_PMHC, source=self.name
+                    df_pmhc, self.COLUMN_MAP_PMHC, source=self.name, stitch=self.stitch
                 )
                 yield result_pmhc, dropped_pmhc
 

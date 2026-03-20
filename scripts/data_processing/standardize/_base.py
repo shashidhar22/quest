@@ -2,7 +2,7 @@
 
 Each database standardizer inherits from BaseStandardizer and implements
 get_column_map() and load_and_standardize() to produce parquet files in
-the unified 15-column schema.
+the unified 23-column schema.
 """
 
 import hashlib
@@ -36,6 +36,7 @@ class BaseStandardizer(ABC):
         self,
         source_dir: str | Path,
         output_dir: str | Path | None = None,
+        stitch: bool = False,
     ):
         self.source_dir = Path(source_dir)
         if output_dir is None:
@@ -43,6 +44,7 @@ class BaseStandardizer(ABC):
                 self.source_dir.parents[1] / "standardized" / self.name
             )
         self.output_dir = Path(output_dir)
+        self.stitch = stitch
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -55,7 +57,7 @@ class BaseStandardizer(ABC):
     def load_and_standardize(self) -> Iterator[tuple[pd.DataFrame, pd.DataFrame]]:
         """Yield (standardized_df, dropped_df) tuples.
 
-        standardized_df must have exactly the 15 TARGET_COLUMNS.
+        standardized_df must have exactly the 23 TARGET_COLUMNS.
         dropped_df has columns: reason, source_file, row_index, field, raw_value.
         Small datasets can yield a single tuple.
         Large datasets should yield chunks of ~1M rows.
@@ -98,75 +100,80 @@ class BaseStandardizer(ABC):
         write_buffer: list[pd.DataFrame] = []
         write_buffer_rows = 0
 
-        for chunk_df, dropped_df in self.load_and_standardize():
-            if chunk_df.empty:
-                continue
+        # Keep dropped file handle open for duration to avoid repeated open/close
+        dropped_fh = open(dropped_path, "w", newline="")
+        try:
+            for chunk_df, dropped_df in self.load_and_standardize():
+                if chunk_df.empty:
+                    continue
 
-            if dropped_df is not None and not dropped_df.empty:
-                total_dropped += len(dropped_df)
-                dropped_df.to_csv(
-                    dropped_path,
-                    sep="\t",
-                    index=False,
-                    mode="a",
-                    header=not dropped_header_written,
+                if dropped_df is not None and not dropped_df.empty:
+                    total_dropped += len(dropped_df)
+                    dropped_df.to_csv(
+                        dropped_fh,
+                        sep="\t",
+                        index=False,
+                        header=not dropped_header_written,
+                    )
+                    dropped_fh.flush()
+                    dropped_header_written = True
+
+                # Validate schema
+                assert list(chunk_df.columns) == TARGET_COLUMNS, (
+                    f"Expected {TARGET_COLUMNS}, got {list(chunk_df.columns)}"
                 )
-                dropped_header_written = True
 
-            # Validate schema
-            assert list(chunk_df.columns) == TARGET_COLUMNS, (
-                f"Expected {TARGET_COLUMNS}, got {list(chunk_df.columns)}"
-            )
+                # Write parquet file(s)
+                if self.streaming:
+                    # Buffer chunks and flush when we have enough rows
+                    write_buffer.append(chunk_df)
+                    write_buffer_rows += len(chunk_df)
 
-            # Write parquet file(s)
-            if self.streaming:
-                # Buffer chunks and flush when we have enough rows
-                write_buffer.append(chunk_df)
-                write_buffer_rows += len(chunk_df)
+                    while write_buffer_rows >= ROWS_PER_FILE:
+                        combined = pd.concat(write_buffer, ignore_index=True)
+                        to_write = combined.iloc[:ROWS_PER_FILE]
+                        remainder = combined.iloc[ROWS_PER_FILE:]
 
-                while write_buffer_rows >= ROWS_PER_FILE:
-                    combined = pd.concat(write_buffer, ignore_index=True)
-                    to_write = combined.iloc[:ROWS_PER_FILE]
-                    remainder = combined.iloc[ROWS_PER_FILE:]
+                        out_file = self.output_dir / f"part_{file_idx:04d}.parquet"
+                        table = pa.Table.from_pandas(to_write, preserve_index=False)
+                        pq.write_table(table, out_file, compression="snappy")
+                        file_idx += 1
+                        total_rows += len(to_write)
+                        pbar.update(len(to_write))
 
+                        write_buffer = [remainder] if len(remainder) > 0 else []
+                        write_buffer_rows = len(remainder)
+                else:
                     out_file = self.output_dir / f"part_{file_idx:04d}.parquet"
-                    table = pa.Table.from_pandas(to_write, preserve_index=False)
+                    table = pa.Table.from_pandas(chunk_df, preserve_index=False)
                     pq.write_table(table, out_file, compression="snappy")
                     file_idx += 1
-                    total_rows += len(to_write)
-                    pbar.update(len(to_write))
+                    total_rows += len(chunk_df)
+                    pbar.update(len(chunk_df))
 
-                    write_buffer = [remainder] if len(remainder) > 0 else []
-                    write_buffer_rows = len(remainder)
-            else:
+                pbar.set_postfix(
+                    dropped=f"{total_dropped:,}", files=file_idx, refresh=False
+                )
+
+            # Flush remaining buffered rows for streaming mode
+            if self.streaming and write_buffer:
+                combined = pd.concat(write_buffer, ignore_index=True)
                 out_file = self.output_dir / f"part_{file_idx:04d}.parquet"
-                table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                table = pa.Table.from_pandas(combined, preserve_index=False)
                 pq.write_table(table, out_file, compression="snappy")
                 file_idx += 1
-                total_rows += len(chunk_df)
-                pbar.update(len(chunk_df))
+                total_rows += len(combined)
+                pbar.update(len(combined))
 
-            pbar.set_postfix(
-                dropped=f"{total_dropped:,}", files=file_idx, refresh=False
-            )
+            pbar.close()
 
-        # Flush remaining buffered rows for streaming mode
-        if self.streaming and write_buffer:
-            combined = pd.concat(write_buffer, ignore_index=True)
-            out_file = self.output_dir / f"part_{file_idx:04d}.parquet"
-            table = pa.Table.from_pandas(combined, preserve_index=False)
-            pq.write_table(table, out_file, compression="snappy")
-            file_idx += 1
-            total_rows += len(combined)
-            pbar.update(len(combined))
-
-        pbar.close()
-
-        # Write empty dropped file if none was written
-        if not dropped_header_written:
-            pd.DataFrame(
-                columns=["reason", "source_file", "row_index", "field", "raw_value"]
-            ).to_csv(dropped_path, sep="\t", index=False)
+            # Write empty dropped file if none was written
+            if not dropped_header_written:
+                pd.DataFrame(
+                    columns=["reason", "source_file", "row_index", "field", "raw_value"]
+                ).to_csv(dropped_fh, sep="\t", index=False)
+        finally:
+            dropped_fh.close()
 
         elapsed = time.time() - start
         checksums = self._compute_source_checksums()
@@ -208,7 +215,7 @@ class BaseStandardizer(ABC):
             return True
 
     def verify(self) -> dict:
-        """Post-run verification: row counts, null ratios, sample values."""
+        """Post-run verification: row counts, null ratios, sample values, combo stats."""
         parquet_files = sorted(self.output_dir.glob("*.parquet"))
         if not parquet_files:
             return {"error": "no parquet files found"}
@@ -216,11 +223,21 @@ class BaseStandardizer(ABC):
         total_rows = 0
         null_counts = {col: 0 for col in TARGET_COLUMNS}
         sample_values = {}
+        combo_counts = {
+            'tra_only': 0, 'trb_only': 0, 'tra_trb': 0,
+            'peptide_only': 0, 'pep_mhcI': 0, 'pep_mhcII': 0,
+            'tcr_pep_mhcI': 0, 'tcr_pep_mhcII': 0, 'tcr_peptide': 0,
+            'other': 0,
+        }
+        unique_sets = {
+            'tra': set(), 'trb': set(), 'peptide': set(), 'mhc_one': set(),
+        }
 
         for pf in parquet_files:
-            table = pq.read_table(pf)
-            total_rows += table.num_rows
-            df = table.to_pandas()
+            df = pq.read_table(pf).to_pandas()
+            total_rows += len(df)
+
+            # Null counts and sample values
             for col in TARGET_COLUMNS:
                 null_counts[col] += (df[col] == "").sum()
                 if col not in sample_values and not df[col].empty:
@@ -228,10 +245,38 @@ class BaseStandardizer(ABC):
                     if not non_empty.empty:
                         sample_values[col] = non_empty.iloc[0]
 
+            # Molecule combination counting
+            has_tra = df['tra'] != ''
+            has_trb = df['trb'] != ''
+            has_tcr = has_tra | has_trb
+            has_pep = df['peptide'] != ''
+            has_mhc_one = df['mhc_one'] != ''
+            has_mhc_two = df['mhc_two'] != ''
+            is_mhcI = has_mhc_one & ~has_mhc_two
+            is_mhcII = has_mhc_one & has_mhc_two
+            has_mhc = is_mhcI | is_mhcII
+
+            combo_counts['tra_only'] += int((has_tra & ~has_trb & ~has_pep).sum())
+            combo_counts['trb_only'] += int((~has_tra & has_trb & ~has_pep).sum())
+            combo_counts['tra_trb'] += int((has_tra & has_trb & ~has_pep).sum())
+            combo_counts['peptide_only'] += int((has_pep & ~has_mhc & ~has_tcr).sum())
+            combo_counts['pep_mhcI'] += int((has_pep & is_mhcI & ~has_tcr).sum())
+            combo_counts['pep_mhcII'] += int((has_pep & is_mhcII & ~has_tcr).sum())
+            combo_counts['tcr_pep_mhcI'] += int((has_tcr & has_pep & is_mhcI).sum())
+            combo_counts['tcr_pep_mhcII'] += int((has_tcr & has_pep & is_mhcII).sum())
+            combo_counts['tcr_peptide'] += int((has_tcr & has_pep & ~has_mhc).sum())
+            combo_counts['other'] += int((~has_tcr & ~has_pep).sum())
+
+            # Unique values per key field
+            for field in unique_sets:
+                non_empty = df.loc[df[field] != '', field]
+                unique_sets[field].update(non_empty.unique())
+
         null_ratios = {
             col: round(null_counts[col] / total_rows, 4) if total_rows > 0 else 0
             for col in TARGET_COLUMNS
         }
+        unique_counts = {field: len(vals) for field, vals in unique_sets.items()}
 
         return {
             "name": self.name,
@@ -239,6 +284,8 @@ class BaseStandardizer(ABC):
             "parquet_files": len(parquet_files),
             "null_ratios": null_ratios,
             "sample_values": sample_values,
+            "combo_counts": combo_counts,
+            "unique_counts": unique_counts,
         }
 
     # ------------------------------------------------------------------

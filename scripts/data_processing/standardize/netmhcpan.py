@@ -89,6 +89,7 @@ class NetmhcpanStandardizer(BaseStandardizer):
                                     self.get_column_map(),
                                     source=self.name,
                                     study_id=fpath.name,
+                                    stitch=self.stitch,
                                 )
                                 yield result, dropped
                                 rows = []
@@ -100,6 +101,7 @@ class NetmhcpanStandardizer(BaseStandardizer):
                         self.get_column_map(),
                         source=self.name,
                         study_id=fpath.name,
+                        stitch=self.stitch,
                     )
                     yield result, dropped
             except Exception as e:
@@ -143,6 +145,7 @@ class NetmhcpanStandardizer(BaseStandardizer):
                         self.get_column_map(),
                         source=self.name,
                         study_id=fpath.name,
+                        stitch=self.stitch,
                     )
                     yield result, dropped
             except Exception as e:
