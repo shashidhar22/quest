@@ -134,6 +134,8 @@ class ImgthlaStandardizer(BaseStandardizer):
             row = {col: "" for col in TARGET_COLUMNS}
             row["mhc_one"] = mhc_one
             row["mhc_two"] = mhc_two
+            row["mhc_one_allele"] = allele_name if mhc_one else ""
+            row["mhc_two_allele"] = allele_name if mhc_two else ""
             row["study_id"] = allele_name
             row["source"] = self.name
             rows.append(row)
