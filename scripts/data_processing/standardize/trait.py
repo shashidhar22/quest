@@ -136,6 +136,7 @@ class TraitStandardizer(BaseStandardizer):
         column_map = self.get_column_map()
         result, dropped = standardize_dataframe(
             merged, column_map, source=self.name, study_id=study_id, stitch=self.stitch,
+            hla_dir=self.hla_dir,
         )
         yield result, dropped
 
@@ -195,10 +196,12 @@ def main():
     parser.add_argument("--source-dir", default="data/databases/trait")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--hla-dir", default="")
     args = parser.parse_args()
 
     standardizer = TraitStandardizer(
         source_dir=args.source_dir, output_dir=args.output_dir,
+        hla_dir=args.hla_dir,
     )
     print(standardizer.run(force=args.force))
 
