@@ -30,6 +30,72 @@ class AdcStandardizer(BaseStandardizer):
     name = "adc"
     streaming = True
 
+    def get_file_list(self) -> list[Path]:
+        files = []
+        for repo_dir in sorted(self.source_dir.iterdir()):
+            if not repo_dir.is_dir() or repo_dir.name.startswith("."):
+                continue
+            rearr_dir = repo_dir / "rearrangements"
+            if rearr_dir.exists():
+                files.extend(sorted(rearr_dir.glob("*.tsv")))
+        return files
+
+    def process_file(self, file_path: Path) -> Iterator[tuple[pd.DataFrame, pd.DataFrame]]:
+        """Process a single ADC TSV file (used by parallel_run)."""
+        repo_dir = file_path.parent.parent
+        study_map = self._load_repertoire_study_ids(repo_dir)
+        repertoire_id = file_path.stem
+        study_id = study_map.get(repertoire_id, repo_dir.name)
+
+        try:
+            for chunk in pd.read_csv(
+                file_path,
+                sep="\t",
+                dtype=str,
+                chunksize=CHUNK_SIZE,
+                on_bad_lines="skip",
+            ):
+                chunk = chunk.fillna("")
+
+                if "productive" in chunk.columns:
+                    chunk = chunk[
+                        chunk["productive"].str.strip().str.lower().isin(
+                            ("true", "t", "1")
+                        )
+                    ]
+
+                if chunk.empty:
+                    continue
+
+                if "locus" in chunk.columns:
+                    for locus, group in chunk.groupby("locus"):
+                        locus = str(locus).strip().upper()
+                        if locus not in ("TRA", "TRB"):
+                            continue
+                        col_map = self._get_column_map_for_locus(locus)
+                        result, dropped = standardize_dataframe(
+                            group,
+                            col_map,
+                            source=self.name,
+                            study_id=study_id,
+                            stitch=self.stitch,
+                            hla_dir=self.hla_dir,
+                        )
+                        yield result, dropped
+                else:
+                    col_map = self._get_column_map_for_locus("TRB")
+                    result, dropped = standardize_dataframe(
+                        chunk,
+                        col_map,
+                        source=self.name,
+                        study_id=study_id,
+                        stitch=self.stitch,
+                        hla_dir=self.hla_dir,
+                    )
+                    yield result, dropped
+        except Exception as e:
+            print(f"  Warning: Failed to read {file_path}: {e}")
+
     def get_column_map(self) -> dict:
         return {}
 
@@ -126,6 +192,7 @@ class AdcStandardizer(BaseStandardizer):
                                     source=self.name,
                                     study_id=study_id,
                                     stitch=self.stitch,
+                                    hla_dir=self.hla_dir,
                                 )
                                 yield result, dropped
                         else:
@@ -137,6 +204,7 @@ class AdcStandardizer(BaseStandardizer):
                                 source=self.name,
                                 study_id=study_id,
                                 stitch=self.stitch,
+                                hla_dir=self.hla_dir,
                             )
                             yield result, dropped
                 except Exception as e:
@@ -153,10 +221,12 @@ def main():
     parser.add_argument("--source-dir", default="data/databases/adc")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--hla-dir", default="")
     args = parser.parse_args()
 
     standardizer = AdcStandardizer(
         source_dir=args.source_dir, output_dir=args.output_dir,
+        hla_dir=args.hla_dir,
     )
     print(standardizer.run(force=args.force))
 
