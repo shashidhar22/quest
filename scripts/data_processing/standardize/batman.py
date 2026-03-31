@@ -138,7 +138,8 @@ class BatmanStandardizer(BaseStandardizer):
             column_map["_binding"] = "binding"
 
         result, dropped = standardize_dataframe(
-            df, column_map, source=self.name, stitch=self.stitch
+            df, column_map, source=self.name, stitch=self.stitch,
+            hla_dir=self.hla_dir,
         )
         yield result, dropped
 
@@ -163,11 +164,13 @@ def main():
         help="Output directory (default: data/standardized/batman)",
     )
     parser.add_argument("--force", action="store_true", help="Force re-run")
+    parser.add_argument("--hla-dir", default="")
     args = parser.parse_args()
 
     standardizer = BatmanStandardizer(
         source_dir=args.source_dir,
         output_dir=args.output_dir,
+        hla_dir=args.hla_dir,
     )
     summary = standardizer.run(force=args.force)
     print(summary)
