@@ -267,6 +267,55 @@ class TCRStitcher:
             self._gene_cache[cache_key] = None
             return None
     
+    def _get_j_motif(self, j_gene: str, chain: str) -> Optional[str]:
+        """Look up the conserved C-terminal residue for a J gene.
+
+        Args:
+            j_gene: Normalized J gene name (e.g., 'TRAJ37*01')
+            chain: 'TRA' or 'TRB'
+
+        Returns:
+            Single amino acid character (usually 'F' or 'W') or None
+        """
+        chain_data = self.tra_data if chain == 'TRA' else self.trb_data
+        j_res = chain_data.get('j_res', {})
+
+        # Try exact match first, then without allele
+        if j_gene in j_res:
+            return j_res[j_gene]
+        base = j_gene.split('*')[0] if '*' in j_gene else j_gene
+        for k, v in j_res.items():
+            if k.startswith(base):
+                return v
+        return None
+
+    def _restore_cdr3_anchors(self, cdr3: str, j_gene: str, chain: str) -> str:
+        """Add missing conserved anchor residues to a CDR3 sequence.
+
+        IMGT-numbered CDR3 starts with a conserved Cysteine (from V gene,
+        position 104) and ends with a conserved Phenylalanine/Tryptophan
+        (from J gene, position 118).  Some databases strip these anchors.
+        Stitchr requires them, so we restore them when missing.
+
+        Args:
+            cdr3: CDR3 amino acid sequence (may or may not have anchors)
+            j_gene: Normalized J gene name
+            chain: 'TRA' or 'TRB'
+
+        Returns:
+            CDR3 with anchors restored if they were missing
+        """
+        # Restore leading C (V gene anchor, IMGT position 104)
+        if not cdr3.startswith('C'):
+            cdr3 = 'C' + cdr3
+
+        # Restore trailing J gene motif (usually F or W, IMGT position 118)
+        j_motif = self._get_j_motif(j_gene, chain)
+        if j_motif and not cdr3.endswith(j_motif):
+            cdr3 = cdr3 + j_motif
+
+        return cdr3
+
     def stitch_tcr(
         self,
         cdr3: str,
@@ -280,7 +329,7 @@ class TCRStitcher:
         Generate full-length TCR sequence using stitchr.
 
         Args:
-            cdr3: CDR3 amino acid sequence
+            cdr3: CDR3 amino acid sequence (anchors restored automatically if missing)
             v_gene: V gene name (will be normalized to IMGT format)
             j_gene: J gene name (will be normalized to IMGT format)
             chain: 'TRA' or 'TRB'
@@ -306,20 +355,23 @@ class TCRStitcher:
             else:
                 norm_v_gene = self.normalize_gene_name(v_gene, chain)
                 norm_j_gene = self.normalize_gene_name(j_gene, chain)
-            
+
             if not norm_v_gene or not norm_j_gene:
                 return None
-            
+
+            # Restore conserved CDR3 anchor residues if missing
+            cdr3 = self._restore_cdr3_anchors(cdr3, norm_j_gene, chain)
+
             # Auto-select constant region if not provided
             if c_gene is None:
                 if chain == 'TRA':
                     c_gene = 'TRAC*01'
                 elif chain == 'TRB':
                     c_gene = 'TRBC1*01'  # Default to TRBC1
-            
+
             # Get chain data
             chain_data = self.tra_data if chain == 'TRA' else self.trb_data
-            
+
             # Build tcr_bits dictionary for stitchr
             tcr_bits = {
                 'v': norm_v_gene,
