@@ -4,7 +4,6 @@ import glob
 import numpy as np
 import pandas as pd
 
-from dask import delayed
 from itertools import product
 from collections import OrderedDict
 
