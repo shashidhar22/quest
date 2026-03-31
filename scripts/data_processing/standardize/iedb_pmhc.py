@@ -247,22 +247,24 @@ def _load_mhc_bind_from_mysql(sql_gz_path: Path) -> pd.DataFrame:
         len(epitope_rows),
     )
 
-    # Build epitope name lookup: curated_epitope_id -> epitope sequence
-    # curated_epitope: col_0=curated_epitope_id, col_6=epitope_id
-    # epitope: col_0=epitope_id, col_1=epitope_description
-    epitope_id_to_name = {}
+    # Build epitope sequence lookup: epitope_id -> peptide sequence
+    # epitope table: col_0=epitope_id, col_1=description, col_2=linear_peptide_seq
+    # Prefer linear_peptide_seq (clean AA sequence) over description
+    # (which may contain modification annotations like "SMYQTLLML + OX(M8)")
+    epitope_id_to_seq = {}
     for row in epitope_rows:
-        if len(row) >= 2 and row[0] and row[1]:
-            epitope_id_to_name[row[0]] = row[1]
+        if len(row) >= 2 and row[0]:
+            seq = row[2] if len(row) >= 3 and row[2] else ""
+            if not seq:
+                seq = row[1] if row[1] else ""
+            if seq:
+                epitope_id_to_seq[row[0]] = seq
 
     curated_to_name = {}
     for row in curated_epitope_rows:
         if len(row) >= 7 and row[0]:
             epitope_id = row[6] if len(row) > 6 else ""
-            name = epitope_id_to_name.get(epitope_id, "")
-            if not name and len(row) >= 3:
-                # Fallback to curated_epitope.col_2 (curated name)
-                name = row[2] if row[2] else ""
+            name = epitope_id_to_seq.get(epitope_id, "")
             if name:
                 curated_to_name[row[0]] = name
 
@@ -391,13 +393,14 @@ class IedbPmhcStandardizer(BaseStandardizer):
 
         df = pd.concat(chunks, ignore_index=True)
 
-        # Split MHC allele into mhc_one/mhc_two
-        mhc_split = df["mhc_allele"].apply(split_mhc_to_alpha_beta)
-        df["mhc_one"] = mhc_split.apply(lambda x: x[0])
-        df["mhc_two"] = mhc_split.apply(lambda x: x[1])
+        # Split MHC allele into mhc_one/mhc_two (unique-then-map for speed)
+        unique_alleles = df["mhc_allele"].unique()
+        split_lookup = {a: split_mhc_to_alpha_beta(a) for a in unique_alleles}
+        df["mhc_one"] = df["mhc_allele"].map(lambda a: split_lookup[a][0])
+        df["mhc_two"] = df["mhc_allele"].map(lambda a: split_lookup[a][1])
 
         column_map = self.get_column_map()
-        result, dropped = standardize_dataframe(df, column_map, source=self.name, stitch=self.stitch)
+        result, dropped = standardize_dataframe(df, column_map, source=self.name, stitch=self.stitch, hla_dir=self.hla_dir)
         yield result, dropped
 
 
@@ -412,10 +415,12 @@ def main():
     parser.add_argument("--source-dir", default="data/databases/IEDB")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--hla-dir", default="")
     args = parser.parse_args()
 
     standardizer = IedbPmhcStandardizer(
-        source_dir=args.source_dir, output_dir=args.output_dir
+        source_dir=args.source_dir, output_dir=args.output_dir,
+        hla_dir=args.hla_dir,
     )
     print(standardizer.run(force=args.force))
 
