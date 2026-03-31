@@ -38,6 +38,82 @@ class ImmuneaccessStandardizer(BaseStandardizer):
     # Track warned parent directories to avoid log spam
     _warned_dirs: set = set()
 
+    def get_file_list(self) -> list[Path]:
+        return sorted(self.source_dir.rglob("*.tsv"))
+
+    def process_file(self, file_path: Path) -> Iterator[tuple[pd.DataFrame, pd.DataFrame]]:
+        """Process a single TSV file (used by parallel_run)."""
+        chain = self._get_chain_type(file_path)
+        column_map = self._get_column_map_for_chain(chain)
+        study_id = file_path.stem
+
+        try:
+            with open(file_path) as f:
+                header_line = f.readline()
+            if not header_line.strip():
+                return
+            header_cols = header_line.strip().split("\t")
+
+            needed = {"amino_acid"}
+            for base, resolved in [
+                ("v_gene", "v_resolved"),
+                ("d_gene", "d_resolved"),
+                ("j_gene", "j_resolved"),
+            ]:
+                if base in header_cols:
+                    needed.add(base)
+                elif resolved in header_cols:
+                    needed.add(resolved)
+            if "frame_type" in header_cols:
+                needed.add("frame_type")
+            elif "productive" in header_cols:
+                needed.add("productive")
+            usecols = [c for c in needed if c in header_cols]
+
+            for chunk in pd.read_csv(
+                file_path,
+                sep="\t",
+                dtype=str,
+                chunksize=CHUNK_SIZE,
+                on_bad_lines="skip",
+                usecols=usecols if usecols else None,
+            ):
+                chunk = chunk.fillna("")
+
+                if "frame_type" in chunk.columns:
+                    chunk = chunk[
+                        chunk["frame_type"].str.strip().str.lower() == "in"
+                    ]
+                elif "productive" in chunk.columns:
+                    chunk = chunk[
+                        chunk["productive"].str.strip().str.lower().isin(
+                            ("true", "t", "1")
+                        )
+                    ]
+
+                if chunk.empty:
+                    continue
+
+                for base, resolved in [
+                    ("v_gene", "v_resolved"),
+                    ("d_gene", "d_resolved"),
+                    ("j_gene", "j_resolved"),
+                ]:
+                    if base not in chunk.columns and resolved in chunk.columns:
+                        chunk[base] = chunk[resolved]
+
+                result, dropped = standardize_dataframe(
+                    chunk,
+                    column_map,
+                    source=self.name,
+                    study_id=study_id,
+                    stitch=self.stitch,
+                    hla_dir=self.hla_dir,
+                )
+                yield result, dropped
+        except Exception as e:
+            print(f"  Warning: Failed to read {file_path.name}: {e}")
+
     def get_column_map(self) -> dict:
         # Will be overridden per-file based on chain type
         return {}
@@ -149,6 +225,7 @@ class ImmuneaccessStandardizer(BaseStandardizer):
                         source=self.name,
                         study_id=study_id,
                         stitch=self.stitch,
+                        hla_dir=self.hla_dir,
                     )
                     yield result, dropped
             except Exception as e:
@@ -165,10 +242,12 @@ def main():
     parser.add_argument("--source-dir", default="data/databases/immuneACCESS")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--hla-dir", default="")
     args = parser.parse_args()
 
     standardizer = ImmuneaccessStandardizer(
         source_dir=args.source_dir, output_dir=args.output_dir,
+        hla_dir=args.hla_dir,
     )
     print(standardizer.run(force=args.force))
 
