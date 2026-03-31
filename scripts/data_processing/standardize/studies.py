@@ -333,11 +333,11 @@ class StudiesStandardizer(BaseStandardizer):
     name = "studies"
     streaming = True
 
-    def __init__(self, source_dir=None, output_dir=None):
+    def __init__(self, source_dir=None, output_dir=None, stitch=False, hla_dir=""):
         # Studies are typically in data/studies/ not data/databases/studies/
         if source_dir is None:
             source_dir = Path("data/studies")
-        super().__init__(source_dir=source_dir, output_dir=output_dir)
+        super().__init__(source_dir=source_dir, output_dir=output_dir, stitch=stitch, hla_dir=hla_dir)
         # Track files that couldn't be parsed
         self._skipped_files: list[tuple] = []
 
@@ -370,6 +370,41 @@ class StudiesStandardizer(BaseStandardizer):
     def get_column_map(self) -> dict:
         return {}  # Determined per-file
 
+    def get_file_list(self) -> list[Path]:
+        if not self.source_dir.exists():
+            return []
+        files = []
+        study_dirs = sorted(
+            d
+            for d in self.source_dir.iterdir()
+            if d.is_dir() and not d.name.startswith((".", "logs", "geo"))
+        )
+        for study_dir in study_dirs:
+            for ext in (
+                "*.csv", "*.tsv", "*.txt", "*.structure",
+                "*.csv.gz", "*.tsv.gz", "*.txt.gz",
+            ):
+                for fpath in sorted(study_dir.rglob(ext)):
+                    if not any(
+                        skip in fpath.name.lower()
+                        for skip in ("metadata", "manifest", "readme", "log", "summary")
+                    ):
+                        files.append(fpath)
+        return files
+
+    def process_file(self, file_path: Path) -> Iterator[tuple[pd.DataFrame, pd.DataFrame]]:
+        """Process a single study file (used by parallel_run)."""
+        # Infer study_id from parent directory name
+        study_id = file_path.parent.name
+        # Walk up if we're in a nested subdirectory until we find a study-like dir
+        for parent in file_path.parents:
+            if parent == self.source_dir:
+                break
+            if parent.parent == self.source_dir:
+                study_id = parent.name
+                break
+        yield from self._process_file(file_path, study_id)
+
     def _split_by_chain(
         self, chunk, chain_col, default_col_map, study_id,
     ) -> Iterator[tuple]:
@@ -398,6 +433,7 @@ class StudiesStandardizer(BaseStandardizer):
                 continue
             result, dropped = standardize_dataframe(
                 group, col_map, source=self.name, study_id=study_id, stitch=self.stitch,
+                hla_dir=self.hla_dir,
             )
             yield result, dropped
 
@@ -426,6 +462,7 @@ class StudiesStandardizer(BaseStandardizer):
                 if lv == "":
                     result, dropped = standardize_dataframe(
                         group, default_col_map, source=self.name, study_id=study_id, stitch=self.stitch,
+                        hla_dir=self.hla_dir,
                     )
                     yield result, dropped
                 continue
@@ -435,6 +472,7 @@ class StudiesStandardizer(BaseStandardizer):
                 continue
             result, dropped = standardize_dataframe(
                 group, col_map, source=self.name, study_id=study_id, stitch=self.stitch,
+                hla_dir=self.hla_dir,
             )
             yield result, dropped
 
@@ -672,6 +710,7 @@ class StudiesStandardizer(BaseStandardizer):
                         source=self.name,
                         study_id=study_id,
                         stitch=self.stitch,
+                        hla_dir=self.hla_dir,
                     )
                     # Merge filter drop records into dropped_df
                     if drop_records:
@@ -697,10 +736,12 @@ def main():
     parser.add_argument("--source-dir", default="data/studies")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--hla-dir", default="")
     args = parser.parse_args()
 
     standardizer = StudiesStandardizer(
         source_dir=args.source_dir, output_dir=args.output_dir,
+        hla_dir=args.hla_dir,
     )
     print(standardizer.run(force=args.force))
 
