@@ -103,7 +103,8 @@ class VdjdbStandardizer(BaseStandardizer):
         # Yield high-score rows with full column map (unchanged behavior)
         if not df_high.empty:
             result, dropped = standardize_dataframe(
-                df_high, self.COLUMN_MAP_FULL, source=self.name, stitch=self.stitch
+                df_high, self.COLUMN_MAP_FULL, source=self.name, stitch=self.stitch,
+                hla_dir=self.hla_dir,
             )
             yield result, dropped
 
@@ -116,7 +117,8 @@ class VdjdbStandardizer(BaseStandardizer):
             df_tcr = df_low[has_tcr].reset_index(drop=True)
             if not df_tcr.empty:
                 result_tcr, dropped_tcr = standardize_dataframe(
-                    df_tcr, self.COLUMN_MAP_TCR, source=self.name, stitch=self.stitch
+                    df_tcr, self.COLUMN_MAP_TCR, source=self.name, stitch=self.stitch,
+                    hla_dir=self.hla_dir,
                 )
                 yield result_tcr, dropped_tcr
 
@@ -129,7 +131,8 @@ class VdjdbStandardizer(BaseStandardizer):
             df_pmhc = df_low[has_pmhc].reset_index(drop=True)
             if not df_pmhc.empty:
                 result_pmhc, dropped_pmhc = standardize_dataframe(
-                    df_pmhc, self.COLUMN_MAP_PMHC, source=self.name, stitch=self.stitch
+                    df_pmhc, self.COLUMN_MAP_PMHC, source=self.name, stitch=self.stitch,
+                    hla_dir=self.hla_dir,
                 )
                 yield result_pmhc, dropped_pmhc
 
@@ -144,10 +147,12 @@ def main():
     parser.add_argument("--source-dir", default="data/databases/vdjdb")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--hla-dir", default="")
     args = parser.parse_args()
 
     standardizer = VdjdbStandardizer(
         source_dir=args.source_dir, output_dir=args.output_dir,
+        hla_dir=args.hla_dir,
     )
     print(standardizer.run(force=args.force))
 
