@@ -103,7 +103,8 @@ class McpasStandardizer(BaseStandardizer):
             column_map["_binding"] = "binding"
 
         result, dropped = standardize_dataframe(
-            df, column_map, source=self.name, stitch=self.stitch
+            df, column_map, source=self.name, stitch=self.stitch,
+            hla_dir=self.hla_dir,
         )
         yield result, dropped
 
@@ -118,10 +119,12 @@ def main():
     parser.add_argument("--source-dir", default="data/databases/McPAS-TCR")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--hla-dir", default="")
     args = parser.parse_args()
 
     standardizer = McpasStandardizer(
         source_dir=args.source_dir, output_dir=args.output_dir,
+        hla_dir=args.hla_dir,
     )
     print(standardizer.run(force=args.force))
 
