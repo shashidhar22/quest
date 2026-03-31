@@ -2,7 +2,7 @@
 
 Provides normalization for CDR3 sequences, gene names, MHC alleles,
 and peptides. Also provides standardize_dataframe() which maps raw
-database columns to the unified 23-column TARGET_COLUMNS schema.
+database columns to the unified 25-column TARGET_COLUMNS schema.
 """
 
 import logging
@@ -14,7 +14,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# The 23 target columns for the unified schema
+# The 25 target columns for the unified schema
 TARGET_COLUMNS = [
     "tra",
     "trav_gene",
@@ -35,6 +35,8 @@ TARGET_COLUMNS = [
     "peptide",
     "mhc_one",
     "mhc_two",
+    "mhc_one_allele",
+    "mhc_two_allele",
     "binding",
     "score",
     "source",
@@ -43,6 +45,9 @@ TARGET_COLUMNS = [
 
 # Valid amino acid characters (standard 20 + U selenocysteine + X unknown)
 VALID_AA = set("ACDEFGHIKLMNPQRSTVWYX" + "U")
+
+# Pre-compiled regex for fast AA validation (avoids Python-level per-char loop)
+_VALID_AA_RE = re.compile(r"^[ACDEFGHIKLMNPQRSTVWYXU]+$")
 
 # NA-like strings to treat as empty
 _NA_STRINGS = {"na", "nan", "none", "null", "n/a", ".", "-", "nd", "not determined"}
@@ -53,11 +58,121 @@ _NORM_CACHE: dict[str, dict[str, str]] = defaultdict(dict)
 # CDR lookup cache: {v_gene: {"cdr1": seq, "cdr2": seq}}
 _CDR_LOOKUP_CACHE: dict[str, dict[str, str]] = {}
 
+# HLA sequence resolution caches
+_HLA_SEQ_DICT: dict[str, str] | None = None  # {allele_no_prefix: aa_sequence}
+_HLA_PREFIX_CACHE: dict[str, str] | None = None  # {prefix: first_4digit_match}
+_HLA_DIR: str | None = None
+
 
 def clear_norm_cache():
     """Clear the global normalization cache."""
+    global _HLA_SEQ_DICT, _HLA_PREFIX_CACHE, _HLA_DIR
     _NORM_CACHE.clear()
     _CDR_LOOKUP_CACHE.clear()
+    _HLA_SEQ_DICT = None
+    _HLA_PREFIX_CACHE = None
+    _HLA_DIR = None
+
+
+def load_hla_sequences(hla_dir: str) -> None:
+    """Load HLA allele→sequence mapping from IMGT/HLA FASTA files.
+
+    Populates the module-level _HLA_SEQ_DICT and _HLA_PREFIX_CACHE.
+    Skips reload if the same directory was already loaded.
+    """
+    global _HLA_SEQ_DICT, _HLA_PREFIX_CACHE, _HLA_DIR
+
+    if _HLA_SEQ_DICT is not None and _HLA_DIR == hla_dir:
+        return  # Already loaded from this directory
+
+    import glob as _glob
+    from collections import OrderedDict
+
+    file_paths = _glob.glob(f"{hla_dir}/*_prot.fasta")
+    fasta_dict = OrderedDict()
+
+    for file_path in file_paths:
+        with open(file_path, "r") as f:
+            header, sequence = None, []
+            for line in f:
+                line = line.strip()
+                if line.startswith(">"):
+                    if header and header not in fasta_dict:
+                        fasta_dict[header] = "".join(sequence)
+                    # Extract HLA ID at four-digit resolution
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        hla_id_full = parts[1]  # e.g. "A*01:01:01:06"
+                        hla_id_four_digit = ":".join(
+                            hla_id_full.split(":")[:2]
+                        )  # "A*01:01"
+                        if hla_id_four_digit not in fasta_dict:
+                            header = hla_id_four_digit
+                        else:
+                            header = None
+                    else:
+                        header = None
+                    sequence = []
+                else:
+                    sequence.append(line)
+            if header and header not in fasta_dict:
+                fasta_dict[header] = "".join(sequence)
+
+    # Build prefix cache for 2-digit fallback: "A*02" → "A*02:01"
+    prefix_cache = {}
+    for key in sorted(fasta_dict.keys()):
+        parts = key.split(":")
+        for i in range(len(parts), 0, -1):
+            prefix = ":".join(parts[:i])
+            if prefix not in prefix_cache:
+                prefix_cache[prefix] = key
+
+    _HLA_SEQ_DICT = fasta_dict
+    _HLA_PREFIX_CACHE = prefix_cache
+    _HLA_DIR = hla_dir
+
+    logger.info(
+        "Loaded %d HLA allele sequences from %s", len(fasta_dict), hla_dir
+    )
+
+
+def resolve_allele_to_sequence(allele: str) -> str:
+    """Resolve a normalized HLA allele name to its amino acid sequence.
+
+    Args:
+        allele: Normalized allele name (e.g., "HLA-A*02:01").
+
+    Returns:
+        Amino acid sequence string, or "" if not found.
+        Requires load_hla_sequences() to have been called first.
+    """
+    if not allele or _HLA_SEQ_DICT is None:
+        return ""
+
+    # Strip HLA- prefix for lookup
+    lookup_key = allele
+    if lookup_key.startswith("HLA-"):
+        lookup_key = lookup_key[4:]
+
+    # Truncate to 4-digit resolution
+    colon_parts = lookup_key.split(":")
+    if len(colon_parts) > 2:
+        lookup_key = ":".join(colon_parts[:2])
+
+    # Direct lookup
+    seq = _HLA_SEQ_DICT.get(lookup_key)
+    if seq:
+        return seq
+
+    # Prefix fallback (e.g., "A*02" matches "A*02:01")
+    if _HLA_PREFIX_CACHE is not None:
+        resolved_key = _HLA_PREFIX_CACHE.get(lookup_key)
+        if resolved_key:
+            seq = _HLA_SEQ_DICT.get(resolved_key)
+            if seq:
+                return seq
+
+    return ""
 
 
 def _is_na(value) -> bool:
@@ -91,9 +206,21 @@ def normalize_cdr3(value) -> str:
     value = "".join(value.split())
     if len(value) < 4:
         return ""
-    if not all(c in VALID_AA for c in value):
+    if not _VALID_AA_RE.match(value):
         return ""
     return value
+
+
+# ---------------------------------------------------------------------------
+# BCR/IG gene detection
+# ---------------------------------------------------------------------------
+# Matches IG heavy/kappa/lambda gene names — used to detect B-cell contamination
+_IG_GENE_RE = re.compile(r"^(?:TCR)?IG[HKL][VDJ]", re.IGNORECASE)
+
+
+def _is_ig_gene(value: str) -> bool:
+    """Check if a gene name is an immunoglobulin (BCR) gene."""
+    return bool(_IG_GENE_RE.match(value.strip()))
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +300,12 @@ _HLA_FULL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Match HLA-A02:01 format (missing asterisk, has colon) — e.g. NetMHCpan data
+_HLA_NOASTERISK_RE = re.compile(
+    r"^(?:HLA-)?((?:DRB[1-9]|DQA1|DQB1|DPA1|DPB1|[A-G])(\d{2,3}):(\d{2,3}))$",
+    re.IGNORECASE,
+)
+
 _HLA_COMPACT_RE = re.compile(
     r"^(HLA-)?([ABC])(\d{2})(\d{2})$",
     re.IGNORECASE,
@@ -210,6 +343,26 @@ def normalize_mhc_allele(value) -> str:
         gene = m.group(2).upper()
         # Ensure HLA- prefix
         return f"HLA-{gene}"
+
+    # Missing asterisk format: HLA-A02:01 or A02:01 -> HLA-A*02:01
+    m = _HLA_NOASTERISK_RE.match(value)
+    if m:
+        raw_gene_digits = m.group(1).upper()
+        # Insert * between gene name and first digit group
+        # E.g., "A02:01" -> gene="A", digits="02:01"
+        gm = re.match(r"([A-Z]+[0-9]*)(\d{2,3}:\d{2,3})", raw_gene_digits)
+        if gm:
+            gene_part = gm.group(1)
+            digit_part = gm.group(2)
+            # Separate gene letters from leading digits that belong to the allele
+            # E.g., DRB1 should stay as DRB1, but A02 -> gene=A, digits=02
+            gm2 = re.match(
+                r"(DRB[1-9]|DQA1|DQB1|DPA1|DPB1|[A-G])(.*)", gene_part
+            )
+            if gm2:
+                gene = gm2.group(1)
+                extra = gm2.group(2)
+                return f"HLA-{gene}*{extra}{digit_part}"
 
     # Compact format: A0201 -> HLA-A*02:01
     m = _HLA_COMPACT_RE.match(value)
@@ -357,7 +510,7 @@ def normalize_peptide(value) -> str:
     if len(value) > 100:
         return ""
     # Reject if contains non-AA characters (spaces, digits, etc.)
-    if not all(c in VALID_AA for c in value):
+    if not _VALID_AA_RE.match(value):
         return ""
     return value
 
@@ -450,22 +603,38 @@ def enrich_cdr_columns(df: pd.DataFrame, stitch: bool = False) -> pd.DataFrame:
                         & df[v_col].ne("")
                         & df[j_col].ne("")
                     )
-                    if mask.any():
-                        subset = df.loc[mask, [cdr3_col, v_col, j_col]]
-                        stitch_df = pd.DataFrame({
-                            "cdr3": subset[cdr3_col],
-                            "v_gene": subset[v_col],
-                            "j_gene": subset[j_col],
-                        })
-                        stitched = stitcher.stitch_batch(
-                            stitch_df, chain=chain
+                    if not mask.any():
+                        continue
+
+                    subset = df.loc[mask, [cdr3_col, v_col, j_col]]
+
+                    # Unique-then-map: stitch each unique (cdr3, v, j) once
+                    unique_combos = (
+                        subset.drop_duplicates()
+                        .reset_index(drop=True)
+                    )
+                    stitch_cache = {}
+                    for _, row in unique_combos.iterrows():
+                        key = (row[cdr3_col], row[v_col], row[j_col])
+                        result = stitcher.stitch_tcr(
+                            cdr3=key[0],
+                            v_gene=key[1],
+                            j_gene=key[2],
+                            chain=chain,
                         )
-                        if stitched is not None and "full_sequence" in stitched.columns:
-                            df.loc[mask, full_col] = (
-                                stitched["full_sequence"].fillna("").values
-                            )
-        except (ImportError, Exception) as e:
-            logger.debug("Stitching unavailable or failed: %s", e)
+                        stitch_cache[key] = result if result else ""
+
+                    # Map back to all rows
+                    df.loc[mask, full_col] = [
+                        stitch_cache.get(
+                            (r[cdr3_col], r[v_col], r[j_col]), ""
+                        )
+                        for _, r in subset.iterrows()
+                    ]
+        except ImportError:
+            logger.debug("Stitching unavailable: stitchr not installed")
+        except Exception as e:
+            logger.debug("Stitching failed: %s", e)
 
     return df
 
@@ -495,8 +664,9 @@ def standardize_dataframe(
     source: str,
     study_id: str = "",
     stitch: bool = False,
+    hla_dir: str = "",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Map and normalize a DataFrame to the 23-column TARGET_COLUMNS schema.
+    """Map and normalize a DataFrame to the 25-column TARGET_COLUMNS schema.
 
     Args:
         df: Input DataFrame with database-specific column names.
@@ -504,6 +674,9 @@ def standardize_dataframe(
         source: Source database name (e.g., "batman").
         study_id: Optional study identifier.
         stitch: If True, generate full-length sequences via TCRStitcher.
+        hla_dir: Path to IMGT/HLA fasta directory. When provided, resolved
+            allele names are copied to mhc_one_allele/mhc_two_allele and
+            mhc_one/mhc_two are replaced with amino acid sequences.
 
     Returns:
         (standardized_df, dropped_df) where:
@@ -536,6 +709,41 @@ def standardize_dataframe(
     result["source"] = source
     if study_id:
         result["study_id"] = study_id
+
+    # ------------------------------------------------------------------
+    # Remove BCR/IG contamination: if any gene field for a chain contains
+    # an immunoglobulin gene (IGH*, IGK*, IGL*), blank the entire chain.
+    # This prevents BCR CDR3 sequences from leaking into TCR output.
+    # ------------------------------------------------------------------
+    for cdr3_col, gene_cols in [
+        ("tra", ["trav_gene", "trad_gene", "traj_gene"]),
+        ("trb", ["trbv_gene", "trbd_gene", "trbj_gene"]),
+    ]:
+        # Check unique gene values for IG patterns (fast unique-then-map)
+        ig_lookups = {}
+        for gene_col in gene_cols:
+            unique_genes = result[gene_col].unique()
+            ig_lookups[gene_col] = {
+                g: _is_ig_gene(str(g)) for g in unique_genes
+            }
+
+        # A row is BCR-contaminated if ANY gene field for the chain is IG
+        ig_mask = None
+        for gene_col in gene_cols:
+            col_is_ig = result[gene_col].map(ig_lookups[gene_col])
+            ig_mask = col_is_ig if ig_mask is None else (ig_mask | col_is_ig)
+
+        if ig_mask is not None and ig_mask.any():
+            ig_count = ig_mask.sum()
+            logger.debug(
+                "Blanking %d BCR-contaminated %s rows (IG genes detected)",
+                ig_count,
+                cdr3_col,
+            )
+            # Blank CDR3 and all gene fields for this chain
+            result.loc[ig_mask, cdr3_col] = ""
+            for gene_col in gene_cols:
+                result.loc[ig_mask, gene_col] = ""
 
     # Normalize columns using unique-then-map for efficiency
     dropped_records: list[pd.DataFrame] = []
@@ -577,6 +785,44 @@ def standardize_dataframe(
                 "field": tgt_col,
                 "raw_value": raw_values[dropped_mask].astype(str).str[:200],
             }))
+
+    # ------------------------------------------------------------------
+    # MHC allele → amino acid sequence resolution
+    # ------------------------------------------------------------------
+    # Copy normalized allele names to allele columns (before resolution)
+    result["mhc_one_allele"] = result["mhc_one"]
+    result["mhc_two_allele"] = result["mhc_two"]
+
+    if hla_dir:
+        load_hla_sequences(hla_dir)
+
+        for mhc_col in ("mhc_one", "mhc_two"):
+            allele_col = f"{mhc_col}_allele"
+            unique_alleles = result[mhc_col].unique()
+            resolve_map = {}
+            for allele in unique_alleles:
+                if allele:
+                    seq = resolve_allele_to_sequence(allele)
+                    resolve_map[allele] = seq
+                else:
+                    resolve_map[allele] = ""
+
+            result[mhc_col] = result[mhc_col].map(resolve_map)
+
+            # Track unresolved alleles (had a value but resolved to "")
+            unresolved_mask = (
+                result[allele_col].ne("")
+                & result[mhc_col].eq("")
+            )
+            if unresolved_mask.any():
+                unresolved_idx = result.index[unresolved_mask]
+                dropped_records.append(pd.DataFrame({
+                    "reason": "mhc_unresolved",
+                    "source_file": source,
+                    "row_index": unresolved_idx,
+                    "field": mhc_col,
+                    "raw_value": result.loc[unresolved_mask, allele_col].astype(str).str[:200],
+                }))
 
     # Enrich CDR1/CDR2/CDR3 and full-length columns
     result = enrich_cdr_columns(result, stitch=stitch)
