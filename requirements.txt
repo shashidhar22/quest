@@ -26,6 +26,9 @@ python-snappy>=0.7.3
 # JSON parsing (for iReceptor)
 ijson>=3.4.0
 
+# Fast JSON serialization (used by deduplicate_streaming.py, falls back to stdlib json)
+orjson>=3.10.0
+
 # Parallel processing
 distributed>=2025.11.0
 cloudpickle>=3.1.2
