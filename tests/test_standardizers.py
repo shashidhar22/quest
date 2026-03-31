@@ -1,7 +1,7 @@
 """Integration tests for per-database standardizers.
 
 Each test creates minimal mock data matching the real schema, runs the
-standardizer, and verifies the output conforms to the 23-column schema.
+standardizer, and verifies the output conforms to the 25-column schema.
 """
 
 import os
@@ -843,8 +843,8 @@ class TestBindingScoreColumns:
         meta_neg = _parse_trait_filename("A0201_GILGFVFTL_BMLF1_EBV_binder_neg.zip")
         assert meta_neg["binding"] == "neg"
 
-    def test_schema_has_23_columns(self):
-        assert len(TARGET_COLUMNS) == 23
+    def test_schema_has_25_columns(self):
+        assert len(TARGET_COLUMNS) == 25
         assert "binding" in TARGET_COLUMNS
         assert "score" in TARGET_COLUMNS
         # binding and score should come after mhc_two, before source
