@@ -64,6 +64,130 @@ class ImmunecodeStandardizer(BaseStandardizer):
     name = "immunecode"
     streaming = True
 
+    def get_file_list(self) -> list[Path]:
+        files = sorted(self.source_dir.rglob("*_TCRB.tsv"))
+        # Include MIRA peptide-detail files
+        files.extend(sorted(self.source_dir.rglob("peptide-detail-ci.csv")))
+        return files
+
+    def process_file(self, file_path: Path) -> Iterator[tuple[pd.DataFrame, pd.DataFrame]]:
+        """Process a single file (used by parallel_run).
+
+        Dispatches to MIRA or Review processing based on filename.
+        """
+        if file_path.name.startswith("peptide-detail"):
+            yield from self._process_mira_file(file_path)
+        else:
+            yield from self._process_review_file(file_path)
+
+    def _process_mira_file(self, file_path: Path) -> Iterator[tuple[pd.DataFrame, pd.DataFrame]]:
+        """Process a single MIRA peptide-detail CSV."""
+        hla_map = self._load_subject_hla()
+        column_map = self.get_column_map()
+
+        df = pd.read_csv(file_path, dtype=str).fillna("")
+        if "TCR BioIdentity" not in df.columns:
+            return
+        df = df[df["TCR BioIdentity"].str.strip() != ""].reset_index(drop=True)
+        if df.empty:
+            return
+
+        parsed = _bio_identity_to_df(df["TCR BioIdentity"])
+
+        if "Amino Acids" in df.columns:
+            peptides = df["Amino Acids"].str.strip().str.split(",")
+            merged = pd.DataFrame({
+                "trb": parsed["trb"].values,
+                "trbv_gene": parsed["trbv_gene"].values,
+                "trbj_gene": parsed["trbj_gene"].values,
+                "peptide": peptides.values,
+                "experiment": df["Experiment"].str.strip().values
+                if "Experiment" in df.columns else "",
+            })
+            merged = merged.explode("peptide", ignore_index=True)
+            merged["peptide"] = merged["peptide"].str.strip()
+        else:
+            merged = pd.DataFrame({
+                "trb": parsed["trb"].values,
+                "trbv_gene": parsed["trbv_gene"].values,
+                "trbj_gene": parsed["trbj_gene"].values,
+                "peptide": "",
+                "experiment": df["Experiment"].str.strip().values
+                if "Experiment" in df.columns else "",
+            })
+
+        if "peptide" in merged.columns:
+            merged = merged[
+                merged["peptide"].str.len().le(25) | (merged["peptide"] == "")
+            ].reset_index(drop=True)
+
+        if merged.empty:
+            return
+
+        if "experiment" in merged.columns:
+            merged["mhc_one"] = merged["experiment"].map(
+                lambda exp: hla_map.get(exp, [""])[0]
+                if exp and hla_map.get(exp) else ""
+            )
+            merged = merged.drop(columns=["experiment"])
+        else:
+            merged["mhc_one"] = ""
+        merged["mhc_two"] = ""
+
+        result, dropped = standardize_dataframe(
+            merged, column_map, source=self.name, stitch=self.stitch,
+            hla_dir=self.hla_dir,
+        )
+        yield result, dropped
+
+    def _process_review_file(self, file_path: Path) -> Iterator[tuple[pd.DataFrame, pd.DataFrame]]:
+        """Process a single Review TSV file."""
+        column_map = self.get_column_map()
+        study_id = file_path.stem
+        usecols = ["bio_identity", "d_gene", "frame_type"]
+
+        try:
+            reader = pd.read_csv(
+                file_path, sep="\t", dtype=str,
+                usecols=usecols, chunksize=_REVIEW_CHUNK_SIZE,
+            )
+        except (ValueError, KeyError):
+            try:
+                reader = pd.read_csv(
+                    file_path, sep="\t", dtype=str,
+                    chunksize=_REVIEW_CHUNK_SIZE,
+                )
+            except Exception:
+                return
+
+        for chunk in reader:
+            chunk = chunk.fillna("")
+
+            if "frame_type" in chunk.columns:
+                chunk = chunk[chunk["frame_type"] == "In"]
+
+            if chunk.empty:
+                continue
+
+            if "bio_identity" not in chunk.columns:
+                continue
+
+            parsed = _bio_identity_to_df(chunk["bio_identity"])
+            merged = pd.DataFrame(index=parsed.index)
+            merged["trb"] = parsed["trb"]
+            merged["trbv_gene"] = parsed["trbv_gene"]
+            merged["trbj_gene"] = parsed["trbj_gene"]
+
+            if "d_gene" in chunk.columns:
+                merged["trbd_gene"] = chunk["d_gene"]
+
+            result, dropped = standardize_dataframe(
+                merged, column_map, source=self.name, study_id=study_id, stitch=self.stitch,
+                hla_dir=self.hla_dir,
+            )
+            if not result.empty:
+                yield result, dropped
+
     def get_column_map(self) -> dict:
         return {
             "trb": "trb",
@@ -183,7 +307,8 @@ class ImmunecodeStandardizer(BaseStandardizer):
             merged["mhc_two"] = ""
 
             result, dropped = standardize_dataframe(
-                merged, column_map, source=self.name, stitch=self.stitch
+                merged, column_map, source=self.name, stitch=self.stitch,
+                hla_dir=self.hla_dir,
             )
             yield result, dropped
 
@@ -239,6 +364,7 @@ class ImmunecodeStandardizer(BaseStandardizer):
 
                 result, dropped = standardize_dataframe(
                     merged, column_map, source=self.name, study_id=study_id, stitch=self.stitch,
+                    hla_dir=self.hla_dir,
                 )
                 if not result.empty:
                     yield result, dropped
@@ -261,10 +387,12 @@ def main():
     parser.add_argument("--source-dir", default="data/databases/immuneCODE")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--hla-dir", default="")
     args = parser.parse_args()
 
     standardizer = ImmunecodeStandardizer(
         source_dir=args.source_dir, output_dir=args.output_dir,
+        hla_dir=args.hla_dir,
     )
     print(standardizer.run(force=args.force))
 
