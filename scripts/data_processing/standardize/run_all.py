@@ -81,8 +81,13 @@ LARGE_DBS = {
 ALL_DBS = {**SMALL_DBS, **LARGE_DBS}
 
 
-def _run_single(db_name: str, db_dir: str, output_dir: str, force: bool, studies_dir: str = DEFAULT_STUDIES_DIR, stitch: bool = False) -> dict:
-    """Run a single standardizer (used for parallel execution)."""
+def _run_single(db_name: str, db_dir: str, output_dir: str, force: bool, studies_dir: str = DEFAULT_STUDIES_DIR, stitch: bool = False, parallel_workers: int = 0, hla_dir: str = "") -> dict:
+    """Run a single standardizer (used for parallel execution).
+
+    Args:
+        parallel_workers: If > 0, use parallel_run with this many workers
+            for standardizers that support it (have get_file_list()).
+    """
     warnings.filterwarnings("ignore")
     cls, subdir = ALL_DBS[db_name]
 
@@ -94,7 +99,9 @@ def _run_single(db_name: str, db_dir: str, output_dir: str, force: bool, studies
     out_dir = Path(output_dir) / db_name
 
     try:
-        standardizer = cls(source_dir=source_dir, output_dir=out_dir, stitch=stitch)
+        standardizer = cls(source_dir=source_dir, output_dir=out_dir, stitch=stitch, hla_dir=hla_dir)
+        if parallel_workers > 0 and standardizer.get_file_list():
+            return standardizer.parallel_run(workers=parallel_workers, force=force)
         return standardizer.run(force=force)
     except Exception as e:
         return {"status": "error", "name": db_name, "error": str(e)}
@@ -164,10 +171,22 @@ def main():
         help="Generate full-length TCR sequences via stitchr",
     )
     parser.add_argument(
+        "--hla-dir",
+        default="",
+        help="Path to IMGT/HLA fasta directory for MHC allele→sequence resolution",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=8,
-        help="Max parallel workers for small DBs",
+        help="Max parallel workers for small DBs (Phase 1)",
+    )
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=0,
+        help="Per-database file-level parallelism for large DBs. "
+             "0 = serial (default). Recommended: 16-32 on high-core machines.",
     )
     args = parser.parse_args()
 
@@ -288,7 +307,7 @@ def main():
         with ProcessPoolExecutor(max_workers=min(args.workers, len(small_dbs))) as pool:
             futures = {
                 pool.submit(
-                    _run_single, db_name, args.db_dir, args.output_dir, args.force, args.studies_dir, args.stitch
+                    _run_single, db_name, args.db_dir, args.output_dir, args.force, args.studies_dir, args.stitch, 0, args.hla_dir
                 ): db_name
                 for db_name in small_dbs
             }
@@ -322,7 +341,7 @@ def main():
         for db_name in large_dbs:
             clear_norm_cache()  # Fresh cache per database to prevent cross-DB accumulation
             overall_pbar.set_postfix(phase=f"large DBs", current=db_name)
-            result = _run_single(db_name, args.db_dir, args.output_dir, args.force, args.studies_dir, args.stitch)
+            result = _run_single(db_name, args.db_dir, args.output_dir, args.force, args.studies_dir, args.stitch, args.parallel_workers, args.hla_dir)
             results.append(result)
             status = result.get("status", "unknown")
             if status == "completed":
