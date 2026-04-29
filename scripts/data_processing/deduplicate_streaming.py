@@ -46,6 +46,9 @@ except ImportError:
 # Valid amino acids
 _valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
 
+# Columns that must contain only valid amino acid characters
+_AA_SEQUENCE_COLUMNS = {'tra', 'trb', 'tra_full', 'trb_full', 'peptide'}
+
 # Mode configurations
 # Standardized schema uses mhc_one/mhc_two for allele IDs (e.g., HLA-A*02:01),
 # not full protein sequences.  Both the legacy mhc_one_id columns and the new
@@ -71,29 +74,42 @@ def is_valid_sequence(seq: Optional[str]) -> bool:
         return False
     return all(aa in _valid_aa for aa in str(seq).upper())
 
-def create_dedup_key(row: Dict[str, Any], mode: str) -> str:
+def create_dedup_key(row: Dict[str, Any], mode: str, dedup_on: str = "cdr3") -> str:
     """
     Create a deduplication key for a row.
     This represents the EXACT row content (field order matters for dedup).
+
+    Args:
+        dedup_on: 'cdr3' uses tra/trb (CDR3), 'full' uses tra_full/trb_full
+                  (falls back to tra/trb if full not available).
     """
     config = MODE_CONFIGS[mode]
-    
+
+    # Map field names to lookup keys based on dedup_on
+    def _lookup(field):
+        if dedup_on == "full":
+            if field == "tra":
+                return row.get("tra_full", "") or row.get("tra", "")
+            if field == "trb":
+                return row.get("trb_full", "") or row.get("trb", "")
+        return row.get(field, "")
+
     # Check required fields first
     for field in config['required']:
-        val = row.get(field, "")
+        val = _lookup(field)
         if not is_valid_sequence(val):
             return ""  # Invalid row
-    
+
     # Create key from ALL columns in canonical order (tra, trb, peptide, mhc_one, mhc_two)
     # This ensures exact row matching - different field combinations are different rows
     parts = []
     for field in ['tra', 'trb', 'peptide', 'mhc_one', 'mhc_two']:
-        val = row.get(field, "")
+        val = _lookup(field)
         if is_valid_sequence(val):
             parts.append(f"{field}:{val}")
         else:
             parts.append(f"{field}:")  # Empty field marker
-    
+
     return "|".join(parts)
 
 _TCR_FIELDS = {'tra', 'trb', 'tra_full', 'trb_full',
@@ -118,7 +134,7 @@ MOLECULE_FIELDS = frozenset([
 _DEDUP_KEY_FIELDS = ('tra', 'trb', 'peptide', 'mhc_one', 'mhc_two')
 
 
-def _emit_sub_row(row_dict: dict, keep_fields: set, mode: str) -> tuple:
+def _emit_sub_row(row_dict: dict, keep_fields: set, mode: str, dedup_on: str = "cdr3") -> tuple:
     """Build a dedup-key + JSON line for a subset of fields from row_dict.
     Returns ("", "") if no valid sequences remain after filtering.
     Single-pass: builds dedup fields and molecule_data simultaneously."""
@@ -135,7 +151,7 @@ def _emit_sub_row(row_dict: dict, keep_fields: set, mode: str) -> tuple:
         elif k in MOLECULE_FIELDS:
             molecule_data[k] = v
 
-    key = create_dedup_key(dedup_fields, mode)
+    key = create_dedup_key(dedup_fields, mode, dedup_on)
     if not key:
         return "", ""
     return key, _json_dumps(molecule_data)
@@ -149,7 +165,7 @@ def process_single_parquet(args: tuple) -> tuple:
     Extraction only: reads rows, creates dedup keys, and writes molecule data.
     TCR stitching is deferred to the write phase (write_parquet_output).
     """
-    pf, mode, _stitch_tcr_unused, exclude_vdjdb_score_zero = args
+    pf, mode, _stitch_tcr_unused, exclude_vdjdb_score_zero, dedup_on = args
     lines = []
     valid_count = 0
 
@@ -162,13 +178,19 @@ def process_single_parquet(args: tuple) -> tuple:
         df = table.to_pandas()
 
         for row_dict in df.to_dict('records'):
+            # Validate amino-acid-only columns: blank out any with non-AA chars
+            for col in _AA_SEQUENCE_COLUMNS:
+                val = row_dict.get(col, "")
+                if val and not is_valid_sequence(val):
+                    row_dict[col] = ""
+
             # Filter negative binding for MLM mode
             if mode == "mlm":
                 binding_val = str(row_dict.get("binding", "")).strip().lower()
                 if binding_val == "neg":
                     # Salvage TCR-side and antigen-side as independent sub-rows
                     for keep in (_TCR_FIELDS, _ANTIGEN_FIELDS):
-                        key, json_data = _emit_sub_row(row_dict, keep, mode)
+                        key, json_data = _emit_sub_row(row_dict, keep, mode, dedup_on)
                         if key:
                             lines.append(f"{key}\t{json_data}\n")
                             valid_count += 1
@@ -181,13 +203,13 @@ def process_single_parquet(args: tuple) -> tuple:
                 if source_val == "vdjdb" and score_val == "0":
                     # Salvage TCR-side and antigen-side as independent sub-rows
                     for keep in (_TCR_FIELDS, _ANTIGEN_FIELDS):
-                        key, json_data = _emit_sub_row(row_dict, keep, mode)
+                        key, json_data = _emit_sub_row(row_dict, keep, mode, dedup_on)
                         if key:
                             lines.append(f"{key}\t{json_data}\n")
                             valid_count += 1
                     continue
 
-            dedup_key = create_dedup_key(row_dict, mode)
+            dedup_key = create_dedup_key(row_dict, mode, dedup_on)
 
             if dedup_key:  # Valid row
                 molecule_data = {k: v for k, v in row_dict.items() if k in MOLECULE_FIELDS}
@@ -200,22 +222,22 @@ def process_single_parquet(args: tuple) -> tuple:
 
     return lines, valid_count, {}
 
-def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str, num_workers: int = None, stitch_tcr: bool = False, exclude_vdjdb_score_zero: bool = False) -> int:
+def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str, num_workers: int = None, stitch_tcr: bool = False, exclude_vdjdb_score_zero: bool = False, dedup_on: str = "cdr3") -> int:
     """
     Extract parquet files to temp file with dedup keys (parallelized).
     Returns number of valid rows extracted.
     """
     if num_workers is None:
         num_workers = cpu_count()  # Use all cores for maximum throughput
-    
+
     valid_count = 0
-    
+
     print(f"   ℹ️  Using {num_workers} parallel workers")
 
     with open(temp_file, 'w', buffering=8*1024*1024) as out:  # 8MB write buffer
         with Pool(num_workers) as pool:
             # Process files in parallel
-            args_list = [(pf, mode, stitch_tcr, exclude_vdjdb_score_zero) for pf in parquet_files]
+            args_list = [(pf, mode, stitch_tcr, exclude_vdjdb_score_zero, dedup_on) for pf in parquet_files]
 
             with tqdm(desc="Extracting parquet files", unit=" files", total=len(parquet_files)) as pbar:
                 for lines, count, _gene_failures in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
@@ -228,7 +250,7 @@ def extract_parquet_to_temp(parquet_files: List[str], temp_file: Path, mode: str
 
 def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, mode: str,
                                      chunk_size: int, num_workers: int = None, stitch_tcr: bool = False,
-                                     exclude_vdjdb_score_zero: bool = False) -> tuple[List[Path], int]:
+                                     exclude_vdjdb_score_zero: bool = False, dedup_on: str = "cdr3") -> tuple[List[Path], int]:
     """
     Stream-extract parquet rows and directly build sorted chunk files without creating
     a giant intermediate extract file. Returns (chunk_files, valid_count).
@@ -243,7 +265,7 @@ def extract_and_create_sorted_chunks(parquet_files: List[str], temp_dir: Path, m
     chunk_idx = 0
     valid_count = 0
 
-    args_list = [(pf, mode, stitch_tcr, exclude_vdjdb_score_zero) for pf in parquet_files]
+    args_list = [(pf, mode, stitch_tcr, exclude_vdjdb_score_zero, dedup_on) for pf in parquet_files]
     with Pool(num_workers) as pool:
         with tqdm(desc="Extracting + chunking", unit=" files", total=len(parquet_files)) as pbar:
             for lines, count, _gene_failures in pool.imap_unordered(process_single_parquet, args_list, chunksize=1):
@@ -342,7 +364,7 @@ def merge_sorted_files(chunk_files: List[Path], output_file: Path, temp_dir: Pat
 
 def extract_and_sort_streaming(parquet_files: List[str], sorted_file: Path, temp_dir: Path, mode: str,
                                num_workers: int, chunk_size: int, max_open_files: int, stitch_tcr: bool = False,
-                               exclude_vdjdb_score_zero: bool = False) -> tuple[int, float]:
+                               exclude_vdjdb_score_zero: bool = False, dedup_on: str = "cdr3") -> tuple[int, float]:
     """
     End-to-end streaming extract + chunked sort + multi-pass merge into sorted_file.
     Returns (valid_count, elapsed_seconds).
@@ -350,7 +372,7 @@ def extract_and_sort_streaming(parquet_files: List[str], sorted_file: Path, temp
     start = time.time()
     chunk_files, valid_count = extract_and_create_sorted_chunks(
         parquet_files, temp_dir, mode, chunk_size, num_workers, stitch_tcr,
-        exclude_vdjdb_score_zero
+        exclude_vdjdb_score_zero, dedup_on
     )
     merge_sorted_files(chunk_files, sorted_file, temp_dir, max_open_files=max_open_files)
     return valid_count, time.time() - start
@@ -1172,7 +1194,7 @@ def write_parquet_output(input_file: Path, output_dir: Path, output_dir_full: Pa
                 
                 seq_cdr3 = " ".join(seq_parts_cdr3)
                 perm_key_cdr3 = "_".join(actual_fields_cdr3) if actual_fields_cdr3 else "empty"
-                
+
                 batch_data_cdr3.append({
                     'permutation_key': perm_key_cdr3,
                     'sequence': seq_cdr3
@@ -1282,6 +1304,8 @@ def main():
     parser.add_argument("--output-deduplicated", required=True, help="Output directory for deduplicated parquet (CDR3 version)")
     parser.add_argument("--output-deduplicated-full", help="Output directory for full-length sequences (default: <output-deduplicated>_full)")
     parser.add_argument("--mode", required=True, choices=list(MODE_CONFIGS.keys()), help="Processing mode")
+    parser.add_argument("--dedup-on", choices=["cdr3", "full"], default="cdr3",
+                        help="Dedup TCR fields using CDR3 (tra/trb) or full-length (tra_full/trb_full, falls back to CDR3)")
     parser.add_argument("--sample", type=int, help="Sample N files for testing")
     parser.add_argument("--tmp-dir", default="/mnt/ephemeral/temp", help="Temp directory for small intermediate files")
     parser.add_argument("--work-dir", help="Working directory for large sorted chunks and merge outputs (default: same as tmp-dir, use EBS for large datasets)")
@@ -1384,7 +1408,7 @@ def main():
             deduped_file = resume_state['deduped_file']
     else:
         print(f"\n{'='*60}")
-        print(f"STAGE 1: MOLECULE DEDUPLICATION (mode={args.mode})")
+        print(f"STAGE 1: MOLECULE DEDUPLICATION (mode={args.mode}, dedup_on={args.dedup_on})")
         print(f"{'='*60}")
 
         # Check if we can resume from chunks or sorted file
@@ -1404,7 +1428,7 @@ def main():
                 # Traditional: extract → external sort
                 extract_file = work_dir / "extract.txt"
                 print("\n📊 Step 1/3: Extracting and tagging molecules...")
-                valid_count = extract_parquet_to_temp(all_files, extract_file, args.mode, args.num_workers, args.stitch_tcr, args.exclude_vdjdb_score_zero)
+                valid_count = extract_parquet_to_temp(all_files, extract_file, args.mode, args.num_workers, args.stitch_tcr, args.exclude_vdjdb_score_zero, args.dedup_on)
                 size_gb = extract_file.stat().st_size / (1024**3)
                 print(f"✓ Extracted {valid_count:,} valid molecules ({size_gb:.2f} GB)")
 
@@ -1419,7 +1443,7 @@ def main():
                     all_files, sorted_file, work_dir, args.mode,
                     args.num_workers if args.num_workers else cpu_count(),
                     args.sort_chunk_size, args.sort_max_open_files, args.stitch_tcr,
-                    args.exclude_vdjdb_score_zero
+                    args.exclude_vdjdb_score_zero, args.dedup_on
                 )
                 print(f"✓ Streamed extract+sort in {sort_time:.1f}s ({sort_time/60:.1f} min)")
 

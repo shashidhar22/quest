@@ -482,8 +482,8 @@ class BaseStandardizer(ABC):
             has_mhc_one = pc.not_equal(table.column('mhc_one'), empty)
             has_mhc_two = pc.not_equal(table.column('mhc_two'), empty)
             is_mhcI = pc.and_(has_mhc_one, pc.invert(has_mhc_two))
-            is_mhcII = pc.and_(has_mhc_one, has_mhc_two)
-            has_mhc = pc.or_(is_mhcI, is_mhcII)
+            is_mhcII = has_mhc_two  # Class II if beta chain present (with or without alpha)
+            has_mhc = pc.or_(has_mhc_one, has_mhc_two)
 
             not_trb = pc.invert(has_trb)
             not_tra = pc.invert(has_tra)

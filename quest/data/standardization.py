@@ -63,15 +63,118 @@ _HLA_SEQ_DICT: dict[str, str] | None = None  # {allele_no_prefix: aa_sequence}
 _HLA_PREFIX_CACHE: dict[str, str] | None = None  # {prefix: first_4digit_match}
 _HLA_DIR: str | None = None
 
+# IMGT gene reference sets (lazy-loaded from stitchr FASTA files)
+_IMGT_GENE_BASES: set[str] | None = None  # gene names without allele, e.g. {'TRBV27', 'TRBV20-1'}
+_IMGT_GENE_ALLELES: set[str] | None = None  # full allele names, e.g. {'TRBV27*01', 'TRBV20-1*01'}
+
 
 def clear_norm_cache():
     """Clear the global normalization cache."""
     global _HLA_SEQ_DICT, _HLA_PREFIX_CACHE, _HLA_DIR
+    global _IMGT_GENE_BASES, _IMGT_GENE_ALLELES
     _NORM_CACHE.clear()
     _CDR_LOOKUP_CACHE.clear()
     _HLA_SEQ_DICT = None
     _HLA_PREFIX_CACHE = None
     _HLA_DIR = None
+    _IMGT_GENE_BASES = None
+    _IMGT_GENE_ALLELES = None
+
+
+def _load_imgt_genes() -> None:
+    """Load valid IMGT gene names from stitchr's reference FASTA files.
+
+    Parses FASTA headers (``>accession|GENE*ALLELE|...``) from the
+    ``Data/HUMAN/TR*.fasta`` files shipped with stitchr.  Populates
+    ``_IMGT_GENE_BASES`` (e.g. ``TRBV27``) and ``_IMGT_GENE_ALLELES``
+    (e.g. ``TRBV27*01``).  Sets both to empty sets if stitchr data is
+    unavailable.
+    """
+    global _IMGT_GENE_BASES, _IMGT_GENE_ALLELES
+
+    if _IMGT_GENE_BASES is not None:
+        return  # already loaded
+
+    bases: set[str] = set()
+    alleles: set[str] = set()
+
+    try:
+        from pathlib import Path
+        import importlib.util
+
+        # Find stitchr Data directory
+        spec = importlib.util.find_spec("Stitchr")
+        if spec is None or spec.origin is None:
+            raise ImportError("Stitchr package not found")
+
+        data_dir = Path(spec.origin).parent.parent / "Data" / "HUMAN"
+        if not data_dir.is_dir():
+            # Try alternative location: sibling Data directory
+            data_dir = Path(spec.origin).parent / "Data" / "HUMAN"
+        if not data_dir.is_dir():
+            raise FileNotFoundError(f"IMGT data directory not found near {spec.origin}")
+
+        for fasta in data_dir.glob("TR*.fasta"):
+            with open(fasta) as f:
+                for line in f:
+                    if line.startswith(">"):
+                        parts = line.split("|")
+                        if len(parts) >= 2:
+                            allele_name = parts[1]  # e.g. TRBV27*01
+                            alleles.add(allele_name)
+                            base = allele_name.split("*")[0]
+                            bases.add(base)
+
+        logger.debug("Loaded %d IMGT gene bases, %d alleles", len(bases), len(alleles))
+
+    except (ImportError, FileNotFoundError) as e:
+        logger.debug("IMGT gene reference unavailable: %s", e)
+
+    _IMGT_GENE_BASES = bases
+    _IMGT_GENE_ALLELES = alleles
+
+
+# Regex for parsing gene-subgroup pattern: TR[ABDG][VDJ]<num>-<num>
+_DASH_ALLELE_RE = re.compile(r"^(TR[ABDG][VDJ]\d+)-(\d+)$")
+
+
+def _validate_against_imgt(gene: str) -> str:
+    """Validate and correct a normalized gene name against IMGT reference.
+
+    Fixes two common issues:
+    1. Dash-as-allele: ``TRBV27-1`` → ``TRBV27*01`` when TRBV27 has no
+       subgroups in IMGT (the ``-1`` is really an allele, not a subgroup).
+    2. ``*00`` alleles: ``TRAV20*00`` → ``TRAV20*01`` (``*00`` is not valid).
+
+    Returns the gene unchanged if IMGT reference is unavailable or the gene
+    cannot be corrected.
+    """
+    _load_imgt_genes()
+
+    if not _IMGT_GENE_BASES:
+        return gene  # no reference data — pass through
+
+    # Split allele suffix
+    if "*" in gene:
+        base, allele = gene.split("*", 1)
+    else:
+        base, allele = gene, None
+
+    # Already valid
+    if base in _IMGT_GENE_BASES:
+        # Fix *00 → *01
+        if allele == "00":
+            return f"{base}*01"
+        return gene
+
+    # Try dash-as-allele reinterpretation: TRBV27-1 → TRBV27*01
+    m = _DASH_ALLELE_RE.match(base)
+    if m:
+        stem, suffix = m.group(1), m.group(2)
+        if stem in _IMGT_GENE_BASES:
+            return f"{stem}*{suffix.zfill(2)}"
+
+    return gene
 
 
 def load_hla_sequences(hla_dir: str) -> None:
@@ -281,12 +384,11 @@ def normalize_gene(value) -> str:
     m = _TCR_GENE_RE.search(value)
     if m:
         gene = m.group(1).upper()
-        # Normalize: ensure TR prefix is uppercase
-        return gene
+        return _validate_against_imgt(gene)
 
     # Check if it looks like a bare TCR gene without the full pattern
     if re.match(r"TR[ABDG][VDJ]", value, re.IGNORECASE):
-        return value.upper()
+        return _validate_against_imgt(value.upper())
 
     return ""
 
@@ -370,6 +472,16 @@ def normalize_mhc_allele(value) -> str:
         gene = m.group(2).upper()
         group = m.group(3)
         protein = m.group(4)
+        return f"HLA-{gene}*{group}:{protein}"
+
+    # Underscore format from NetMHCpan: DRB1_0101 -> HLA-DRB1*01:01
+    m = re.match(
+        r"^(DRB[1-9]|DQA1|DQB1|DPA1|DPB1)_(\d{2})(\d{2})$", value, re.IGNORECASE
+    )
+    if m:
+        gene = m.group(1).upper()
+        group = m.group(2)
+        protein = m.group(3)
         return f"HLA-{gene}*{group}:{protein}"
 
     # Mouse MHC: H-2Kb, H-2Db, H-2IAb etc.
@@ -457,6 +569,17 @@ def split_mhc_to_alpha_beta(allele) -> tuple[str, str]:
 
     mhc_one = ""
     mhc_two = ""
+
+    # Handle NetMHCIIpan heterodimer format: HLA-DPA10103-DPB10201
+    m = re.match(
+        r"^HLA-(D[PQ]A1)(\d{2})(\d{2})-(D[PQ]B1)(\d{2})(\d{2})$",
+        allele,
+        re.IGNORECASE,
+    )
+    if m:
+        alpha = f"HLA-{m.group(1).upper()}*{m.group(2)}:{m.group(3)}"
+        beta = f"HLA-{m.group(4).upper()}*{m.group(5)}:{m.group(6)}"
+        return (alpha, beta)
 
     # Handle slash-separated class II pairs: DQA1*01:02/DQB1*06:02
     parts = re.split(r"[/,]", allele)
