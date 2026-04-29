@@ -1,0 +1,1885 @@
+{
+  "phases": {
+    "1_clustering": {
+      "output_dir": "/home/ubuntu/quest/data/benchmark_v2/clusters",
+      "summary": {
+        "unique_sequence_counts": {
+          "mhc_one_alleles": 16594,
+          "mhc_two_alleles": 5721,
+          "peptides_interaction": 5497,
+          "peptides_pm": 4736475,
+          "tra_cdr3_all": 29081162,
+          "tra_cdr3_interaction": 51041,
+          "tra_cdr3_restriction": 48254,
+          "trb_cdr3_all": 864578714,
+          "trb_cdr3_interaction": 208982,
+          "trb_cdr3_restriction": 73742
+        },
+        "cluster_size_distributions": {
+          "trb_cdr3_interaction_clusters.tsv": {
+            "n_clusters": 160341,
+            "min_size": 1,
+            "median_size": 1,
+            "max_size": 8095,
+            "top10": [
+              {
+                "cluster_id": "CASSIGQGLSYEQYF",
+                "size": 8095
+              },
+              {
+                "cluster_id": "CASSFLLGGAQPQHF",
+                "size": 1771
+              },
+              {
+                "cluster_id": "CASSPRDHTDTQYF",
+                "size": 1620
+              },
+              {
+                "cluster_id": "CASSPGPGNEQFF",
+                "size": 737
+              },
+              {
+                "cluster_id": "CASSLGSNQPQHF",
+                "size": 611
+              },
+              {
+                "cluster_id": "CASSPGQGNTEAFF",
+                "size": 455
+              },
+              {
+                "cluster_id": "CASSWTSGGTDTQYF",
+                "size": 385
+              },
+              {
+                "cluster_id": "CSVGGTGAGTSGAYSYNEQFF",
+                "size": 385
+              },
+              {
+                "cluster_id": "CASSLTSGYNEQFF",
+                "size": 317
+              },
+              {
+                "cluster_id": "CASSERSSYNEQFF",
+                "size": 312
+              }
+            ]
+          },
+          "tra_cdr3_interaction_clusters.tsv": {
+            "n_clusters": 34164,
+            "min_size": 1,
+            "median_size": 1,
+            "max_size": 853,
+            "top10": [
+              {
+                "cluster_id": "CAGMNYGGSQGNLIF",
+                "size": 853
+              },
+              {
+                "cluster_id": "CAVPMYSGGGADGLF",
+                "size": 608
+              },
+              {
+                "cluster_id": "CAMREGGNFNKFYS",
+                "size": 559
+              },
+              {
+                "cluster_id": "AFMTNAGGTSYGKLT",
+                "size": 421
+              },
+              {
+                "cluster_id": "CAFHTSGTYKYIL",
+                "size": 258
+              },
+              {
+                "cluster_id": "AMSESGGSNYKLTF",
+                "size": 237
+              },
+              {
+                "cluster_id": "CAWQGNYGQNFVF",
+                "size": 196
+              },
+              {
+                "cluster_id": "CAMSGSNDYKLSF",
+                "size": 178
+              },
+              {
+                "cluster_id": "CAVSNTGNQFYF",
+                "size": 171
+              },
+              {
+                "cluster_id": "AGLAYSGAGSYQLTF",
+                "size": 166
+              }
+            ]
+          },
+          "trb_cdr3_restriction_clusters.tsv": {
+            "n_clusters": 57001,
+            "min_size": 1,
+            "median_size": 1,
+            "max_size": 485,
+            "top10": [
+              {
+                "cluster_id": "CASSSGQGYEQYF",
+                "size": 485
+              },
+              {
+                "cluster_id": "CSVGGTGHGTSGAYSYNEQFF",
+                "size": 386
+              },
+              {
+                "cluster_id": "CASSIYSNQPQHF",
+                "size": 355
+              },
+              {
+                "cluster_id": "CASSPTSGSVYEQFF",
+                "size": 278
+              },
+              {
+                "cluster_id": "CSVGAGGTNEKLFF",
+                "size": 268
+              },
+              {
+                "cluster_id": "CASRLRGRGIVNNEQFF",
+                "size": 219
+              },
+              {
+                "cluster_id": "CASSFLLGGAQPQHF",
+                "size": 215
+              },
+              {
+                "cluster_id": "CASSPGQGSYEQYF",
+                "size": 210
+              },
+              {
+                "cluster_id": "CASSLAGSYNEQFF",
+                "size": 201
+              },
+              {
+                "cluster_id": "CSARDGTGNGYTIYF",
+                "size": 160
+              }
+            ]
+          },
+          "tra_cdr3_restriction_clusters.tsv": {
+            "n_clusters": 32333,
+            "min_size": 1,
+            "median_size": 1,
+            "max_size": 861,
+            "top10": [
+              {
+                "cluster_id": "CAGMNYGGSQGNLIF",
+                "size": 861
+              },
+              {
+                "cluster_id": "CAMREGGNFNKFYS",
+                "size": 616
+              },
+              {
+                "cluster_id": "CAVPMYSGGGADGLF",
+                "size": 578
+              },
+              {
+                "cluster_id": "AFMTNAGGTSYGKLT",
+                "size": 414
+              },
+              {
+                "cluster_id": "CAFHTSGTYKYIL",
+                "size": 249
+              },
+              {
+                "cluster_id": "CAPNSGAGSYQLTFS",
+                "size": 242
+              },
+              {
+                "cluster_id": "CAWQGNYGQNFVF",
+                "size": 188
+              },
+              {
+                "cluster_id": "CAVPNTGNQFYF",
+                "size": 168
+              },
+              {
+                "cluster_id": "CAMSGSNDYKLSFGA",
+                "size": 164
+              },
+              {
+                "cluster_id": "CVVNGGDSSYKLIF",
+                "size": 155
+              }
+            ]
+          },
+          "trb_cdr3_all_clusters.tsv": {
+            "status": "missing"
+          },
+          "tra_cdr3_all_clusters.tsv": {
+            "n_clusters": 20303686,
+            "min_size": 1,
+            "median_size": 1,
+            "max_size": 1063107,
+            "top10": [
+              {
+                "cluster_id": "CLVGDWRSGGYNKLIF",
+                "size": 1063107
+              },
+              {
+                "cluster_id": "YATDAEWYSGGSNYKLTF",
+                "size": 760743
+              },
+              {
+                "cluster_id": "CATEPNAGGTSYGKLTFGQG",
+                "size": 487285
+              },
+              {
+                "cluster_id": "CAYRRGNYGGSQGNLIFGKG",
+                "size": 364089
+              },
+              {
+                "cluster_id": "FIVRGHLMYSGGGADGLTF",
+                "size": 317202
+              },
+              {
+                "cluster_id": "CAVRPYNAGNNRKLIW",
+                "size": 156096
+              },
+              {
+                "cluster_id": "CAYRRGTTSGTYKYIF",
+                "size": 132321
+              },
+              {
+                "cluster_id": "CGAYPSRTDSWGKLQFGAG",
+                "size": 131068
+              },
+              {
+                "cluster_id": "CAVRDWGDTGFQKLVF",
+                "size": 128967
+              },
+              {
+                "cluster_id": "CAVRDRGLWGWELPTHF",
+                "size": 109686
+              }
+            ]
+          },
+          "peptide_clusters_interaction.tsv": {
+            "n_clusters": 2067,
+            "min_size": 1,
+            "median_size": 1,
+            "max_size": 330,
+            "top10": [
+              {
+                "cluster_id": "ARDYVDRFYKTLRAEQASQE",
+                "size": 330
+              },
+              {
+                "cluster_id": "APVPGVLLKEFTVSGNILTI",
+                "size": 272
+              },
+              {
+                "cluster_id": "VVGADGVGK",
+                "size": 175
+              },
+              {
+                "cluster_id": "ALVPMVATV",
+                "size": 172
+              },
+              {
+                "cluster_id": "ALYNTVATL",
+                "size": 166
+              },
+              {
+                "cluster_id": "LLFGPVYV",
+                "size": 153
+              },
+              {
+                "cluster_id": "ALLMWITQC",
+                "size": 153
+              },
+              {
+                "cluster_id": "WGPDPAAA",
+                "size": 145
+              },
+              {
+                "cluster_id": "AMDQVPFSV",
+                "size": 141
+              },
+              {
+                "cluster_id": "APSVWRSSL",
+                "size": 134
+              }
+            ]
+          },
+          "peptide_clusters_pm.tsv": {
+            "n_clusters": 4533801,
+            "min_size": 1,
+            "median_size": 1,
+            "max_size": 2289,
+            "top10": [
+              {
+                "cluster_id": "RIHTGEKPYKCEECGK",
+                "size": 2289
+              },
+              {
+                "cluster_id": "LNEDLRSWTAADMAAQITKR",
+                "size": 1068
+              },
+              {
+                "cluster_id": "DTQFVRFDSDAASPRGEPR",
+                "size": 388
+              },
+              {
+                "cluster_id": "ARDYVDRFYKTLRAEQASQE",
+                "size": 387
+              },
+              {
+                "cluster_id": "APVPGVLLKEFTVSGNILTI",
+                "size": 382
+              },
+              {
+                "cluster_id": "AQDLELSWNLNGLQAY",
+                "size": 273
+              },
+              {
+                "cluster_id": "EPEVLQDSLDRCYSTPSGYLE",
+                "size": 173
+              },
+              {
+                "cluster_id": "PAGDGTFQKWAAVVVPSGEE",
+                "size": 172
+              },
+              {
+                "cluster_id": "YSFHKFHYLTFVPSAEDF",
+                "size": 155
+              },
+              {
+                "cluster_id": "SHSMRYFYTSVSRPGRG",
+                "size": 142
+              }
+            ]
+          },
+          "peptide_clusters_mmseqs2.tsv": {
+            "n_clusters": 4004,
+            "min_size": 1,
+            "median_size": 1,
+            "max_size": 330,
+            "top10": [
+              {
+                "cluster_id": "ARDYVDRFYKTLRAEQASQE",
+                "size": 330
+              },
+              {
+                "cluster_id": "APVPGVLLKEFTVSGNILTI",
+                "size": 272
+              },
+              {
+                "cluster_id": "ENPVVHFFKNIVTP",
+                "size": 39
+              },
+              {
+                "cluster_id": "MEVGWYRSPFSRVVAL",
+                "size": 15
+              },
+              {
+                "cluster_id": "VDSITEVECFLTPEA",
+                "size": 15
+              },
+              {
+                "cluster_id": "LVEALYLVCGERGFF",
+                "size": 12
+              },
+              {
+                "cluster_id": "APRGPHGGAASGL",
+                "size": 11
+              },
+              {
+                "cluster_id": "ALWGPDPAAA",
+                "size": 10
+              },
+              {
+                "cluster_id": "LPEPLPQGQLTAY",
+                "size": 9
+              },
+              {
+                "cluster_id": "MTEYKLVVVGAGGVGKSALTIQLIQ",
+                "size": 7
+              }
+            ]
+          }
+        },
+        "trb_foundation": {
+          "status": "running",
+          "n_clusters": null,
+          "pid_file": "/home/ubuntu/quest/data/benchmark_v2/clusters/logs/trb_all.pid",
+          "log": "/home/ubuntu/quest/data/benchmark_v2/clusters/logs/trb_all.log"
+        },
+        "peptide_method_agreement": {
+          "n_common": 5497,
+          "total_pairs": 15105756,
+          "sampled_pairs": 5000000,
+          "ed_only_pairs": 40518,
+          "mmseqs_only_pairs": 12,
+          "both_agree_same": 31049,
+          "both_agree_diff": 4928421,
+          "pct_agreement": 99.1894
+        },
+        "timings_seconds": {
+          "allele_inventory": 0.11,
+          "collect": 115.84,
+          "peptide_cluster": 137.09,
+          "tcr_cluster": 691.6
+        }
+      },
+      "files": {
+        "parquet_files": [],
+        "other_files": [
+          {
+            "path": "clusters/peptide_clusters_interaction.tsv",
+            "size_bytes": 134356
+          },
+          {
+            "path": "clusters/peptide_clusters_mmseqs2.tsv",
+            "size_bytes": 135904
+          },
+          {
+            "path": "clusters/peptide_clusters_pm.tsv",
+            "size_bytes": 120706754
+          },
+          {
+            "path": "clusters/tra_cdr3_all_clusters.tsv",
+            "size_bytes": 926158472
+          },
+          {
+            "path": "clusters/tra_cdr3_interaction_clusters.tsv",
+            "size_bytes": 1456933
+          },
+          {
+            "path": "clusters/tra_cdr3_restriction_clusters.tsv",
+            "size_bytes": 1373512
+          },
+          {
+            "path": "clusters/trb_cdr3_all_clusters.tsv",
+            "size_bytes": 28830608613
+          },
+          {
+            "path": "clusters/trb_cdr3_interaction_clusters.tsv",
+            "size_bytes": 6458053
+          },
+          {
+            "path": "clusters/trb_cdr3_restriction_clusters.tsv",
+            "size_bytes": 2233254
+          },
+          {
+            "path": "clusters/unique_mhc_one_alleles.txt",
+            "size_bytes": 4936943
+          },
+          {
+            "path": "clusters/unique_mhc_two_alleles.txt",
+            "size_bytes": 955970
+          },
+          {
+            "path": "clusters/unique_peptides_interaction.txt",
+            "size_bytes": 67973
+          },
+          {
+            "path": "clusters/unique_peptides_pm.txt",
+            "size_bytes": 60325673
+          },
+          {
+            "path": "clusters/unique_tra_cdr3_all.txt",
+            "size_bytes": 461320808
+          },
+          {
+            "path": "clusters/unique_tra_cdr3_interaction.txt",
+            "size_bytes": 728425
+          },
+          {
+            "path": "clusters/unique_tra_cdr3_restriction.txt",
+            "size_bytes": 686226
+          },
+          {
+            "path": "clusters/unique_trb_cdr3_all.txt",
+            "size_bytes": 14401642578
+          },
+          {
+            "path": "clusters/unique_trb_cdr3_interaction.txt",
+            "size_bytes": 3226746
+          },
+          {
+            "path": "clusters/unique_trb_cdr3_restriction.txt",
+            "size_bytes": 1116706
+          },
+          {
+            "path": "clusters/clustering_summary.json",
+            "size_bytes": 9360
+          },
+          {
+            "path": "clusters/mhc_one_alleles.json",
+            "size_bytes": 5053140
+          },
+          {
+            "path": "clusters/mhc_two_alleles.json",
+            "size_bytes": 996055
+          },
+          {
+            "path": "clusters/peptide_clustering_agreement.json",
+            "size_bytes": 216
+          },
+          {
+            "path": "clusters/sequence_counts.json",
+            "size_bytes": 305
+          },
+          {
+            "path": "clusters/timings.json",
+            "size_bytes": 124
+          }
+        ]
+      }
+    },
+    "2_splits": {
+      "output_dir": "/home/ubuntu/quest/data/benchmark_v2/splits",
+      "summary": {
+        "partition_files": [
+          {
+            "file": "as_paired_i_test_iid.parquet",
+            "rows": 6696
+          },
+          {
+            "file": "as_paired_i_test_level4.parquet",
+            "rows": 4872
+          },
+          {
+            "file": "as_paired_i_test_mixed.parquet",
+            "rows": 71616
+          },
+          {
+            "file": "as_paired_i_test_novel_allele.parquet",
+            "rows": 2328
+          },
+          {
+            "file": "as_paired_i_test_novel_pep.parquet",
+            "rows": 49776
+          },
+          {
+            "file": "as_paired_i_test_novel_tcr.parquet",
+            "rows": 715200
+          },
+          {
+            "file": "as_paired_i_train.parquet",
+            "rows": 553440
+          },
+          {
+            "file": "as_paired_i_val.parquet",
+            "rows": 33768
+          },
+          {
+            "file": "as_paired_ii_eval.parquet",
+            "rows": 151632
+          },
+          {
+            "file": "as_tra_i_test_iid.parquet",
+            "rows": 4020
+          },
+          {
+            "file": "as_tra_i_test_level4.parquet",
+            "rows": 9516
+          },
+          {
+            "file": "as_tra_i_test_mixed.parquet",
+            "rows": 59562
+          },
+          {
+            "file": "as_tra_i_test_novel_allele.parquet",
+            "rows": 41910
+          },
+          {
+            "file": "as_tra_i_test_novel_pep.parquet",
+            "rows": 45588
+          },
+          {
+            "file": "as_tra_i_test_novel_tcr.parquet",
+            "rows": 101976
+          },
+          {
+            "file": "as_tra_i_train.parquet",
+            "rows": 216498
+          },
+          {
+            "file": "as_tra_i_val.parquet",
+            "rows": 4266
+          },
+          {
+            "file": "as_tra_ii_eval.parquet",
+            "rows": 40806
+          },
+          {
+            "file": "as_trb_i_test_iid.parquet",
+            "rows": 1044
+          },
+          {
+            "file": "as_trb_i_test_level4.parquet",
+            "rows": 83178
+          },
+          {
+            "file": "as_trb_i_test_mixed.parquet",
+            "rows": 298800
+          },
+          {
+            "file": "as_trb_i_test_novel_allele.parquet",
+            "rows": 200106
+          },
+          {
+            "file": "as_trb_i_test_novel_pep.parquet",
+            "rows": 26688
+          },
+          {
+            "file": "as_trb_i_test_novel_tcr.parquet",
+            "rows": 28734
+          },
+          {
+            "file": "as_trb_i_train.parquet",
+            "rows": 60282
+          },
+          {
+            "file": "as_trb_i_val.parquet",
+            "rows": 7572
+          },
+          {
+            "file": "as_trb_ii_eval.parquet",
+            "rows": 56076
+          },
+          {
+            "file": "mr_paired_i_test_iid.parquet",
+            "rows": 4049
+          },
+          {
+            "file": "mr_paired_i_test_level4.parquet",
+            "rows": 2976
+          },
+          {
+            "file": "mr_paired_i_test_novel_allele.parquet",
+            "rows": 2786
+          },
+          {
+            "file": "mr_paired_i_test_novel_tcr.parquet",
+            "rows": 30525
+          },
+          {
+            "file": "mr_paired_i_train.parquet",
+            "rows": 18861
+          },
+          {
+            "file": "mr_paired_i_val.parquet",
+            "rows": 4084
+          },
+          {
+            "file": "mr_paired_ii_eval.parquet",
+            "rows": 185904
+          },
+          {
+            "file": "mr_tra_i_test_iid.parquet",
+            "rows": 7780
+          },
+          {
+            "file": "mr_tra_i_test_level4.parquet",
+            "rows": 10176
+          },
+          {
+            "file": "mr_tra_i_test_novel_allele.parquet",
+            "rows": 20336
+          },
+          {
+            "file": "mr_tra_i_test_novel_tcr.parquet",
+            "rows": 21972
+          },
+          {
+            "file": "mr_tra_i_train.parquet",
+            "rows": 30217
+          },
+          {
+            "file": "mr_tra_i_val.parquet",
+            "rows": 6449
+          },
+          {
+            "file": "mr_tra_ii_eval.parquet",
+            "rows": 240290
+          },
+          {
+            "file": "mr_trb_i_test_iid.parquet",
+            "rows": 15389
+          },
+          {
+            "file": "mr_trb_i_test_level4.parquet",
+            "rows": 2816
+          },
+          {
+            "file": "mr_trb_i_test_novel_allele.parquet",
+            "rows": 6616
+          },
+          {
+            "file": "mr_trb_i_test_novel_tcr.parquet",
+            "rows": 39552
+          },
+          {
+            "file": "mr_trb_i_train.parquet",
+            "rows": 64811
+          },
+          {
+            "file": "mr_trb_i_val.parquet",
+            "rows": 13417
+          },
+          {
+            "file": "mr_trb_ii_test_iid.parquet",
+            "rows": 188484
+          },
+          {
+            "file": "mr_trb_ii_test_novel_allele.parquet",
+            "rows": 70688
+          },
+          {
+            "file": "pair_negatives_train.parquet",
+            "rows": 9550368
+          },
+          {
+            "file": "pair_test_iid.parquet",
+            "rows": 196718
+          },
+          {
+            "file": "pair_test_novel_both.parquet",
+            "rows": 116052
+          },
+          {
+            "file": "pair_test_novel_tra.parquet",
+            "rows": 468817
+          },
+          {
+            "file": "pair_test_novel_trb.parquet",
+            "rows": 492366
+          },
+          {
+            "file": "pair_train.parquet",
+            "rows": 1591728
+          },
+          {
+            "file": "pair_val.parquet",
+            "rows": 197656
+          },
+          {
+            "file": "pm_i_test_iid.parquet",
+            "rows": 323624
+          },
+          {
+            "file": "pm_i_test_level4.parquet",
+            "rows": 143805
+          },
+          {
+            "file": "pm_i_test_novel_allele.parquet",
+            "rows": 575952
+          },
+          {
+            "file": "pm_i_test_novel_pep.parquet",
+            "rows": 807866
+          },
+          {
+            "file": "pm_i_train.parquet",
+            "rows": 2589642
+          },
+          {
+            "file": "pm_i_val.parquet",
+            "rows": 324075
+          },
+          {
+            "file": "pm_ii_test_iid.parquet",
+            "rows": 79122
+          },
+          {
+            "file": "pm_ii_test_level4.parquet",
+            "rows": 13095
+          },
+          {
+            "file": "pm_ii_test_novel_allele.parquet",
+            "rows": 52889
+          },
+          {
+            "file": "pm_ii_test_novel_pep.parquet",
+            "rows": 190315
+          },
+          {
+            "file": "pm_ii_train.parquet",
+            "rows": 604698
+          },
+          {
+            "file": "pm_ii_val.parquet",
+            "rows": 76133
+          }
+        ],
+        "leakage_validation": [
+          {
+            "status": "PASS",
+            "n_train": 1455,
+            "n_test_total": 463,
+            "n_test_sampled": 463,
+            "sampled": false,
+            "violations": [],
+            "n_violations": 0,
+            "closest": null,
+            "check": "novel_pep",
+            "partition": "as_paired_i_test_novel_pep"
+          },
+          {
+            "status": "PASS",
+            "n_train": 11743,
+            "n_test": 14120,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_tcr",
+            "partition": "as_paired_i_test_novel_tcr"
+          },
+          {
+            "status": "PASS",
+            "n_train": 61,
+            "n_test": 14,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_allele",
+            "partition": "as_paired_i_test_novel_allele",
+            "allele_col": "mhc_one_allele"
+          },
+          {
+            "check": "level4",
+            "partition": "as_paired_i_test_level4",
+            "tcr_disjoint": {
+              "status": "PASS",
+              "n_train": 11743,
+              "n_test": 91,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "pep_disjoint": {
+              "status": "PASS",
+              "n_train": 448,
+              "n_test": 18,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "allele_disjoint": {
+              "status": "PASS",
+              "n_train": 61,
+              "n_test": 9,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "status": "PASS"
+          },
+          {
+            "status": "PASS",
+            "n_train": 702,
+            "n_test_total": 257,
+            "n_test_sampled": 257,
+            "sampled": false,
+            "violations": [],
+            "n_violations": 0,
+            "closest": null,
+            "check": "novel_pep",
+            "partition": "as_tra_i_test_novel_pep"
+          },
+          {
+            "status": "PASS",
+            "n_train": 15390,
+            "n_test": 6870,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_tcr",
+            "partition": "as_tra_i_test_novel_tcr"
+          },
+          {
+            "status": "PASS",
+            "n_train": 70,
+            "n_test": 11,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_allele",
+            "partition": "as_tra_i_test_novel_allele",
+            "allele_col": "mhc_one_allele"
+          },
+          {
+            "check": "level4",
+            "partition": "as_tra_i_test_level4",
+            "tcr_disjoint": {
+              "status": "PASS",
+              "n_train": 15390,
+              "n_test": 945,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "pep_disjoint": {
+              "status": "PASS",
+              "n_train": 386,
+              "n_test": 101,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "allele_disjoint": {
+              "status": "PASS",
+              "n_train": 70,
+              "n_test": 7,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "status": "PASS"
+          },
+          {
+            "status": "PASS",
+            "n_train": 818,
+            "n_test_total": 297,
+            "n_test_sampled": 297,
+            "sampled": false,
+            "violations": [],
+            "n_violations": 0,
+            "closest": null,
+            "check": "novel_pep",
+            "partition": "as_trb_i_test_novel_pep"
+          },
+          {
+            "status": "PASS",
+            "n_train": 5518,
+            "n_test": 2543,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_tcr",
+            "partition": "as_trb_i_test_novel_tcr"
+          },
+          {
+            "status": "PASS",
+            "n_train": 91,
+            "n_test": 14,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_allele",
+            "partition": "as_trb_i_test_novel_allele",
+            "allele_col": "mhc_one_allele"
+          },
+          {
+            "check": "level4",
+            "partition": "as_trb_i_test_level4",
+            "tcr_disjoint": {
+              "status": "PASS",
+              "n_train": 5518,
+              "n_test": 8045,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "pep_disjoint": {
+              "status": "PASS",
+              "n_train": 306,
+              "n_test": 131,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "allele_disjoint": {
+              "status": "PASS",
+              "n_train": 91,
+              "n_test": 11,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "status": "PASS"
+          },
+          {
+            "status": "PASS",
+            "n_train": 10088,
+            "n_test": 15529,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_tcr",
+            "partition": "mr_paired_i_test_novel_tcr"
+          },
+          {
+            "status": "PASS",
+            "n_train": 116,
+            "n_test": 7,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_allele",
+            "partition": "mr_paired_i_test_novel_allele",
+            "allele_col": "mhc_one_allele"
+          },
+          {
+            "check": "level4",
+            "partition": "mr_paired_i_test_level4",
+            "tcr_disjoint": {
+              "status": "PASS",
+              "n_train": 10088,
+              "n_test": 2835,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "allele_disjoint": {
+              "status": "PASS",
+              "n_train": 116,
+              "n_test": 7,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "status": "PASS"
+          },
+          {
+            "status": "PASS",
+            "n_train": 14804,
+            "n_test": 9068,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_tcr",
+            "partition": "mr_tra_i_test_novel_tcr"
+          },
+          {
+            "status": "PASS",
+            "n_train": 121,
+            "n_test": 8,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_allele",
+            "partition": "mr_tra_i_test_novel_allele",
+            "allele_col": "mhc_one_allele"
+          },
+          {
+            "check": "level4",
+            "partition": "mr_tra_i_test_level4",
+            "tcr_disjoint": {
+              "status": "PASS",
+              "n_train": 14804,
+              "n_test": 6108,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "allele_disjoint": {
+              "status": "PASS",
+              "n_train": 121,
+              "n_test": 8,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "status": "PASS"
+          },
+          {
+            "status": "PASS",
+            "n_train": 26655,
+            "n_test": 16311,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_tcr",
+            "partition": "mr_trb_i_test_novel_tcr"
+          },
+          {
+            "status": "PASS",
+            "n_train": 147,
+            "n_test": 11,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_allele",
+            "partition": "mr_trb_i_test_novel_allele",
+            "allele_col": "mhc_one_allele"
+          },
+          {
+            "check": "level4",
+            "partition": "mr_trb_i_test_level4",
+            "tcr_disjoint": {
+              "status": "PASS",
+              "n_train": 26655,
+              "n_test": 2328,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "allele_disjoint": {
+              "status": "PASS",
+              "n_train": 147,
+              "n_test": 11,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "status": "PASS"
+          },
+          {
+            "status": "PASS",
+            "n_train": 746823,
+            "n_test": 219904,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_tra",
+            "partition": "pair_test_novel_tra"
+          },
+          {
+            "status": "PASS",
+            "n_train": 1296349,
+            "n_test": 405035,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_trb",
+            "partition": "pair_test_novel_trb"
+          },
+          {
+            "check": "novel_both",
+            "partition": "pair_test_novel_both",
+            "status": "PASS",
+            "tra_cluster_overlap": 0,
+            "trb_cluster_overlap": 0
+          },
+          {
+            "status": "FAIL",
+            "n_train": 2302126,
+            "n_test_total": 719349,
+            "n_test_sampled": 43,
+            "sampled": true,
+            "violations": [
+              {
+                "test": "ACVKARNAGR",
+                "train": "ACVQARNEGR",
+                "dist": 2,
+                "threshold": 2
+              },
+              {
+                "test": "AKEACAKALGTG",
+                "train": "AAKEAYAKANGTG",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "AKEACAKALGTG",
+                "train": "AKEAASKALGVG",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "AKEACAKALGTG",
+                "train": "AKEACAKALGTGI",
+                "dist": 1,
+                "threshold": 3
+              },
+              {
+                "test": "AKEACAKALGTG",
+                "train": "AKEACSKALGTG",
+                "dist": 1,
+                "threshold": 3
+              },
+              {
+                "test": "AKEACAKALGTG",
+                "train": "AKEACSKALGTGI",
+                "dist": 2,
+                "threshold": 3
+              },
+              {
+                "test": "AKEACAKALGTG",
+                "train": "AKEAMAKALGTG",
+                "dist": 1,
+                "threshold": 3
+              },
+              {
+                "test": "ALILRGSVAHKSCL",
+                "train": "ALILRGSVAHK",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "ALILRGSVAHKSCL",
+                "train": "ILRGSVAHKSCL",
+                "dist": 2,
+                "threshold": 3
+              },
+              {
+                "test": "ALILRGSVAHKSCL",
+                "train": "ILRGSVAHKSCLP",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "ALILRGSVAHKSCL",
+                "train": "LRGSVAHKSCL",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "ALILRGSVAHKSCL",
+                "train": "RSALILRGSVAHKSC",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "DLTTDKLRSMVKKW",
+                "train": "MDLTTDKYRSMVKK",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "DTAKSLQPLAPRNKTRV",
+                "train": "AKSLQPLAPRNKTRVV",
+                "dist": 3,
+                "threshold": 4
+              },
+              {
+                "test": "DTAKSLQPLAPRNKTRV",
+                "train": "AKSLQPLAPRNKTRVVS",
+                "dist": 4,
+                "threshold": 4
+              },
+              {
+                "test": "DTAKSLQPLAPRNKTRV",
+                "train": "DTAKSLQPLAPRNKTRVVS",
+                "dist": 2,
+                "threshold": 4
+              },
+              {
+                "test": "DTAKSLQPLAPRNKTRV",
+                "train": "EKDTAKSLQPLAPRNKTRVVS",
+                "dist": 4,
+                "threshold": 4
+              },
+              {
+                "test": "DTAKSLQPLAPRNKTRV",
+                "train": "GEKDTAKSLQPLAPRNKTR",
+                "dist": 4,
+                "threshold": 4
+              },
+              {
+                "test": "DTAKSLQPLAPRNKTRV",
+                "train": "KDTAKSLQPLAPRNKTRVVS",
+                "dist": 3,
+                "threshold": 4
+              },
+              {
+                "test": "FFLYDRLAST",
+                "train": "AFFLYDRLASTV",
+                "dist": 2,
+                "threshold": 2
+              }
+            ],
+            "n_violations": 39,
+            "closest": {
+              "test": "AKEACAKALGTG",
+              "train": "AKEACAKALGTGI",
+              "dist": 1,
+              "threshold": 3
+            },
+            "check": "novel_pep",
+            "partition": "pm_i_test_novel_pep"
+          },
+          {
+            "status": "PASS",
+            "n_train": 214,
+            "n_test": 41,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_allele",
+            "partition": "pm_i_test_novel_allele",
+            "allele_col": "mhc_one_allele"
+          },
+          {
+            "check": "level4",
+            "partition": "pm_i_test_level4",
+            "pep_disjoint": {
+              "status": "PASS",
+              "n_train": 2250338,
+              "n_test": 130056,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "allele_disjoint": {
+              "status": "PASS",
+              "n_train": 214,
+              "n_test": 41,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "status": "PASS"
+          },
+          {
+            "status": "FAIL",
+            "n_train": 485391,
+            "n_test_total": 151236,
+            "n_test_sampled": 206,
+            "sampled": true,
+            "violations": [
+              {
+                "test": "ADLGYKQMNAVALVGMI",
+                "train": "DLGYKQMNAVALVG",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "ALHTAGYEMSLNGSP",
+                "train": "ALHTAGYEMSLNG",
+                "dist": 2,
+                "threshold": 3
+              },
+              {
+                "test": "ALHTAGYEMSLNGSP",
+                "train": "HTAGYEMSLNGSPR",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "APGEEAAAGEEGAAGGDPQEAK",
+                "train": "APGEEAAAGEEGAAGGDP",
+                "dist": 4,
+                "threshold": 4
+              },
+              {
+                "test": "DIKSGKLSRELDFVS",
+                "train": "DIKSGKLSRELD",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "DIKSGKLSRELDFVS",
+                "train": "DIKSGKLSRELDFV",
+                "dist": 1,
+                "threshold": 3
+              },
+              {
+                "test": "DIKSGKLSRELDFVS",
+                "train": "EDIKSGKLSRELDFV",
+                "dist": 2,
+                "threshold": 3
+              },
+              {
+                "test": "DSGLWVPNSKASEAKEG",
+                "train": "SGLWVPNSKASEAK",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "EVISWLDANTLAEKD",
+                "train": "CQEVISWLDANTLAEKD",
+                "dist": 2,
+                "threshold": 3
+              },
+              {
+                "test": "EVISWLDANTLAEKD",
+                "train": "CQEVISWLDANTLAEKDE",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "EVISWLDANTLAEKD",
+                "train": "EVISWLDANTLAEK",
+                "dist": 1,
+                "threshold": 3
+              },
+              {
+                "test": "EVISWLDANTLAEKD",
+                "train": "EVISWLDANTLAEKDEF",
+                "dist": 2,
+                "threshold": 3
+              },
+              {
+                "test": "EVISWLDANTLAEKD",
+                "train": "EVISWLDANTLAEKDEFE",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "EVISWLDANTLAEKD",
+                "train": "ISWLDANTLAEKD",
+                "dist": 2,
+                "threshold": 3
+              },
+              {
+                "test": "EVISWLDANTLAEKD",
+                "train": "KCQEVISWLDANTLAEKD",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "EVISWLDANTLAEKD",
+                "train": "QEVISWLDANTLAEKDE",
+                "dist": 2,
+                "threshold": 3
+              },
+              {
+                "test": "EVISWLDANTLAEKD",
+                "train": "VISWLDANTLAEKD",
+                "dist": 1,
+                "threshold": 3
+              },
+              {
+                "test": "GAAYEVLSDSEKRKQYD",
+                "train": "AYEVLSDSEKRKQY",
+                "dist": 3,
+                "threshold": 3
+              },
+              {
+                "test": "GAAYEVLSDSEKRKQYD",
+                "train": "EAYEVLSDEVKRKQYD",
+                "dist": 4,
+                "threshold": 4
+              },
+              {
+                "test": "GAAYEVLSDSEKRKQYD",
+                "train": "YEVLSDSEKRKQYD",
+                "dist": 3,
+                "threshold": 3
+              }
+            ],
+            "n_violations": 126,
+            "closest": {
+              "test": "DIKSGKLSRELDFVS",
+              "train": "DIKSGKLSRELDFV",
+              "dist": 1,
+              "threshold": 3
+            },
+            "check": "novel_pep",
+            "partition": "pm_ii_test_novel_pep"
+          },
+          {
+            "status": "PASS",
+            "n_train": 77,
+            "n_test": 14,
+            "n_overlap": 0,
+            "sample_overlap": [],
+            "check": "novel_allele",
+            "partition": "pm_ii_test_novel_allele",
+            "allele_col": "mhc_two_allele"
+          },
+          {
+            "check": "level4",
+            "partition": "pm_ii_test_level4",
+            "pep_disjoint": {
+              "status": "PASS",
+              "n_train": 397301,
+              "n_test": 7787,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "allele_disjoint": {
+              "status": "PASS",
+              "n_train": 77,
+              "n_test": 14,
+              "n_overlap": 0,
+              "sample_overlap": []
+            },
+            "status": "PASS"
+          }
+        ],
+        "timings_seconds": {
+          "as": 79.88,
+          "leakage": 85.95,
+          "mr": 139.23,
+          "pair": 1253.19,
+          "pm": 360.62,
+          "prep_lookup": 1425.27
+        },
+        "lookup_stats": {
+          "n_rows": 24399183,
+          "n_multi_source": 636645,
+          "n_multi_mhc_one_allele": 3428,
+          "n_multi_mhc_two_allele": 15,
+          "n_no_source": 0,
+          "distinct_sources_seen": [
+            "batman",
+            "cedar",
+            "cedar_pmhc",
+            "iedb",
+            "iedb_pmhc",
+            "imgthla",
+            "immunecode",
+            "mcpas",
+            "netmhcpan",
+            "ots",
+            "rcc_atlas",
+            "tadb",
+            "trait",
+            "vdjdb"
+          ],
+          "experimental_sources": [
+            "iedb",
+            "cedar",
+            "vdjdb",
+            "mcpas",
+            "batman",
+            "trait",
+            "immunecode",
+            "ots"
+          ],
+          "computational_sources": [
+            "netmhcpan",
+            "cedar_pmhc"
+          ]
+        }
+      },
+      "lookup_stats": {
+        "n_rows": 24399183,
+        "n_multi_source": 636645,
+        "n_multi_mhc_one_allele": 3428,
+        "n_multi_mhc_two_allele": 15,
+        "n_no_source": 0,
+        "distinct_sources_seen": [
+          "batman",
+          "cedar",
+          "cedar_pmhc",
+          "iedb",
+          "iedb_pmhc",
+          "imgthla",
+          "immunecode",
+          "mcpas",
+          "netmhcpan",
+          "ots",
+          "rcc_atlas",
+          "tadb",
+          "trait",
+          "vdjdb"
+        ],
+        "experimental_sources": [
+          "iedb",
+          "cedar",
+          "vdjdb",
+          "mcpas",
+          "batman",
+          "trait",
+          "immunecode",
+          "ots"
+        ],
+        "computational_sources": [
+          "netmhcpan",
+          "cedar_pmhc"
+        ]
+      }
+    },
+    "3_foundation": {
+      "output_dir": "/home/ubuntu/quest/data/benchmark_v2/foundation",
+      "summary": {
+        "exclusion_count": 3677196,
+        "partition_totals": {
+          "test": 71678813,
+          "train": 1290967150,
+          "val": 71697996
+        },
+        "per_subset_partition": {
+          "trb_mhc_one": {
+            "train": 137808,
+            "val": 7886,
+            "test": 7800
+          },
+          "peptide_mhc_one": {
+            "train": 5403916,
+            "val": 301442,
+            "test": 299912
+          },
+          "peptide_mhc_two": {
+            "val": 79532,
+            "test": 79372,
+            "train": 1427072
+          },
+          "tra_peptide_mhc_one": {
+            "val": 6282,
+            "test": 6552,
+            "train": 116550
+          },
+          "trb_peptide": {
+            "test": 70342,
+            "train": 1276534,
+            "val": 71508
+          },
+          "tra_trb": {
+            "train": 3506876,
+            "test": 183070,
+            "val": 182290
+          },
+          "peptide_mhc_one_mhc_two": {
+            "train": 678000,
+            "test": 37386,
+            "val": 37578
+          },
+          "tra_peptide": {
+            "val": 8366,
+            "test": 7826,
+            "train": 150184
+          },
+          "tra_mhc_one": {
+            "val": 5910,
+            "test": 5790,
+            "train": 103908
+          },
+          "tra_trb_peptide": {
+            "val": 19032,
+            "test": 18708,
+            "train": 337068
+          },
+          "tra": {
+            "val": 1946100,
+            "train": 35158460,
+            "test": 1953298
+          },
+          "trb_peptide_mhc_one": {
+            "val": 2316,
+            "train": 40734,
+            "test": 2136
+          },
+          "trb": {
+            "train": 1242415552,
+            "test": 68995515,
+            "val": 69017736
+          },
+          "tra_trb_mhc_one": {
+            "train": 122664,
+            "test": 6570,
+            "val": 6690
+          },
+          "tra_trb_peptide_mhc_one": {
+            "train": 91824,
+            "test": 4536,
+            "val": 5328
+          }
+        },
+        "output_sizes": {
+          "foundation_10M.parquet": {
+            "rows": 9999999,
+            "size_gb": 0.15
+          },
+          "foundation_100M.parquet": {
+            "rows": 100000000,
+            "size_gb": 1.86
+          },
+          "foundation_500M.parquet": {
+            "rows": 500000000,
+            "size_gb": 9.47
+          },
+          "mini_M2_10M.parquet": {
+            "rows": 10000000,
+            "size_gb": 0.15
+          },
+          "mini_M3_10M.parquet": {
+            "rows": 10000000,
+            "size_gb": 0.15
+          },
+          "mini_O1_10M.parquet": {
+            "rows": 9999999,
+            "size_gb": 0.17
+          },
+          "mini_O3_10M.parquet": {
+            "rows": 9999999,
+            "size_gb": 0.16
+          },
+          "foundation_val.parquet": {
+            "rows": 71697996,
+            "size_gb": 3.75
+          },
+          "foundation_test.parquet": {
+            "rows": 71678813,
+            "size_gb": 3.75
+          }
+        },
+        "exposure_per_dataset": {
+          "foundation_10M.parquet": {
+            "min": 1,
+            "median": 1.0,
+            "max": 1136
+          },
+          "foundation_100M.parquet": {
+            "min": 1,
+            "median": 1.0,
+            "max": 40103
+          },
+          "foundation_500M.parquet": {
+            "min": 1,
+            "median": 1.0,
+            "max": 61727
+          },
+          "mini_M2_10M.parquet": {
+            "min": 1,
+            "median": 2.0,
+            "max": 612
+          },
+          "mini_M3_10M.parquet": {
+            "min": 1,
+            "median": 2.0,
+            "max": 612
+          },
+          "mini_O1_10M.parquet": {
+            "min": 1,
+            "median": 1.0,
+            "max": 1136
+          },
+          "mini_O3_10M.parquet": {
+            "min": 1,
+            "median": 1.0,
+            "max": 1136
+          },
+          "foundation_val.parquet": {
+            "min": 1,
+            "median": 1.0,
+            "max": 172
+          },
+          "foundation_test.parquet": {
+            "min": 1,
+            "median": 1.0,
+            "max": 213
+          }
+        },
+        "timings_seconds": {
+          "exclusion": 1.59,
+          "minis_order": 8.9,
+          "minis_weight": 760.78,
+          "partition": 1784.09,
+          "scaled": 2835.15,
+          "val_test": 1523.36
+        }
+      }
+    },
+    "4_tokenization": {
+      "output_dir": "/home/ubuntu/quest/data/benchmark_v2/tokenized",
+      "summary": {
+        "tasks": {
+          "as": {
+            "file_count": 123,
+            "rows": 13385694,
+            "formats": {
+              "C5": 24,
+              "C3": 27,
+              "C4": 24,
+              "C1": 24,
+              "C2": 24
+            }
+          },
+          "foundation": {
+            "file_count": 74,
+            "rows": 753376808,
+            "formats": {
+              "C3": 4
+            }
+          },
+          "mini": {
+            "file_count": 4,
+            "rows": 39999998,
+            "formats": {
+              "C3": 4
+            }
+          },
+          "mr": {
+            "file_count": 94,
+            "rows": 2199426,
+            "formats": {
+              "C2": 18,
+              "C3": 22,
+              "C5": 18,
+              "C4": 18,
+              "C1": 18
+            }
+          },
+          "pair": {
+            "file_count": 18,
+            "rows": 9190011,
+            "formats": {
+              "T1": 6,
+              "T2": 6,
+              "T3": 6
+            }
+          },
+          "pm": {
+            "file_count": 36,
+            "rows": 17343648,
+            "formats": {
+              "M3": 12,
+              "M1": 12,
+              "M2": 12
+            }
+          }
+        },
+        "format_lengths": {
+          "C1": {
+            "min": 275,
+            "median": 399,
+            "mean": 399.55803134182173,
+            "max": 572,
+            "p95": 408,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/mr/mr_paired_i_C1_val.parquet"
+          },
+          "C2": {
+            "min": 62,
+            "median": 81,
+            "mean": 81.53819784524975,
+            "max": 122,
+            "p95": 90,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/mr/mr_paired_i_C2_val.parquet"
+          },
+          "C3": {
+            "min": 2,
+            "median": 50,
+            "mean": 48.795813579581356,
+            "max": 164,
+            "p95": 77,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/mini/mini_O3_10M_C3_sep.parquet"
+          },
+          "C4": {
+            "min": 35,
+            "median": 57,
+            "mean": 60.29232164449819,
+            "max": 106,
+            "p95": 85,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/mr/mr_trb_i_C4_test_novel_allele.parquet"
+          },
+          "C5": {
+            "min": 57,
+            "median": 369,
+            "mean": 460.991428784378,
+            "max": 685,
+            "p95": 645,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/mr/mr_trb_i_C5_val.parquet"
+          },
+          "M1": {
+            "min": 99,
+            "median": 286,
+            "mean": 349.83254450982145,
+            "max": 552,
+            "p95": 538,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/pm/pm_ii_M1_train.parquet"
+          },
+          "M2": {
+            "min": 57,
+            "median": 60,
+            "mean": 61.23175499498573,
+            "max": 100,
+            "p95": 83,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/pm/pm_i_M2_val.parquet"
+          },
+          "M3": {
+            "min": 31,
+            "median": 34,
+            "mean": 34.46361427564119,
+            "max": 61,
+            "p95": 44,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/pm/pm_i_M3_train.parquet"
+          },
+          "T1": {
+            "min": 15,
+            "median": 27,
+            "mean": 27.522192840285477,
+            "max": 72,
+            "p95": 33,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/pair/pair_T1_test_novel_trb.parquet"
+          },
+          "T2": {
+            "min": 20,
+            "median": 50,
+            "mean": 49.270654534174334,
+            "max": 89,
+            "p95": 56,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/pair/pair_T2_test_novel_both.parquet"
+          },
+          "T3": {
+            "min": 2,
+            "median": 583,
+            "mean": 426.3466679483547,
+            "max": 658,
+            "p95": 593,
+            "sample_file": "/home/ubuntu/quest/data/benchmark_v2/tokenized/pair/pair_T3_val.parquet"
+          }
+        },
+        "total_files": 349,
+        "total_rows": 835495585,
+        "total_size_gb": 44.79,
+        "timings_seconds": {
+          "benchmark": 3231.82,
+          "foundation_manifests": 10822.56,
+          "foundation_val_test": 3018.08,
+          "mini": 784.74
+        }
+      }
+    }
+  }
+}
