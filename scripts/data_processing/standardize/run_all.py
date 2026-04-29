@@ -44,6 +44,7 @@ from scripts.data_processing.standardize.studies import StudiesStandardizer
 from scripts.data_processing.standardize.imgthla import ImgthlaStandardizer
 from scripts.data_processing.standardize.rcc_atlas import RccAtlasStandardizer
 from quest.data.standardization import clear_norm_cache
+from scripts.data_processing.fix_gene_names import process_database as fix_genes_for_db
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +360,33 @@ def main():
             overall_pbar.update(1)
 
     overall_pbar.close()
+
+    # Phase 3: Fix gene names and re-annotate CDR1/CDR2
+    completed_dbs = [
+        r.get("name", "") for r in results if r.get("status") == "completed"
+    ]
+    if completed_dbs:
+        print(f"\nPhase 3: Fixing gene names & re-annotating CDR1/CDR2...")
+        output_path = Path(args.output_dir)
+        for db_name in completed_dbs:
+            try:
+                fix_stats = fix_genes_for_db(
+                    db_name,
+                    input_dir=output_path,
+                    output_dir=output_path,
+                    dry_run=False,
+                    workers=1,
+                )
+                wc = fix_stats.get("wrong_chain_nulled", 0)
+                gc = fix_stats.get("genes_corrected", 0)
+                cdr = fix_stats.get("cdr_updated", 0)
+                if wc or gc or cdr:
+                    print(
+                        f"  {db_name}: {wc:,} wrong-chain nulled, "
+                        f"{gc:,} genes corrected, {cdr:,} CDR filled"
+                    )
+            except Exception as e:
+                print(f"  {db_name}: gene fix ERROR - {e}")
 
     # Summary
     overall_elapsed = time.time() - overall_start
