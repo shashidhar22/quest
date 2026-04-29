@@ -258,12 +258,20 @@ def _infer_chain_from_path(fpath: Path) -> Optional[str]:
 
 
 def _infer_chain_from_mitcr_header(first_line: str) -> Optional[str]:
-    """Infer chain type from MiTCR metadata header line."""
-    upper = first_line.upper()
-    if "TRA" in upper:
-        return "TRA"
-    if "TRB" in upper:
-        return "TRB"
+    """Infer chain type from MiTCR metadata header line.
+
+    MiTCR headers are tab-separated with the gene locus in the 3rd field:
+        MiTCRFullExportV1.1<TAB>HomoSapiens<TAB>TRB<TAB>...
+    We check the tab-separated fields as whole tokens to avoid false matches
+    from XML substrings like 'CDR3Extractor' or 'interpretationStrategy'.
+    """
+    fields = first_line.upper().split("\t")
+    for field in fields:
+        field = field.strip()
+        if field == "TRA":
+            return "TRA"
+        if field == "TRB":
+            return "TRB"
     return None
 
 
@@ -404,6 +412,54 @@ class StudiesStandardizer(BaseStandardizer):
                 study_id = parent.name
                 break
         yield from self._process_file(file_path, study_id)
+
+    def _pair_chains_by_cell(
+        self, chunk, chain_col, cell_col, alpha_src_map, beta_src_map, study_id,
+    ) -> Iterator[tuple]:
+        """Pair alpha/beta rows on a per-cell barcode and emit one row per cell.
+
+        alpha_src_map / beta_src_map: {source_col: target_col} for the
+        respective chain (case-preserved column names from the chunk).
+        Cells with only one chain present become single-chain rows; cells
+        with both become paired rows.
+        """
+        from quest.data.standardization import TARGET_COLUMNS
+
+        if cell_col not in chunk.columns or chain_col not in chunk.columns:
+            return
+
+        cu = chunk[chain_col].astype(str).str.strip().str.upper()
+        alpha_rows = chunk[cu == "TRA"]
+        beta_rows = chunk[cu == "TRB"]
+
+        def _prep(df, src_map):
+            cols = [cell_col] + [c for c in src_map.keys() if c in df.columns]
+            sub = df[cols].rename(columns={**src_map, cell_col: "_cell_id"})
+            sub = sub[sub["_cell_id"].astype(str).str.strip() != ""]
+            # First contig per cell — 10x can emit multiple per chain
+            return sub.drop_duplicates(subset=["_cell_id"], keep="first")
+
+        alpha = _prep(alpha_rows, alpha_src_map)
+        beta = _prep(beta_rows, beta_src_map)
+
+        if alpha.empty and beta.empty:
+            return
+
+        merged = pd.merge(alpha, beta, on="_cell_id", how="outer").fillna("")
+        merged = merged.drop(columns=["_cell_id"])
+        if merged.empty:
+            return
+
+        for col in TARGET_COLUMNS:
+            if col not in merged.columns:
+                merged[col] = ""
+
+        identity = {c: c for c in merged.columns if c in TARGET_COLUMNS}
+        result, dropped = standardize_dataframe(
+            merged, identity, source=self.name, study_id=study_id,
+            stitch=self.stitch, hla_dir=self.hla_dir,
+        )
+        yield result, dropped
 
     def _split_by_chain(
         self, chunk, chain_col, default_col_map, study_id,
@@ -690,19 +746,61 @@ class StudiesStandardizer(BaseStandardizer):
                         yield empty_result, dropped_df
                     continue
 
-                # 10x format: split by chain column for correct alpha/beta mapping
+                # 10x format: pair by cell barcode when present, else split by chain
                 if fmt == "10x" and "chain" in [c.lower() for c in chunk.columns]:
                     chain_col = next(
                         c for c in chunk.columns if c.lower() == "chain"
                     )
-                    yield from self._split_by_chain(
-                        chunk, chain_col, col_map, study_id,
+                    cell_col = next(
+                        (c for c in chunk.columns
+                         if c.lower() in ("barcode", "cell_id", "cell")),
+                        None,
                     )
-                # AIRR format: split by locus column
+                    if cell_col is not None:
+                        alpha_src = {
+                            c: t for c in chunk.columns
+                            for s, t in self._ALPHA_MAP_10X.items()
+                            if c.lower() == s
+                        }
+                        beta_src = {
+                            c: t for c in chunk.columns
+                            for s, t in self._BETA_MAP_10X.items()
+                            if c.lower() == s
+                        }
+                        yield from self._pair_chains_by_cell(
+                            chunk, chain_col, cell_col,
+                            alpha_src, beta_src, study_id,
+                        )
+                    else:
+                        yield from self._split_by_chain(
+                            chunk, chain_col, col_map, study_id,
+                        )
+                # AIRR format: pair by cell_id when present, else split by locus
                 elif fmt == "airr" and "locus" in chunk.columns:
-                    yield from self._split_by_locus(
-                        chunk, col_map, study_id,
+                    cell_col = next(
+                        (c for c in chunk.columns
+                         if c.lower() in ("cell_id", "cell")),
+                        None,
                     )
+                    if cell_col is not None:
+                        alpha_src = {
+                            c: t for c in chunk.columns
+                            for s, t in self._ALPHA_MAP_AIRR.items()
+                            if c.lower() == s
+                        }
+                        beta_src = {
+                            c: t for c in chunk.columns
+                            for s, t in self._BETA_MAP_AIRR.items()
+                            if c.lower() == s
+                        }
+                        yield from self._pair_chains_by_cell(
+                            chunk, "locus", cell_col,
+                            alpha_src, beta_src, study_id,
+                        )
+                    else:
+                        yield from self._split_by_locus(
+                            chunk, col_map, study_id,
+                        )
                 else:
                     result, dropped = standardize_dataframe(
                         chunk,

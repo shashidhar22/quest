@@ -133,6 +133,69 @@ class TestNormalizeGene:
         assert normalize_gene("TRDV1") != ""
         assert normalize_gene("TRGV9") != ""
 
+    # --- IMGT validation: dash-as-allele correction ---
+
+    def test_dash_as_allele_trbv27(self):
+        """TRBV27-1 should become TRBV27*01 (TRBV27 has no subgroups)."""
+        assert normalize_gene("TRBV27-1") == "TRBV27*01"
+
+    def test_dash_as_allele_traj33(self):
+        """TRAJ33-1 should become TRAJ33*01 (all TRAJ are single-gene)."""
+        assert normalize_gene("TRAJ33-1") == "TRAJ33*01"
+
+    def test_dash_as_allele_trbv13(self):
+        """TRBV13-1 should become TRBV13*01 (no subgroups)."""
+        assert normalize_gene("TRBV13-1") == "TRBV13*01"
+
+    def test_dash_as_allele_trbv9(self):
+        assert normalize_gene("TRBV9-1") == "TRBV9*01"
+
+    def test_dash_as_allele_trav27(self):
+        assert normalize_gene("TRAV27-1") == "TRAV27*01"
+
+    def test_dash_as_allele_trdv1(self):
+        assert normalize_gene("TRDV1-1") == "TRDV1*01"
+
+    def test_dash_as_allele_with_existing_allele(self):
+        """TRBV13-1*01 — dash is not a subgroup, should fix to TRBV13*01."""
+        assert normalize_gene("TRBV13-1*01") == "TRBV13*01"
+
+    def test_dash_as_allele_high_number(self):
+        """TRAJ9-14 should become TRAJ9*14."""
+        assert normalize_gene("TRAJ9-14") == "TRAJ9*14"
+
+    # --- Valid subgroups should NOT be reinterpreted ---
+
+    def test_valid_subgroup_trbv20_1(self):
+        """TRBV20-1 is a real subgroup — should stay unchanged."""
+        assert normalize_gene("TRBV20-1") == "TRBV20-1"
+
+    def test_valid_subgroup_trbv6_5(self):
+        assert normalize_gene("TRBV6-5") == "TRBV6-5"
+
+    def test_valid_subgroup_with_allele(self):
+        assert normalize_gene("TRAV12-2*01") == "TRAV12-2*01"
+
+    def test_valid_subgroup_trbj2_1(self):
+        assert normalize_gene("TRBJ2-1") == "TRBJ2-1"
+
+    # --- *00 allele fix ---
+
+    def test_allele_00_trav(self):
+        """*00 alleles should be corrected to *01."""
+        assert normalize_gene("TRAV20*00") == "TRAV20*01"
+
+    def test_allele_00_trbv(self):
+        assert normalize_gene("TRBV27*00") == "TRBV27*01"
+
+    # --- Already correct ---
+
+    def test_already_correct_trbv27(self):
+        assert normalize_gene("TRBV27*01") == "TRBV27*01"
+
+    def test_already_correct_trbv27_bare(self):
+        assert normalize_gene("TRBV27") == "TRBV27"
+
 
 # -----------------------------------------------------------------------
 # normalize_mhc_allele
@@ -695,3 +758,70 @@ class TestHlaResolution:
         result, _ = standardize_dataframe(df, column_map, source="test")
         assert list(result.columns) == TARGET_COLUMNS
         assert len(TARGET_COLUMNS) == 25
+
+
+# -----------------------------------------------------------------------
+# normalize_mhc_allele — underscore format (NetMHCIIpan)
+# -----------------------------------------------------------------------
+class TestNetMHCIIpanUnderscoreFormat:
+    def test_drb1_underscore(self):
+        assert normalize_mhc_allele("DRB1_0101") == "HLA-DRB1*01:01"
+
+    def test_drb5_underscore(self):
+        assert normalize_mhc_allele("DRB5_0101") == "HLA-DRB5*01:01"
+
+    def test_dqa1_underscore(self):
+        assert normalize_mhc_allele("DQA1_0501") == "HLA-DQA1*05:01"
+
+    def test_dqb1_underscore(self):
+        assert normalize_mhc_allele("DQB1_0602") == "HLA-DQB1*06:02"
+
+    def test_dpa1_underscore(self):
+        assert normalize_mhc_allele("DPA1_0103") == "HLA-DPA1*01:03"
+
+    def test_dpb1_underscore(self):
+        assert normalize_mhc_allele("DPB1_0201") == "HLA-DPB1*02:01"
+
+    def test_drb3_underscore(self):
+        assert normalize_mhc_allele("DRB3_0101") == "HLA-DRB3*01:01"
+
+    def test_drb4_underscore(self):
+        assert normalize_mhc_allele("DRB4_0101") == "HLA-DRB4*01:01"
+
+
+# -----------------------------------------------------------------------
+# split_mhc_to_alpha_beta — NetMHCIIpan heterodimer format
+# -----------------------------------------------------------------------
+class TestNetMHCIIpanHeterodimer:
+    def test_dpa_dpb_heterodimer(self):
+        m1, m2 = split_mhc_to_alpha_beta("HLA-DPA10103-DPB10201")
+        assert m1 == "HLA-DPA1*01:03"
+        assert m2 == "HLA-DPB1*02:01"
+
+    def test_dqa_dqb_heterodimer(self):
+        m1, m2 = split_mhc_to_alpha_beta("HLA-DQA10501-DQB10201")
+        assert m1 == "HLA-DQA1*05:01"
+        assert m2 == "HLA-DQB1*02:01"
+
+    def test_dqa_dqb_heterodimer_variant(self):
+        m1, m2 = split_mhc_to_alpha_beta("HLA-DQA10102-DQB10602")
+        assert m1 == "HLA-DQA1*01:02"
+        assert m2 == "HLA-DQB1*06:02"
+
+    def test_drb_underscore_splits_to_mhc_two(self):
+        """DRB beta-only allele goes to mhc_two."""
+        m1, m2 = split_mhc_to_alpha_beta("DRB1_0101")
+        assert m1 == ""
+        assert m2 == "HLA-DRB1*01:01"
+
+    def test_class_i_still_works(self):
+        """Class I alleles should still go to mhc_one."""
+        m1, m2 = split_mhc_to_alpha_beta("HLA-A*02:01")
+        assert m1 == "HLA-A*02:01"
+        assert m2 == ""
+
+    def test_slash_separated_still_works(self):
+        """Slash-separated pairs should still work."""
+        m1, m2 = split_mhc_to_alpha_beta("HLA-DQA1*01:02/HLA-DQB1*06:02")
+        assert m1 == "HLA-DQA1*01:02"
+        assert m2 == "HLA-DQB1*06:02"
