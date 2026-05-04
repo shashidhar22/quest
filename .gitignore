@@ -97,6 +97,10 @@ missed_files.txt
 missing_data.txt
 Miniforge3-Linux-x86_64.sh
 
+# Build artifacts and large data dirs (never commit)
+quest.egg-info/
+benchmark_v2/
+
 # Track B baseline integrations
 track_b/*/repo/
 track_b/*/results/checkpoints/
