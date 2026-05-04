@@ -318,17 +318,28 @@ class NativeESMTrainer:
 
         self.train_dataset = self._load_dataset(train_path)
 
-        # Load all val datasets
-        self.val_datasets = {"val": self._load_dataset(val_path)}
+        # Load all val datasets — pass val_max_samples through so parquet loading
+        # only reads the row groups needed (avoids materializing a 71M-row val).
+        val_max = int(self.config.get("val_max_samples") or 0)
+        self.val_datasets = {"val": self._load_dataset(val_path, max_rows=val_max)}
 
         # Additional val splits
         val_parent = os.path.dirname(val_path)
         for split_name in (self.config.get("val_splits") or []):
             split_path = os.path.join(val_parent, split_name)
             if os.path.exists(split_path):
-                self.val_datasets[split_name] = self._load_dataset(split_path)
+                self.val_datasets[split_name] = self._load_dataset(split_path, max_rows=val_max)
             elif self._is_main_process():
                 print(f"WARNING: Val split {split_path} not found, skipping")
+
+        # If val_max applied via .select() to non-parquet (HF dataset) val sets,
+        # do it here as a fallback.
+        if val_max > 0:
+            for name, ds in list(self.val_datasets.items()):
+                if len(ds) > val_max:
+                    self.val_datasets[name] = ds.select(range(val_max))
+                    if self._is_main_process():
+                        print(f"Val ({name}): subsampled to {val_max:,} of {len(ds):,}")
 
         if self._is_main_process():
             print(f"Train: {len(self.train_dataset):,} sequences")
@@ -401,16 +412,21 @@ class NativeESMTrainer:
             else:
                 train_sampler = None
 
-        # DataLoaders optimized for p4d.24xlarge
+        # DataLoaders. Workers fork from the main process, so each holds a
+        # reference to the dataset (memmap-backed; shared via kernel page cache).
+        # Keep num_workers modest — sequences here are tiny so collation is cheap
+        # and CPU-side throughput is not the bottleneck on small ESM-2 models.
+        train_workers = int(self.config.get("dataloader_num_workers", 4))
+        val_workers = int(self.config.get("val_dataloader_num_workers", 2))
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.config.get("batch_size", 16),
             sampler=train_sampler,
             shuffle=(train_sampler is None),
-            num_workers=min(8, os.cpu_count() or 4),
-            prefetch_factor=4,
+            num_workers=train_workers,
+            prefetch_factor=2 if train_workers > 0 else None,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=train_workers > 0,
             drop_last=True,
             collate_fn=self.data_collator,
         )
@@ -423,27 +439,117 @@ class NativeESMTrainer:
                 dataset,
                 batch_size=self.config.get("batch_size", 16),
                 sampler=val_sampler,
-                num_workers=12,
-                prefetch_factor=8,
+                num_workers=val_workers,
+                prefetch_factor=2 if val_workers > 0 else None,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=val_workers > 0,
                 collate_fn=self.data_collator,
             )
 
         # Keep self.val_loader pointing to unified for backward compat
         self.val_loader = self.val_loaders["val"]
 
-    def _load_dataset(self, path: str, compute_lengths: bool = True):
-        """Load sharded dataset and optionally compute lengths for bucketing."""
-        shard_dirs = sorted(glob.glob(os.path.join(path, "shard_*")))
-        if not shard_dirs:
-            shard_dirs = sorted(glob.glob(os.path.join(path, "shard_batch_*")))
+    def _load_parquet_input_ids(self, files, max_rows: int = 0):
+        """Stream parquet → on-disk Arrow IPC cache → memmap-loaded HF Dataset.
 
-        if shard_dirs:
-            datasets = [load_from_disk(s) for s in shard_dirs]
-            dataset = concatenate_datasets(datasets)
+        Why not pq.read_table: that materializes the full input_ids column
+        in the parent process heap (~340 B/row × 100M rows ≈ 34 GB). When the
+        DataLoader forks num_workers persistent processes, every page touched
+        by Python refcount/metadata writes triggers copy-on-write — host RSS
+        grows unbounded over the run and OOM-kills the box.
+
+        With this path the table is written once to an Arrow IPC stream file
+        (low-RSS row-group-by-row-group conversion) and reloaded via
+        Dataset.from_file(in_memory=False), which mmap's the file. All forked
+        DataLoader workers share the same kernel page cache → no COW, RSS
+        stays at ~tens of MB regardless of dataset size.
+
+        Cache lives next to the source parquets in `.input_ids_arrow_cache/`.
+        Cache key includes file path, mtime, size, and max_rows so it
+        auto-invalidates on any source change.
+        """
+        import hashlib
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from datasets import Dataset
+
+        cache_dir = os.path.join(os.path.dirname(files[0]), ".input_ids_arrow_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        sig_parts = []
+        for fp in files:
+            st = os.stat(fp)
+            sig_parts.append(f"{os.path.abspath(fp)}:{st.st_mtime_ns}:{st.st_size}")
+        sig_parts.append(f"max_rows={int(max_rows or 0)}")
+        digest = hashlib.sha256("|".join(sig_parts).encode()).hexdigest()[:16]
+        arrow_path = os.path.join(cache_dir, f"input_ids_{digest}.arrow")
+
+        if not os.path.exists(arrow_path):
+            if self._is_main_process():
+                print(f"  Building Arrow IPC cache: {arrow_path}")
+                print(f"  (one-time conversion, low RSS — streams row groups)")
+            first_pf = pq.ParquetFile(files[0])
+            schema = pa.schema([first_pf.schema_arrow.field("input_ids")])
+            tmp_path = arrow_path + ".tmp"
+            collected = 0
+            try:
+                with pa.OSFile(tmp_path, "wb") as sink:
+                    with pa.ipc.new_stream(sink, schema) as writer:
+                        for fp in files:
+                            if max_rows and collected >= max_rows:
+                                break
+                            pf = pq.ParquetFile(fp)
+                            for rg_idx in range(pf.num_row_groups):
+                                if max_rows and collected >= max_rows:
+                                    break
+                                rg = pf.read_row_group(rg_idx, columns=["input_ids"])
+                                if max_rows and collected + rg.num_rows > max_rows:
+                                    rg = rg.slice(0, max_rows - collected)
+                                writer.write_table(rg)
+                                collected += rg.num_rows
+                os.rename(tmp_path, arrow_path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+            if self._is_main_process():
+                size_gb = os.path.getsize(arrow_path) / 1e9
+                print(f"  Wrote {collected:,} rows ({size_gb:.2f} GB on disk)")
+
+        if self._is_main_process():
+            size_gb = os.path.getsize(arrow_path) / 1e9
+            print(f"  Memmap-loading Arrow IPC: {arrow_path} ({size_gb:.2f} GB)")
+        return Dataset.from_file(arrow_path, in_memory=False)
+
+    def _load_dataset(self, path: str, compute_lengths: bool = True, max_rows: int = 0):
+        """Load dataset. Supports: .parquet file, dir of *.parquet files,
+        HF dataset dir, or dir of shard_* HF subdirs.
+
+        For parquet inputs, only the `input_ids` column is read (all other
+        columns in the foundation tokenized parquets are unused by MLM training).
+        This avoids the slow / bloated HF parquet loader that materializes every
+        column (which inflates 4.5 GB → 70+ GB on disk for the 10M file).
+        """
+        if path.endswith(".parquet") and os.path.isfile(path):
+            dataset = self._load_parquet_input_ids([path], max_rows=max_rows)
+        elif (
+            os.path.isdir(path)
+            and glob.glob(os.path.join(path, "*.parquet"))
+            and not glob.glob(os.path.join(path, "shard_*"))
+            and not glob.glob(os.path.join(path, "shard_batch_*"))
+        ):
+            files = sorted(glob.glob(os.path.join(path, "*.parquet")))
+            dataset = self._load_parquet_input_ids(files, max_rows=max_rows)
         else:
-            dataset = load_from_disk(path)
+            shard_dirs = sorted(glob.glob(os.path.join(path, "shard_*")))
+            if not shard_dirs:
+                shard_dirs = sorted(glob.glob(os.path.join(path, "shard_batch_*")))
+
+            if shard_dirs:
+                datasets = [load_from_disk(s) for s in shard_dirs]
+                dataset = concatenate_datasets(datasets)
+            else:
+                dataset = load_from_disk(path)
 
         # Compute lengths on-the-fly if needed for bucketing
         if compute_lengths and self.config.get("use_length_bucketing", True):
@@ -773,6 +879,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--val_splits", type=str, nargs="*", default=None,
                         help="Additional val split directory names relative to val parent, e.g. val_singles val_pairs")
+    parser.add_argument("--val_max_samples", type=int, default=0,
+                        help="Cap val set to first N samples (0 = full). Use for periodic eval on huge val sets.")
 
     # Model
     parser.add_argument("--model_name", type=str, default="facebook/esm2_t33_650M_UR50D")
@@ -810,7 +918,16 @@ def parse_args():
 
     # Optimization
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    parser.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing",
+                        help="Disable gradient checkpointing (recommended for small models like ESM2-8M/35M).")
     parser.add_argument("--use_amp", action="store_true", default=True)
+
+    # DataLoader workers (memmap-backed datasets keep RSS low even at 4–8 workers,
+    # but defaults stay conservative to avoid host-RAM pressure with persistent forks)
+    parser.add_argument("--dataloader_num_workers", type=int, default=4,
+                        help="Train DataLoader workers (forked from main; memmap datasets are shared).")
+    parser.add_argument("--val_dataloader_num_workers", type=int, default=2,
+                        help="Val DataLoader workers (kept low — eval is short).")
 
     # Logging & Checkpointing
     parser.add_argument("--logging_steps", type=int, default=50)
