@@ -96,3 +96,16 @@ misc/
 missed_files.txt
 missing_data.txt
 Miniforge3-Linux-x86_64.sh
+
+# Track B baseline integrations
+track_b/*/repo/
+track_b/*/results/checkpoints/
+track_b/shared/cache/
+# Allow track_b code, verification docs, and small result artifacts (metrics/predictions JSON)
+!track_b/
+!track_b/**/*.py
+!track_b/**/*.md
+!track_b/**/*.yml
+!track_b/**/*.yaml
+!track_b/**/*.json
+!track_b/**/*.tsv
