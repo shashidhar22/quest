@@ -1,23 +1,23 @@
 {
-  "generated_at": "2026-04-27T15:14:45Z",
-  "wall_seconds": 0.8,
+  "generated_at": "2026-05-07T04:54:41Z",
+  "wall_seconds": 0.9,
   "args": {
     "root": "/home/ubuntu/quest/data/deduplicated_again",
     "subset_filter": null
   },
   "pipeline_run": {
-    "run_timestamp": "2026-04-08T22:38:14",
-    "dedup_elapsed_seconds": 4615.1,
+    "run_timestamp": "2026-05-06T21:28:55",
+    "dedup_elapsed_seconds": 5401.2,
     "dedup_rows_out": 1439165664,
-    "explosion_elapsed_seconds": 466.9,
+    "explosion_elapsed_seconds": 468.7,
     "explosion_rows_out": 1461360146
   },
   "top_level": {
     "deduped_parquet": {
       "path": "data/deduplicated_again/deduped_parquet",
       "file_count": 64,
-      "size_bytes": 30013789399,
-      "size_human": "28.0G",
+      "size_bytes": 30006056530,
+      "size_human": "27.9G",
       "row_count": 1439165664,
       "schema": [
         "tra_full",
@@ -30,13 +30,15 @@
         "tra_cdr3",
         "trb_cdr1",
         "trb_cdr2",
-        "trb_cdr3"
+        "trb_cdr3",
+        "mhc_one_allele",
+        "mhc_two_allele"
       ]
     },
     "deduped_db": {
       "path": "data/deduplicated_again/deduped.db",
-      "size_bytes": 158349668352,
-      "size_human": "147.5G"
+      "size_bytes": 158489915392,
+      "size_human": "147.6G"
     },
     "mhc_pseudo_lookup": {
       "path": "data/deduplicated_again/mhc_pseudo_lookup.json",
@@ -63,7 +65,7 @@
       "deduped": {
         "order_key_count": 1,
         "file_count": 1,
-        "size_bytes": 568177,
+        "size_bytes": 383534,
         "row_count_from_parquet": 16594,
         "row_count_matches_expected": true,
         "schema": [
@@ -78,6 +80,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -88,7 +92,7 @@
       "enriched": {
         "order_key_count": 1,
         "file_count": 1,
-        "size_bytes": 765887,
+        "size_bytes": 582567,
         "row_count_from_parquet": 16594,
         "row_count_matches_expected": true,
         "schema": [
@@ -103,6 +107,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -148,7 +154,7 @@
       "deduped": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 22904,
+        "size_bytes": 23811,
         "row_count_from_parquet": 266,
         "row_count_matches_expected": true,
         "schema": [
@@ -163,6 +169,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -174,7 +182,7 @@
       "enriched": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 37223,
+        "size_bytes": 38611,
         "row_count_from_parquet": 266,
         "row_count_matches_expected": true,
         "schema": [
@@ -189,6 +197,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -233,7 +243,7 @@
       "deduped": {
         "order_key_count": 1,
         "file_count": 1,
-        "size_bytes": 138334,
+        "size_bytes": 132926,
         "row_count_from_parquet": 5721,
         "row_count_matches_expected": true,
         "schema": [
@@ -248,6 +258,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -258,7 +270,7 @@
       "enriched": {
         "order_key_count": 1,
         "file_count": 1,
-        "size_bytes": 180116,
+        "size_bytes": 182938,
         "row_count_from_parquet": 5721,
         "row_count_matches_expected": true,
         "schema": [
@@ -273,6 +285,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -315,8 +329,8 @@
       ],
       "deduped": {
         "order_key_count": 1,
-        "file_count": 28,
-        "size_bytes": 280468969,
+        "file_count": 64,
+        "size_bytes": 280831890,
         "row_count_from_parquet": 16714242,
         "row_count_matches_expected": true,
         "schema": [
@@ -331,6 +345,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -340,8 +356,8 @@
       },
       "enriched": {
         "order_key_count": 1,
-        "file_count": 28,
-        "size_bytes": 287263548,
+        "file_count": 64,
+        "size_bytes": 296743088,
         "row_count_from_parquet": 16714242,
         "row_count_matches_expected": true,
         "schema": [
@@ -356,6 +372,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -401,7 +419,7 @@
       "deduped": {
         "order_key_count": 2,
         "file_count": 78,
-        "size_bytes": 254314377,
+        "size_bytes": 260811294,
         "row_count_from_parquet": 9529928,
         "row_count_matches_expected": true,
         "schema": [
@@ -416,6 +434,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -427,7 +447,7 @@
       "enriched": {
         "order_key_count": 2,
         "file_count": 78,
-        "size_bytes": 291702723,
+        "size_bytes": 298582110,
         "row_count_from_parquet": 9529928,
         "row_count_matches_expected": true,
         "schema": [
@@ -442,6 +462,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -493,7 +515,7 @@
       "deduped": {
         "order_key_count": 6,
         "file_count": 18,
-        "size_bytes": 54750583,
+        "size_bytes": 56655050,
         "row_count_from_parquet": 1754808,
         "row_count_matches_expected": true,
         "schema": [
@@ -508,6 +530,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -523,7 +547,7 @@
       "enriched": {
         "order_key_count": 6,
         "file_count": 18,
-        "size_bytes": 63068513,
+        "size_bytes": 65020444,
         "row_count_from_parquet": 1754808,
         "row_count_matches_expected": true,
         "schema": [
@@ -538,6 +562,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -588,7 +614,7 @@
       "deduped": {
         "order_key_count": 2,
         "file_count": 18,
-        "size_bytes": 59811645,
+        "size_bytes": 61208635,
         "row_count_from_parquet": 2032504,
         "row_count_matches_expected": true,
         "schema": [
@@ -603,6 +629,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -614,7 +642,7 @@
       "enriched": {
         "order_key_count": 2,
         "file_count": 18,
-        "size_bytes": 65869212,
+        "size_bytes": 67308480,
         "row_count_from_parquet": 2032504,
         "row_count_matches_expected": true,
         "schema": [
@@ -629,6 +657,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -672,8 +702,8 @@
       ],
       "deduped": {
         "order_key_count": 1,
-        "file_count": 60,
-        "size_bytes": 1180036447,
+        "file_count": 64,
+        "size_bytes": 1180092925,
         "row_count_from_parquet": 39057858,
         "row_count_matches_expected": true,
         "schema": [
@@ -688,6 +718,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -697,8 +729,8 @@
       },
       "enriched": {
         "order_key_count": 1,
-        "file_count": 60,
-        "size_bytes": 1160741448,
+        "file_count": 64,
+        "size_bytes": 1226487498,
         "row_count_from_parquet": 39057858,
         "row_count_matches_expected": true,
         "schema": [
@@ -713,6 +745,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -758,7 +792,7 @@
       "deduped": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 4397968,
+        "size_bytes": 4449368,
         "row_count_from_parquet": 136834,
         "row_count_matches_expected": true,
         "schema": [
@@ -773,6 +807,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -784,7 +820,7 @@
       "enriched": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 4775463,
+        "size_bytes": 5105714,
         "row_count_from_parquet": 136834,
         "row_count_matches_expected": true,
         "schema": [
@@ -799,6 +835,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -850,7 +888,7 @@
       "deduped": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 378675,
+        "size_bytes": 355493,
         "row_count_from_parquet": 8364,
         "row_count_matches_expected": true,
         "schema": [
@@ -865,6 +903,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -880,7 +920,7 @@
       "enriched": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 468976,
+        "size_bytes": 439799,
         "row_count_from_parquet": 8364,
         "row_count_matches_expected": true,
         "schema": [
@@ -895,6 +935,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -945,7 +987,7 @@
       "deduped": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 193572,
+        "size_bytes": 180227,
         "row_count_from_parquet": 5216,
         "row_count_matches_expected": true,
         "schema": [
@@ -960,6 +1002,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -971,7 +1015,7 @@
       "enriched": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 227122,
+        "size_bytes": 213105,
         "row_count_from_parquet": 5216,
         "row_count_matches_expected": true,
         "schema": [
@@ -986,6 +1030,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -1032,7 +1078,7 @@
       "deduped": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 4894110,
+        "size_bytes": 4884982,
         "row_count_from_parquet": 166376,
         "row_count_matches_expected": true,
         "schema": [
@@ -1047,6 +1093,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -1058,7 +1106,7 @@
       "enriched": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 4879730,
+        "size_bytes": 5177207,
         "row_count_from_parquet": 166376,
         "row_count_matches_expected": true,
         "schema": [
@@ -1073,6 +1121,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -1124,7 +1174,7 @@
       "deduped": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 15340189,
+        "size_bytes": 15507820,
         "row_count_from_parquet": 460824,
         "row_count_matches_expected": true,
         "schema": [
@@ -1139,6 +1189,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -1154,7 +1206,7 @@
       "enriched": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 16658210,
+        "size_bytes": 17679179,
         "row_count_from_parquet": 460824,
         "row_count_matches_expected": true,
         "schema": [
@@ -1169,6 +1221,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -1243,7 +1297,7 @@
       "deduped": {
         "order_key_count": 24,
         "file_count": 24,
-        "size_bytes": 1255967,
+        "size_bytes": 1211465,
         "row_count_from_parquet": 22512,
         "row_count_matches_expected": true,
         "schema": [
@@ -1258,6 +1312,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -1291,7 +1347,7 @@
       "enriched": {
         "order_key_count": 24,
         "file_count": 24,
-        "size_bytes": 1549061,
+        "size_bytes": 1481230,
         "row_count_from_parquet": 22512,
         "row_count_matches_expected": true,
         "schema": [
@@ -1306,6 +1362,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -1379,7 +1437,7 @@
       "deduped": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 680571,
+        "size_bytes": 694741,
         "row_count_from_parquet": 18294,
         "row_count_matches_expected": true,
         "schema": [
@@ -1394,6 +1452,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -1409,7 +1469,7 @@
       "enriched": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 738315,
+        "size_bytes": 762501,
         "row_count_from_parquet": 18294,
         "row_count_matches_expected": true,
         "schema": [
@@ -1424,6 +1484,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -1473,8 +1535,8 @@
       ],
       "deduped": {
         "order_key_count": 2,
-        "file_count": 53,
-        "size_bytes": 346427416,
+        "file_count": 51,
+        "size_bytes": 345949578,
         "row_count_from_parquet": 6394624,
         "row_count_matches_expected": true,
         "schema": [
@@ -1489,6 +1551,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -1499,8 +1563,8 @@
       },
       "enriched": {
         "order_key_count": 2,
-        "file_count": 53,
-        "size_bytes": 344095429,
+        "file_count": 51,
+        "size_bytes": 372149173,
         "row_count_from_parquet": 6394624,
         "row_count_matches_expected": true,
         "schema": [
@@ -1515,6 +1579,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -1566,7 +1632,7 @@
       "deduped": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 16797830,
+        "size_bytes": 16912134,
         "row_count_from_parquet": 293448,
         "row_count_matches_expected": true,
         "schema": [
@@ -1581,6 +1647,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -1596,7 +1664,7 @@
       "enriched": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 16754379,
+        "size_bytes": 18421227,
         "row_count_from_parquet": 293448,
         "row_count_matches_expected": true,
         "schema": [
@@ -1611,6 +1679,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -1685,7 +1755,7 @@
       "deduped": {
         "order_key_count": 24,
         "file_count": 24,
-        "size_bytes": 1775351,
+        "size_bytes": 1720102,
         "row_count_from_parquet": 20136,
         "row_count_matches_expected": true,
         "schema": [
@@ -1700,6 +1770,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -1733,7 +1805,7 @@
       "enriched": {
         "order_key_count": 24,
         "file_count": 24,
-        "size_bytes": 2078983,
+        "size_bytes": 2023320,
         "row_count_from_parquet": 20136,
         "row_count_matches_expected": true,
         "schema": [
@@ -1748,6 +1820,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -1821,7 +1895,7 @@
       "deduped": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 916544,
+        "size_bytes": 931528,
         "row_count_from_parquet": 14136,
         "row_count_matches_expected": true,
         "schema": [
@@ -1836,6 +1910,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -1851,7 +1927,7 @@
       "enriched": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 1036153,
+        "size_bytes": 1065301,
         "row_count_from_parquet": 14136,
         "row_count_matches_expected": true,
         "schema": [
@@ -1866,6 +1942,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -1921,7 +1999,7 @@
       "deduped": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 19959897,
+        "size_bytes": 19971141,
         "row_count_from_parquet": 382050,
         "row_count_matches_expected": true,
         "schema": [
@@ -1936,6 +2014,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -1951,7 +2031,7 @@
       "enriched": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 18962465,
+        "size_bytes": 20722495,
         "row_count_from_parquet": 382050,
         "row_count_matches_expected": true,
         "schema": [
@@ -1966,6 +2046,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -2040,7 +2122,7 @@
       "deduped": {
         "order_key_count": 24,
         "file_count": 24,
-        "size_bytes": 78479363,
+        "size_bytes": 79064839,
         "row_count_from_parquet": 1369896,
         "row_count_matches_expected": true,
         "schema": [
@@ -2055,6 +2137,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -2088,7 +2172,7 @@
       "enriched": {
         "order_key_count": 24,
         "file_count": 24,
-        "size_bytes": 78650708,
+        "size_bytes": 85648091,
         "row_count_from_parquet": 1369896,
         "row_count_matches_expected": true,
         "schema": [
@@ -2103,6 +2187,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -2292,7 +2378,7 @@
       "deduped": {
         "order_key_count": 120,
         "file_count": 120,
-        "size_bytes": 7205467,
+        "size_bytes": 7079065,
         "row_count_from_parquet": 67800,
         "row_count_matches_expected": true,
         "schema": [
@@ -2307,6 +2393,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -2436,7 +2524,7 @@
       "enriched": {
         "order_key_count": 120,
         "file_count": 120,
-        "size_bytes": 8365236,
+        "size_bytes": 8290515,
         "row_count_from_parquet": 67800,
         "row_count_matches_expected": true,
         "schema": [
@@ -2451,6 +2539,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -2639,7 +2729,7 @@
       "deduped": {
         "order_key_count": 24,
         "file_count": 24,
-        "size_bytes": 4475746,
+        "size_bytes": 4536055,
         "row_count_from_parquet": 83832,
         "row_count_matches_expected": true,
         "schema": [
@@ -2654,6 +2744,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -2687,7 +2779,7 @@
       "enriched": {
         "order_key_count": 24,
         "file_count": 24,
-        "size_bytes": 4553221,
+        "size_bytes": 4665939,
         "row_count_from_parquet": 83832,
         "row_count_matches_expected": true,
         "schema": [
@@ -2702,6 +2794,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -2768,7 +2862,7 @@
       "deduped": {
         "order_key_count": 1,
         "file_count": 64,
-        "size_bytes": 46178053098,
+        "size_bytes": 46179779819,
         "row_count_from_parquet": 1380428803,
         "row_count_matches_expected": true,
         "schema": [
@@ -2783,6 +2877,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -2793,7 +2889,7 @@
       "enriched": {
         "order_key_count": 1,
         "file_count": 64,
-        "size_bytes": 45700817886,
+        "size_bytes": 47265627900,
         "row_count_from_parquet": 1380428803,
         "row_count_matches_expected": true,
         "schema": [
@@ -2808,6 +2904,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -2853,7 +2951,7 @@
       "deduped": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 7222578,
+        "size_bytes": 7294720,
         "row_count_from_parquet": 202560,
         "row_count_matches_expected": true,
         "schema": [
@@ -2868,6 +2966,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -2879,7 +2979,7 @@
       "enriched": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 7828988,
+        "size_bytes": 8228559,
         "row_count_from_parquet": 202560,
         "row_count_matches_expected": true,
         "schema": [
@@ -2894,6 +2994,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -2945,7 +3047,7 @@
       "deduped": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 405626,
+        "size_bytes": 381754,
         "row_count_from_parquet": 8880,
         "row_count_matches_expected": true,
         "schema": [
@@ -2960,6 +3062,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -2975,7 +3079,7 @@
       "enriched": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 492588,
+        "size_bytes": 468725,
         "row_count_from_parquet": 8880,
         "row_count_matches_expected": true,
         "schema": [
@@ -2990,6 +3094,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -3040,7 +3146,7 @@
       "deduped": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 323035,
+        "size_bytes": 329639,
         "row_count_from_parquet": 8312,
         "row_count_matches_expected": true,
         "schema": [
@@ -3055,6 +3161,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -3066,7 +3174,7 @@
       "enriched": {
         "order_key_count": 2,
         "file_count": 2,
-        "size_bytes": 375625,
+        "size_bytes": 394610,
         "row_count_from_parquet": 8312,
         "row_count_matches_expected": true,
         "schema": [
@@ -3081,6 +3189,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -3127,7 +3237,7 @@
       "deduped": {
         "order_key_count": 2,
         "file_count": 12,
-        "size_bytes": 48020937,
+        "size_bytes": 47994507,
         "row_count_from_parquet": 1418384,
         "row_count_matches_expected": true,
         "schema": [
@@ -3142,6 +3252,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -3153,7 +3265,7 @@
       "enriched": {
         "order_key_count": 2,
         "file_count": 12,
-        "size_bytes": 50672547,
+        "size_bytes": 51014326,
         "row_count_from_parquet": 1418384,
         "row_count_matches_expected": true,
         "schema": [
@@ -3168,6 +3280,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -3219,7 +3333,7 @@
       "deduped": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 25135161,
+        "size_bytes": 25327271,
         "row_count_from_parquet": 680868,
         "row_count_matches_expected": true,
         "schema": [
@@ -3234,6 +3348,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -3249,7 +3365,7 @@
       "enriched": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 27430134,
+        "size_bytes": 28548874,
         "row_count_from_parquet": 680868,
         "row_count_matches_expected": true,
         "schema": [
@@ -3264,6 +3380,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -3338,7 +3456,7 @@
       "deduped": {
         "order_key_count": 24,
         "file_count": 24,
-        "size_bytes": 1384221,
+        "size_bytes": 1324229,
         "row_count_from_parquet": 25536,
         "row_count_matches_expected": true,
         "schema": [
@@ -3353,6 +3471,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -3386,7 +3506,7 @@
       "enriched": {
         "order_key_count": 24,
         "file_count": 24,
-        "size_bytes": 1688398,
+        "size_bytes": 1613694,
         "row_count_from_parquet": 25536,
         "row_count_matches_expected": true,
         "schema": [
@@ -3401,6 +3521,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -3474,7 +3596,7 @@
       "deduped": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 1134369,
+        "size_bytes": 1154621,
         "row_count_from_parquet": 30540,
         "row_count_matches_expected": true,
         "schema": [
@@ -3489,6 +3611,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence"
         ],
         "per_order_key_rows": {
@@ -3504,7 +3628,7 @@
       "enriched": {
         "order_key_count": 6,
         "file_count": 6,
-        "size_bytes": 1250915,
+        "size_bytes": 1296886,
         "row_count_from_parquet": 30540,
         "row_count_matches_expected": true,
         "schema": [
@@ -3519,6 +3643,8 @@
           "trb_cdr1",
           "trb_cdr2",
           "trb_cdr3",
+          "mhc_one_allele",
+          "mhc_two_allele",
           "sequence",
           "subset_key",
           "order_key",
@@ -3559,10 +3685,10 @@
     "subset_count": 31,
     "total_deduped_rows": 1461360146,
     "total_enriched_rows": 1461360146,
-    "total_deduped_bytes": 48594969127,
-    "total_enriched_bytes": 48163979202,
-    "total_deduped_files": 639,
-    "total_enriched_files": 639,
+    "total_deduped_bytes": 48607175163,
+    "total_enriched_bytes": 49855984106,
+    "total_deduped_files": 677,
+    "total_enriched_files": 677,
     "buggy_subsets": []
   }
 }

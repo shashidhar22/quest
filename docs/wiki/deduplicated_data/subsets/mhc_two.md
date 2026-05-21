@@ -24,12 +24,12 @@
 
 **Deduped exploded** (`exploded_deduped/subset_key=mhc_two/`):
 
-- 1 order_keys · 1 parquet files · 135.1K (138,334 bytes) · 5,721 rows (matches expected)
-- Schema: `tra_full`, `trb_full`, `peptide`, `mhc_one`, `mhc_two`, `tra_cdr1`, `tra_cdr2`, `tra_cdr3`, `trb_cdr1`, `trb_cdr2`, `trb_cdr3`, `sequence`
+- 1 order_keys · 1 parquet files · 129.8K (132,926 bytes) · 5,721 rows (matches expected)
+- Schema: `tra_full`, `trb_full`, `peptide`, `mhc_one`, `mhc_two`, `tra_cdr1`, `tra_cdr2`, `tra_cdr3`, `trb_cdr1`, `trb_cdr2`, `trb_cdr3`, `mhc_one_allele`, `mhc_two_allele`, `sequence`
 
 **Enriched exploded** (`exploded_deduped_enriched/subset_key=mhc_two/`):
 
-- 1 order_keys · 1 parquet files · 175.9K (180,116 bytes) · 5,721 rows (matches expected) · enriched row count == deduped row count
+- 1 order_keys · 1 parquet files · 178.7K (182,938 bytes) · 5,721 rows (matches expected) · enriched row count == deduped row count
 - Schema columns added vs deduped: `mhc_one_contact`, `mhc_one_pocket`, `mhc_one_pocket_contact`, `mhc_two_contact`, `mhc_two_pocket`, `mhc_two_pocket_contact`, `order_key`, `subset_key`
 
 <!-- END: AUTO-INVENTORY -->

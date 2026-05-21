@@ -9,14 +9,15 @@ The driver script is [`tcrbench_dedup.py`](../../../tcrbench_dedup.py) (DuckDB-b
 ```
 data/deduplicated_again/
 ├── deduped.db                              # 158 GB DuckDB working store
-├── deduped_parquet/                        # 1.44B unique deduped rows
+├── deduped_parquet/                        # 1.44B unique deduped rows  (13 cols)
 │                                           # cols: tra_full, trb_full, peptide, mhc_one, mhc_two,
-│                                           #       tra_cdr1..cdr3, trb_cdr1..cdr3
+│                                           #       tra_cdr1..cdr3, trb_cdr1..cdr3,
+│                                           #       mhc_one_allele, mhc_two_allele       ← 4-digit IMGT
 ├── exploded_deduped/
-│   └── subset_key=X/order_key=Y/*.parquet  # 1.46B exploded rows, 31 subsets × {n_pop!} order_keys
+│   └── subset_key=X/order_key=Y/*.parquet  # 1.46B exploded rows (15 cols), 31 subsets × {n_pop!} order_keys
 │                                           # adds: sequence (whitespace-joined per order_key)
 ├── exploded_deduped_enriched/
-│   └── subset_key=X/order_key=Y/*.parquet  # same rows + 6 MHC pseudosequence cols + subset_key/order_key
+│   └── subset_key=X/order_key=Y/*.parquet  # same rows + 6 MHC pseudosequence cols + subset_key/order_key (22 cols)
 │                                           # adds: mhc_one_pocket, mhc_one_contact, mhc_one_pocket_contact,
 │                                           #       mhc_two_pocket, mhc_two_contact, mhc_two_pocket_contact
 ├── combination_counts.{json,csv}            # 11 biological combos (populated subsets only)
@@ -24,6 +25,19 @@ data/deduplicated_again/
 ├── pipeline_run_log.json                    # timing + row counts per stage
 └── mhc_pseudo_lookup.json                   # 8 MB: MHC sequence → pseudosequence cache
 ```
+
+### Allele ID columns (added 2026-05-06 rebuild)
+
+`mhc_one_allele` and `mhc_two_allele` are populated via a **post-dedup LEFT JOIN** against a small `(sequence → MIN(allele))` lookup built from `data/standardized_again/`. Alleles are truncated to **4-digit IMGT resolution** (e.g. `HLA-A*02:01`, `HLA-DRB1*01:01`) — synonymous DNA variants collapse to the same protein-level label.
+
+Class membership for a row is now unambiguous from the allele prefix:
+
+| `mhc_one_allele` prefix | `mhc_two_allele` | Class |
+|---|---|---|
+| `HLA-{A,B,C,E,F,G}*` | NULL | I |
+| `HLA-{DRA,DPA,DQA,DMA,DOA}*` (α-chain) | `HLA-{DRB,DPB,DQB,DMB,DOB}*` (β-chain) | II |
+
+Note: `mhc_one`/`mhc_two` carry **α-chain / β-chain** protein sequences, not class-I / class-II directly — class-II rows place the α-chain in `mhc_one` and the β-chain in `mhc_two`, so column membership alone is not a class signal. Use the allele columns instead.
 
 ## How to read this manifest
 
@@ -98,55 +112,55 @@ Source: `permutation_counts.json`. Counts here are over the same deduped rows, b
 
 <!-- BEGIN: AUTO-MASTER-TABLE (build_deduplicated_manifest.py) -->
 
-**Last regenerated**: 2026-04-27T15:14:45Z · **Subsets**: 31
+**Last regenerated**: 2026-05-07T04:54:41Z · **Subsets**: 31
 
 **Pipeline run**:
 
-- Run timestamp: `2026-04-08T22:38:14`
-- Dedup elapsed: 4,615.1s · output rows: 1,439,165,664
-- Explosion elapsed: 466.9s · output rows: 1,461,360,146
+- Run timestamp: `2026-05-06T21:28:55`
+- Dedup elapsed: 5,401.2s · output rows: 1,439,165,664
+- Explosion elapsed: 468.7s · output rows: 1,461,360,146
 
 **Top-level artifacts**:
 
-- `deduped_parquet/`: 64 files, 28.0G (30,013,789,399 bytes), 1,439,165,664 rows
-- `deduped.db` (DuckDB intermediate): 147.5G (158,349,668,352 bytes)
+- `deduped_parquet/`: 64 files, 27.9G (30,006,056,530 bytes), 1,439,165,664 rows
+- `deduped.db` (DuckDB intermediate): 147.6G (158,489,915,392 bytes)
 - `mhc_pseudo_lookup.json`: 7.8M, 22,315 entries
 
-**Totals across 31 subsets**: deduped exploded rows = 1,461,360,146 · enriched exploded rows = 1,461,360,146 · deduped exploded size = 45.3G · enriched exploded size = 44.9G
+**Totals across 31 subsets**: deduped exploded rows = 1,461,360,146 · enriched exploded rows = 1,461,360,146 · deduped exploded size = 45.3G · enriched exploded size = 46.4G
 
 | Subset | Populated cols | Order keys | Combination | Permutation rows | Total exploded rows | Deduped size | Enriched size |
 |--------|---------------:|-----------:|------------:|-----------------:|--------------------:|-------------:|--------------:|
-| [`mhc_one_mhc_two`](subsets/mhc_one_mhc_two.md) | 2 (mhc_one, mhc_two) | 2 | — | 133 | 266 | 22.4K | 36.4K |
-| [`mhc_one`](subsets/mhc_one.md) | 1 (mhc_one) | 1 | — | 16,594 | 16,594 | 554.9K | 747.9K |
-| [`mhc_two`](subsets/mhc_two.md) | 1 (mhc_two) | 1 | — | 5,721 | 5,721 | 135.1K | 175.9K |
-| [`peptide_mhc_one_mhc_two`](subsets/peptide_mhc_one_mhc_two.md) | 3 (peptide, mhc_one, mhc_two) | 6 | 292,468 | 292,468 | 1,754,808 | 52.2M | 60.1M |
-| [`peptide_mhc_one`](subsets/peptide_mhc_one.md) | 2 (peptide, mhc_one) | 2 | 4,764,964 | 4,764,964 | 9,529,928 | 242.5M | 278.2M |
-| [`peptide_mhc_two`](subsets/peptide_mhc_two.md) | 2 (peptide, mhc_two) | 2 | — | 1,016,252 | 2,032,504 | 57.0M | 62.8M |
-| [`peptide`](subsets/peptide.md) | 1 (peptide) | 1 | — | 16,714,242 | 16,714,242 | 267.5M | 274.0M |
-| [`tra_mhc_one_mhc_two`](subsets/tra_mhc_one_mhc_two.md) | 3 (tra, mhc_one, mhc_two) | 6 | — | 1,394 | 8,364 | 369.8K | 458.0K |
-| [`tra_mhc_one`](subsets/tra_mhc_one.md) | 2 (tra, mhc_one) | 2 | — | 68,417 | 136,834 | 4.2M | 4.6M |
-| [`tra_mhc_two`](subsets/tra_mhc_two.md) | 2 (tra, mhc_two) | 2 | — | 2,608 | 5,216 | 189.0K | 221.8K |
-| [`tra_peptide_mhc_one_mhc_two`](subsets/tra_peptide_mhc_one_mhc_two.md) | 4 (tra, peptide, mhc_one, mhc_two) | 24 | 938 | 938 | 22,512 | 1.2M | 1.5M |
-| [`tra_peptide_mhc_one`](subsets/tra_peptide_mhc_one.md) | 3 (tra, peptide, mhc_one) | 6 | 76,804 | 76,804 | 460,824 | 14.6M | 15.9M |
-| [`tra_peptide_mhc_two`](subsets/tra_peptide_mhc_two.md) | 3 (tra, peptide, mhc_two) | 6 | — | 3,049 | 18,294 | 664.6K | 721.0K |
-| [`tra_peptide`](subsets/tra_peptide.md) | 2 (tra, peptide) | 2 | — | 83,188 | 166,376 | 4.7M | 4.7M |
-| [`tra_trb_mhc_one_mhc_two`](subsets/tra_trb_mhc_one_mhc_two.md) | 4 (tra, trb, mhc_one, mhc_two) | 24 | — | 839 | 20,136 | 1.7M | 2.0M |
-| [`tra_trb_mhc_one`](subsets/tra_trb_mhc_one.md) | 3 (tra, trb, mhc_one) | 6 | — | 48,908 | 293,448 | 16.0M | 16.0M |
-| [`tra_trb_mhc_two`](subsets/tra_trb_mhc_two.md) | 3 (tra, trb, mhc_two) | 6 | — | 2,356 | 14,136 | 895.1K | 1011.9K |
-| [`tra_trb_peptide_mhc_one_mhc_two`](subsets/tra_trb_peptide_mhc_one_mhc_two.md) | 5 (tra, trb, peptide, mhc_one, mhc_two) | 120 | 565 | 565 | 67,800 | 6.9M | 8.0M |
-| [`tra_trb_peptide_mhc_one`](subsets/tra_trb_peptide_mhc_one.md) | 4 (tra, trb, peptide, mhc_one) | 24 | 57,079 | 57,079 | 1,369,896 | 74.8M | 75.0M |
-| [`tra_trb_peptide_mhc_two`](subsets/tra_trb_peptide_mhc_two.md) | 4 (tra, trb, peptide, mhc_two) | 24 | — | 3,493 | 83,832 | 4.3M | 4.3M |
-| [`tra_trb_peptide`](subsets/tra_trb_peptide.md) | 3 (tra, trb, peptide) | 6 | — | 63,675 | 382,050 | 19.0M | 18.1M |
-| [`tra_trb`](subsets/tra_trb.md) | 2 (tra, trb) | 2 | 3,197,312 | 3,197,312 | 6,394,624 | 330.4M | 328.2M |
+| [`mhc_one_mhc_two`](subsets/mhc_one_mhc_two.md) | 2 (mhc_one, mhc_two) | 2 | — | 133 | 266 | 23.3K | 37.7K |
+| [`mhc_one`](subsets/mhc_one.md) | 1 (mhc_one) | 1 | — | 16,594 | 16,594 | 374.5K | 568.9K |
+| [`mhc_two`](subsets/mhc_two.md) | 1 (mhc_two) | 1 | — | 5,721 | 5,721 | 129.8K | 178.7K |
+| [`peptide_mhc_one_mhc_two`](subsets/peptide_mhc_one_mhc_two.md) | 3 (peptide, mhc_one, mhc_two) | 6 | 292,468 | 292,468 | 1,754,808 | 54.0M | 62.0M |
+| [`peptide_mhc_one`](subsets/peptide_mhc_one.md) | 2 (peptide, mhc_one) | 2 | 4,764,964 | 4,764,964 | 9,529,928 | 248.7M | 284.8M |
+| [`peptide_mhc_two`](subsets/peptide_mhc_two.md) | 2 (peptide, mhc_two) | 2 | — | 1,016,252 | 2,032,504 | 58.4M | 64.2M |
+| [`peptide`](subsets/peptide.md) | 1 (peptide) | 1 | — | 16,714,242 | 16,714,242 | 267.8M | 283.0M |
+| [`tra_mhc_one_mhc_two`](subsets/tra_mhc_one_mhc_two.md) | 3 (tra, mhc_one, mhc_two) | 6 | — | 1,394 | 8,364 | 347.2K | 429.5K |
+| [`tra_mhc_one`](subsets/tra_mhc_one.md) | 2 (tra, mhc_one) | 2 | — | 68,417 | 136,834 | 4.2M | 4.9M |
+| [`tra_mhc_two`](subsets/tra_mhc_two.md) | 2 (tra, mhc_two) | 2 | — | 2,608 | 5,216 | 176.0K | 208.1K |
+| [`tra_peptide_mhc_one_mhc_two`](subsets/tra_peptide_mhc_one_mhc_two.md) | 4 (tra, peptide, mhc_one, mhc_two) | 24 | 938 | 938 | 22,512 | 1.2M | 1.4M |
+| [`tra_peptide_mhc_one`](subsets/tra_peptide_mhc_one.md) | 3 (tra, peptide, mhc_one) | 6 | 76,804 | 76,804 | 460,824 | 14.8M | 16.9M |
+| [`tra_peptide_mhc_two`](subsets/tra_peptide_mhc_two.md) | 3 (tra, peptide, mhc_two) | 6 | — | 3,049 | 18,294 | 678.5K | 744.6K |
+| [`tra_peptide`](subsets/tra_peptide.md) | 2 (tra, peptide) | 2 | — | 83,188 | 166,376 | 4.7M | 4.9M |
+| [`tra_trb_mhc_one_mhc_two`](subsets/tra_trb_mhc_one_mhc_two.md) | 4 (tra, trb, mhc_one, mhc_two) | 24 | — | 839 | 20,136 | 1.6M | 1.9M |
+| [`tra_trb_mhc_one`](subsets/tra_trb_mhc_one.md) | 3 (tra, trb, mhc_one) | 6 | — | 48,908 | 293,448 | 16.1M | 17.6M |
+| [`tra_trb_mhc_two`](subsets/tra_trb_mhc_two.md) | 3 (tra, trb, mhc_two) | 6 | — | 2,356 | 14,136 | 909.7K | 1.0M |
+| [`tra_trb_peptide_mhc_one_mhc_two`](subsets/tra_trb_peptide_mhc_one_mhc_two.md) | 5 (tra, trb, peptide, mhc_one, mhc_two) | 120 | 565 | 565 | 67,800 | 6.8M | 7.9M |
+| [`tra_trb_peptide_mhc_one`](subsets/tra_trb_peptide_mhc_one.md) | 4 (tra, trb, peptide, mhc_one) | 24 | 57,079 | 57,079 | 1,369,896 | 75.4M | 81.7M |
+| [`tra_trb_peptide_mhc_two`](subsets/tra_trb_peptide_mhc_two.md) | 4 (tra, trb, peptide, mhc_two) | 24 | — | 3,493 | 83,832 | 4.3M | 4.4M |
+| [`tra_trb_peptide`](subsets/tra_trb_peptide.md) | 3 (tra, trb, peptide) | 6 | — | 63,675 | 382,050 | 19.0M | 19.8M |
+| [`tra_trb`](subsets/tra_trb.md) | 2 (tra, trb) | 2 | 3,197,312 | 3,197,312 | 6,394,624 | 329.9M | 354.9M |
 | [`tra`](subsets/tra.md) | 1 (tra) | 1 | 39,057,858 | 39,057,858 | 39,057,858 | 1.1G | 1.1G |
-| [`trb_mhc_one_mhc_two`](subsets/trb_mhc_one_mhc_two.md) | 3 (trb, mhc_one, mhc_two) | 6 | — | 1,480 | 8,880 | 396.1K | 481.0K |
-| [`trb_mhc_one`](subsets/trb_mhc_one.md) | 2 (trb, mhc_one) | 2 | — | 101,280 | 202,560 | 6.9M | 7.5M |
-| [`trb_mhc_two`](subsets/trb_mhc_two.md) | 2 (trb, mhc_two) | 2 | — | 4,156 | 8,312 | 315.5K | 366.8K |
-| [`trb_peptide_mhc_one_mhc_two`](subsets/trb_peptide_mhc_one_mhc_two.md) | 4 (trb, peptide, mhc_one, mhc_two) | 24 | 1,064 | 1,064 | 25,536 | 1.3M | 1.6M |
-| [`trb_peptide_mhc_one`](subsets/trb_peptide_mhc_one.md) | 3 (trb, peptide, mhc_one) | 6 | 113,478 | 113,478 | 680,868 | 24.0M | 26.2M |
+| [`trb_mhc_one_mhc_two`](subsets/trb_mhc_one_mhc_two.md) | 3 (trb, mhc_one, mhc_two) | 6 | — | 1,480 | 8,880 | 372.8K | 457.7K |
+| [`trb_mhc_one`](subsets/trb_mhc_one.md) | 2 (trb, mhc_one) | 2 | — | 101,280 | 202,560 | 7.0M | 7.8M |
+| [`trb_mhc_two`](subsets/trb_mhc_two.md) | 2 (trb, mhc_two) | 2 | — | 4,156 | 8,312 | 321.9K | 385.4K |
+| [`trb_peptide_mhc_one_mhc_two`](subsets/trb_peptide_mhc_one_mhc_two.md) | 4 (trb, peptide, mhc_one, mhc_two) | 24 | 1,064 | 1,064 | 25,536 | 1.3M | 1.5M |
+| [`trb_peptide_mhc_one`](subsets/trb_peptide_mhc_one.md) | 3 (trb, peptide, mhc_one) | 6 | 113,478 | 113,478 | 680,868 | 24.2M | 27.2M |
 | [`trb_peptide_mhc_two`](subsets/trb_peptide_mhc_two.md) | 3 (trb, peptide, mhc_two) | 6 | — | 5,090 | 30,540 | 1.1M | 1.2M |
-| [`trb_peptide`](subsets/trb_peptide.md) | 2 (trb, peptide) | 2 | — | 709,192 | 1,418,384 | 45.8M | 48.3M |
-| [`trb`](subsets/trb.md) | 1 (trb) | 1 | 1,380,428,803 | 1,380,428,803 | 1,380,428,803 | 43.0G | 42.6G |
+| [`trb_peptide`](subsets/trb_peptide.md) | 2 (trb, peptide) | 2 | — | 709,192 | 1,418,384 | 45.8M | 48.7M |
+| [`trb`](subsets/trb.md) | 1 (trb) | 1 | 1,380,428,803 | 1,380,428,803 | 1,380,428,803 | 43.0G | 44.0G |
 
 *Permutation rows* = canonical rows per order_key partition (= rows after dedup for that column subset). *Total exploded rows* = permutation rows × `n!` rotations. *Combination* counts come from `combination_counts.json` (only 11 of 31 subsets are tracked there — namely the ones whose populated columns include all of the chains that anchor a complete training record).
 

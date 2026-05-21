@@ -49,8 +49,70 @@ CDR_COLUMNS = {
 }
 ALL_CDR_COLUMNS = [c for cols in CDR_COLUMNS.values() for c in cols]
 
-# All columns read from input (dedup keys + carried CDR columns)
-ALL_COLUMNS = DEDUP_COLUMNS + ALL_CDR_COLUMNS
+# Allele-ID columns carried alongside their parent MHC sequence (not used
+# for dedup). Multiple allele IDs can share the same protein sequence
+# (synonymous coding variants); we keep one canonical label per sequence
+# via FIRST() in the dedup aggregation.
+ALLELE_COLUMNS = {
+    "mhc_one": "mhc_one_allele",
+    "mhc_two": "mhc_two_allele",
+}
+ALL_ALLELE_COLUMNS = list(ALLELE_COLUMNS.values())
+
+# NOTE: source-aggregation column was attempted (see git history for
+# bitmap-based BIT_OR(_source_bit) implementation) but the additional
+# per-group state pushed the GROUP BY past the 800 GB memory limit and
+# caused multi-TB spill. Skipped for now — sources can be recovered post-hoc
+# by joining individual deduped sequences back to data/standardized_again/
+# if/when needed.
+
+
+def build_allele_lookups(con: duckdb.DuckDBPyConnection, input_path: str) -> None:
+    """Build tiny in-memory lookup tables: mhc_one → mhc_one_allele and
+    mhc_two → mhc_two_allele, sourced from upstream standardized data.
+
+    Alleles are truncated to **4-digit (2-field) IMGT resolution**
+    (e.g. ``HLA-A*02:01`` from ``HLA-A*02:01:01:01``) so that synonymous
+    DNA variants collapse to the same protein-level label. After
+    truncation, ``MIN()`` picks one canonical 4-digit allele per
+    protein sequence — for sequences that map to multiple distinct
+    4-digit alleles (rare; usually identical sequence shared across
+    HLA-B/HLA-C "B-only" patches), MIN gives the lexically smallest.
+    """
+    logger.info("  Building allele lookup tables (mhc_one, mhc_two → 4-digit allele)")
+    t0 = time.time()
+    # First two ':'-separated fields, falling back to the raw allele if it
+    # doesn't contain a ':'. Empty regexp_extract result → NULLIF + COALESCE.
+    truncate_expr = (
+        "COALESCE(NULLIF(regexp_extract({col}, '^([^:]+:[^:]+)', 1), ''), {col})"
+    )
+    one_expr = truncate_expr.format(col="mhc_one_allele")
+    two_expr = truncate_expr.format(col="mhc_two_allele")
+    con.execute(f"""
+        CREATE OR REPLACE TABLE mhc_one_allele_lookup AS
+        SELECT mhc_one, MIN({one_expr}) AS mhc_one_allele
+        FROM read_parquet('{input_path}', hive_partitioning=true)
+        WHERE mhc_one IS NOT NULL AND mhc_one != ''
+          AND mhc_one_allele IS NOT NULL AND mhc_one_allele != ''
+        GROUP BY mhc_one
+    """)
+    n1 = con.execute("SELECT COUNT(*) FROM mhc_one_allele_lookup").fetchone()[0]
+    con.execute(f"""
+        CREATE OR REPLACE TABLE mhc_two_allele_lookup AS
+        SELECT mhc_two, MIN({two_expr}) AS mhc_two_allele
+        FROM read_parquet('{input_path}', hive_partitioning=true)
+        WHERE mhc_two IS NOT NULL AND mhc_two != ''
+          AND mhc_two_allele IS NOT NULL AND mhc_two_allele != ''
+        GROUP BY mhc_two
+    """)
+    n2 = con.execute("SELECT COUNT(*) FROM mhc_two_allele_lookup").fetchone()[0]
+    logger.info(
+        f"  allele lookups built in {time.time()-t0:.1f}s: "
+        f"mhc_one={n1:,} pairs, mhc_two={n2:,} pairs"
+    )
+
+# All columns read from input (dedup keys + carried CDR + allele ID columns)
+ALL_COLUMNS = DEDUP_COLUMNS + ALL_CDR_COLUMNS + ALL_ALLELE_COLUMNS
 
 # Columns that must contain only valid amino acid characters
 AA_ONLY_COLUMNS = {"tra_full", "trb_full", "peptide", "mhc_one", "mhc_two",
@@ -387,6 +449,13 @@ def step1_sanitize_dedup(con: duckdb.DuckDBPyConnection, args: argparse.Namespac
             )
         else:
             cdr_exprs.append(f"NULL AS {col}")
+    # Allele-ID columns are populated via a small post-dedup LOOKUP table
+    # (16,594 + 5,721 distinct sequences) rather than being carried through
+    # the 1.44B-group GROUP BY's per-group state. Keeping them here would
+    # widen the GROUP BY's per-group state by ~25 GB and the salvage UNION
+    # ALL intermediate width by 2 cols × 5.7B rows, doubling the disk spill
+    # vs the original successful run. The lookup tables are built in
+    # build_allele_lookups() during step 1 and JOINed during parquet export.
 
     # Carry binding/source/score for salvage logic (handle missing columns)
     meta_exprs = []
@@ -468,7 +537,7 @@ GROUP BY {", ".join(DEDUP_COLUMNS)}"""
     logger.info(f"STEP 1: complete in {elapsed_str(elapsed)}")
     logger.info(f"  Rows after dedup: {row_count:,}")
 
-    # H5: collapse 11 separate COUNT() scans into a single pass over `deduped`.
+    # H5: collapse separate COUNT() scans into a single pass over `deduped`.
     stat_cols = DEDUP_COLUMNS + ALL_CDR_COLUMNS
     stats_sql = "SELECT " + ", ".join(f"COUNT({c})" for c in stat_cols) + " FROM deduped"
     stats_row = con.execute(stats_sql).fetchone()
@@ -486,20 +555,34 @@ GROUP BY {", ".join(DEDUP_COLUMNS)}"""
     cdr_parts = [f"{col}={stats[col]:,}" for col in ALL_CDR_COLUMNS]
     logger.info(f"  CDR non-null: {' '.join(cdr_parts)}")
 
-    # Sanity check: no empty strings (cast to VARCHAR to handle NULL-typed columns)
-    conditions = " OR ".join(f"CAST({col} AS VARCHAR) = ''" for col in ALL_COLUMNS)
+    # Sanity check: no empty strings remain
+    conditions = " OR ".join(f"CAST({col} AS VARCHAR) = ''" for col in DEDUP_COLUMNS + ALL_CDR_COLUMNS)
     empty_count = con.execute(f"SELECT COUNT(*) FROM deduped WHERE {conditions}").fetchone()[0]
     if empty_count == 0:
         logger.info("  Empty string check: PASS")
     else:
         logger.warning(f"  Empty string check: FAIL — {empty_count:,} rows with empty strings remain")
 
-    # Export to Parquet
+    # Build allele lookup tables from upstream standardized data — tiny
+    # (~17,912 + 6,111 distinct sequence→allele pairs) so kept in memory
+    # for free LEFT JOINs at parquet-export and explosion time.
+    build_allele_lookups(con, input_path)
+
+    # Export to Parquet — LEFT JOIN deduped with the small allele lookup
+    # tables to enrich the output with mhc_one_allele / mhc_two_allele.
     parquet_dir = str(args.output_dir_resolved / "deduped_parquet")
     os.makedirs(parquet_dir, exist_ok=True)
-    logger.info(f"  Exporting deduped table to {parquet_dir}/")
+    logger.info(f"  Exporting deduped table (with allele lookup) to {parquet_dir}/")
+    export_select = (
+        ", ".join(f"d.{c}" for c in DEDUP_COLUMNS + ALL_CDR_COLUMNS)
+        + ", l1.mhc_one_allele AS mhc_one_allele"
+        + ", l2.mhc_two_allele AS mhc_two_allele"
+    )
     export_sql = (
-        f"COPY (SELECT * FROM deduped) TO '{parquet_dir}/' "
+        f"COPY (SELECT {export_select} FROM deduped d "
+        f"LEFT JOIN mhc_one_allele_lookup l1 ON d.mhc_one = l1.mhc_one "
+        f"LEFT JOIN mhc_two_allele_lookup l2 ON d.mhc_two = l2.mhc_two) "
+        f"TO '{parquet_dir}/' "
         "(FORMAT PARQUET, PER_THREAD_OUTPUT true, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)"
     )
     logger.debug(f"  SQL:\n{export_sql}")
@@ -633,10 +716,13 @@ def step3_explode(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> d
                 cdr_cols_in_mask.extend(CDR_COLUMNS.get(parent, []))
 
             where = " AND ".join(f"{c} IS NOT NULL" for c in cols_in_mask)
-            # Dedup on the in-mask columns; carry CDRs via FIRST() since CDRs
-            # are functionally determined by their parent chain (already
-            # collapsed in step 1's GROUP BY).
-            select_parts = list(cols_in_mask) + [f"FIRST({c}) AS {c}" for c in cdr_cols_in_mask]
+            # Dedup on the in-mask columns; carry CDRs via FIRST() since they
+            # are functionally determined by their parent (already collapsed
+            # in step 1's GROUP BY). Allele columns are populated via LEFT
+            # JOIN with the small lookup tables at COPY time.
+            select_parts = list(cols_in_mask) + [
+                f"FIRST({c}) AS {c}" for c in cdr_cols_in_mask
+            ]
             temp_sql = (
                 "CREATE TEMP TABLE m_subset AS "
                 f"SELECT {', '.join(select_parts)} "
@@ -670,21 +756,43 @@ def step3_explode(con: duckdb.DuckDBPyConnection, args: argparse.Namespace) -> d
                 # because untyped NULL is inferred as INTEGER).
                 for col in DEDUP_COLUMNS:
                     if col in cols_in_mask:
-                        copy_select_parts.append(col)
+                        copy_select_parts.append(f"m.{col}")
                     else:
                         copy_select_parts.append(f"CAST(NULL AS VARCHAR) AS {col}")
                 for cdr in ALL_CDR_COLUMNS:
                     if cdr in cdr_cols_in_mask:
-                        copy_select_parts.append(cdr)
+                        copy_select_parts.append(f"m.{cdr}")
                     else:
                         copy_select_parts.append(f"CAST(NULL AS VARCHAR) AS {cdr}")
+                # Allele columns: LEFT JOIN against the small lookup tables
+                # only when the parent MHC column is in the mask; else NULL.
+                if "mhc_one" in cols_in_mask:
+                    copy_select_parts.append("l1.mhc_one_allele AS mhc_one_allele")
+                else:
+                    copy_select_parts.append("CAST(NULL AS VARCHAR) AS mhc_one_allele")
+                if "mhc_two" in cols_in_mask:
+                    copy_select_parts.append("l2.mhc_two_allele AS mhc_two_allele")
+                else:
+                    copy_select_parts.append("CAST(NULL AS VARCHAR) AS mhc_two_allele")
                 ordered_cols = [DEDUP_COLUMNS[i] for i in col_indices]
                 copy_select_parts.append(
-                    f"CONCAT_WS(' ', {', '.join(ordered_cols)}) AS sequence"
+                    f"CONCAT_WS(' ', {', '.join(f'm.{c}' for c in ordered_cols)}) AS sequence"
                 )
 
+                # Build JOIN clauses only for MHC parents present in the mask
+                join_clauses = []
+                if "mhc_one" in cols_in_mask:
+                    join_clauses.append(
+                        "LEFT JOIN mhc_one_allele_lookup l1 ON m.mhc_one = l1.mhc_one"
+                    )
+                if "mhc_two" in cols_in_mask:
+                    join_clauses.append(
+                        "LEFT JOIN mhc_two_allele_lookup l2 ON m.mhc_two = l2.mhc_two"
+                    )
+
                 copy_sql = (
-                    "COPY (SELECT " + ", ".join(copy_select_parts) + " FROM m_subset) "
+                    "COPY (SELECT " + ", ".join(copy_select_parts)
+                    + " FROM m_subset m " + " ".join(join_clauses) + ") "
                     f"TO '{partition_dir}/' "
                     "(FORMAT PARQUET, PER_THREAD_OUTPUT true, "
                     "COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)"
