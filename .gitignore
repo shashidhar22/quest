@@ -101,6 +101,12 @@ Miniforge3-Linux-x86_64.sh
 quest.egg-info/
 benchmark_v2/
 
+# Third-party tools vendored into the repo (not source we maintain)
+vendor/
+
+# Clustering tmp / batch dirs produced by clusTCR + GIANA pipelines
+clustcr_batch_tmp*/
+
 # Track B baseline integrations
 track_b/*/repo/
 track_b/*/results/checkpoints/
