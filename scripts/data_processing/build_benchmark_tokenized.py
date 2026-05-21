@@ -42,6 +42,14 @@ SCRATCH = Path("/scratch")
 THREADS = 64
 SHARD_ROWS = 5_000_000  # rows per shard for foundation_500M
 
+# Reduced settings for very large sharded manifests (e.g. foundation_500M).
+# The parent process holds ~100 GB of Python objects just representing the
+# manifest (`rows` list + `by_file` dict) plus in-flight Arrow tables from
+# workers. With THREADS=64 and SHARD_ROWS=5M this OOM'd at ~354 GB RSS.
+# Halving threads and shard size keeps peak parent memory well under 1 TB.
+THREADS_LARGE = 16
+SHARD_ROWS_LARGE = 2_000_000
+
 # Full enriched-stage molecule columns (matches Phase 2/3 schema). These are
 # preserved on every tokenized output, regardless of which subset the format
 # happens to read for `input_sequence` construction. This list does NOT include
@@ -554,9 +562,38 @@ def _tokenize_manifest(
     sharded: bool = False,
     shard_dir: Optional[Path] = None,
     shard_size: int = SHARD_ROWS,
+    threads: int = THREADS,
 ) -> int:
     """Tokenize a sample manifest by joining back to source parquet files."""
     t0 = time.time()
+
+    # Shard-level resume: scan existing shards for source_files already done.
+    # Each worker returns one source_file's worth of rows in one Arrow table,
+    # so a source_file appearing in any completed shard is fully processed.
+    completed_files: set = set()
+    n_already_written = 0
+    starting_shard_idx = 0
+    if sharded:
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        existing = sorted(shard_dir.glob("shard_*.parquet"))
+        if existing:
+            print(f"[manifest] found {len(existing)} existing shards — scanning for resume", flush=True)
+            paths_sql = "[" + ",".join(f"'{p}'" for p in existing) + "]"
+            con0 = duckdb.connect()
+            done = con0.execute(
+                f"SELECT DISTINCT source_file FROM read_parquet({paths_sql})"
+            ).fetchall()
+            completed_files.update(r[0] for r in done)
+            n_already_written = con0.execute(
+                f"SELECT COUNT(*) FROM read_parquet({paths_sql})"
+            ).fetchone()[0]
+            con0.close()
+            last_idx = max(int(p.stem.removeprefix("shard_")) for p in existing)
+            starting_shard_idx = last_idx + 1
+            print(f"[manifest] resume: {len(completed_files)} source files done, "
+                  f"{n_already_written:,} rows already written, "
+                  f"next shard = shard_{starting_shard_idx:04d}", flush=True)
+
     print(f"[manifest] reading {manifest_path.name} ...", flush=True)
     con = duckdb.connect()
     con.execute("SET threads=64")
@@ -580,22 +617,26 @@ def _tokenize_manifest(
 
     by_file: Dict[str, List[Tuple[int, str, str]]] = {}
     for src, idx, bh, ok in rows:
+        if src in completed_files:
+            continue
         by_file.setdefault(src, []).append((idx, bh, ok))
+    # Free the manifest tuple list — by_file owns what we still need.
+    del rows, df
 
     args_list = [(f, info, fmt, use_sep) for f, info in by_file.items()]
+    if completed_files:
+        print(f"[manifest] {len(args_list)} source files remaining after resume filter", flush=True)
     schema = _build_canonical_schema(fmt)
 
-    n_written = 0
+    n_written = n_already_written
     if sharded:
-        shard_dir.mkdir(parents=True, exist_ok=True)
-        shard_idx = 0
+        shard_idx = starting_shard_idx
         shard_buffer: List[pa.Table] = []
         shard_rows = 0
-        with Pool(processes=THREADS) as pool:
-            for tbl in pool.imap_unordered(_process_source_file_for_manifest, args_list, chunksize=4):
+        with Pool(processes=threads) as pool:
+            for tbl in pool.imap_unordered(_process_source_file_for_manifest, args_list, chunksize=1):
                 if tbl is None or tbl.num_rows == 0:
                     continue
-                # Cast to canonical schema
                 tbl = _cast_to_schema(tbl, schema)
                 shard_buffer.append(tbl)
                 shard_rows += tbl.num_rows
@@ -614,7 +655,7 @@ def _tokenize_manifest(
     else:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with pq.ParquetWriter(str(out_path), schema, compression="zstd") as writer:
-            with Pool(processes=THREADS) as pool:
+            with Pool(processes=threads) as pool:
                 for tbl in pool.imap_unordered(_process_source_file_for_manifest, args_list, chunksize=4):
                     if tbl is None or tbl.num_rows == 0:
                         continue
@@ -659,9 +700,11 @@ def task_foundation_manifests() -> None:
             if done_marker.exists():
                 print(f"[foundation:{size}] skip — _COMPLETE marker present at {shard_dir}", flush=True)
                 continue
-            print(f"[foundation:{size}] starting...", flush=True)
+            print(f"[foundation:{size}] starting (threads={THREADS_LARGE}, shard_size={SHARD_ROWS_LARGE:,})...", flush=True)
             n = _tokenize_manifest(manifest_path, None, fmt, use_sep=False,
-                                   sharded=True, shard_dir=shard_dir)
+                                   sharded=True, shard_dir=shard_dir,
+                                   shard_size=SHARD_ROWS_LARGE,
+                                   threads=THREADS_LARGE)
             done_marker.write_text(f"rows={n}\n")
         else:
             out_path = OUT_ROOT / "foundation" / f"foundation_{size}_C3.parquet"
