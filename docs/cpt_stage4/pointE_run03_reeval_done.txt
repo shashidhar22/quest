@@ -1,0 +1,5 @@
+STATUS=PASS
+overall_ppl=3.3282
+cdr3_ppl=6.3419
+pocket_ppl=15.4994
+eval_wall_seconds=1094.5

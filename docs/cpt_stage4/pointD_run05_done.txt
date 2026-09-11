@@ -1,0 +1,10 @@
+STATUS=PASS
+elapsed_hr=5.67
+overall_ppl=1.7460363374087398
+cdr3_ppl=4.001616770495851
+cdr12_ppl=None
+pocket_ppl=2.0007164362025693
+pocket_contact_only_ppl=4.487002408920991
+peptide_ppl=15.354303047090461
+framework_ppl=1.2828253758088186
+result_file=/home/ubuntu/quest/checkpoints/cpt_stage4_pointD_run05/final/canonical_v2_results.json
