@@ -1,0 +1,188 @@
+{
+  "timestamp_utc": "20260504T153243Z",
+  "cells": {
+    "deeptcr": {
+      "as_paired_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      },
+      "as_trb_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      },
+      "as_trb_ii": {
+        "conditions": [
+          "eval"
+        ],
+        "count": 1
+      }
+    },
+    "esm2_35m-base": {
+      "as_trb_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      }
+    },
+    "esm2_8m-base": {
+      "as_trb_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      }
+    },
+    "lstm": {
+      "as_paired_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      },
+      "as_paired_ii": {
+        "conditions": [
+          "eval"
+        ],
+        "count": 1
+      },
+      "as_trb_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      },
+      "as_trb_ii": {
+        "conditions": [
+          "eval"
+        ],
+        "count": 1
+      }
+    },
+    "mlp": {
+      "as_paired_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      },
+      "as_paired_ii": {
+        "conditions": [
+          "eval"
+        ],
+        "count": 1
+      },
+      "as_trb_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      },
+      "as_trb_ii": {
+        "conditions": [
+          "eval"
+        ],
+        "count": 1
+      }
+    },
+    "tcrbert": {
+      "as_paired_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      },
+      "as_trb_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      },
+      "as_trb_ii": {
+        "conditions": [
+          "eval"
+        ],
+        "count": 1
+      }
+    },
+    "tulip-original": {
+      "as_paired_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      },
+      "as_paired_ii": {
+        "conditions": [
+          "eval"
+        ],
+        "count": 1
+      },
+      "as_trb_i": {
+        "conditions": [
+          "test_iid",
+          "test_novel_tcr",
+          "test_novel_pep",
+          "test_novel_allele",
+          "test_level4"
+        ],
+        "count": 5
+      },
+      "as_trb_ii": {
+        "conditions": [
+          "eval"
+        ],
+        "count": 1
+      }
+    }
+  },
+  "total_cells_observed": 68
+}

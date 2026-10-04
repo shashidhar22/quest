@@ -1,0 +1,50 @@
+=== TULIP pretrain corpus inventory ===
+file                                                 rows   unique peps
+tulip2_pretune (main)                             948,661       332,014
+tulip2_finetune02_bichain                           7,087           693
+final_below20_train_pnas                          241,573           415
+test_unseen (held out at pretrain)                 35,880         1,880
+
+Union of all TULIP train+finetune peptides: 332,032
+Union including test_unseen-as-pretrain: 332,057
+
+=== AS candidate pool overlap with TULIP train ===
+  class I  pool                       pool=3,563  TULIP-train-overlap=1,546  (43.4%)
+  class II pool                       pool=  990  TULIP-train-overlap=  271  (27.4%)
+
+=== Per-condition AS test-peptide overlap with TULIP train ===
+task            condition              rows  unique peps  in TULIP train      %
+  as_trb_i      test_iid              1,044           39              31   79.5
+  as_trb_i      test_novel_tcr       28,734          561             206   36.7
+  as_trb_i      test_novel_pep       26,688          297             162   54.5
+  as_trb_i      test_novel_allele   200,106        1,583             654   41.3
+  as_trb_i      test_level4          83,178          335             150   44.8
+  as_trb_i      test_mixed          298,800        1,257             742   59.0
+  as_paired_i   test_iid              6,696           53              43   81.1
+  as_paired_i   test_novel_tcr      715,200        1,779             703   39.5
+  as_paired_i   test_novel_pep       49,776          463             240   51.8
+  as_paired_i   test_novel_allele     2,328           49              30   61.2
+  as_paired_i   test_level4           4,872          108              12   11.1
+  as_paired_i   test_mixed           71,616          714             313   43.8
+  as_paired_ii  test_iid                360            7               6   85.7
+  as_paired_ii  test_novel_tcr       58,344          437             116   26.5
+  as_paired_ii  test_novel_pep       14,904           57              48   84.2
+  as_paired_ii  test_novel_allele     3,672           30              20   66.7
+  as_paired_ii  test_level4             840           11               7   63.6
+  as_paired_ii  test_mixed           46,368          432              76   17.6
+  as_paired_ii  eval                151,632          951             253   26.6
+  as_trb_ii     eval                 56,076          988             269   27.2
+  as_tra_i      test_iid              4,020          109              31   28.4
+  as_tra_i      test_novel_tcr      101,976          829             344   41.5
+  as_tra_i      test_novel_pep       45,588          257             214   83.3
+  as_tra_i      test_novel_allele    41,910        1,074             322   30.0
+  as_tra_i      test_level4           9,516          201              99   49.3
+  as_tra_i      test_mixed           59,562        1,690             475   28.1
+  as_tra_ii     eval                 40,806          956             257   26.9
+
+=== Diagnostic: AS-TRB-I test_level4 peptide audit ===
+  test_level4 has 335 unique peptides
+  of which 150 (44.8%) are in TULIP train
+  TULIP-original got recall@10=1.000 on these. If ~100% are train peps, that's pure memorization.
+
+Wrote summary to /home/ubuntu/quest/track_a/tulip_pretrain_leakage_audit.txt

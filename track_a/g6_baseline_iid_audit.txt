@@ -1,0 +1,42 @@
+=== deeptcr ===
+  iid            : R@10=   0.0  MRR=0.0005628677178716013  AUC=    NA
+  novel_tcr      : R@10= 0.833  MRR=0.568904936973715  AUC=    NA
+  novel_pep      : R@10=   0.0  MRR=0.00045079075488163876  AUC=    NA
+  novel_allele   : R@10= 0.075  MRR=0.04065350977940845  AUC=    NA
+  level4         : R@10=   0.0  MRR=0.0005422995119844606  AUC=    NA
+=== esm2_35m-base ===
+  iid            : R@10=   0.0  MRR=0.0035808776659114845  AUC=    NA
+  novel_tcr      : R@10=0.0055  MRR=0.012216298347738118  AUC=    NA
+  novel_pep      : R@10= 0.006  MRR=0.0017209739555456825  AUC=    NA
+  novel_allele   : R@10=   0.0  MRR=0.0007862307554890646  AUC=    NA
+  level4         : R@10=0.0005  MRR=0.0010718298246296918  AUC=    NA
+=== esm2_8m-base ===
+  iid            : R@10=   0.0  MRR=0.0006529462086169483  AUC=    NA
+  novel_tcr      : R@10=0.0065  MRR=0.01800418395221523  AUC=    NA
+  novel_pep      : R@10= 0.003  MRR=0.0027905298121927162  AUC=    NA
+  novel_allele   : R@10= 0.012  MRR=0.004943698915954969  AUC=    NA
+  level4         : R@10=   0.0  MRR=0.00211007096517632  AUC=    NA
+=== lstm ===
+  iid            : R@10=0.022988505747126436  MRR=0.005662106235751567  AUC=    NA
+  novel_tcr      : R@10=0.5425  MRR=0.41359256135260236  AUC=    NA
+  novel_pep      : R@10=   0.0  MRR=0.019778007887766718  AUC=    NA
+  novel_allele   : R@10=   0.0  MRR=0.019524109599903205  AUC=    NA
+  level4         : R@10=   0.0  MRR=0.001026728279492925  AUC=    NA
+=== mlp ===
+  iid            : R@10=0.04597701149425287  MRR=0.01297651351107717  AUC=    NA
+  novel_tcr      : R@10=0.6805  MRR=0.4209665407458227  AUC=    NA
+  novel_pep      : R@10=   0.0  MRR=0.0030777370912924793  AUC=    NA
+  novel_allele   : R@10= 0.009  MRR=0.006329351982016165  AUC=    NA
+  level4         : R@10=   0.0  MRR=0.0012398381662051022  AUC=    NA
+=== tcrbert ===
+  iid            : R@10=0.011494252873563218  MRR=0.003206743480479069  AUC=    NA
+  novel_tcr      : R@10=   0.0  MRR=0.0017048099919275703  AUC=    NA
+  novel_pep      : R@10=   0.0  MRR=0.0008050219143397499  AUC=    NA
+  novel_allele   : R@10=   0.0  MRR=0.0015937752071191566  AUC=    NA
+  level4         : R@10=   0.0  MRR=0.0010400237750015364  AUC=    NA
+=== tulip-original ===
+  iid            : R@10=  0.24  MRR=0.06863599312583427  AUC=    NA
+  novel_tcr      : R@10=   1.0  MRR=0.3789226190476191  AUC=    NA
+  novel_pep      : R@10=  0.82  MRR=0.6650424125838725  AUC=    NA
+  novel_allele   : R@10=  0.75  MRR=0.44672877811909034  AUC=    NA
+  level4         : R@10=   1.0  MRR=0.4686666666666666  AUC=    NA

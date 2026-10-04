@@ -1,0 +1,84 @@
+{
+  "_comment": "Expected cells per (baseline, task). Counts = number of conditions per task. Verified against actual _summary.json conditions: Class I has 5 (test_iid, test_novel_tcr, test_novel_pep, test_novel_allele, test_level4); Class II has 1 (eval). Baseline keys match subdirectory names under /home/ubuntu/quest/results/. TRA tasks excluded (appendix-only, deferred). TULIP-retrained excluded (deferred per ANOMALIES.md).",
+  "baselines": {
+    "lstm": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    },
+    "mlp": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    },
+    "deeptcr": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    },
+    "tcrbert": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    },
+    "tulip-original": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    }
+  },
+  "esm_sft": {
+    "esm2_8m-base": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    },
+    "esm2_8m-cpt": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    },
+    "esm2_35m-base": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    },
+    "esm2_35m-cpt": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    },
+    "esmc_300m-base": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    },
+    "esmc_300m-cpt": {
+      "as_trb_i": 5,
+      "as_paired_i": 5,
+      "as_trb_ii": 1,
+      "as_paired_ii": 5
+    }
+  },
+  "expected_processes": [
+    "resume_gpu0.sh",
+    "resume_gpu1.sh",
+    "resume_gpu2.sh",
+    "resume_gpu3.sh"
+  ],
+  "expected_total_cells": 176,
+  "deferred": {
+    "tulip-retrained": "transformers 5.x API breakage; would need older sidecar env",
+    "tra_tasks": "appendix-only, only if main tasks complete with time to spare"
+  }
+}

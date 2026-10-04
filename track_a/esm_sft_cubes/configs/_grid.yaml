@@ -1,0 +1,93 @@
+# Phase 1 grid: 5 CPT checkpoints × 2 cubes = 10 runs.
+# Each entry expands to a per-run YAML at materialize time (see run_phase1.py).
+
+output_root: /home/ubuntu/quest/checkpoints/sft_retrieval/phase1_crossenc
+
+defaults:
+  epochs: 3
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  patience: 2
+  neg_seed: 43
+  seed: 42
+  max_test_rows: 300
+  eval_batch_size: 128
+  n100_pool_size: 100
+  n100_seeds: 10
+  n100_base_seed: 42
+
+runs:
+  - ckpt_name: A
+    ckpt_path: /home/ubuntu/quest/checkpoints/cpt_stage4_pointA_run01/final
+    tcr_variant: cdr3
+    mhc_variant: pocket
+    cube_name: cube_a_trb
+    max_seq_len: 128
+    batch_size: 64
+  - ckpt_name: A
+    ckpt_path: /home/ubuntu/quest/checkpoints/cpt_stage4_pointA_run01/final
+    tcr_variant: cdr3
+    mhc_variant: pocket
+    cube_name: cube_c_paired
+    max_seq_len: 128
+    batch_size: 64
+
+  - ckpt_name: B
+    ckpt_path: /home/ubuntu/quest/checkpoints/cpt_stage4_pointB_run10/final
+    tcr_variant: cdr123
+    mhc_variant: pocket_contact
+    cube_name: cube_a_trb
+    max_seq_len: 192
+    batch_size: 48
+  - ckpt_name: B
+    ckpt_path: /home/ubuntu/quest/checkpoints/cpt_stage4_pointB_run10/final
+    tcr_variant: cdr123
+    mhc_variant: pocket_contact
+    cube_name: cube_c_paired
+    max_seq_len: 256
+    batch_size: 32
+
+  - ckpt_name: C
+    ckpt_path: /home/ubuntu/quest/checkpoints/cpt_stage4_pointC_run09/final
+    tcr_variant: full
+    mhc_variant: full
+    cube_name: cube_a_trb
+    max_seq_len: 768
+    batch_size: 8
+  - ckpt_name: C
+    ckpt_path: /home/ubuntu/quest/checkpoints/cpt_stage4_pointC_run09/final
+    tcr_variant: full
+    mhc_variant: full
+    cube_name: cube_c_paired
+    max_seq_len: 1024
+    batch_size: 4
+
+  - ckpt_name: D
+    ckpt_path: /home/ubuntu/quest/checkpoints/cpt_stage4_pointD_run05/final
+    tcr_variant: cdr3
+    mhc_variant: full
+    cube_name: cube_a_trb
+    max_seq_len: 512
+    batch_size: 16
+  - ckpt_name: D
+    ckpt_path: /home/ubuntu/quest/checkpoints/cpt_stage4_pointD_run05/final
+    tcr_variant: cdr3
+    mhc_variant: full
+    cube_name: cube_c_paired
+    max_seq_len: 512
+    batch_size: 16
+
+  - ckpt_name: E
+    ckpt_path: /home/ubuntu/quest/checkpoints/cpt_stage2_run03_full/final
+    tcr_variant: full
+    mhc_variant: pocket
+    cube_name: cube_a_trb
+    max_seq_len: 512
+    batch_size: 16
+  - ckpt_name: E
+    ckpt_path: /home/ubuntu/quest/checkpoints/cpt_stage2_run03_full/final
+    tcr_variant: full
+    mhc_variant: pocket
+    cube_name: cube_c_paired
+    max_seq_len: 512
+    batch_size: 16
