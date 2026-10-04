@@ -1,0 +1,62 @@
+{
+  "epoch": 0,
+  "global_step": 2000,
+  "best_eval_loss": 1.7405383146889377,
+  "lora_info": {
+    "target_modules": [
+      "query",
+      "key",
+      "value",
+      "dense",
+      "intermediate.dense",
+      "output.dense"
+    ],
+    "trainable_params": 11100160,
+    "total_params": 159240314,
+    "trainable_pct": 6.970697131380939,
+    "rank": 32,
+    "alpha": 64,
+    "dropout": 0.05
+  },
+  "config": {
+    "base_model": "facebook/esm2_t30_150M_UR50D",
+    "dataset_path": "/home/ubuntu/quest/data/cpt_datasets/run01_cdr3_pocket_proportional_10M",
+    "canonical_eval_path": "/home/ubuntu/quest/data/cpt_canonical_eval",
+    "output_dir": "/home/ubuntu/quest/checkpoints/cpt_stage1_run01_proportional",
+    "lora_r": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.05,
+    "lora_target_modules": "auto",
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.95,
+    "warmup_ratio": 0.05,
+    "gradient_clip": 1.0,
+    "num_epochs": 1,
+    "batch_size": 128,
+    "gradient_accumulation_steps": 4,
+    "eval_every_n_steps": 500,
+    "save_every_n_steps": 2000,
+    "logging_steps": 50,
+    "max_length": 128,
+    "mlm_probability": 0.15,
+    "attn_implementation": "flash_attention_2",
+    "use_compile": false,
+    "use_length_bucketing": true,
+    "bucket_boundaries": [
+      32,
+      48,
+      64,
+      96,
+      128
+    ],
+    "dataloader_num_workers": 4,
+    "eval_batch_size": 64,
+    "early_stopping_patience": 8,
+    "wandb_project": "tcrbench-v3-cpt-stage1",
+    "wandb_run_name": "stage1-esm2_150m-run01-proportional",
+    "report_to": "wandb",
+    "seed": 42
+  }
+}

@@ -1,0 +1,1439 @@
+{
+  "epoch": -1,
+  "global_step": 1500,
+  "best_eval_loss": 5.468387094883782,
+  "lora_info": {
+    "target_modules": [
+      "layernorm_qkv.1",
+      "out_proj",
+      "ffn.1",
+      "ffn.3"
+    ],
+    "trainable_params": 14745600,
+    "total_params": 347742784,
+    "trainable_pct": 4.240375552983437,
+    "rank": 32,
+    "alpha": 64,
+    "dropout": 0.05
+  },
+  "config": {
+    "base_model": "esmc_300m",
+    "dataset_path": "/home/ubuntu/quest/data/cpt_datasets/run02_cdr123_pocket_proportional_10M",
+    "canonical_eval_path": "/home/ubuntu/quest/data/cpt_canonical_eval_v2",
+    "output_dir": "/home/ubuntu/quest/checkpoints/cpt_stage2_run02_cdr123",
+    "lora_r": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.05,
+    "lora_target_modules": "auto",
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.95,
+    "warmup_ratio": 0.05,
+    "gradient_clip": 1.0,
+    "num_epochs": 1,
+    "batch_size": 128,
+    "gradient_accumulation_steps": 2,
+    "eval_every_n_steps": 500,
+    "save_every_n_steps": 2000,
+    "logging_steps": 50,
+    "max_length": 96,
+    "mlm_probability": 0.15,
+    "eos_strategy": "raw",
+    "attn_implementation": "sdpa",
+    "use_compile": false,
+    "use_length_bucketing": true,
+    "bucket_boundaries": [
+      24,
+      32,
+      48,
+      64,
+      96
+    ],
+    "dataloader_num_workers": 4,
+    "eval_batch_size": 64,
+    "gradient_checkpointing": false,
+    "region_eval": true,
+    "tcr_variant": "cdr123",
+    "mhc_variant": "pocket",
+    "region_eval_batch_size": 16,
+    "early_stopping_patience": 8,
+    "early_stop_metric_path": [
+      "cdr3",
+      "overall",
+      "_",
+      "perplexity"
+    ],
+    "early_stop_n_patience": 3,
+    "early_stop_min_rel": 0.01,
+    "wandb_project": "tcrbench-v3-cpt-stage2",
+    "wandb_run_name": "stage2-esmc_300m-run02-cdr123",
+    "report_to": "wandb",
+    "seed": 42
+  },
+  "canonical_buckets": {
+    "overall": {
+      "overall": {
+        "_": {
+          "loss": 1.6957104137344867,
+          "perplexity": 5.450516712066443,
+          "n_rows": 19463,
+          "n_masked_tokens": 113547
+        }
+      },
+      "stratum_key": {
+        "none_nseg1": {
+          "loss": 0.8340328236627967,
+          "perplexity": 2.3025859643265822,
+          "n_rows": 9774,
+          "n_masked_tokens": 38867
+        },
+        "II_partial_DQ_beta": {
+          "loss": 2.3829095871984416,
+          "perplexity": 10.836386450894478,
+          "n_rows": 205,
+          "n_masked_tokens": 1340
+        },
+        "II_partial_DR_beta": {
+          "loss": 2.678490790504117,
+          "perplexity": 14.56309793655781,
+          "n_rows": 1600,
+          "n_masked_tokens": 9035
+        },
+        "none_nseg2": {
+          "loss": 1.6927239316375366,
+          "perplexity": 5.434263124092056,
+          "n_rows": 4991,
+          "n_masked_tokens": 34558
+        },
+        "none_nseg3": {
+          "loss": 1.7898982838796433,
+          "perplexity": 5.988843273498066,
+          "n_rows": 316,
+          "n_masked_tokens": 2542
+        },
+        "II_partial_DP_beta": {
+          "loss": 2.5841854574364502,
+          "perplexity": 13.25248997523798,
+          "n_rows": 165,
+          "n_masked_tokens": 1033
+        },
+        "I": {
+          "loss": 2.795043700610299,
+          "perplexity": 16.363343825644257,
+          "n_rows": 23,
+          "n_masked_tokens": 166
+        },
+        "II_complete": {
+          "loss": 2.564678204090929,
+          "perplexity": 12.996475484045883,
+          "n_rows": 2371,
+          "n_masked_tokens": 25747
+        },
+        "none_nseg4+": {
+          "loss": 2.0074433677332397,
+          "perplexity": 7.444260760094934,
+          "n_rows": 18,
+          "n_masked_tokens": 259
+        }
+      },
+      "mhc_class": {
+        "none": {
+          "loss": 1.2591944567037079,
+          "perplexity": 3.522582751235565,
+          "n_rows": 15099,
+          "n_masked_tokens": 76226
+        },
+        "II_partial_DQ_beta": {
+          "loss": 2.3829095871984416,
+          "perplexity": 10.836386450894478,
+          "n_rows": 205,
+          "n_masked_tokens": 1340
+        },
+        "II_partial_DR_beta": {
+          "loss": 2.678490790504117,
+          "perplexity": 14.56309793655781,
+          "n_rows": 1600,
+          "n_masked_tokens": 9035
+        },
+        "II_partial_DP_beta": {
+          "loss": 2.5841854574364502,
+          "perplexity": 13.25248997523798,
+          "n_rows": 165,
+          "n_masked_tokens": 1033
+        },
+        "I": {
+          "loss": 2.795043700610299,
+          "perplexity": 16.363343825644257,
+          "n_rows": 23,
+          "n_masked_tokens": 166
+        },
+        "II_complete": {
+          "loss": 2.564678204090929,
+          "perplexity": 12.996475484045883,
+          "n_rows": 2371,
+          "n_masked_tokens": 25747
+        }
+      },
+      "n_segments": {
+        "1": {
+          "loss": 0.8369525458822052,
+          "perplexity": 2.309318699804489,
+          "n_rows": 9785,
+          "n_masked_tokens": 38924
+        },
+        "2": {
+          "loss": 1.9203551708700461,
+          "perplexity": 6.823381505315272,
+          "n_rows": 6805,
+          "n_masked_tokens": 44210
+        },
+        "3": {
+          "loss": 2.5335343349880906,
+          "perplexity": 12.597952931293603,
+          "n_rows": 2458,
+          "n_masked_tokens": 25069
+        },
+        "4": {
+          "loss": 2.1841049711969887,
+          "perplexity": 8.88269472682155,
+          "n_rows": 246,
+          "n_masked_tokens": 3147
+        },
+        "5": {
+          "loss": 2.1301032134969122,
+          "perplexity": 8.415735384093228,
+          "n_rows": 169,
+          "n_masked_tokens": 2197
+        }
+      },
+      "subset_key": {
+        "trb": {
+          "loss": 0.8008811169098276,
+          "perplexity": 2.227502754410146,
+          "n_rows": 9381,
+          "n_masked_tokens": 37601
+        },
+        "tra": {
+          "loss": 1.4679682212637164,
+          "perplexity": 4.340407428600093,
+          "n_rows": 239,
+          "n_masked_tokens": 924
+        },
+        "peptide": {
+          "loss": 2.7661410641164808,
+          "perplexity": 15.897169334756219,
+          "n_rows": 154,
+          "n_masked_tokens": 342
+        },
+        "mhc_two": {
+          "loss": 2.8467555897576466,
+          "perplexity": 17.23178407308201,
+          "n_rows": 3,
+          "n_masked_tokens": 7
+        },
+        "trb_peptide": {
+          "loss": 1.532299722027164,
+          "perplexity": 4.628809566755543,
+          "n_rows": 272,
+          "n_masked_tokens": 1447
+        },
+        "tra_trb": {
+          "loss": 1.6709313361771003,
+          "perplexity": 5.317117515797739,
+          "n_rows": 4579,
+          "n_masked_tokens": 32054
+        },
+        "tra_peptide": {
+          "loss": 2.0715641647937115,
+          "perplexity": 7.9372285467050805,
+          "n_rows": 20,
+          "n_masked_tokens": 110
+        },
+        "tra_trb_peptide": {
+          "loss": 1.7517865161363737,
+          "perplexity": 5.764892555325758,
+          "n_rows": 297,
+          "n_masked_tokens": 2310
+        },
+        "peptide_mhc_two": {
+          "loss": 2.743321036337764,
+          "perplexity": 15.538503436396129,
+          "n_rows": 1783,
+          "n_masked_tokens": 9434
+        },
+        "trb_mhc_two": {
+          "loss": 1.753612622556955,
+          "perplexity": 5.775429480480247,
+          "n_rows": 9,
+          "n_masked_tokens": 58
+        },
+        "mhc_one": {
+          "loss": 2.825196989774704,
+          "perplexity": 16.864266747008863,
+          "n_rows": 8,
+          "n_masked_tokens": 50
+        },
+        "tra_mhc_two": {
+          "loss": 2.1039478925864814,
+          "perplexity": 8.198472796427616,
+          "n_rows": 6,
+          "n_masked_tokens": 34
+        },
+        "peptide_mhc_one": {
+          "loss": 2.6490209292726856,
+          "perplexity": 14.14018762213698,
+          "n_rows": 134,
+          "n_masked_tokens": 1050
+        },
+        "tra_peptide_mhc_two": {
+          "loss": 2.5082661262838744,
+          "perplexity": 12.283613351281053,
+          "n_rows": 16,
+          "n_masked_tokens": 130
+        },
+        "trb_peptide_mhc_two": {
+          "loss": 2.198195363564511,
+          "perplexity": 9.008741318343855,
+          "n_rows": 33,
+          "n_masked_tokens": 301
+        },
+        "tra_trb_mhc_two": {
+          "loss": 1.9701046692242818,
+          "perplexity": 7.171427076773294,
+          "n_rows": 19,
+          "n_masked_tokens": 179
+        },
+        "mhc_one_mhc_two": {
+          "loss": 2.5296652555465697,
+          "perplexity": 12.549304623373748,
+          "n_rows": 1,
+          "n_masked_tokens": 10
+        },
+        "tra_mhc_one": {
+          "loss": 2.5581732988357544,
+          "perplexity": 12.912209012214648,
+          "n_rows": 1,
+          "n_masked_tokens": 13
+        },
+        "tra_trb_peptide_mhc_two": {
+          "loss": 2.0938220344240963,
+          "perplexity": 8.115875115690478,
+          "n_rows": 101,
+          "n_masked_tokens": 1265
+        },
+        "peptide_mhc_one_mhc_two": {
+          "loss": 2.636968636737404,
+          "perplexity": 13.970788816924875,
+          "n_rows": 2038,
+          "n_masked_tokens": 21488
+        },
+        "tra_mhc_one_mhc_two": {
+          "loss": 2.387315852769231,
+          "perplexity": 10.884239797277726,
+          "n_rows": 11,
+          "n_masked_tokens": 142
+        },
+        "trb_mhc_one_mhc_two": {
+          "loss": 2.16268206357788,
+          "perplexity": 8.694425416620014,
+          "n_rows": 25,
+          "n_masked_tokens": 287
+        },
+        "tra_peptide_mhc_one": {
+          "loss": 2.5227993584747583,
+          "perplexity": 12.463437504226102,
+          "n_rows": 4,
+          "n_masked_tokens": 53
+        },
+        "tra_trb_mhc_one": {
+          "loss": 1.9803885447094216,
+          "perplexity": 7.245557661407969,
+          "n_rows": 6,
+          "n_masked_tokens": 75
+        },
+        "trb_peptide_mhc_one": {
+          "loss": 2.1255488316794353,
+          "perplexity": 8.377494060774376,
+          "n_rows": 9,
+          "n_masked_tokens": 104
+        },
+        "tra_peptide_mhc_one_mhc_two": {
+          "loss": 2.487571023824049,
+          "perplexity": 12.03201511962001,
+          "n_rows": 20,
+          "n_masked_tokens": 262
+        },
+        "trb_peptide_mhc_one_mhc_two": {
+          "loss": 2.276644662177543,
+          "perplexity": 9.743931316832326,
+          "n_rows": 45,
+          "n_masked_tokens": 567
+        },
+        "tra_trb_peptide_mhc_one_mhc_two": {
+          "loss": 2.1301032134969122,
+          "perplexity": 8.415735384093228,
+          "n_rows": 169,
+          "n_masked_tokens": 2197
+        },
+        "tra_trb_mhc_one_mhc_two": {
+          "loss": 2.219350764321115,
+          "perplexity": 9.201355078234002,
+          "n_rows": 62,
+          "n_masked_tokens": 794
+        },
+        "tra_trb_peptide_mhc_one": {
+          "loss": 2.0074433677332397,
+          "perplexity": 7.444260760094934,
+          "n_rows": 18,
+          "n_masked_tokens": 259
+        }
+      }
+    },
+    "cdr3": {
+      "overall": {
+        "_": {
+          "loss": 1.698983709129199,
+          "perplexity": 5.468387094883782,
+          "n_rows": 14627,
+          "n_masked_tokens": 44953
+        }
+      },
+      "stratum_key": {
+        "none_nseg1": {
+          "loss": 1.2526373063805398,
+          "perplexity": 3.4995602102311363,
+          "n_rows": 9053,
+          "n_masked_tokens": 24504
+        },
+        "none_nseg2": {
+          "loss": 2.3147635799957924,
+          "perplexity": 10.122529467365297,
+          "n_rows": 4764,
+          "n_masked_tokens": 17547
+        },
+        "none_nseg3": {
+          "loss": 1.7774938945570502,
+          "perplexity": 5.9150141790214255,
+          "n_rows": 314,
+          "n_masked_tokens": 1284
+        },
+        "II_partial_DQ_beta": {
+          "loss": 1.8764131921878684,
+          "perplexity": 6.530040805441417,
+          "n_rows": 61,
+          "n_masked_tokens": 211
+        },
+        "II_partial_DR_beta": {
+          "loss": 1.825217183049626,
+          "perplexity": 6.204142307342107,
+          "n_rows": 93,
+          "n_masked_tokens": 347
+        },
+        "II_partial_DP_beta": {
+          "loss": 1.9180950484191999,
+          "perplexity": 6.807977241902486,
+          "n_rows": 25,
+          "n_masked_tokens": 100
+        },
+        "II_complete": {
+          "loss": 1.6329600011027323,
+          "perplexity": 5.119004574480122,
+          "n_rows": 299,
+          "n_masked_tokens": 890
+        },
+        "none_nseg4+": {
+          "loss": 1.513056717793058,
+          "perplexity": 4.5405889022498735,
+          "n_rows": 18,
+          "n_masked_tokens": 70
+        }
+      },
+      "mhc_class": {
+        "none": {
+          "loss": 1.697961000451369,
+          "perplexity": 5.462797386756819,
+          "n_rows": 14149,
+          "n_masked_tokens": 43405
+        },
+        "II_partial_DQ_beta": {
+          "loss": 1.8764131921878684,
+          "perplexity": 6.530040805441417,
+          "n_rows": 61,
+          "n_masked_tokens": 211
+        },
+        "II_partial_DR_beta": {
+          "loss": 1.825217183049626,
+          "perplexity": 6.204142307342107,
+          "n_rows": 93,
+          "n_masked_tokens": 347
+        },
+        "II_partial_DP_beta": {
+          "loss": 1.9180950484191999,
+          "perplexity": 6.807977241902486,
+          "n_rows": 25,
+          "n_masked_tokens": 100
+        },
+        "II_complete": {
+          "loss": 1.6329600011027323,
+          "perplexity": 5.119004574480122,
+          "n_rows": 299,
+          "n_masked_tokens": 890
+        }
+      },
+      "n_segments": {
+        "1": {
+          "loss": 1.2526373063805398,
+          "perplexity": 3.4995602102311363,
+          "n_rows": 9053,
+          "n_masked_tokens": 24504
+        },
+        "2": {
+          "loss": 2.314670577573548,
+          "perplexity": 10.121588091381394,
+          "n_rows": 4778,
+          "n_masked_tokens": 17580
+        },
+        "3": {
+          "loss": 1.7875474944198457,
+          "perplexity": 5.974781298701201,
+          "n_rows": 409,
+          "n_masked_tokens": 1550
+        },
+        "4": {
+          "loss": 1.7794376796799833,
+          "perplexity": 5.9265228771790675,
+          "n_rows": 229,
+          "n_masked_tokens": 805
+        },
+        "5": {
+          "loss": 1.5267226044747686,
+          "perplexity": 4.6030660058346236,
+          "n_rows": 158,
+          "n_masked_tokens": 514
+        }
+      },
+      "subset_key": {
+        "trb": {
+          "loss": 1.2330957977932047,
+          "perplexity": 3.4318373825395714,
+          "n_rows": 8832,
+          "n_masked_tokens": 23929
+        },
+        "tra": {
+          "loss": 2.06586993070461,
+          "perplexity": 7.892160544992092,
+          "n_rows": 221,
+          "n_masked_tokens": 575
+        },
+        "trb_peptide": {
+          "loss": 1.2598069613025273,
+          "perplexity": 3.5247410102747376,
+          "n_rows": 244,
+          "n_masked_tokens": 626
+        },
+        "tra_trb": {
+          "loss": 2.3542868296298707,
+          "perplexity": 10.530616059707022,
+          "n_rows": 4501,
+          "n_masked_tokens": 16869
+        },
+        "tra_peptide": {
+          "loss": 2.0651978608220816,
+          "perplexity": 7.886858243539859,
+          "n_rows": 18,
+          "n_masked_tokens": 49
+        },
+        "tra_trb_peptide": {
+          "loss": 1.7711468568475777,
+          "perplexity": 5.877590252147471,
+          "n_rows": 297,
+          "n_masked_tokens": 1237
+        },
+        "trb_mhc_two": {
+          "loss": 2.2485330903104375,
+          "perplexity": 9.473828387707618,
+          "n_rows": 8,
+          "n_masked_tokens": 21
+        },
+        "tra_mhc_two": {
+          "loss": 2.2944183883567653,
+          "perplexity": 9.918665523002609,
+          "n_rows": 6,
+          "n_masked_tokens": 12
+        },
+        "tra_peptide_mhc_two": {
+          "loss": 1.8513913118819658,
+          "perplexity": 6.3686741734328765,
+          "n_rows": 14,
+          "n_masked_tokens": 38
+        },
+        "tra_trb_mhc_two": {
+          "loss": 1.9497398482890773,
+          "perplexity": 7.026859293316004,
+          "n_rows": 19,
+          "n_masked_tokens": 73
+        },
+        "trb_peptide_mhc_two": {
+          "loss": 1.9583090674543822,
+          "perplexity": 7.087332725637606,
+          "n_rows": 31,
+          "n_masked_tokens": 82
+        },
+        "tra_mhc_one": {
+          "loss": 4.286052068074544,
+          "perplexity": 72.67896973534722,
+          "n_rows": 1,
+          "n_masked_tokens": 3
+        },
+        "tra_trb_peptide_mhc_two": {
+          "loss": 1.789503733905332,
+          "perplexity": 5.986480841617717,
+          "n_rows": 101,
+          "n_masked_tokens": 432
+        },
+        "tra_mhc_one_mhc_two": {
+          "loss": 1.6810713737555172,
+          "perplexity": 5.371307567477727,
+          "n_rows": 9,
+          "n_masked_tokens": 23
+        },
+        "trb_mhc_one_mhc_two": {
+          "loss": 1.529331836705096,
+          "perplexity": 4.615092156702669,
+          "n_rows": 22,
+          "n_masked_tokens": 50
+        },
+        "tra_peptide_mhc_one": {
+          "loss": 2.7759794945066627,
+          "perplexity": 16.054344439010414,
+          "n_rows": 3,
+          "n_masked_tokens": 11
+        },
+        "tra_trb_mhc_one": {
+          "loss": 1.8416728845664434,
+          "perplexity": 6.307080458186445,
+          "n_rows": 6,
+          "n_masked_tokens": 21
+        },
+        "trb_peptide_mhc_one": {
+          "loss": 1.478839578355352,
+          "perplexity": 4.387850968245988,
+          "n_rows": 8,
+          "n_masked_tokens": 15
+        },
+        "tra_peptide_mhc_one_mhc_two": {
+          "loss": 2.2344927261205942,
+          "perplexity": 9.34174182843544,
+          "n_rows": 17,
+          "n_masked_tokens": 37
+        },
+        "trb_peptide_mhc_one_mhc_two": {
+          "loss": 1.346412328586258,
+          "perplexity": 3.843611150935054,
+          "n_rows": 39,
+          "n_masked_tokens": 98
+        },
+        "tra_trb_peptide_mhc_one_mhc_two": {
+          "loss": 1.5267226044747686,
+          "perplexity": 4.6030660058346236,
+          "n_rows": 158,
+          "n_masked_tokens": 514
+        },
+        "tra_trb_mhc_one_mhc_two": {
+          "loss": 2.016923272511035,
+          "perplexity": 7.515167205395414,
+          "n_rows": 54,
+          "n_masked_tokens": 168
+        },
+        "tra_trb_peptide_mhc_one": {
+          "loss": 1.513056717793058,
+          "perplexity": 4.5405889022498735,
+          "n_rows": 18,
+          "n_masked_tokens": 70
+        }
+      }
+    },
+    "cdr12": {
+      "overall": {
+        "_": {
+          "loss": 0.5316904910668797,
+          "perplexity": 1.7018067674484478,
+          "n_rows": 12216,
+          "n_masked_tokens": 31669
+        }
+      },
+      "stratum_key": {
+        "none_nseg1": {
+          "loss": 0.055324795508547915,
+          "perplexity": 1.0568838300561292,
+          "n_rows": 6941,
+          "n_masked_tokens": 14021
+        },
+        "none_nseg2": {
+          "loss": 0.8973076563088175,
+          "perplexity": 2.4529899207233448,
+          "n_rows": 4580,
+          "n_masked_tokens": 15617
+        },
+        "none_nseg3": {
+          "loss": 0.8786431642229416,
+          "perplexity": 2.4076307296744592,
+          "n_rows": 221,
+          "n_masked_tokens": 687
+        },
+        "II_partial_DQ_beta": {
+          "loss": 1.0023915457192774,
+          "perplexity": 2.7247905035244893,
+          "n_rows": 53,
+          "n_masked_tokens": 172
+        },
+        "II_partial_DP_beta": {
+          "loss": 0.6528479964261231,
+          "perplexity": 1.9210040583851575,
+          "n_rows": 25,
+          "n_masked_tokens": 61
+        },
+        "II_partial_DR_beta": {
+          "loss": 1.1574681171557055,
+          "perplexity": 3.1818669545795486,
+          "n_rows": 84,
+          "n_masked_tokens": 266
+        },
+        "II_complete": {
+          "loss": 1.0770531191314912,
+          "perplexity": 2.936014704638219,
+          "n_rows": 294,
+          "n_masked_tokens": 778
+        },
+        "none_nseg4+": {
+          "loss": 1.3051755504817102,
+          "perplexity": 3.6883365261286882,
+          "n_rows": 18,
+          "n_masked_tokens": 67
+        }
+      },
+      "mhc_class": {
+        "none": {
+          "loss": 0.5093457897507103,
+          "perplexity": 1.6642021006652647,
+          "n_rows": 11760,
+          "n_masked_tokens": 30392
+        },
+        "II_partial_DQ_beta": {
+          "loss": 1.0023915457192774,
+          "perplexity": 2.7247905035244893,
+          "n_rows": 53,
+          "n_masked_tokens": 172
+        },
+        "II_partial_DP_beta": {
+          "loss": 0.6528479964261231,
+          "perplexity": 1.9210040583851575,
+          "n_rows": 25,
+          "n_masked_tokens": 61
+        },
+        "II_partial_DR_beta": {
+          "loss": 1.1574681171557055,
+          "perplexity": 3.1818669545795486,
+          "n_rows": 84,
+          "n_masked_tokens": 266
+        },
+        "II_complete": {
+          "loss": 1.0770531191314912,
+          "perplexity": 2.936014704638219,
+          "n_rows": 294,
+          "n_masked_tokens": 778
+        }
+      },
+      "n_segments": {
+        "1": {
+          "loss": 0.055324795508547915,
+          "perplexity": 1.0568838300561292,
+          "n_rows": 6941,
+          "n_masked_tokens": 14021
+        },
+        "2": {
+          "loss": 0.8965973407779632,
+          "perplexity": 2.451248142564899,
+          "n_rows": 4592,
+          "n_masked_tokens": 15645
+        },
+        "3": {
+          "loss": 0.9022910593115294,
+          "perplexity": 2.4652446678702638,
+          "n_rows": 300,
+          "n_masked_tokens": 863
+        },
+        "4": {
+          "loss": 1.0902358060321926,
+          "perplexity": 2.9749755070287587,
+          "n_rows": 224,
+          "n_masked_tokens": 675
+        },
+        "5": {
+          "loss": 1.1194525893394642,
+          "perplexity": 3.063176928550053,
+          "n_rows": 159,
+          "n_masked_tokens": 465
+        }
+      },
+      "subset_key": {
+        "trb": {
+          "loss": 0.044410585981043534,
+          "perplexity": 1.0454114980878608,
+          "n_rows": 6782,
+          "n_masked_tokens": 13672
+        },
+        "tra": {
+          "loss": 0.482886608288032,
+          "perplexity": 1.6207461154154703,
+          "n_rows": 159,
+          "n_masked_tokens": 349
+        },
+        "tra_peptide": {
+          "loss": 0.9041258010963377,
+          "perplexity": 2.469771907159733,
+          "n_rows": 12,
+          "n_masked_tokens": 28
+        },
+        "trb_peptide": {
+          "loss": 0.3447452792993227,
+          "perplexity": 1.4116303024088965,
+          "n_rows": 198,
+          "n_masked_tokens": 401
+        },
+        "tra_trb": {
+          "loss": 0.911792461033551,
+          "perplexity": 2.4887795780667976,
+          "n_rows": 4369,
+          "n_masked_tokens": 15185
+        },
+        "tra_trb_peptide": {
+          "loss": 0.8914824265320144,
+          "perplexity": 2.4387422291228757,
+          "n_rows": 204,
+          "n_masked_tokens": 647
+        },
+        "tra_mhc_two": {
+          "loss": 1.0989922565058805,
+          "perplexity": 3.001140120104081,
+          "n_rows": 5,
+          "n_masked_tokens": 12
+        },
+        "trb_mhc_two": {
+          "loss": 0.051488801147570484,
+          "perplexity": 1.0528373956554864,
+          "n_rows": 7,
+          "n_masked_tokens": 16
+        },
+        "tra_trb_mhc_two": {
+          "loss": 1.3175662912794435,
+          "perplexity": 3.7343220570490057,
+          "n_rows": 18,
+          "n_masked_tokens": 58
+        },
+        "trb_peptide_mhc_two": {
+          "loss": 0.47731663584328576,
+          "perplexity": 1.6117436990927831,
+          "n_rows": 25,
+          "n_masked_tokens": 52
+        },
+        "tra_mhc_one": {
+          "loss": 1.3755894502003987,
+          "perplexity": 3.957408730921265,
+          "n_rows": 1,
+          "n_masked_tokens": 3
+        },
+        "tra_peptide_mhc_two": {
+          "loss": 1.890412459266372,
+          "perplexity": 6.622099464122785,
+          "n_rows": 11,
+          "n_masked_tokens": 22
+        },
+        "tra_trb_peptide_mhc_two": {
+          "loss": 1.0716267871704321,
+          "perplexity": 2.920126061720585,
+          "n_rows": 96,
+          "n_masked_tokens": 339
+        },
+        "tra_peptide_mhc_one": {
+          "loss": 0.7687557625273863,
+          "perplexity": 2.1570806627828194,
+          "n_rows": 4,
+          "n_masked_tokens": 6
+        },
+        "trb_peptide_mhc_one": {
+          "loss": 0.33341569179719954,
+          "perplexity": 1.3957273703148634,
+          "n_rows": 8,
+          "n_masked_tokens": 16
+        },
+        "trb_mhc_one_mhc_two": {
+          "loss": 0.5591226439979096,
+          "perplexity": 1.7491372108664525,
+          "n_rows": 19,
+          "n_masked_tokens": 32
+        },
+        "tra_trb_mhc_one": {
+          "loss": 0.9384187895015607,
+          "perplexity": 2.5559367474155716,
+          "n_rows": 5,
+          "n_masked_tokens": 18
+        },
+        "tra_mhc_one_mhc_two": {
+          "loss": 1.1940851412364282,
+          "perplexity": 3.300536863786553,
+          "n_rows": 6,
+          "n_masked_tokens": 12
+        },
+        "trb_peptide_mhc_one_mhc_two": {
+          "loss": 0.39593853331952056,
+          "perplexity": 1.4857779889036766,
+          "n_rows": 37,
+          "n_masked_tokens": 67
+        },
+        "tra_trb_peptide_mhc_one_mhc_two": {
+          "loss": 1.1194525893394642,
+          "perplexity": 3.063176928550053,
+          "n_rows": 159,
+          "n_masked_tokens": 465
+        },
+        "tra_peptide_mhc_one_mhc_two": {
+          "loss": 1.401389810166532,
+          "perplexity": 4.060839843256884,
+          "n_rows": 15,
+          "n_masked_tokens": 31
+        },
+        "tra_trb_mhc_one_mhc_two": {
+          "loss": 1.2585377806497582,
+          "perplexity": 3.5202703148386747,
+          "n_rows": 58,
+          "n_masked_tokens": 171
+        },
+        "tra_trb_peptide_mhc_one": {
+          "loss": 1.3051755504817102,
+          "perplexity": 3.6883365261286882,
+          "n_rows": 18,
+          "n_masked_tokens": 67
+        }
+      }
+    },
+    "pocket": {
+      "overall": {
+        "_": {
+          "loss": 2.6480649375109753,
+          "perplexity": 14.126676178704514,
+          "n_rows": 4442,
+          "n_masked_tokens": 25966
+        }
+      },
+      "stratum_key": {
+        "II_partial_DQ_beta": {
+          "loss": 2.731159831588784,
+          "perplexity": 15.350680903579617,
+          "n_rows": 195,
+          "n_masked_tokens": 564
+        },
+        "II_partial_DR_beta": {
+          "loss": 2.75077195749307,
+          "perplexity": 15.654711993147924,
+          "n_rows": 1541,
+          "n_masked_tokens": 4565
+        },
+        "II_partial_DP_beta": {
+          "loss": 2.781435187906027,
+          "perplexity": 16.142171380585857,
+          "n_rows": 158,
+          "n_masked_tokens": 490
+        },
+        "I": {
+          "loss": 2.7928058643426215,
+          "perplexity": 16.32676628391025,
+          "n_rows": 23,
+          "n_masked_tokens": 140
+        },
+        "none_nseg2": {
+          "loss": 2.5816859802986025,
+          "perplexity": 13.219407041766734,
+          "n_rows": 119,
+          "n_masked_tokens": 686
+        },
+        "II_complete": {
+          "loss": 2.6199294683619403,
+          "perplexity": 13.734754816158365,
+          "n_rows": 2369,
+          "n_masked_tokens": 19311
+        },
+        "none_nseg3": {
+          "loss": 2.5293488092061165,
+          "perplexity": 12.545334070117105,
+          "n_rows": 19,
+          "n_masked_tokens": 113
+        },
+        "none_nseg4+": {
+          "loss": 2.657721772098664,
+          "perplexity": 14.263755966983053,
+          "n_rows": 18,
+          "n_masked_tokens": 97
+        }
+      },
+      "mhc_class": {
+        "II_partial_DQ_beta": {
+          "loss": 2.731159831588784,
+          "perplexity": 15.350680903579617,
+          "n_rows": 195,
+          "n_masked_tokens": 564
+        },
+        "II_partial_DR_beta": {
+          "loss": 2.75077195749307,
+          "perplexity": 15.654711993147924,
+          "n_rows": 1541,
+          "n_masked_tokens": 4565
+        },
+        "II_partial_DP_beta": {
+          "loss": 2.781435187906027,
+          "perplexity": 16.142171380585857,
+          "n_rows": 158,
+          "n_masked_tokens": 490
+        },
+        "I": {
+          "loss": 2.7928058643426215,
+          "perplexity": 16.32676628391025,
+          "n_rows": 23,
+          "n_masked_tokens": 140
+        },
+        "none": {
+          "loss": 2.583316975244088,
+          "perplexity": 13.240985420163755,
+          "n_rows": 156,
+          "n_masked_tokens": 896
+        },
+        "II_complete": {
+          "loss": 2.6199294683619403,
+          "perplexity": 13.734754816158365,
+          "n_rows": 2369,
+          "n_masked_tokens": 19311
+        }
+      },
+      "n_segments": {
+        "1": {
+          "loss": 2.82784453714103,
+          "perplexity": 16.90897484931404,
+          "n_rows": 11,
+          "n_masked_tokens": 57
+        },
+        "2": {
+          "loss": 2.718579582303387,
+          "perplexity": 15.158775153154885,
+          "n_rows": 1867,
+          "n_masked_tokens": 5950
+        },
+        "3": {
+          "loss": 2.6110134411992467,
+          "perplexity": 13.612839676135977,
+          "n_rows": 2157,
+          "n_masked_tokens": 17686
+        },
+        "4": {
+          "loss": 2.761229379283027,
+          "perplexity": 15.819278892481739,
+          "n_rows": 240,
+          "n_masked_tokens": 1311
+        },
+        "5": {
+          "loss": 2.728236046567435,
+          "perplexity": 15.305864361579578,
+          "n_rows": 167,
+          "n_masked_tokens": 962
+        }
+      },
+      "subset_key": {
+        "mhc_two": {
+          "loss": 2.8467555897576466,
+          "perplexity": 17.23178407308201,
+          "n_rows": 3,
+          "n_masked_tokens": 7
+        },
+        "peptide_mhc_two": {
+          "loss": 2.7362171227630236,
+          "perplexity": 15.42851040397278,
+          "n_rows": 1718,
+          "n_masked_tokens": 5133
+        },
+        "trb_mhc_two": {
+          "loss": 2.5555483996868134,
+          "perplexity": 12.878360210048656,
+          "n_rows": 8,
+          "n_masked_tokens": 21
+        },
+        "mhc_one": {
+          "loss": 2.825196989774704,
+          "perplexity": 16.864266747008863,
+          "n_rows": 8,
+          "n_masked_tokens": 50
+        },
+        "tra_mhc_two": {
+          "loss": 3.0813300609588623,
+          "perplexity": 21.7873616522702,
+          "n_rows": 6,
+          "n_masked_tokens": 10
+        },
+        "peptide_mhc_one": {
+          "loss": 2.606629682280927,
+          "perplexity": 13.553294879177113,
+          "n_rows": 133,
+          "n_masked_tokens": 769
+        },
+        "tra_peptide_mhc_two": {
+          "loss": 3.082911606132984,
+          "perplexity": 21.821846611520574,
+          "n_rows": 16,
+          "n_masked_tokens": 40
+        },
+        "trb_peptide_mhc_two": {
+          "loss": 2.8854763394464618,
+          "perplexity": 17.91209780247395,
+          "n_rows": 31,
+          "n_masked_tokens": 92
+        },
+        "tra_trb_mhc_two": {
+          "loss": 2.7895600410799184,
+          "perplexity": 16.273858397375996,
+          "n_rows": 17,
+          "n_masked_tokens": 48
+        },
+        "mhc_one_mhc_two": {
+          "loss": 2.5296652555465697,
+          "perplexity": 12.549304623373748,
+          "n_rows": 1,
+          "n_masked_tokens": 10
+        },
+        "tra_mhc_one": {
+          "loss": 2.324475475719997,
+          "perplexity": 10.221317350347602,
+          "n_rows": 1,
+          "n_masked_tokens": 7
+        },
+        "tra_trb_peptide_mhc_two": {
+          "loss": 2.9420246504692,
+          "perplexity": 18.95418308555361,
+          "n_rows": 95,
+          "n_masked_tokens": 268
+        },
+        "peptide_mhc_one_mhc_two": {
+          "loss": 2.6086032265416352,
+          "perplexity": 13.58006931807945,
+          "n_rows": 2038,
+          "n_masked_tokens": 17081
+        },
+        "tra_mhc_one_mhc_two": {
+          "loss": 2.67294568039268,
+          "perplexity": 14.482567436528482,
+          "n_rows": 11,
+          "n_masked_tokens": 107
+        },
+        "trb_mhc_one_mhc_two": {
+          "loss": 2.567469442944701,
+          "perplexity": 13.032802426380181,
+          "n_rows": 25,
+          "n_masked_tokens": 205
+        },
+        "tra_peptide_mhc_one": {
+          "loss": 2.607606046474897,
+          "perplexity": 13.56653429320061,
+          "n_rows": 4,
+          "n_masked_tokens": 26
+        },
+        "tra_trb_mhc_one": {
+          "loss": 2.5822908907300897,
+          "perplexity": 13.227406018072564,
+          "n_rows": 6,
+          "n_masked_tokens": 36
+        },
+        "trb_peptide_mhc_one": {
+          "loss": 2.45208208167962,
+          "perplexity": 11.612499739179338,
+          "n_rows": 9,
+          "n_masked_tokens": 51
+        },
+        "tra_peptide_mhc_one_mhc_two": {
+          "loss": 2.6861040384576813,
+          "perplexity": 14.674393535043025,
+          "n_rows": 20,
+          "n_masked_tokens": 164
+        },
+        "trb_peptide_mhc_one_mhc_two": {
+          "loss": 2.828983483534158,
+          "perplexity": 16.928244236546682,
+          "n_rows": 45,
+          "n_masked_tokens": 327
+        },
+        "tra_trb_peptide_mhc_one_mhc_two": {
+          "loss": 2.728236046567435,
+          "perplexity": 15.305864361579578,
+          "n_rows": 167,
+          "n_masked_tokens": 962
+        },
+        "tra_trb_mhc_one_mhc_two": {
+          "loss": 2.6551899705450612,
+          "perplexity": 14.227688644383347,
+          "n_rows": 62,
+          "n_masked_tokens": 455
+        },
+        "tra_trb_peptide_mhc_one": {
+          "loss": 2.657721772098664,
+          "perplexity": 14.263755966983053,
+          "n_rows": 18,
+          "n_masked_tokens": 97
+        }
+      }
+    },
+    "pocket_contact_only": {},
+    "peptide": {
+      "overall": {
+        "_": {
+          "loss": 2.789547891488082,
+          "perplexity": 16.27366067783997,
+          "n_rows": 4477,
+          "n_masked_tokens": 10959
+        }
+      },
+      "stratum_key": {
+        "none_nseg1": {
+          "loss": 2.7661410641164808,
+          "perplexity": 15.897169334756219,
+          "n_rows": 154,
+          "n_masked_tokens": 342
+        },
+        "none_nseg2": {
+          "loss": 2.9600379100058882,
+          "perplexity": 19.298703355593034,
+          "n_rows": 335,
+          "n_masked_tokens": 708
+        },
+        "none_nseg3": {
+          "loss": 3.009115737443993,
+          "perplexity": 20.269468466355548,
+          "n_rows": 239,
+          "n_masked_tokens": 458
+        },
+        "II_partial_DR_beta": {
+          "loss": 2.774605502869379,
+          "perplexity": 16.032301051192288,
+          "n_rows": 1443,
+          "n_masked_tokens": 3857
+        },
+        "II_partial_DP_beta": {
+          "loss": 2.8139452953769273,
+          "perplexity": 16.67557869215841,
+          "n_rows": 146,
+          "n_masked_tokens": 382
+        },
+        "II_partial_DQ_beta": {
+          "loss": 2.7592625252276886,
+          "perplexity": 15.788195258146281,
+          "n_rows": 167,
+          "n_masked_tokens": 393
+        },
+        "I": {
+          "loss": 2.8070935882054844,
+          "perplexity": 16.56171304254941,
+          "n_rows": 13,
+          "n_masked_tokens": 26
+        },
+        "II_complete": {
+          "loss": 2.757556633709308,
+          "perplexity": 15.761285269051768,
+          "n_rows": 1967,
+          "n_masked_tokens": 4768
+        },
+        "none_nseg4+": {
+          "loss": 2.7507235288619993,
+          "perplexity": 15.653953875233745,
+          "n_rows": 13,
+          "n_masked_tokens": 25
+        }
+      },
+      "mhc_class": {
+        "none": {
+          "loss": 2.928030124059298,
+          "perplexity": 18.690775699537898,
+          "n_rows": 741,
+          "n_masked_tokens": 1533
+        },
+        "II_partial_DR_beta": {
+          "loss": 2.774605502869379,
+          "perplexity": 16.032301051192288,
+          "n_rows": 1443,
+          "n_masked_tokens": 3857
+        },
+        "II_partial_DP_beta": {
+          "loss": 2.8139452953769273,
+          "perplexity": 16.67557869215841,
+          "n_rows": 146,
+          "n_masked_tokens": 382
+        },
+        "II_partial_DQ_beta": {
+          "loss": 2.7592625252276886,
+          "perplexity": 15.788195258146281,
+          "n_rows": 167,
+          "n_masked_tokens": 393
+        },
+        "I": {
+          "loss": 2.8070935882054844,
+          "perplexity": 16.56171304254941,
+          "n_rows": 13,
+          "n_masked_tokens": 26
+        },
+        "II_complete": {
+          "loss": 2.757556633709308,
+          "perplexity": 15.761285269051768,
+          "n_rows": 1967,
+          "n_masked_tokens": 4768
+        }
+      },
+      "n_segments": {
+        "1": {
+          "loss": 2.7661410641164808,
+          "perplexity": 15.897169334756219,
+          "n_rows": 154,
+          "n_masked_tokens": 342
+        },
+        "2": {
+          "loss": 2.781366323583987,
+          "perplexity": 16.141059799172073,
+          "n_rows": 1967,
+          "n_masked_tokens": 5035
+        },
+        "3": {
+          "loss": 2.773724893808845,
+          "perplexity": 16.018189076103916,
+          "n_rows": 2092,
+          "n_masked_tokens": 4970
+        },
+        "4": {
+          "loss": 3.047893614895391,
+          "perplexity": 21.070914185592486,
+          "n_rows": 158,
+          "n_masked_tokens": 356
+        },
+        "5": {
+          "loss": 2.92965941606235,
+          "perplexity": 18.7212532525906,
+          "n_rows": 106,
+          "n_masked_tokens": 256
+        }
+      },
+      "subset_key": {
+        "peptide": {
+          "loss": 2.7661410641164808,
+          "perplexity": 15.897169334756219,
+          "n_rows": 154,
+          "n_masked_tokens": 342
+        },
+        "trb_peptide": {
+          "loss": 3.0722754357116564,
+          "perplexity": 21.59097569972921,
+          "n_rows": 208,
+          "n_masked_tokens": 420
+        },
+        "tra_peptide": {
+          "loss": 3.071570924737237,
+          "perplexity": 21.57576997732841,
+          "n_rows": 18,
+          "n_masked_tokens": 33
+        },
+        "tra_trb_peptide": {
+          "loss": 3.002180892930414,
+          "perplexity": 20.129389129769514,
+          "n_rows": 227,
+          "n_masked_tokens": 426
+        },
+        "peptide_mhc_two": {
+          "loss": 2.7517991550029905,
+          "perplexity": 15.670800736069493,
+          "n_rows": 1619,
+          "n_masked_tokens": 4301
+        },
+        "peptide_mhc_one": {
+          "loss": 2.765031139011697,
+          "perplexity": 15.879534455924356,
+          "n_rows": 122,
+          "n_masked_tokens": 281
+        },
+        "tra_peptide_mhc_two": {
+          "loss": 3.027206273873647,
+          "perplexity": 20.639490884771412,
+          "n_rows": 15,
+          "n_masked_tokens": 30
+        },
+        "trb_peptide_mhc_two": {
+          "loss": 2.8105489681164424,
+          "perplexity": 16.619039037595833,
+          "n_rows": 30,
+          "n_masked_tokens": 75
+        },
+        "tra_trb_peptide_mhc_two": {
+          "loss": 3.2029874925790107,
+          "perplexity": 24.60593053590912,
+          "n_rows": 92,
+          "n_masked_tokens": 226
+        },
+        "peptide_mhc_one_mhc_two": {
+          "loss": 2.746909542467816,
+          "perplexity": 15.594363618588217,
+          "n_rows": 1808,
+          "n_masked_tokens": 4407
+        },
+        "tra_peptide_mhc_one": {
+          "loss": 3.076229977607727,
+          "perplexity": 21.67652716464632,
+          "n_rows": 4,
+          "n_masked_tokens": 10
+        },
+        "trb_peptide_mhc_one": {
+          "loss": 3.112893072041598,
+          "perplexity": 22.486004018564046,
+          "n_rows": 8,
+          "n_masked_tokens": 22
+        },
+        "tra_peptide_mhc_one_mhc_two": {
+          "loss": 2.8367743651072184,
+          "perplexity": 17.060645273328294,
+          "n_rows": 16,
+          "n_masked_tokens": 30
+        },
+        "trb_peptide_mhc_one_mhc_two": {
+          "loss": 2.764048458735148,
+          "perplexity": 15.863937615222712,
+          "n_rows": 37,
+          "n_masked_tokens": 75
+        },
+        "tra_trb_peptide_mhc_one_mhc_two": {
+          "loss": 2.92965941606235,
+          "perplexity": 18.7212532525906,
+          "n_rows": 106,
+          "n_masked_tokens": 256
+        },
+        "tra_trb_peptide_mhc_one": {
+          "loss": 2.7507235288619993,
+          "perplexity": 15.653953875233745,
+          "n_rows": 13,
+          "n_masked_tokens": 25
+        }
+      }
+    },
+    "framework": {},
+    "_diagnostics": {
+      "n_rows_total": 19708,
+      "n_rows_tokenized": 19708,
+      "n_rows_empty": 0,
+      "n_rows_annot_fail": 0,
+      "tcr_variant": "cdr123",
+      "mhc_variant": "pocket",
+      "eos_strategy": "raw",
+      "mlm_probability": 0.15,
+      "mask_seed": 12345
+    }
+  }
+}
