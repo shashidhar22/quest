@@ -1,0 +1,93 @@
+{
+  "n_patience": 3,
+  "min_rel_improvement": 0.01,
+  "metric_path": [
+    "pocket",
+    "overall",
+    "_",
+    "perplexity"
+  ],
+  "best": 2.0899975240174995,
+  "history": [
+    {
+      "metric": 3.79623337658782,
+      "best": 3.79623337658782,
+      "improved": true
+    },
+    {
+      "metric": 3.518120314275728,
+      "best": 3.518120314275728,
+      "improved": true
+    },
+    {
+      "metric": 3.0033764053501057,
+      "best": 3.0033764053501057,
+      "improved": true
+    },
+    {
+      "metric": 2.86434891888445,
+      "best": 2.86434891888445,
+      "improved": true
+    },
+    {
+      "metric": 2.6708760841927424,
+      "best": 2.6708760841927424,
+      "improved": true
+    },
+    {
+      "metric": 2.558958641133102,
+      "best": 2.558958641133102,
+      "improved": true
+    },
+    {
+      "metric": 2.437006375828584,
+      "best": 2.437006375828584,
+      "improved": true
+    },
+    {
+      "metric": 2.3913213139908733,
+      "best": 2.3913213139908733,
+      "improved": true
+    },
+    {
+      "metric": 2.335314924851862,
+      "best": 2.335314924851862,
+      "improved": true
+    },
+    {
+      "metric": 2.2880376726868783,
+      "best": 2.2880376726868783,
+      "improved": true
+    },
+    {
+      "metric": 2.2640174482813613,
+      "best": 2.2640174482813613,
+      "improved": true
+    },
+    {
+      "metric": 2.14563787739203,
+      "best": 2.14563787739203,
+      "improved": true
+    },
+    {
+      "metric": 2.129948740488092,
+      "best": 2.129948740488092,
+      "improved": false
+    },
+    {
+      "metric": 2.097594555859794,
+      "best": 2.097594555859794,
+      "improved": true
+    },
+    {
+      "metric": 2.0915214455237536,
+      "best": 2.0915214455237536,
+      "improved": false
+    },
+    {
+      "metric": 2.0899975240174995,
+      "best": 2.0899975240174995,
+      "improved": false
+    }
+  ]
+}

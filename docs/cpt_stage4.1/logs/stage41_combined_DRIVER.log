@@ -1,0 +1,81 @@
+[2026-10-02 19:50:30] === Stage 4.1 pipeline start ===
+[2026-10-02 19:50:30] FIXED_MAX_LENGTH=1024  buckets=[64, 128, 256, 512, 1024]  effective_batch=1024  gpus=4
+[2026-10-02 19:50:30] === Stage 4.1 preflight ===
+[2026-10-02 19:50:30]   OK canonical eval present: /home/ubuntu/quest/data/cpt_canonical_eval_v2
+[2026-10-02 19:50:30]   OK dataset present: pointA_run01 -> run01_cdr3_pocket_proportional_10M
+[2026-10-02 19:50:30]   OK dataset present: pointD_run05 -> run05_cdr3_fullmhc_proportional_10M
+[2026-10-02 19:50:30]   OK dataset present: pointF_run11 -> run11_cdr123_fullmhc_proportional_10M
+[2026-10-02 19:50:30]   OK effective batch 1024 for pointA_run01
+[2026-10-02 19:50:30]   OK effective batch 1024 for pointD_run05
+[2026-10-02 19:50:30]   OK effective batch 1024 for pointF_run11
+[2026-10-02 19:50:43]   OK pointA_run01 max tokens 162 <= 1024 (no truncation)
+[2026-10-02 19:50:54]   OK pointD_run05 max tokens 578 <= 1024 (no truncation)
+[2026-10-02 19:51:07]   OK pointF_run11 max tokens 608 <= 1024 (no truncation)
+[2026-10-02 19:51:07] === preflight PASS ===
+[2026-10-02 19:51:07] --- pointA_run01 (cdr3 x pocket) start  [Stage 4: max_length=64 (truncating; dataset max is 162)]
+[2026-10-02 19:51:07]   CMD: torchrun --nproc_per_node=4 --master_port=29750 /home/ubuntu/quest/scripts/training/train_cpt_stage2_single.py --dataset_path /home/ubuntu/quest/data/cpt_datasets/run01_cdr3_pocket_proportional_10M --output_dir /home/ubuntu/quest/checkpoints/cpt_stage41_pointA_run01 --tcr_variant cdr3 --mhc_variant pocket --max_length 1024 --batch_size 128 --gradient_accumulation_steps 2 --bucket_boundaries 64 128 256 512 1024 --wandb_run_name stage41-pointA-cdr3-pocket --base_model esmc_300m --canonical_eval_path /home/ubuntu/quest/data/cpt_canonical_eval_v2 --eos_strategy raw --num_epochs 1 --lr 2e-4 --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 --eval_steps 500 --save_steps 2000 --logging_steps 50 --no_compile --attn_implementation sdpa --wandb_project tcrbench-v3-cpt-stage41 --report_to wandb --early_stop_n_patience 3 --early_stop_min_rel 0.01 --early_stop_metric_path pocket overall _ perplexity
+[2026-10-02 19:51:40] === Stage 4.1 pipeline start ===
+[2026-10-02 19:51:40] FIXED_MAX_LENGTH=1024  buckets=[64, 128, 256, 512, 1024]  effective_batch=1024  gpus=4
+[2026-10-02 19:51:40] === Stage 4.1 preflight ===
+[2026-10-02 19:51:40]   OK canonical eval present: /home/ubuntu/quest/data/cpt_canonical_eval_v2
+[2026-10-02 19:51:40]   OK dataset present: pointA_run01 -> run01_cdr3_pocket_proportional_10M
+[2026-10-02 19:51:40]   OK dataset present: pointD_run05 -> run05_cdr3_fullmhc_proportional_10M
+[2026-10-02 19:51:40]   OK dataset present: pointF_run11 -> run11_cdr123_fullmhc_proportional_10M
+[2026-10-02 19:51:40]   OK effective batch 1024 for pointA_run01
+[2026-10-02 19:51:40]   OK effective batch 1024 for pointD_run05
+[2026-10-02 19:51:40]   OK effective batch 1024 for pointF_run11
+[2026-10-02 19:51:53]   OK pointA_run01 max tokens 162 <= 1024 (no truncation)
+[2026-10-02 19:52:04]   OK pointD_run05 max tokens 578 <= 1024 (no truncation)
+[2026-10-02 19:52:17]   OK pointF_run11 max tokens 608 <= 1024 (no truncation)
+[2026-10-02 19:52:17] === preflight PASS ===
+[2026-10-02 19:52:17] --- pointA_run01 (cdr3 x pocket) start  [Stage 4: max_length=64 (truncating; dataset max is 162)]
+[2026-10-02 19:52:17]   CMD: torchrun --nproc_per_node=4 --master_port=29750 /home/ubuntu/quest/scripts/training/train_cpt_stage2_single.py --dataset_path /home/ubuntu/quest/data/cpt_datasets/run01_cdr3_pocket_proportional_10M --output_dir /home/ubuntu/quest/checkpoints/cpt_stage41_pointA_run01 --tcr_variant cdr3 --mhc_variant pocket --max_length 1024 --batch_size 128 --gradient_accumulation_steps 2 --bucket_boundaries 64 128 256 512 1024 --wandb_run_name stage41-pointA-cdr3-pocket --base_model esmc_300m --canonical_eval_path /home/ubuntu/quest/data/cpt_canonical_eval_v2 --eos_strategy raw --num_epochs 1 --lr 2e-4 --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 --eval_steps 500 --save_steps 2000 --logging_steps 50 --no_compile --attn_implementation sdpa --wandb_project tcrbench-v3-cpt-stage41 --report_to wandb --early_stop_n_patience 3 --early_stop_min_rel 0.01 --early_stop_metric_path pocket overall _ perplexity
+[2026-10-02 21:27:17] --- pointA_run01 DONE in 1.58 hr  metrics={'overall_ppl': 4.405138963672459, 'cdr3_ppl': 3.8492634948548394, 'cdr12_ppl': None, 'pocket_ppl': 3.368017095165239, 'pocket_contact_only_ppl': None, 'peptide_ppl': 14.907689069563748, 'framework_ppl': None, 'global_step': 7800, 'result_file': '/home/ubuntu/quest/checkpoints/cpt_stage41_pointA_run01/final/canonical_v2_results.json'}
+[2026-10-02 21:27:17] --- pointD_run05 (cdr3 x full MHC) start  [Stage 4: max_length=1024 (already non-truncating) — reproducibility control]
+[2026-10-02 21:27:17]   CMD: torchrun --nproc_per_node=4 --master_port=29751 /home/ubuntu/quest/scripts/training/train_cpt_stage2_single.py --dataset_path /home/ubuntu/quest/data/cpt_datasets/run05_cdr3_fullmhc_proportional_10M --output_dir /home/ubuntu/quest/checkpoints/cpt_stage41_pointD_run05 --tcr_variant cdr3 --mhc_variant full --max_length 1024 --batch_size 16 --gradient_accumulation_steps 16 --bucket_boundaries 64 128 256 512 1024 --wandb_run_name stage41-pointD-cdr3-fullmhc --base_model esmc_300m --canonical_eval_path /home/ubuntu/quest/data/cpt_canonical_eval_v2 --eos_strategy raw --num_epochs 1 --lr 2e-4 --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 --eval_steps 500 --save_steps 2000 --logging_steps 50 --no_compile --attn_implementation sdpa --wandb_project tcrbench-v3-cpt-stage41 --report_to wandb --early_stop_n_patience 3 --early_stop_min_rel 0.01 --early_stop_metric_path pocket overall _ perplexity --gradient_checkpointing
+[2026-10-03 03:26:06] --- pointD_run05 DONE in 5.98 hr  metrics={'overall_ppl': 1.7256057607799085, 'cdr3_ppl': 4.023705574059983, 'cdr12_ppl': None, 'pocket_ppl': 1.862336150388746, 'pocket_contact_only_ppl': 4.162447613648795, 'peptide_ppl': 15.213914412289514, 'framework_ppl': 1.2745270710321916, 'global_step': 7800, 'result_file': '/home/ubuntu/quest/checkpoints/cpt_stage41_pointD_run05/final/canonical_v2_results.json'}
+[2026-10-03 03:26:06] --- pointF_run11 (cdr123 x full MHC) start  [Stage 4: NEW — Stage 4 Point B was cdr123 x pocket_contact]
+[2026-10-03 03:26:06]   CMD: torchrun --nproc_per_node=4 --master_port=29752 /home/ubuntu/quest/scripts/training/train_cpt_stage2_single.py --dataset_path /home/ubuntu/quest/data/cpt_datasets/run11_cdr123_fullmhc_proportional_10M --output_dir /home/ubuntu/quest/checkpoints/cpt_stage41_pointF_run11 --tcr_variant cdr123 --mhc_variant full --max_length 1024 --batch_size 16 --gradient_accumulation_steps 16 --bucket_boundaries 64 128 256 512 1024 --wandb_run_name stage41-pointF-cdr123-fullmhc --base_model esmc_300m --canonical_eval_path /home/ubuntu/quest/data/cpt_canonical_eval_v2 --eos_strategy raw --num_epochs 1 --lr 2e-4 --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 --eval_steps 500 --save_steps 2000 --logging_steps 50 --no_compile --attn_implementation sdpa --wandb_project tcrbench-v3-cpt-stage41 --report_to wandb --early_stop_n_patience 3 --early_stop_min_rel 0.01 --early_stop_metric_path pocket overall _ perplexity --gradient_checkpointing
+[2026-10-03 09:28:58] --- pointF_run11 DONE in 6.05 hr  metrics={'overall_ppl': 1.9663056435227693, 'cdr3_ppl': 5.78601288900132, 'cdr12_ppl': 2.2598366532123944, 'pocket_ppl': 2.0899975240174995, 'pocket_contact_only_ppl': 4.022778807913081, 'peptide_ppl': 16.648633529793596, 'framework_ppl': 1.3764570005639383, 'global_step': 7800, 'result_file': '/home/ubuntu/quest/checkpoints/cpt_stage41_pointF_run11/final/canonical_v2_results.json'}
+[2026-10-03 09:28:58] === Stage 4.1 pipeline complete ===
+[2026-10-03 09:28:58] {
+  "pointA_run01": {
+    "status": "PASS",
+    "elapsed_hr": 1.5834451410505506,
+    "overall_ppl": 4.405138963672459,
+    "cdr3_ppl": 3.8492634948548394,
+    "cdr12_ppl": null,
+    "pocket_ppl": 3.368017095165239,
+    "pocket_contact_only_ppl": null,
+    "peptide_ppl": 14.907689069563748,
+    "framework_ppl": null,
+    "global_step": 7800,
+    "result_file": "/home/ubuntu/quest/checkpoints/cpt_stage41_pointA_run01/final/canonical_v2_results.json"
+  },
+  "pointD_run05": {
+    "status": "PASS",
+    "elapsed_hr": 5.9802027063237295,
+    "overall_ppl": 1.7256057607799085,
+    "cdr3_ppl": 4.023705574059983,
+    "cdr12_ppl": null,
+    "pocket_ppl": 1.862336150388746,
+    "pocket_contact_only_ppl": 4.162447613648795,
+    "peptide_ppl": 15.213914412289514,
+    "framework_ppl": 1.2745270710321916,
+    "global_step": 7800,
+    "result_file": "/home/ubuntu/quest/checkpoints/cpt_stage41_pointD_run05/final/canonical_v2_results.json"
+  },
+  "pointF_run11": {
+    "status": "PASS",
+    "elapsed_hr": 6.047680936389499,
+    "overall_ppl": 1.9663056435227693,
+    "cdr3_ppl": 5.78601288900132,
+    "cdr12_ppl": 2.2598366532123944,
+    "pocket_ppl": 2.0899975240174995,
+    "pocket_contact_only_ppl": 4.022778807913081,
+    "peptide_ppl": 16.648633529793596,
+    "framework_ppl": 1.3764570005639383,
+    "global_step": 7800,
+    "result_file": "/home/ubuntu/quest/checkpoints/cpt_stage41_pointF_run11/final/canonical_v2_results.json"
+  }
+}

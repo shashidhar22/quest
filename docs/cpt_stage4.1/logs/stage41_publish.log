@@ -1,0 +1,26 @@
+[2026-10-04 00:03:05] manual publish (watcher loop never fired: pgrep -f matched the tmux wrapper's cmdline)
+[2026-10-04 00:03:05] done markers: 3 of 3
+/home/ubuntu/quest/scripts/training/build_stage41_summary.py:102: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  lines.append(f"Generated: {datetime.utcnow().isoformat()}Z")
+Traceback (most recent call last):
+  File "/home/ubuntu/quest/scripts/training/build_stage41_summary.py", line 244, in <module>
+    main()
+    ~~~~^^
+  File "/home/ubuntu/quest/scripts/training/build_stage41_summary.py", line 129, in main
+    f"| {pt['key']} | {pt['tcr']} | {pt['mhc']} | {dataset_by_key[pt['key']]} | {status} | {elapsed or '—'} |"
+                                                   ~~~~~~~~~~~~~~^^^^^^^^^^^
+KeyError: 'F'
+[2026-10-04 00:03:05] summary rc=1
+[2026-10-04 00:03:05] syncing cpt_stage41_pointA_run01
+[2026-10-04 00:03:07]   rc=0 objects_now=35
+[2026-10-04 00:03:07] syncing cpt_stage41_pointD_run05
+[2026-10-04 00:03:10]   rc=0 objects_now=35
+[2026-10-04 00:03:10] syncing cpt_stage41_pointF_run11
+[2026-10-04 00:03:13]   rc=0 objects_now=35
+[2026-10-04 00:03:14] uploaded stage41_launch.log rc=0
+[2026-10-04 00:03:14] uploaded stage41_combined_DRIVER.log rc=0
+[2026-10-04 00:03:15] uploaded stage41_run11_build.log rc=0
+[2026-10-04 00:03:16] uploaded stage41_maxlen.log rc=0
+[2026-10-04 00:03:17] uploaded stage41_maxlen_run11.log rc=0
+[2026-10-04 00:03:18] uploaded stage41_validate_pointD_rescore.json rc=0
+[2026-10-04 00:03:18] PUBLISH_DONE

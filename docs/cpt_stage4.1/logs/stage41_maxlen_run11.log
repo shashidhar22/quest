@@ -1,0 +1,14 @@
+tokenizer: EsmSequenceTokenizer
+
+=== run11_cdr123_fullmhc_proportional_10M ===
+  test        rows=1,009,000  MAX_TOK=  607  max_chars=  637  p50=  32 p95=  35 p99=  56  coverage=OK
+              %rows over window: 64:0.51%  128:0.476%  256:0.476%  384:0.238%  512:0.238%  1024:0.0%
+  train       rows=7,987,764  MAX_TOK=  603  max_chars=  633  p50=  30 p95=  32 p99=  35  coverage=OK
+              %rows over window: 64:0.33%  128:0.322%  256:0.322%  384:0.122%  512:0.122%  1024:0.0%
+  validation  rows=1,001,780  MAX_TOK=  608  max_chars=  638  p50=  27 p95=  35 p99=  54  coverage=OK
+              %rows over window: 64:0.352%  128:0.314%  256:0.312%  384:0.14%  512:0.14%  1024:0.0%
+  -> dataset max tokens: 608
+
+GLOBAL MAX TOKENS = 608   (coverage complete: True)
+SMALLEST SAFE max_length (power-of-2-ish) = 640
+EXIT=0

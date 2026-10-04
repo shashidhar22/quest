@@ -1,0 +1,10 @@
+STATUS=PASS
+elapsed_hr=1.58
+max_length=1024
+effective_batch=1024
+overall_ppl=4.405138963672459
+cdr3_ppl=3.8492634948548394
+pocket_ppl=3.368017095165239
+peptide_ppl=14.907689069563748
+global_step=7800
+result_file=/home/ubuntu/quest/checkpoints/cpt_stage41_pointA_run01/final/canonical_v2_results.json

@@ -1,0 +1,12 @@
+STATUS=PASS
+elapsed_hr=5.98
+max_length=1024
+effective_batch=1024
+overall_ppl=1.7256057607799085
+cdr3_ppl=4.023705574059983
+pocket_ppl=1.862336150388746
+pocket_contact_only_ppl=4.162447613648795
+peptide_ppl=15.213914412289514
+framework_ppl=1.2745270710321916
+global_step=7800
+result_file=/home/ubuntu/quest/checkpoints/cpt_stage41_pointD_run05/final/canonical_v2_results.json
