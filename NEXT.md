@@ -12,10 +12,12 @@ idle incident). Start Stage 4.2 (`plans/stage4-2.md`) and 4.3 in parallel.
 '<publish cmd>'` with `MAX_HOURS` set to ~1.5× the expected run, in its own tmux session.
 The old name-pattern watcher cost ~USD 100 on 2026-10-03.
 
-**Uncommitted and only on this laptop:** this repo has no commits since the recovery work.
-New since then: `plans/stage4-2..7.md`, `scripts/training/autostop_when_done.sh`,
-`tests/test_autostop_when_done.sh`, the fixed `build_stage41_summary.py`, and
-`docs/cpt_stage4.1/{SUMMARY.md,results/,logs/}`. Commit + install the backup standard next.
+**Committed but NOT pushed (no backup yet).** Branch `yxu2/tcrbench2-continue` is 7 commits
+ahead of anything on `origin` (`shashidhar22/quest`, a collaborator's repo — push needs
+Yuexin's go-ahead; the branch has never been pushed). Until it is, the recovered Stage 0–4
+scripts, `track_a/`, Stage 4.1 results and the 4.2–4.7 plans exist only on this laptop. The
+repo also lacks the backup standard (`scripts/claude-memory.sh`, `MIGRATE.md`).
+`track_a/monitor/` (5,196 polling snapshots) is excluded locally via `.git/info/exclude`.
 
 ## Status at wrap-up
 
