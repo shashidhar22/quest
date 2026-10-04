@@ -131,8 +131,36 @@ def project_input_text(tcr_variant: str, mhc_variant: str, row: dict) -> str:
     return EOS.join(segments)
 
 
+def _ii_beta_subclass(allele: str) -> str:
+    """DRB/DPB/DQB sub-label for a class-II beta allele name."""
+    s = allele.upper()
+    for pref in ('HLA-', 'HLA_', 'HLA*', 'HLA'):
+        if s.startswith(pref):
+            s = s[len(pref):]
+            break
+    s = s.lstrip('-_*')
+    if s.startswith('DRB'):
+        return 'II_partial_DR_beta'
+    if s.startswith('DPB'):
+        return 'II_partial_DP_beta'
+    if s.startswith('DQB'):
+        return 'II_partial_DQ_beta'
+    return 'II_partial_DR_beta'
+
+
 def derive_mhc_class(mhc_one_allele, mhc_two_allele) -> str:
-    """Match the builder's mhc_class derivation logic."""
+    """Match the builder's mhc_class derivation logic.
+
+    Fixed 2026-10-02: the single-``mhc_one`` branch previously returned 'none'
+    for anything that was not class I, so a class-II chain sitting in the
+    ``mhc_one`` column was labelled 'none' despite carrying a real MHC. That is
+    not a corner case — the imgthla standardizer deliberately puts the class-II
+    ALPHA chain in ``mhc_one`` and the beta chain in ``mhc_two``. In
+    cpt_canonical_eval_v2 this mislabelled 157 of 19,708 rows (145 DQA1, 7 DRA,
+    5 DPA1), whose pocket residues were then reported under ``mhc_class=none``.
+    The region labels were always correct; only this stratum label was wrong.
+    Both single-chain branches now share the same class-II handling.
+    """
     c1 = hla_class(mhc_one_allele) if mhc_one_allele else 'null'
     c2 = hla_class(mhc_two_allele) if mhc_two_allele else 'null'
     has1 = mhc_one_allele not in (None, '')
@@ -141,24 +169,18 @@ def derive_mhc_class(mhc_one_allele, mhc_two_allele) -> str:
         return 'I' if c1 == 'I' else 'II_complete'
     if has2:
         if c2 == 'II_beta':
-            s = mhc_two_allele.upper()
-            for pref in ('HLA-', 'HLA_', 'HLA*', 'HLA'):
-                if s.startswith(pref):
-                    s = s[len(pref):]
-                    break
-            s = s.lstrip('-_*')
-            if s.startswith('DRB'):
-                return 'II_partial_DR_beta'
-            if s.startswith('DPB'):
-                return 'II_partial_DP_beta'
-            if s.startswith('DQB'):
-                return 'II_partial_DQ_beta'
-            return 'II_partial_DR_beta'
+            return _ii_beta_subclass(mhc_two_allele)
         if c2 in ('II_alpha', 'II_unknown_chain'):
             return 'II_partial_alpha'
         return 'none'
     if has1:
-        return 'I' if c1 == 'I' else 'none'
+        if c1 == 'I':
+            return 'I'
+        if c1 == 'II_beta':
+            return _ii_beta_subclass(mhc_one_allele)
+        if c1 in ('II_alpha', 'II_unknown_chain'):
+            return 'II_partial_alpha'
+        return 'none'
     return 'none'
 
 

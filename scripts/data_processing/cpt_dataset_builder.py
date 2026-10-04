@@ -692,7 +692,27 @@ def main():
                 ELSE 'none'
               END
             WHEN mhc_one_allele IS NOT NULL THEN
-              CASE ({h1}) WHEN 'I' THEN 'I' ELSE 'none' END
+              -- Fixed 2026-10-02: this branch previously collapsed every
+              -- non-class-I chain to 'none', so a class-II chain sitting in
+              -- mhc_one was mislabelled. That is the imgthla convention (class-II
+              -- ALPHA goes in mhc_one, beta in mhc_two), not a corner case: it
+              -- mislabelled 157 of cpt_canonical_eval_v2's 19,708 rows. Mirror
+              -- the mhc_two branch above.
+              CASE ({h1})
+                WHEN 'I' THEN 'I'
+                WHEN 'II_beta' THEN
+                  CASE
+                    WHEN substr(upper(replace(replace(replace(mhc_one_allele, 'HLA-', ''),
+                         'HLA_',''), 'HLA*', '')), 1, 3) = 'DRB' THEN 'II_partial_DR_beta'
+                    WHEN substr(upper(replace(replace(replace(mhc_one_allele, 'HLA-', ''),
+                         'HLA_',''), 'HLA*', '')), 1, 3) = 'DPB' THEN 'II_partial_DP_beta'
+                    WHEN substr(upper(replace(replace(replace(mhc_one_allele, 'HLA-', ''),
+                         'HLA_',''), 'HLA*', '')), 1, 3) = 'DQB' THEN 'II_partial_DQ_beta'
+                    ELSE 'II_partial_DR_beta' END
+                WHEN 'II_alpha' THEN 'II_partial_alpha'
+                WHEN 'II_unknown_chain' THEN 'II_partial_alpha'
+                ELSE 'none'
+              END
             ELSE 'none'
           END
         """

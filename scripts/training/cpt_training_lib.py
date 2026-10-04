@@ -841,6 +841,56 @@ def _preprocess_for_eos_strategy(text: str, eos_strategy: str) -> str:
     raise ValueError(f"unknown eos_strategy: {eos_strategy}")
 
 
+# ---------------------------------------------------------------------------
+# mhc_class stratum repair (added 2026-10-02)
+# ---------------------------------------------------------------------------
+# cpt_canonical_eval_v2 labels 157 of its 19,708 rows ``mhc_class='none'``
+# although they carry a fully populated MHC: a class-II ALPHA chain sitting in
+# the ``mhc_one`` column (145 DQA1, 7 DRA, 5 DPA1). That placement is the
+# imgthla standardizer's documented convention -- class-II alpha goes in
+# ``mhc_one``, beta in ``mhc_two`` -- but the builder's class derivation only
+# handled class-II chains found in ``mhc_two``, so these fell through to 'none'.
+#
+# The consequence is purely a REPORTING one: their pocket residues were always
+# labelled 'pocket' correctly (they genuinely are pocket residues), but they
+# were accumulated under the 'none' stratum, which is why every Stage 4 point
+# shows 835-888 pocket tokens for ``mhc_class=none`` despite SUMMARY claiming
+# "MHC-bearing rows only". Point D: 157 rows / 862 masked tokens.
+#
+# The repair below is deliberately conservative: it only ever reclassifies a row
+# whose STORED label is 'none' and which carries a non-empty allele. It can
+# therefore never move an already-classified row between strata, and every
+# 'overall' aggregate is untouched.
+_II_ALPHA_PREFIXES = ("DQA", "DRA", "DPA")
+_II_BETA_PREFIXES = {
+    "DRB": "II_partial_DR_beta",
+    "DPB": "II_partial_DP_beta",
+    "DQB": "II_partial_DQ_beta",
+}
+
+
+def _strip_hla_prefix(allele: str) -> str:
+    s = str(allele).upper().strip()
+    for pref in ("HLA-", "HLA_", "HLA*", "HLA"):
+        if s.startswith(pref):
+            s = s[len(pref):]
+            break
+    return s.lstrip("-_*")
+
+
+def _relabel_none_stratum(a1, a2):
+    """Corrected label for a row stored as 'none', or None to leave it alone."""
+    for allele in (a1, a2):
+        if not allele or not str(allele).strip():
+            continue
+        core = _strip_hla_prefix(allele)
+        if core[:3] in _II_BETA_PREFIXES:
+            return _II_BETA_PREFIXES[core[:3]]
+        if core[:3] in _II_ALPHA_PREFIXES:
+            return "II_partial_alpha"
+    return None
+
+
 @torch.no_grad()
 def region_restricted_eval(
     model,
@@ -920,6 +970,32 @@ def region_restricted_eval(
 
     # Pre-pull metadata columns to avoid per-row dataset access overhead.
     meta_cols: dict[str, list] = {c: canonical_eval_v2[c] for c in available_buckets}
+
+    # Repair the mhc_class stratum (see _relabel_none_stratum above). Reporting
+    # only: masking, tokenization and all 'overall' aggregates are unaffected.
+    if "mhc_class" in meta_cols:
+        _cols = canonical_eval_v2.column_names
+        _a1 = canonical_eval_v2["mhc_one_allele"] if "mhc_one_allele" in _cols else [None] * n_examples
+        _a2 = canonical_eval_v2["mhc_two_allele"] if "mhc_two_allele" in _cols else [None] * n_examples
+        _fixed = list(meta_cols["mhc_class"])
+        _n_relabelled = 0
+        _moved: dict[str, int] = {}
+        for _i, _lab in enumerate(_fixed):
+            if _lab != "none":
+                continue
+            _new = _relabel_none_stratum(_a1[_i], _a2[_i])
+            if _new is not None:
+                _fixed[_i] = _new
+                _n_relabelled += 1
+                _moved[_new] = _moved.get(_new, 0) + 1
+        if _n_relabelled:
+            meta_cols["mhc_class"] = _fixed
+            if verbose:
+                print(
+                    f"  region_restricted_eval: repaired mhc_class on {_n_relabelled} rows "
+                    f"stored as 'none' but carrying an MHC allele -> {_moved}",
+                    flush=True,
+                )
     n_examples = len(canonical_eval_v2)
 
     # Tokenize + annotate per row (Python; eval set is ~20k rows).
