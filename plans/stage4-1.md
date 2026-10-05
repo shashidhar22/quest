@@ -1,7 +1,10 @@
 # CPT Stage 4.1 — Stage 4 re-run at a fixed, non-truncating `max_length`
 
-**Date:** 2026-10-02 · **Status:** dataset build in flight, training not yet launched
-**Box:** `i-0030c1a9c845b3714` (`neurips_two_s41`), g6.24xlarge, 4× L4, us-west-2a
+**Date:** 2026-10-02 · **Status: COMPLETE 2026-10-03** — all three arms PASS at 7,800 steps.
+Results and the post-run idle incident: `docs/cpt_stage4.1/README.md` §10–11. Headline:
+`pocket_ppl` A 3.368 / D **1.862** / F 2.090; arm D reproduces Stage 4 Point D.
+**Box:** `i-0030c1a9c845b3714` (`neurips_two_s41`), g6.24xlarge, 4× L4, us-west-2a — chosen only
+because g6.12xlarge had no capacity; it was oversized (4 % CPU, 10 of 23 GB per GPU).
 
 ## Goal
 
