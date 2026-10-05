@@ -47,8 +47,12 @@ Track A's ESM-C cells ran 0.9–3.3 GPU-h. Wave 1 ≈ 4–13 GPU-h ≈ **USD 4�
 (≈ USD 0.80/h); wave 2 another ≈ USD 6–16. Engineering ≈ 1 day.
 
 ## Verification
-- **Smoke, before any new number:** base ESM-C on `as_trb_i` reproduces Track A's base Recall@10
-  within its CI. If it does not, the harness changed and nothing downstream is comparable.
+- **Smoke, before any new number:** the base arm's Recall@10 on `test_iid` (in-distribution)
+  exceeds the analytic random rate of 0.10 (10 of a 100-peptide pool) outside its CI; if not, the
+  harness is broken. *Changed 2026-10-05:* the earlier check — "reproduce Track A's base recall" —
+  is void, because Track A's inputs carried no MHC and its arms had unequal capacity (see
+  `~/Documents/ACS/quest-cpt/findings.md` finding 3). Implemented in `track_a/esm_sft/judge.py`,
+  which also fixes both defects and makes the comparison paired.
 - **Power:** every reported cell has n ≥ 500 queries.
 - **Decision:** arm D's CI excludes base on `test_level4`. If it does not, stages 4.4–4.7 have no
   downstream justification — stop and rethink rather than spending on them.

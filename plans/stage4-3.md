@@ -44,8 +44,14 @@ Raise the token budget above 16,384 only after a memory test.
 
 ## Verification
 - **Equivalence (the one that matters):** re-run arm 2's config for 2,000 steps under the new
-  batching; `pocket_ppl` and `cdr3_ppl` at step 2000 within 2 % of arm 2's own
-  `checkpoint_step_2000` re-scored. This run doubles as 4.4's control.
+  batching. **Pre-registered 2026-10-05, before the run:** PASS = `overall_ppl` and `cdr3_ppl` at
+  step 2000 each within 2 % of Stage 4.1 arm 2's step-2000 eval; `pocket_ppl` is reported and
+  flagged if > 5 % off, not gated at 2 %. Reason: pocket has the fewest tokens, and two runs of
+  the *identical* config (Stage 4 Point D vs 4.1 arm D) already differed by 7 % on pocket while
+  agreeing within 1 % on overall/cdr3 — a new sampler necessarily changes data order. This run
+  doubles as 4.4's control.
+- **Eval rewrite, A/B on the box:** old and new `region_restricted_eval` re-score the same
+  adapter; every value must be **exactly** equal (the new loop sums in the same order).
 - **No rank disagreement:** assert at every optimizer step that each rank's micro-batch count is
   equal (`dist.all_reduce` of the count, min == max); a desync fails loudly instead of hanging.
 - **Eval rewrite is faithful within float tolerance:** every region's perplexity on a fixed
