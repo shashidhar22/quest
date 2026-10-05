@@ -16,6 +16,131 @@ from torch.utils.data import Dataset, Sampler
 
 
 # =============================================================================
+# Token-budget, step-synchronised batch sampler (Stage 4.3, 2026-10-05)
+# =============================================================================
+
+
+class TokenBudgetStepSampler(Sampler):
+    """Batch sampler whose optimizer steps are always ``rows_per_step`` rows and whose
+    micro-batches fill a token budget — identically on every rank.
+
+    Why it exists: ``DistributedLengthBucketSampler`` uses one fixed ``batch_size`` for every
+    length bucket, so batch 16 (sized for the rare 600-token rows) starves the GPU on the 99.5 %
+    of rows that are ~17 tokens (Stage 4.1 arms 2–3: 23–26 % GPU). Letting the micro-batch size
+    vary by length fixes that, but only if every rank agrees on how many micro-batches make a
+    step — otherwise DDP all-reduces mismatched counts and hangs or mis-averages. The old
+    sampler stride-shards one flat index list, so it cannot give that guarantee.
+
+    Design (deterministic in ``seed + epoch``, so every rank computes the same global plan):
+      1. Shuffle rows within each length bucket, then concatenate buckets shortest-first.
+      2. Chunk that sequence into global step-batches of exactly ``rows_per_step`` rows. Only the
+         final partial chunk is dropped (< ``rows_per_step`` rows per epoch in total) — never a
+         whole sparse bucket of long rows, which would silently discard the full-MHC rows.
+      3. Each step-batch's micro-batch size comes from its GLOBAL max length: the largest divisor
+         ``d`` of ``rows_per_step // world_size`` with ``d * max_len <= token_budget``. All ranks
+         see the same step-batch, so all derive the same ``d`` and the same accumulation count.
+      4. Shuffle rows within the step-batch (balances long rows across ranks), give rank ``r``
+         its contiguous slice, split that slice into micro-batches of ``d`` rows.
+      5. Shuffle the order of step-batches.
+
+    Use as ``DataLoader(ds, batch_sampler=sampler, ...)``. The trainer must step the optimizer
+    by ``step_plan()`` (micro-batches per optimizer step, in yield order), not by a fixed
+    ``gradient_accumulation_steps``.
+
+    Loss weighting note: the trainer keeps the existing mean-of-micro-batch-means, so changing
+    the micro-batch partition reweights rows slightly versus Stage 4.1. The Stage 4.3
+    equivalence run (within 2 % at step 2000) is the check that this is immaterial.
+    """
+
+    def __init__(
+        self,
+        lengths: np.ndarray,
+        rows_per_step: int = 1024,
+        token_budget: int = 16384,
+        max_micro_rows: int = 256,
+        bucket_boundaries: List[int] = [64, 128, 256, 512, 1024],
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
+        if num_replicas is None:
+            num_replicas = dist.get_world_size() if dist.is_initialized() else 1
+        if rank is None:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+        if rows_per_step % num_replicas:
+            raise ValueError(f"rows_per_step={rows_per_step} not divisible by world size {num_replicas}")
+        self.lengths = np.asarray(lengths)
+        self.rows_per_step = rows_per_step
+        self.rows_per_rank = rows_per_step // num_replicas
+        self.token_budget = token_budget
+        self.max_micro_rows = max_micro_rows
+        self.bucket_boundaries = sorted(bucket_boundaries)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        bucket_ids = np.digitize(self.lengths, self.bucket_boundaries)
+        self.bucket_indices = [np.where(bucket_ids == b)[0] for b in range(len(self.bucket_boundaries) + 1)]
+        self._divisors = [d for d in range(1, self.rows_per_rank + 1) if self.rows_per_rank % d == 0]
+        self._cache_key = None
+        self._cache = None
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def micro_rows_for(self, max_len: int) -> int:
+        """Largest divisor of rows_per_rank that fits the token budget (and the row cap)."""
+        fits = [d for d in self._divisors
+                if d <= self.max_micro_rows and d * max(int(max_len), 1) <= self.token_budget]
+        return fits[-1] if fits else 1
+
+    def _plan(self):
+        key = (self.epoch, self.rank)
+        if self._cache_key == key:
+            return self._cache
+        rng = np.random.default_rng(self.seed + self.epoch)
+        ordered = []
+        for idx in self.bucket_indices:
+            idx = idx.copy()
+            if self.shuffle:
+                rng.shuffle(idx)
+            ordered.append(idx)
+        flat = np.concatenate(ordered) if ordered else np.array([], dtype=np.int64)
+        # Drop the epoch remainder from the SHORT end. The sequence is shortest-first, so cutting
+        # the tail would drop the longest (full-MHC) rows every epoch — caught by a test.
+        flat = flat[len(flat) % self.rows_per_step:]
+        n_steps = len(flat) // self.rows_per_step
+        steps = [flat[i * self.rows_per_step:(i + 1) * self.rows_per_step].copy() for i in range(n_steps)]
+        for s in steps:
+            if self.shuffle:
+                rng.shuffle(s)
+        if self.shuffle:
+            order = rng.permutation(n_steps)
+            steps = [steps[i] for i in order]
+        micro_batches, plan = [], []
+        lo, hi = self.rank * self.rows_per_rank, (self.rank + 1) * self.rows_per_rank
+        for s in steps:
+            d = self.micro_rows_for(int(self.lengths[s].max()))
+            mine = s[lo:hi]
+            micro_batches.extend(mine[j:j + d].tolist() for j in range(0, self.rows_per_rank, d))
+            plan.append(self.rows_per_rank // d)
+        self._cache_key, self._cache = key, (micro_batches, plan)
+        return self._cache
+
+    def step_plan(self) -> List[int]:
+        """Micro-batches per optimizer step for the current epoch, in yield order."""
+        return list(self._plan()[1])
+
+    def __iter__(self):
+        return iter(self._plan()[0])
+
+    def __len__(self) -> int:
+        return len(self._plan()[0])
+
+
+# =============================================================================
 # Length Bucket Samplers (from esm_native_trainer.py)
 # =============================================================================
 

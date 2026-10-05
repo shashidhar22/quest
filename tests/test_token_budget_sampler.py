@@ -1,0 +1,128 @@
+"""Falsifiable tests for TokenBudgetStepSampler (Stage 4.3). Laptop-only: ranks are simulated
+by constructing one sampler per rank with explicit rank/num_replicas; no torch.distributed init.
+
+Each test states what a failure would look like. The length profile mimics run05 (99.5 % short
+rows, a thin tail of long full-MHC rows) plus a deliberately sparse long bucket, because silently
+dropping those rows is the failure that matters most for this programme.
+"""
+import numpy as np
+import pytest
+
+from quest.training.samplers import TokenBudgetStepSampler
+
+WORLD, STEP, BUDGET = 4, 1024, 16384
+
+
+def _lengths(n_short=40_000, seed=0):
+    rng = np.random.default_rng(seed)
+    short = rng.integers(10, 30, size=n_short)          # ~17-token rows (bucket <64)
+    mid = rng.integers(70, 250, size=300)               # buckets <128, <256
+    long_ = rng.integers(520, 610, size=7)              # SPARSE: 7 rows in [512,1024)
+    edge = np.array([1024, 1024])                       # exactly 1024 -> np.digitize overflow bucket
+    return np.concatenate([short, mid, long_, edge])
+
+
+def _ranks(lengths, **kw):
+    return [TokenBudgetStepSampler(lengths, rows_per_step=STEP, token_budget=BUDGET,
+                                   num_replicas=WORLD, rank=r, **kw) for r in range(WORLD)]
+
+
+def test_all_ranks_agree_on_accumulation_plan():
+    """Failure: any two ranks with different micro-batch counts for the same step (DDP desync)."""
+    plans = [s.step_plan() for s in _ranks(_lengths())]
+    assert all(p == plans[0] for p in plans), "ranks disagree on micro-batches per step"
+    assert len(plans[0]) > 0
+
+
+def test_every_step_is_exactly_rows_per_step():
+    """Failure: an optimizer step whose rows, summed over ranks, differ from 1024."""
+    samplers = _ranks(_lengths())
+    per_rank = [list(iter(s)) for s in samplers]
+    plan = samplers[0].step_plan()
+    cursor = 0
+    for n_micro in plan:
+        total = sum(len(mb) for r in range(WORLD) for mb in per_rank[r][cursor:cursor + n_micro])
+        assert total == STEP, f"step has {total} rows"
+        cursor += n_micro
+    assert cursor == len(per_rank[0])
+
+
+def test_micro_batches_respect_token_budget():
+    """Failure: rows x longest row in any micro-batch exceeds the budget (OOM risk)."""
+    lengths = _lengths()
+    for s in _ranks(lengths):
+        for mb in s:
+            assert len(mb) * lengths[mb].max() <= BUDGET, (len(mb), lengths[mb].max())
+
+
+def test_no_duplicates_and_sparse_long_rows_are_kept():
+    """Failure: a row yielded twice, or the 9 long rows (7 sparse + 2 at exactly 1024) dropped.
+    Per-bucket chunking with per-bucket remainder dropping would lose all 9."""
+    lengths = _lengths()
+    seen = [i for s in _ranks(lengths) for mb in s for i in mb]
+    assert len(seen) == len(set(seen)), "row yielded twice in one epoch"
+    dropped = set(range(len(lengths))) - set(seen)
+    assert len(dropped) < STEP, f"{len(dropped)} rows dropped (expected < one step)"
+    long_rows = set(np.where(lengths >= 70)[0])
+    assert not (long_rows & dropped), f"{len(long_rows & dropped)} non-short rows dropped"
+    assert all(lengths[i] < 64 for i in dropped), "the remainder must come from the short end"
+
+
+def test_short_rows_get_large_micro_batches():
+    """Failure: short-row steps still at 16 rows (the Stage 4.1 starvation this fixes)."""
+    s = TokenBudgetStepSampler(np.full(8192, 20), rows_per_step=STEP, token_budget=BUDGET,
+                               num_replicas=WORLD, rank=0)
+    assert set(len(mb) for mb in s) == {256}, "short rows should fill 256-row micro-batches"
+    assert set(s.step_plan()) == {1}, "one micro-batch per rank per step for short rows"
+
+
+def test_long_rows_fall_back_to_proven_size():
+    """Failure: a 600-token step not at 16 rows (the size Stage 4.1 proved fits in memory)."""
+    s = TokenBudgetStepSampler(np.full(4096, 600), rows_per_step=STEP, token_budget=BUDGET,
+                               num_replicas=WORLD, rank=0)
+    assert set(len(mb) for mb in s) == {16}
+    assert set(s.step_plan()) == {16}
+
+
+def test_deterministic_per_epoch_and_reshuffled_across_epochs():
+    """Failure: same seed+epoch gives a different order, or epoch 1 repeats epoch 0."""
+    lengths = _lengths()
+    a, b = _ranks(lengths)[0], _ranks(lengths)[0]
+    assert list(iter(a)) == list(iter(b))
+    e0 = list(iter(a))
+    a.set_epoch(1)
+    assert list(iter(a)) != e0
+
+
+def test_world_size_invariant_step_size():
+    """Failure: effective rows per optimizer step depends on GPU count (1 vs 4)."""
+    lengths = _lengths()
+    one = TokenBudgetStepSampler(lengths, rows_per_step=STEP, token_budget=BUDGET, num_replicas=1, rank=0)
+    rows, cur = list(iter(one)), 0
+    for n in one.step_plan():
+        assert sum(len(mb) for mb in rows[cur:cur + n]) == STEP
+        cur += n
+
+
+def test_naive_per_rank_sizing_would_desync():
+    """Falsifies the design choice: if each rank sized micro-batches from ITS OWN slice's max
+    length (the obvious implementation), ranks would disagree on some step. If this test ever
+    fails, the global-max rule is no longer necessary — and the sampler's docstring is wrong."""
+    # One step-batch: 1023 short rows and a single 600-token row. Only one rank's slice holds it.
+    lengths = np.full(STEP, 20)
+    lengths[0] = 600
+    s = TokenBudgetStepSampler(lengths, rows_per_step=STEP, token_budget=BUDGET,
+                               num_replicas=WORLD, rank=0, shuffle=False)
+    per_rank = STEP // WORLD
+    naive = {per_rank // s.micro_rows_for(lengths[r * per_rank:(r + 1) * per_rank].max())
+             for r in range(WORLD)}
+    assert len(naive) > 1, "naive per-rank sizing agreed — the global-max rule would be unneeded"
+    plans = [TokenBudgetStepSampler(lengths, rows_per_step=STEP, token_budget=BUDGET,
+                                    num_replicas=WORLD, rank=r, shuffle=False).step_plan()
+             for r in range(WORLD)]
+    assert all(p == plans[0] == [16] for p in plans), plans
+
+
+def test_rejects_indivisible_world_size():
+    with pytest.raises(ValueError):
+        TokenBudgetStepSampler(np.full(100, 20), rows_per_step=1024, num_replicas=3, rank=0)
