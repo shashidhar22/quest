@@ -84,6 +84,9 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--no_compile", action="store_true")
     ap.add_argument("--gradient_checkpointing", action="store_true")
+    ap.add_argument("--token_budget", type=int, default=0,
+                    help="Stage 4.3: tokens per micro-batch for step-synchronised batching; "
+                         "0 = off (fixed batch_size, the Stage 4.1 path)")
     # Early stop
     ap.add_argument("--early_stop_n_patience", type=int, default=3)
     ap.add_argument("--early_stop_min_rel", type=float, default=0.01)
@@ -136,6 +139,7 @@ def main() -> None:
         use_length_bucketing=not args.no_length_bucketing,
         bucket_boundaries=list(args.bucket_boundaries),
         gradient_checkpointing=args.gradient_checkpointing,
+        token_budget=args.token_budget,
         region_eval=True,
         tcr_variant=args.tcr_variant,
         mhc_variant=args.mhc_variant,

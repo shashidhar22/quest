@@ -51,7 +51,14 @@ import wandb
 
 from quest.training.callbacks import EarlyStopping
 from quest.training.collators import DataCollatorForMLMDynamic
-from quest.training.samplers import DistributedLengthBucketSampler, LengthBucketSampler
+from contextlib import nullcontext
+import time
+
+from quest.training.samplers import (
+    DistributedLengthBucketSampler,
+    LengthBucketSampler,
+    TokenBudgetStepSampler,
+)
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -891,6 +898,9 @@ def _relabel_none_stratum(a1, a2):
     return None
 
 
+_REGION_EVAL_CACHE: dict = {}
+
+
 @torch.no_grad()
 def region_restricted_eval(
     model,
@@ -968,6 +978,8 @@ def region_restricted_eval(
         for r in regions
     }
 
+    n_examples = len(canonical_eval_v2)
+
     # Pre-pull metadata columns to avoid per-row dataset access overhead.
     meta_cols: dict[str, list] = {c: canonical_eval_v2[c] for c in available_buckets}
 
@@ -996,14 +1008,18 @@ def region_restricted_eval(
                     f"stored as 'none' but carrying an MHC allele -> {_moved}",
                     flush=True,
                 )
-    n_examples = len(canonical_eval_v2)
 
     # Tokenize + annotate per row (Python; eval set is ~20k rows).
     # Then group rows into batches and run forward passes.
-    cached: list[dict] = []
-    annot_fail_rows: list[int] = []
-    empty_rows: list[int] = []
-    for i in range(n_examples):
+    # Stage 4.3: the tokenize + annotate pass is a pure function of these inputs, so it is
+    # computed once per process and reused by every periodic eval.
+    _ck = (id(canonical_eval_v2), n_examples, tcr_variant, mhc_variant, eos_strategy,
+           int(max_length), sep_id, id(tokenizer))
+    _hit = _REGION_EVAL_CACHE.get(_ck)
+    cached: list[dict] = [] if _hit is None else _hit[0]
+    annot_fail_rows: list[int] = [] if _hit is None else _hit[1]
+    empty_rows: list[int] = [] if _hit is None else _hit[2]
+    for i in (range(n_examples) if _hit is None else ()):
         row = canonical_eval_v2[i]
         text, kinds = project_canonical_row_to_run_input(row, tcr_variant, mhc_variant)
         if not text:
@@ -1044,9 +1060,11 @@ def region_restricted_eval(
             "length": len(ids),
         })
 
+    if _hit is None:
+        _REGION_EVAL_CACHE[_ck] = (cached, annot_fail_rows, empty_rows)
     if verbose:
         print(
-            f"  region_restricted_eval: tokenized {len(cached):,}/{n_examples:,} rows "
+            f"  region_restricted_eval: {'cached' if _hit else 'tokenized'} {len(cached):,}/{n_examples:,} rows "
             f"(empty={len(empty_rows)}, annot_fail={len(annot_fail_rows)})",
             flush=True,
         )
@@ -1114,35 +1132,37 @@ def region_restricted_eval(
         token_loss = token_loss.view(labels_d.shape).cpu()
         per_mask = (labels_d != -100).cpu()
 
-        for bi, b in enumerate(batch):
+        # Stage 4.3: visit only masked positions. np.nonzero is row-major, the same order as the
+        # old nested loop, so every float sum is accumulated in the same order (bit-identical).
+        tl_np = token_loss.numpy()
+        _bis, _poss = np.nonzero(per_mask.numpy())
+        for bi, pos in zip(_bis.tolist(), _poss.tolist()):
+            b = batch[bi]
             row_idx = b["row_idx"]
             tr = region_table[bi]
-            for pos in range(max_len):
-                if not bool(per_mask[bi, pos]):
-                    continue
-                tl = float(token_loss[bi, pos])
-                # Attribute to 'overall' always
-                acc["overall"]["overall"]["_"]["loss_sum"] += tl
-                acc["overall"]["overall"]["_"]["n_tokens"] += 1
-                acc["overall"]["overall"]["_"]["rows"].add(row_idx)
+            tl = float(tl_np[bi, pos])
+            # Attribute to 'overall' always
+            acc["overall"]["overall"]["_"]["loss_sum"] += tl
+            acc["overall"]["overall"]["_"]["n_tokens"] += 1
+            acc["overall"]["overall"]["_"]["rows"].add(row_idx)
+            for dim in available_buckets:
+                val = meta_cols[dim][row_idx]
+                acc["overall"][dim][val]["loss_sum"] += tl
+                acc["overall"][dim][val]["n_tokens"] += 1
+                acc["overall"][dim][val]["rows"].add(row_idx)
+            # Attribute to the token's region
+            region = tr[pos]
+            if region == "special":
+                continue
+            if region in acc:
+                acc[region]["overall"]["_"]["loss_sum"] += tl
+                acc[region]["overall"]["_"]["n_tokens"] += 1
+                acc[region]["overall"]["_"]["rows"].add(row_idx)
                 for dim in available_buckets:
                     val = meta_cols[dim][row_idx]
-                    acc["overall"][dim][val]["loss_sum"] += tl
-                    acc["overall"][dim][val]["n_tokens"] += 1
-                    acc["overall"][dim][val]["rows"].add(row_idx)
-                # Attribute to the token's region
-                region = tr[pos]
-                if region == "special":
-                    continue
-                if region in acc:
-                    acc[region]["overall"]["_"]["loss_sum"] += tl
-                    acc[region]["overall"]["_"]["n_tokens"] += 1
-                    acc[region]["overall"]["_"]["rows"].add(row_idx)
-                    for dim in available_buckets:
-                        val = meta_cols[dim][row_idx]
-                        acc[region][dim][val]["loss_sum"] += tl
-                        acc[region][dim][val]["n_tokens"] += 1
-                        acc[region][dim][val]["rows"].add(row_idx)
+                    acc[region][dim][val]["loss_sum"] += tl
+                    acc[region][dim][val]["n_tokens"] += 1
+                    acc[region][dim][val]["rows"].add(row_idx)
 
     # Reduce.
     out: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
@@ -1304,6 +1324,10 @@ class CPTConfig:
     attn_implementation: str = "flash_attention_2"
     use_compile: bool = True
     use_length_bucketing: bool = True
+    # Stage 4.3: token-budget, step-synchronised batching. 0 = off (Stage 4.1 path, unchanged).
+    # When > 0, micro-batches fill this many tokens and every optimizer step is exactly
+    # batch_size * gradient_accumulation_steps * world_size rows (the effective batch).
+    token_budget: int = 0
     bucket_boundaries: list[int] = field(default_factory=lambda: [32, 48, 64, 96, 128])
     dataloader_num_workers: int = 4
     eval_batch_size: int = 64
@@ -1499,8 +1523,33 @@ class CPTTrainer:
             separator_token_id=self.tokenizer.eos_token_id,
         )
 
+        # Stage 4.3 path: token-budget step-synchronised batch sampler (opt-in).
+        self._token_mode = self.cfg.token_budget > 0
+        if self._token_mode:
+            if "length" not in self.train_ds.column_names:
+                raise ValueError("token_budget needs a 'length' column in the train dataset")
+            rows_per_step = self.cfg.batch_size * self.cfg.gradient_accumulation_steps * self.world_size
+            self.train_sampler = TokenBudgetStepSampler(
+                lengths=np.array(self.train_ds["length"]),
+                rows_per_step=rows_per_step,
+                token_budget=self.cfg.token_budget,
+                bucket_boundaries=self.cfg.bucket_boundaries,
+                num_replicas=self.world_size,
+                rank=self.global_rank,
+                seed=self.cfg.seed,
+            )
+            self.train_loader = DataLoader(
+                self.train_ds,
+                batch_sampler=self.train_sampler,
+                num_workers=self.cfg.dataloader_num_workers,
+                pin_memory=True,
+                collate_fn=self.collator,
+                persistent_workers=self.cfg.dataloader_num_workers > 0,
+            )
+            self._log(f"token-budget batching: {rows_per_step} rows/step, budget {self.cfg.token_budget} tokens, "
+                      f"{len(self.train_sampler.step_plan())} steps/epoch")
         # Length-bucketed sampler if 'length' column is present.
-        if self.cfg.use_length_bucketing and "length" in self.train_ds.column_names:
+        elif self.cfg.use_length_bucketing and "length" in self.train_ds.column_names:
             lengths = np.array(self.train_ds["length"])
             if self.is_distributed:
                 self.train_sampler = DistributedLengthBucketSampler(
@@ -1556,7 +1605,10 @@ class CPTTrainer:
             betas=(self.cfg.adam_beta1, self.cfg.adam_beta2),
             fused=True,
         )
-        steps_per_epoch = max(1, len(self.train_loader) // self.cfg.gradient_accumulation_steps)
+        if getattr(self, "_token_mode", False):
+            steps_per_epoch = max(1, len(self.train_sampler.step_plan()))
+        else:
+            steps_per_epoch = max(1, len(self.train_loader) // self.cfg.gradient_accumulation_steps)
         total_steps = steps_per_epoch * self.cfg.num_epochs
         warmup_steps = int(total_steps * self.cfg.warmup_ratio)
         self.total_steps = total_steps
@@ -1581,7 +1633,7 @@ class CPTTrainer:
                   f"ga{cfg.gradient_accumulation_steps}*ws{self.world_size}="
                   f"{cfg.batch_size*cfg.gradient_accumulation_steps*self.world_size} effective\n")
         for epoch in range(cfg.num_epochs):
-            if self.is_distributed and hasattr(self.train_sampler, "set_epoch"):
+            if (self.is_distributed or getattr(self, "_token_mode", False)) and hasattr(self.train_sampler, "set_epoch"):
                 self.train_sampler.set_epoch(epoch)
             self._train_one_epoch(epoch)
             if self.should_stop:
@@ -1607,13 +1659,35 @@ class CPTTrainer:
         )
         self.optimizer.zero_grad()
         accum_loss = 0.0
+        token_mode = getattr(self, "_token_mode", False)
+        plan = self.train_sampler.step_plan() if token_mode else None
+        if plan is not None and self.is_distributed:
+            # Every rank must run the same micro-batch count per step, or DDP desyncs.
+            sig = torch.tensor([len(plan), sum(plan), sum((i + 1) * n for i, n in enumerate(plan)) % 2_000_000_011],
+                               dtype=torch.long, device=self.device)
+            lo, hi = sig.clone(), sig.clone()
+            dist.all_reduce(lo, op=dist.ReduceOp.MIN)
+            dist.all_reduce(hi, op=dist.ReduceOp.MAX)
+            if not torch.equal(lo, hi):
+                raise RuntimeError(f"rank {self.global_rank}: step plans differ across ranks {lo.tolist()} vs {hi.tolist()}")
+        step_i, micro_i = 0, 0
+        thr_rows, thr_tokens, thr_t0 = 0, 0, time.perf_counter()
 
         for step, batch in pbar:
             input_ids = batch["input_ids"].to(self.device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
             labels = batch["labels"].to(self.device, non_blocking=True)
 
-            with autocast(device_type="cuda", dtype=torch.bfloat16):
+            n_acc = plan[step_i] if plan is not None else cfg.gradient_accumulation_steps
+            closes_step = (micro_i + 1 == n_acc) if plan is not None \
+                else ((step + 1) % cfg.gradient_accumulation_steps == 0)
+            thr_rows += int(input_ids.size(0))
+            thr_tokens += int(batch["attention_mask"].sum())  # CPU copy: no GPU sync
+            sync_ctx = (self.model.no_sync() if (plan is not None and self.is_distributed
+                                                 and not closes_step and hasattr(self.model, "no_sync"))
+                        else nullcontext())
+            with sync_ctx:
+              with autocast(device_type="cuda", dtype=torch.bfloat16):
                 if self.is_esmc:
                     logits = _model_forward_logits(self.model, input_ids, attention_mask)
                     raw_loss = torch.nn.functional.cross_entropy(
@@ -1628,11 +1702,13 @@ class CPTTrainer:
                         labels=labels,
                     )
                     raw_loss = out.loss
-                loss = raw_loss / cfg.gradient_accumulation_steps
-            loss.backward()
+                loss = raw_loss / n_acc
+              loss.backward()  # outside autocast, as before; inside no_sync when deferring
             accum_loss += loss.item()
+            micro_i += 1
 
-            if (step + 1) % cfg.gradient_accumulation_steps == 0:
+            if closes_step:
+                step_i, micro_i = step_i + 1, 0
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), cfg.gradient_clip
                 )
@@ -1654,9 +1730,14 @@ class CPTTrainer:
                             "train/learning_rate": self.scheduler.get_last_lr()[0],
                             "train/global_step": self.global_step,
                             "train/epoch_frac": epoch + (step + 1) / len(self.train_loader),
+                            # local rank's throughput since the last log; x world_size for the job
+                            "train/rows_per_sec": thr_rows / max(1e-9, time.perf_counter() - thr_t0),
+                            "train/tokens_per_sec": thr_tokens / max(1e-9, time.perf_counter() - thr_t0),
                         }
                     )
                 accum_loss = 0.0
+                if self.global_step % cfg.logging_steps == 0:
+                    thr_rows, thr_tokens, thr_t0 = 0, 0, time.perf_counter()
 
                 if self.global_step % cfg.eval_every_n_steps == 0:
                     self._run_canonical_eval()
