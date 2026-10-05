@@ -4,6 +4,22 @@ Updated 2026-10-04 00:30 UTC. First place to look when resuming.
 
 ## First move next time
 
+**Cost review 2026-10-05 (Cost Explorer works for our role — use it).** Idle run-rate was
+≈ USD 800/mo, 3/4 of it snapshots. Done on Yuexin's call: `neurips_two` terminated (root was
+already in `snap-0aa5bccb08a3012e3`/AMI `ami-0b855eb5871217bce`); data-loader and KS
+snapshots moved to the **archive tier** (in progress 18:05 UTC; 90-day minimum, 24–72 h to
+restore). Expected idle bill after: ≈ USD 300/mo (s41 1 TB + inference 300 GB volumes, the
+AMI snapshot, two archived snapshots). `run11_cdr123_fullmhc_proportional_10M` is now in S3
+(`cpt_datasets/`, 35 files / 3,185,473,264 B, VERIFY PASS 18:13 UTC).
+
+**The box's instance type is a per-boot knob — stop thinking "the g6.24xlarge box".** The
+run11 backup ran by switching `i-0030c1a9c845b3714` to m5.xlarge (`modify-instance-attribute
+--instance-type`), booting, syncing, stopping, and switching back — USD 0.05, and it sidesteps
+the g6.12xlarge/24xlarge capacity shortage that blocked a plain start the same hour. Same
+volume, same env, same SSM. Use g6.xlarge for single-GPU training (4.2, 4.4, 4.5), r6i for
+DuckDB builds, g6.12xlarge only for the 4.7 scaling run. Always set the type back and verify
+with `describe-instances` (the modify call's own echo lags).
+
 **Nothing is running. Every box is stopped; KS RNA-Seq is decommissioned.** Stage 4.1 is
 complete and pulled local: `docs/cpt_stage4.1/README.md` §10 (results) and §11 (the 14.5 h
 idle incident). Start Stage 4.2 (`plans/stage4-2.md`) and 4.3 in parallel.
