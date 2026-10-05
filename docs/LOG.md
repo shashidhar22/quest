@@ -55,3 +55,31 @@ or the project memory, not in this log.
   records, `quest-cpt/` knowledge split from the 767-line checkpoints doc); this LOG.md
   created; NEXT.md cut to its contract; memory 10 → 4 files; `warren-gpu.sh` gained
   `inventory`, `cost`, `type`.
+
+## 2026-10-05 (evening) — Stages 4.2 / 4.3 set up; Track A invalidated; GPU outage
+
+- **Plans 4.2–4.7 corrected** before any run: 4.3's sampler would have desynced DDP; 4.4's
+  token-matched screen confounded sampling with repetition (step 1 is now run06 vs 4.1 arm A,
+  no build); 4.2 gated on a 4-cell wave; 4.5 judged downstream; 4.6 step 1 promoted.
+- **4.3 code committed:** `TokenBudgetStepSampler` (10/10 tests; first version dropped the
+  longest rows every epoch — the remainder came off the long end — caught by a test, fixed, and
+  the fix proven by a mutant run); trainer wiring behind `--token_budget` (Stage 4.1 path
+  unchanged); region eval caches tokenization and loops only over masked positions in the same
+  order (should be bit-identical — NOT YET VERIFIED). Fixed a latent `n_examples` NameError.
+  Equivalence criteria pre-registered in `plans/stage4-3.md`. Mid-run resume NOT built.
+- **Track A downstream evidence invalidated.** Its ESM SFT never fed MHC to the model (loader
+  omits the pocket column; 2,800/2,800 rows empty, checked on the box) and its base arms had no
+  trainable LoRA. Old ESM-C crash (bf16 vs fp32 head) is already fixed in current `model.py`.
+  `track_a/esm_sft/judge.py` fixes both defects, pairs arms by row_id-seeded distractors.
+  Written, compiles, NOT yet run. Corrected in quest-cpt/findings.md, memory, plans/stage4-2.md.
+- **GPU outage:** every g6 (xlarge…24xlarge) and g5.12xlarge refused in us-west-2a AND 2b,
+  probed 19:50–20:39 UTC with immediately-terminated launches (no leaks). A CPU A/B of the eval
+  rewrite was started on m6i.2xlarge then abandoned (the GPU job repeats it).
+- **Launch kit** `scripts/training/stage43_box/`: laptop retry loop every 15 min for 24 h with
+  `caffeinate -ims -w <pid>` (lid-close and SSO-session expiry still end it); on-box OS
+  shutdown timer 240 min + PID watchdog (MAX_HOURS 3, idle 20 min, publishes to S3 first); the
+  loop stops the box itself if SSM or launch verification fails. Worst case ≈ 4 h ≈ USD 18.
+- Gotchas: modules loaded via `importlib.util.spec_from_file_location` must be put in
+  `sys.modules` before `exec_module` or dataclasses fail; ESM-C on CPU needs
+  `esm.models.esmc.is_flash_attn_available = False` before construction (the flash path makes
+  CUDA calls); SSM lands as a user who cannot `cd` into `/home/ubuntu/quest`.
