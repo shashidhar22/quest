@@ -25,12 +25,24 @@ for attempt in $(seq 1 96); do                # 96 x 15 min = 24 h
   errs=0
   [ "$st" = stopping ] && { sleep 60; continue; }
   [ "$st" = stopped ] || { log "box is '$st', not stopped — someone else is using it; aborting without touching it"; exit 4; }
-  started=""; types=$(read_types)
+  started=""; types=$(read_types); why=""
   for T in $types; do
-    aws ec2 modify-instance-attribute --instance-id $B --instance-type "{\"Value\":\"$T\"}" 2>/dev/null
+    if ! aws ec2 modify-instance-attribute --instance-id $B --instance-type "{\"Value\":\"$T\"}" 2>/tmp/gpuretry.err; then
+      why="$why $T:modify-$(grep -o '([A-Za-z.]*)' /tmp/gpuretry.err | head -1 | tr -d '()')"; continue
+    fi
     if aws ec2 start-instances --instance-ids $B >/dev/null 2>/tmp/gpuretry.err; then started=$T; break; fi
+    why="$why $T:$(grep -o '([A-Za-z.]*)' /tmp/gpuretry.err | head -1 | tr -d '()')"   # the AWS error class, per type
   done
-  if [ -z "$started" ]; then log "attempt $attempt: no capacity for $types"; sleep 900; continue; fi
+  if [ -z "$started" ]; then
+    # Say "no capacity" only when every refusal really was InsufficientInstanceCapacity: strip
+    # those tokens and see whether any type:error is left.
+    if echo "$why" | sed 's/[^ ]*:InsufficientInstanceCapacity//g' | grep -q ':'; then
+      log "attempt $attempt: refused —$why"
+    else
+      log "attempt $attempt: no capacity for $types"
+    fi
+    sleep 900; continue
+  fi
   log "attempt $attempt: STARTED as $started"
   aws ec2 wait instance-running --instance-ids $B
   ok=""
