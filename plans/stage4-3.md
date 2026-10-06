@@ -1,7 +1,32 @@
 # CPT Stage 4.3 — trainer efficiency + mid-run resume
 
-**Status:** planned, can run in parallel with 4.2 · **Depends on:** nothing (engineering)
+**Status:** code complete (all four changes), laptop-verified; GPU verification queued on the retry
+loop (2026-10-06) · **Depends on:** nothing (engineering)
 · **Knowledge:** `~/Documents/ACS/quest-cpt/findings.md` (GPU-efficiency section)
+
+## Built (2026-10-05/06) — what exists and what has been checked
+- Changes 1–3 (cached eval, `TokenBudgetStepSampler` + `no_sync` + rank-plan check, rows/s and
+  tokens/s log): committed 2026-10-05; sampler tests 10/10.
+- Change 4, **mid-run resume** (2026-10-06): `checkpoint_step_N/training_state.pt` (optimizer,
+  scheduler, counters, early-stop history, config, W&B run id; written last and atomically);
+  `--resume_from <dir>|auto`. Resume restores the exact data order (the samplers are deterministic
+  in seed+epoch; the interrupted epoch skips the consumed micro-batches) and the exact
+  optimizer/LR state; masking noise is not replayed. `auto` refuses to start fresh over an
+  old-format run. Token-budget runs may resume on a different GPU count (`rows_per_step` is the
+  invariant). `tests/test_cpt_resume.py` 8/8 on CPU (tiny local ESM-2): adapter bitwise, optimizer
+  moments, LR position, counters, data order == uninterrupted run's tail (token and Stage 4.1
+  paths), config drift refused, auto picks newest by number, random-sampler path refused, re-save
+  over an older checkpoint never leaves mixed state. Independent mutation check: 6/6 deliberate
+  bugs caught. Also fixed: step-checkpoint cleanup sorted by name (would have deleted
+  `step_10000` before `step_8000`).
+- **On-box harness** `scripts/training/stage43_box/`: one 4-GPU job runs the eval A/B + judge
+  smoke, the 2,000-step equivalence run, and the resume check (train to step 1000, kill,
+  `--resume_from auto`, stop after step 2000) → verdicts `EVAL_AB`, `TRAIN_EQUIV`, `RESUME_LOG`,
+  `RESUME` in `run.log`. `dryrun.sh` exercises the whole flow on a laptop with stubs (passes).
+  The first kit never stopped the run after 4 evals (it waited on a `training.log` only the
+  Stage 4.1 driver writes) — fixed before any GPU launch.
+- **Not yet checked on a GPU:** everything above (the retry loop has had no g6 capacity since
+  2026-10-05 19:50 UTC).
 
 ## Goal
 Cut a 10M full-MHC run from ≈ 5.7 h on 4× L4 to ≈ 2–2.5 h **without changing the optimization**,

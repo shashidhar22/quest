@@ -95,3 +95,30 @@ or the project memory, not in this log.
 - Cost review written to acs-notes `AWSconnection/cost-review-2026-10.md`: idle bill
   USD 1,328/mo on 2026-08-01 (Cost Explorer actual, 16,600 GB gp3) → USD 973 on 09-30 → ≈ USD 295
   now (projection until archive tiering completes) — −78 %, ≈ USD 12,400/yr.
+
+## 2026-10-06 (afternoon) — Stage 4.3 mid-run resume built; launch kit bug fixed before launch
+
+- **Resume (change 4 of 4.3) built:** `checkpoint_step_N/training_state.pt` (optimizer, scheduler,
+  counters, early-stop history, config, W&B id; written last, atomically) and
+  `--resume_from <dir>|auto`. Exact data order (deterministic samplers + a skip wrapper) and exact
+  optimizer/LR state; masking noise not replayed. `tests/test_cpt_resume.py` 8/8 on a tiny local
+  ESM-2 (CPU, no network; scratch venv with transformers 5.19 / peft 0.21 / datasets 3.6).
+  Independent `verifier` pass: 6/6 deliberate mutants caught (skip off-by-one, scheduler not
+  restored, adapter not loaded, `rows_per_step` check dropped, name-ordered auto, legacy skip
+  miscounted). Two defects it found by reading, both fixed and tested: `auto` into a dir of
+  old-format checkpoints started fresh silently and the keep-3 cleanup then deleted the new run's
+  own checkpoints (now refuses); a stray `checkpoint_step_10.bak` crashed rank 0 mid-save (now
+  ignored). Also fixed: cleanup sorted checkpoints by name (`step_10000` < `step_8000`).
+- **Launch-kit bug caught before any GPU time:** `run_s43.sh` waited for 4 eval lines in
+  `$OUT/training.log`, a file only the Stage 4.1 driver writes — the equivalence run would never
+  have been stopped at step 2000 (≈ 2 extra GPU-hours to the 3-h ceiling, no `TRAIN_EQUIV`
+  verdict). Rewritten: torchrun logs into the checkpoint dir; the resume check (train to 1000,
+  kill, `--resume_from auto`, stop after 2000) runs on GPUs 0/1 after the eval A/B while the
+  equivalence run holds 2/3; `TRAIN_EQUIV` is written as soon as that run stops; new verdicts
+  `RESUME_LOG` + `RESUME`. `dryrun.sh` exercises the whole flow on the laptop with stubs (passes).
+  New `s43.tgz` + `s43box.tgz` uploaded 18:49 UTC (originals kept in the session scratchpad).
+- **Retry loop left running untouched** (the permission classifier declined stopping it): it will
+  launch with the OLD in-memory launch script (watchdog 3 h, OS timer 240 min, PUB without
+  `resume_training.log` — but `s43_out/` is synced, and the resume log is copied there). The repo's
+  `launch_s43.sh` has 4 h / 300 min; `gpu_retry_loop.sh` still points at a dead scratchpad path —
+  fix both at the next restart (NEXT.md item 1).
