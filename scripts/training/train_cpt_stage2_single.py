@@ -87,6 +87,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--token_budget", type=int, default=0,
                     help="Stage 4.3: tokens per micro-batch for step-synchronised batching; "
                          "0 = off (fixed batch_size, the Stage 4.1 path)")
+    ap.add_argument("--resume_from", default=None,
+                    help="Stage 4.3: a checkpoint_step_N dir to resume from, or 'auto' = the newest "
+                         "resumable checkpoint_step_* under --output_dir (fresh start if none)")
     # Early stop
     ap.add_argument("--early_stop_n_patience", type=int, default=3)
     ap.add_argument("--early_stop_min_rel", type=float, default=0.01)
@@ -140,6 +143,7 @@ def main() -> None:
         bucket_boundaries=list(args.bucket_boundaries),
         gradient_checkpointing=args.gradient_checkpointing,
         token_budget=args.token_budget,
+        resume_from=args.resume_from,
         region_eval=True,
         tcr_variant=args.tcr_variant,
         mhc_variant=args.mhc_variant,

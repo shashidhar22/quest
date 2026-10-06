@@ -28,9 +28,11 @@ What is genuinely new here:
 from __future__ import annotations
 
 import glob
+import itertools
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -43,7 +45,7 @@ from datasets import Dataset, load_from_disk
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Sampler
 from tqdm import tqdm
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
@@ -1282,6 +1284,107 @@ class CdrPplPlateauCallback:
 
 
 # ---------------------------------------------------------------------------
+# Mid-run resume (Stage 4.3)
+# ---------------------------------------------------------------------------
+# A ``checkpoint_step_N`` directory is resumable when it also holds
+# ``training_state.pt`` (optimizer + scheduler + counters), written last and
+# atomically, so its presence means the whole checkpoint is complete. Resume
+# restores the exact data order (the samplers are deterministic in seed+epoch,
+# so the interrupted epoch simply skips the micro-batches already consumed) and
+# the exact optimizer/LR state; MLM masking noise is NOT replayed, so a resumed
+# run matches an uninterrupted one within noise, not bit-for-bit.
+
+RESUME_STATE_FILE = "training_state.pt"
+
+# Config fields that fix the data order or the optimization; a resume must match
+# the checkpoint on all of them. Cadence (eval/save/logging) and output/wandb
+# names may differ. ``rows_per_step`` is checked separately so a token-budget run
+# can resume on a different GPU count (the sampler is world-size invariant).
+_RESUME_MATCH_KEYS = (
+    "base_model", "dataset_path", "canonical_eval_path", "lora_r", "lora_alpha", "lora_dropout",
+    "lora_target_modules", "learning_rate", "weight_decay", "adam_beta1", "adam_beta2",
+    "warmup_ratio", "gradient_clip", "num_epochs", "max_length", "mlm_probability",
+    "eos_strategy", "token_budget", "bucket_boundaries", "use_length_bucketing",
+    "region_eval", "tcr_variant", "mhc_variant", "early_stop_metric_path",
+    "early_stop_n_patience", "early_stop_min_rel", "seed",
+)
+# The Stage 4.1 sampler stride-shards per rank, so its data order also depends on these.
+_RESUME_MATCH_KEYS_LEGACY = ("batch_size", "gradient_accumulation_steps", "world_size")
+
+
+class _SkipSampler(Sampler):
+    """Wrap a deterministic sampler / batch sampler and skip its first ``skip`` yields.
+
+    The trainer sets ``skip`` before every epoch (non-zero only for the epoch being
+    resumed); the DataLoader reads it when it creates the epoch's iterator.
+    """
+
+    def __init__(self, base):
+        self.base = base
+        self.skip = 0
+
+    def __iter__(self):
+        return itertools.islice(iter(self.base), self.skip, None)
+
+    def __len__(self) -> int:
+        return max(0, len(self.base) - self.skip)
+
+
+_STEP_DIR_RE = re.compile(r"^checkpoint_step_(\d+)$")
+
+
+def _step_checkpoints(output_dir: str) -> list[tuple[int, str]]:
+    """``[(step, path)]`` of the step checkpoints in ``output_dir``, ascending by step number.
+    Only exact ``checkpoint_step_<int>`` names count; a stray ``checkpoint_step_10.bak`` is ignored
+    rather than crashing rank 0 mid-save (which would hang the other ranks)."""
+    out = []
+    for d in glob.glob(os.path.join(output_dir, "checkpoint_step_*")):
+        m = _STEP_DIR_RE.match(os.path.basename(d))
+        if m and os.path.isdir(d):
+            out.append((int(m.group(1)), d))
+    return sorted(out)
+
+
+def resolve_resume_dir(resume_from: str | None, output_dir: str) -> str | None:
+    """``None`` → fresh run. ``'auto'`` → the newest resumable ``checkpoint_step_*`` under
+    ``output_dir``; a fresh run only if that directory holds NO step checkpoints at all. Any
+    other value is a checkpoint path and must be resumable. An old-format or partial checkpoint
+    therefore never turns into a silent fresh start — which would also let the keep-3 cleanup
+    delete the new run's own checkpoints behind the old, higher-numbered ones."""
+    if not resume_from:
+        return None
+    if resume_from == "auto":
+        steps = _step_checkpoints(output_dir)
+        cands = [d for _, d in steps if os.path.exists(os.path.join(d, RESUME_STATE_FILE))]
+        if cands:
+            return cands[-1]
+        if steps:
+            raise FileNotFoundError(
+                f"resume_from=auto: none of the {len(steps)} step checkpoints in {output_dir} has "
+                f"{RESUME_STATE_FILE} (saved before Stage 4.3 resume support?); move them away to start "
+                f"fresh, or pass an explicit checkpoint path"
+            )
+        return None
+    if not os.path.exists(os.path.join(resume_from, RESUME_STATE_FILE)):
+        raise FileNotFoundError(
+            f"{resume_from} has no {RESUME_STATE_FILE}: not a resumable checkpoint "
+            f"(saved before Stage 4.3 resume support, a 'best'/'final' save, or interrupted mid-save)"
+        )
+    return resume_from
+
+
+def check_resume_config(saved: dict, current: dict, *, token_mode: bool) -> None:
+    """Raise ``ValueError`` naming every field on which the checkpoint and the current run
+    disagree. Values are compared through JSON so tuple/list spellings are equal."""
+    keys = _RESUME_MATCH_KEYS + ("rows_per_step",) + (() if token_mode else _RESUME_MATCH_KEYS_LEGACY)
+    norm = lambda v: json.dumps(v, sort_keys=True, default=str)
+    bad = [k for k in keys if norm(saved.get(k)) != norm(current.get(k))]
+    if bad:
+        detail = ", ".join(f"{k}: checkpoint={saved.get(k)!r} now={current.get(k)!r}" for k in bad)
+        raise ValueError(f"resume config mismatch on {len(bad)} field(s) — {detail}")
+
+
+# ---------------------------------------------------------------------------
 # CPT Trainer
 # ---------------------------------------------------------------------------
 
@@ -1358,6 +1461,10 @@ class CPTConfig:
     # Reproducibility
     seed: int = 42
 
+    # Stage 4.3 mid-run resume: a checkpoint_step_N dir, or "auto" (newest resumable
+    # checkpoint under output_dir; fresh start if none). None = fresh start.
+    resume_from: str | None = None
+
 
 class CPTTrainer:
     """DDP MLM trainer specialised for CPT.
@@ -1390,6 +1497,19 @@ class CPTTrainer:
         torch.set_float32_matmul_precision("high")
         torch.manual_seed(cfg.seed + self.global_rank)
 
+        # Stage 4.3 resume: resolve and validate BEFORE any heavy loading so a bad
+        # checkpoint or a config mismatch fails in seconds, on every rank alike.
+        self._token_mode = cfg.token_budget > 0
+        self._resume_dir = resolve_resume_dir(cfg.resume_from, cfg.output_dir)
+        self._resume_state: dict | None = None
+        if self._resume_dir is not None:
+            self._resume_state = torch.load(
+                os.path.join(self._resume_dir, RESUME_STATE_FILE), map_location="cpu", weights_only=True
+            )
+            check_resume_config(
+                self._resume_state["config"], self._config_for_resume(), token_mode=self._token_mode
+            )
+
         self._setup_tokenizer_and_model()
         self._setup_data()
         self._setup_optimizer()
@@ -1401,15 +1521,54 @@ class CPTTrainer:
         self.best_eval_loss = float("inf")
         self.should_stop = False
         self.last_eval_result: dict | None = None
+        self._start_epoch = 0      # epoch to (re)start from
+        self._skip_steps = 0       # optimizer steps of that epoch already done
+        self._epoch_steps_done = 0
+        if self._resume_state is not None:
+            self._apply_resume_state()
 
-        # WandB (rank 0 only).
+        # WandB (rank 0 only). On resume, continue the checkpoint's run so the curve is one line.
         self.use_wandb = cfg.report_to == "wandb" and self.global_rank == 0
         if self.use_wandb:
+            wb_id = (self._resume_state or {}).get("wandb_run_id")
             wandb.init(
                 project=cfg.wandb_project,
                 name=cfg.wandb_run_name,
                 config={k: v for k, v in cfg.__dict__.items() if not callable(v)},
+                **({"id": wb_id, "resume": "allow"} if wb_id else {}),
             )
+
+    # -- resume helpers ------------------------------------------------------
+
+    def _config_for_resume(self) -> dict:
+        """The run's config plus the two derived values a resume must agree on."""
+        d = {k: v for k, v in self.cfg.__dict__.items() if not callable(v)}
+        d["rows_per_step"] = self.cfg.batch_size * self.cfg.gradient_accumulation_steps * self.world_size
+        d["world_size"] = self.world_size
+        return d
+
+    def _apply_resume_state(self) -> None:
+        st = self._resume_state
+        assert st is not None
+        self.optimizer.load_state_dict(st["optimizer"])
+        self.scheduler.load_state_dict(st["scheduler"])
+        self.global_step = int(st["global_step"])
+        self.best_eval_loss = float(st["best_eval_loss"])
+        if self.cdr3_plateau is not None and st.get("cdr3_plateau"):
+            self.cdr3_plateau.best = float(st["cdr3_plateau"]["best"])
+            self.cdr3_plateau.history = list(st["cdr3_plateau"]["history"])
+        if self.scheduler.last_epoch != self.global_step:
+            raise RuntimeError(
+                f"resume: scheduler at {self.scheduler.last_epoch} but global_step={self.global_step}"
+            )
+        self._start_epoch, self._skip_steps = int(st["epoch"]), int(st["step_in_epoch"])
+        steps_per_epoch = self.total_steps // max(1, self.cfg.num_epochs)
+        if self._skip_steps >= steps_per_epoch:  # checkpoint fell on an epoch boundary
+            self._start_epoch, self._skip_steps = self._start_epoch + 1, 0
+        self._log(
+            f"Resumed from {self._resume_dir}: global_step={self.global_step}, continuing at "
+            f"epoch {self._start_epoch} after {self._skip_steps} of {steps_per_epoch} steps"
+        )
 
     # -- setup helpers -------------------------------------------------------
 
@@ -1437,6 +1596,20 @@ class CPTTrainer:
             f"trainable={info['trainable_params']:,}/{info['total_params']:,} "
             f"({info['trainable_pct']:.2f}%)  ESM-C={self.is_esmc}"
         )
+        if self._resume_dir is not None:
+            # Load the checkpoint's adapter into the freshly built LoRA (before DDP / compile).
+            from peft import set_peft_model_state_dict
+            from safetensors.torch import load_file
+
+            sd = load_file(os.path.join(self._resume_dir, "adapter_model.safetensors"))
+            n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+            res = set_peft_model_state_dict(model, sd)
+            if res.unexpected_keys or len(sd) != n_trainable:
+                raise RuntimeError(
+                    f"resume: adapter has {len(sd)} tensors for {n_trainable} trainable params, "
+                    f"unexpected={list(res.unexpected_keys)[:5]}"
+                )
+            self._log(f"  loaded {len(sd)} adapter tensors from {self._resume_dir}")
         model = model.to(self.device)
         if self.is_distributed:
             model = DDP(model, device_ids=[self.local_rank], find_unused_parameters=False)
@@ -1524,7 +1697,9 @@ class CPTTrainer:
         )
 
         # Stage 4.3 path: token-budget step-synchronised batch sampler (opt-in).
-        self._token_mode = self.cfg.token_budget > 0
+        # The two deterministic samplers are wrapped in _SkipSampler so a resumed epoch can
+        # skip what was already consumed; the fallback (random) path is not resumable.
+        self._skip: _SkipSampler | None = None
         if self._token_mode:
             if "length" not in self.train_ds.column_names:
                 raise ValueError("token_budget needs a 'length' column in the train dataset")
@@ -1538,9 +1713,10 @@ class CPTTrainer:
                 rank=self.global_rank,
                 seed=self.cfg.seed,
             )
+            self._skip = _SkipSampler(self.train_sampler)
             self.train_loader = DataLoader(
                 self.train_ds,
-                batch_sampler=self.train_sampler,
+                batch_sampler=self._skip,
                 num_workers=self.cfg.dataloader_num_workers,
                 pin_memory=True,
                 collate_fn=self.collator,
@@ -1569,10 +1745,11 @@ class CPTTrainer:
                     shuffle=True,
                     drop_last=True,
                 )
+            self._skip = _SkipSampler(self.train_sampler)
             self.train_loader = DataLoader(
                 self.train_ds,
                 batch_size=self.cfg.batch_size,
-                sampler=self.train_sampler,
+                sampler=self._skip,
                 num_workers=self.cfg.dataloader_num_workers,
                 pin_memory=True,
                 collate_fn=self.collator,
@@ -1595,6 +1772,11 @@ class CPTTrainer:
                 collate_fn=self.collator,
                 persistent_workers=self.cfg.dataloader_num_workers > 0,
                 drop_last=True,
+            )
+        if self._resume_dir is not None and self._skip is None:
+            raise RuntimeError(
+                "resume needs a deterministic sampler (token_budget > 0 or length bucketing); "
+                "this run's data order is random and cannot be continued"
             )
 
     def _setup_optimizer(self) -> None:
@@ -1632,10 +1814,10 @@ class CPTTrainer:
         self._log(f"\nStarting training: {cfg.num_epochs} epoch(s), bs={cfg.batch_size}*"
                   f"ga{cfg.gradient_accumulation_steps}*ws{self.world_size}="
                   f"{cfg.batch_size*cfg.gradient_accumulation_steps*self.world_size} effective\n")
-        for epoch in range(cfg.num_epochs):
+        for epoch in range(self._start_epoch, cfg.num_epochs):
             if (self.is_distributed or getattr(self, "_token_mode", False)) and hasattr(self.train_sampler, "set_epoch"):
                 self.train_sampler.set_epoch(epoch)
-            self._train_one_epoch(epoch)
+            self._train_one_epoch(epoch, skip_steps=self._skip_steps if epoch == self._start_epoch else 0)
             if self.should_stop:
                 self._log(f"Stopping after epoch {epoch+1} due to early-stop trigger")
                 break
@@ -1648,17 +1830,9 @@ class CPTTrainer:
             dist.barrier()
             dist.destroy_process_group()
 
-    def _train_one_epoch(self, epoch: int) -> None:
+    def _train_one_epoch(self, epoch: int, skip_steps: int = 0) -> None:
         cfg = self.cfg
         self.model.train()
-        pbar = tqdm(
-            enumerate(self.train_loader),
-            total=len(self.train_loader),
-            desc=f"epoch {epoch+1}",
-            disable=not self._is_main(),
-        )
-        self.optimizer.zero_grad()
-        accum_loss = 0.0
         token_mode = getattr(self, "_token_mode", False)
         plan = self.train_sampler.step_plan() if token_mode else None
         if plan is not None and self.is_distributed:
@@ -1670,7 +1844,23 @@ class CPTTrainer:
             dist.all_reduce(hi, op=dist.ReduceOp.MAX)
             if not torch.equal(lo, hi):
                 raise RuntimeError(f"rank {self.global_rank}: step plans differ across ranks {lo.tolist()} vs {hi.tolist()}")
-        step_i, micro_i = 0, 0
+        # Resume: skip the loader batches of the steps already done, BEFORE the epoch iterator is
+        # created below (the DataLoader reads the sampler when iteration starts).
+        skip_batches = sum(plan[:skip_steps]) if plan is not None else skip_steps * cfg.gradient_accumulation_steps
+        if self._skip is not None:
+            self._skip.skip = skip_batches if token_mode else skip_batches * cfg.batch_size
+        if skip_steps:
+            self._log(f"  epoch {epoch+1}: skipping {skip_steps} done steps = {skip_batches} loader batches")
+        pbar = tqdm(
+            enumerate(self.train_loader),
+            total=len(self.train_loader),
+            desc=f"epoch {epoch+1}",
+            disable=not self._is_main(),
+        )
+        n_batches_epoch = len(self.train_loader) + skip_batches
+        self.optimizer.zero_grad()
+        accum_loss = 0.0
+        step_i, micro_i = skip_steps, 0
         thr_rows, thr_tokens, thr_t0 = 0, 0, time.perf_counter()
 
         for step, batch in pbar:
@@ -1709,6 +1899,7 @@ class CPTTrainer:
 
             if closes_step:
                 step_i, micro_i = step_i + 1, 0
+                self._epoch_steps_done = step_i
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), cfg.gradient_clip
                 )
@@ -1729,7 +1920,7 @@ class CPTTrainer:
                             "train/grad_norm": float(grad_norm) if torch.is_tensor(grad_norm) else grad_norm,
                             "train/learning_rate": self.scheduler.get_last_lr()[0],
                             "train/global_step": self.global_step,
-                            "train/epoch_frac": epoch + (step + 1) / len(self.train_loader),
+                            "train/epoch_frac": epoch + (step + 1 + skip_batches) / n_batches_epoch,
                             # local rank's throughput since the last log; x world_size for the job
                             "train/rows_per_sec": thr_rows / max(1e-9, time.perf_counter() - thr_t0),
                             "train/tokens_per_sec": thr_tokens / max(1e-9, time.perf_counter() - thr_t0),
@@ -1890,6 +2081,11 @@ class CPTTrainer:
             return
         out_dir = os.path.join(self.cfg.output_dir, f"checkpoint_{tag}")
         os.makedirs(out_dir, exist_ok=True)
+        stale_state = os.path.join(out_dir, RESUME_STATE_FILE)
+        if os.path.exists(stale_state):
+            # Re-saving over an older run's checkpoint of the same step: drop its state first so
+            # a kill mid-save can never leave a new adapter beside an old training_state.pt.
+            os.remove(stale_state)
         model = self.model.module if isinstance(self.model, DDP) else self.model
         unwrapped = getattr(model, "_orig_mod", model)  # undo torch.compile wrapper
         unwrapped.save_pretrained(out_dir)
@@ -1905,11 +2101,27 @@ class CPTTrainer:
             meta["canonical_buckets"] = buckets
         with open(os.path.join(out_dir, "trainer_state.json"), "w") as f:
             json.dump(meta, f, indent=2, default=str)
+        if tag.startswith("step_"):
+            # Resume state, written last and atomically: its presence marks a complete checkpoint.
+            state = {
+                "format": 1,
+                "global_step": self.global_step,
+                "epoch": epoch,
+                "step_in_epoch": self._epoch_steps_done,
+                "best_eval_loss": self.best_eval_loss,
+                "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict(),
+                "cdr3_plateau": self.cdr3_plateau.state_dict() if self.cdr3_plateau is not None else None,
+                "config": self._config_for_resume(),
+                "wandb_run_id": wandb.run.id if (self.use_wandb and wandb.run is not None) else None,
+            }
+            tmp = os.path.join(out_dir, RESUME_STATE_FILE + ".tmp")
+            torch.save(state, tmp)
+            os.replace(tmp, os.path.join(out_dir, RESUME_STATE_FILE))
         self._log(f"  saved checkpoint: {out_dir}")
 
-        # Cleanup old step checkpoints (keep 3).
-        step_ckpts = sorted(glob.glob(os.path.join(self.cfg.output_dir, "checkpoint_step_*")))
-        for old in step_ckpts[:-3]:
+        # Cleanup old step checkpoints (keep the 3 newest by step number, not by name).
+        for _, old in _step_checkpoints(self.cfg.output_dir)[:-3]:
             import shutil
             shutil.rmtree(old, ignore_errors=True)
 
