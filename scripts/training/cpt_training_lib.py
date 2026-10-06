@@ -1312,6 +1312,22 @@ _RESUME_MATCH_KEYS = (
 _RESUME_MATCH_KEYS_LEGACY = ("batch_size", "gradient_accumulation_steps", "world_size")
 
 
+def micro_batch_loss_scale(n_rows: int, rows_per_rank: int, n_acc: int, token_mode: bool) -> float:
+    """Weight of one micro-batch's mean loss within the optimizer step.
+
+    Fixed-batch path: ``1 / n_acc`` (the mean of ``n_acc`` equal micro-batch means).
+    Token-budget path: ``n_rows / rows_per_rank`` — the micro-batch's ROW share of the rank's step.
+    The two coincide whenever micro-batches are equal (``n_rows * n_acc == rows_per_rank``), so
+    the fixed-batch weighting of Stage 4.1 is reproduced exactly, and a step whose micro-batches
+    differ in size (a few long rows beside many short ones) weights each row the same regardless
+    of how the rows were partitioned. With ``1 / n_acc`` a 16-row micro-batch would have carried
+    the same weight as a 256-row one.
+    """
+    if token_mode:
+        return n_rows / float(rows_per_rank)
+    return 1.0 / n_acc
+
+
 class _SkipSampler(Sampler):
     """Wrap a deterministic sampler / batch sampler and skip its first ``skip`` yields.
 
@@ -1704,6 +1720,7 @@ class CPTTrainer:
             if "length" not in self.train_ds.column_names:
                 raise ValueError("token_budget needs a 'length' column in the train dataset")
             rows_per_step = self.cfg.batch_size * self.cfg.gradient_accumulation_steps * self.world_size
+            self._rows_per_rank = rows_per_step // self.world_size
             self.train_sampler = TokenBudgetStepSampler(
                 lengths=np.array(self.train_ds["length"]),
                 rows_per_step=rows_per_step,
@@ -1892,7 +1909,11 @@ class CPTTrainer:
                         labels=labels,
                     )
                     raw_loss = out.loss
-                loss = raw_loss / n_acc
+                if plan is None:
+                    loss = raw_loss / n_acc            # Stage 4.1 path, bit-identical to before
+                else:
+                    loss = raw_loss * micro_batch_loss_scale(
+                        int(input_ids.size(0)), self._rows_per_rank, n_acc, token_mode=True)
               loss.backward()  # outside autocast, as before; inside no_sync when deferring
             accum_loss += loss.item()
             micro_i += 1

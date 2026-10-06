@@ -123,9 +123,11 @@ def test_skip_sampler_yields_exactly_the_tail():
 
 
 def test_run_a_is_a_real_token_budget_run(run_a):
-    """Guards the fixture: a mixed plan (so skipping is non-trivial), 15 steps, 3 resumable saves."""
+    """Guards the fixture: more than one micro-batch per step (so skipping by micro-batch count is
+    not the same as skipping by step), 15 steps, 3 resumable saves. Under the v2 sampler every
+    step of this small fixture cuts the same way, so the plan is uniform; that is fine."""
     plan = run_a["plan"]
-    assert len(plan) == STEPS_PER_EPOCH and len(set(plan)) > 1, plan
+    assert len(plan) == STEPS_PER_EPOCH and max(plan) > 1, plan
     assert sum(plan) == len(run_a["seen"])
     for s in (5, 10, 15):
         assert (run_a["out"] / f"checkpoint_step_{s}" / L.RESUME_STATE_FILE).exists()

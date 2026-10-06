@@ -65,8 +65,33 @@ EOF
   [ "$n_pass" -eq 4 ] && [ "$n_bad" -eq 0 ]
 }
 
+r2_layout(){   # PHASES=R2: only the equivalence run, into the v2 dir, then equiv_v2 verdicts
+  local W=$(mktemp -d) Q O OLD
+  Q=$W/quest; O=$W/out; OLD=$W/old
+  mkdir -p $Q/checkpoints/cpt_stage41_pointD_run05 $Q/checkpoints/s43_equiv_pointD $Q/scripts/training $O $OLD $W/bin
+  for d in cpt_stage41_pointD_run05 s43_equiv_pointD; do
+    printf '[canonical_v2 eval @ step 2000] overall_ppl=1.800  cdr3_ppl=2.900  framework_ppl=1.2\n' > $Q/checkpoints/$d/training.log
+    echo '{"history": [{"metric": 3.0}, {"metric": 2.5}, {"metric": 2.2}, {"metric": 2.0}]}' > $Q/checkpoints/$d/early_stop_history.json
+  done
+  cp /tmp/s43_stub_torchrun $W/bin/torchrun
+  cat > $W/bin/python <<EOF
+#!/bin/bash
+case "\$1" in -c) echo v2 ;; *s43_compare.py) exec $PYREAL "\$@" ;; esac
+EOF
+  chmod +x $W/bin/python
+  sed -e 's/sleep 90/sleep 1/; s/sleep 30/sleep 1/; s/sleep 15/sleep 1/; s/sleep 5/sleep 1/' $HERE/run_s43.sh > $W/run_s43.sh
+  PHASES=R2 NGPU=1 Q=$Q O=$O OLD=$OLD CMP=$HERE/s43_compare.py TORCHRUN=$W/bin/torchrun PY=$W/bin/python bash $W/run_s43.sh
+  echo "=== [R2] run.log ==="; cat $O/run.log
+  grep -q 'sampler=v2 phases=R2' $O/run.log || { echo "[R2] start line missing sampler/phases"; return 1; }
+  [ -f $Q/checkpoints/s43_equiv_v2_pointD/training.log ] || { echo "[R2] v2 dir not used"; return 1; }
+  [ "$(grep -cE '^(TRAIN_EQUIV_V2|V2_VS_V1) PASS' $O/run.log)" = 2 ] || { echo "[R2] expected 2 PASS verdicts"; return 1; }
+  grep -q '^TRAIN_EQUIV ' $O/run.log && { echo "[R2] must not emit the v1 verdict"; return 1; }
+  echo "[R2] verdicts: 2 PASS (expect 2), v1 result left intact"
+}
+
 rc=0
 one_layout 4 "4-GPU parallel" 2 || rc=1
 one_layout 1 "1-GPU sequential" 1 || rc=1
+r2_layout || rc=1
 echo "=== dryrun overall: $([ $rc -eq 0 ] && echo PASS || echo FAIL) ==="
 exit $rc

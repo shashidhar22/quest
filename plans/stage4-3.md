@@ -1,8 +1,12 @@
 # CPT Stage 4.3 — trainer efficiency + mid-run resume
 
-**Status:** code complete (all four changes), laptop-verified; GPU verification queued on the retry
-loop (2026-10-06) · **Depends on:** nothing (engineering)
-· **Knowledge:** `~/Documents/ACS/quest-cpt/findings.md` (GPU-efficiency section)
+**Status (2026-10-06 23:30 UTC):** first GPU run done on one L4. `EVAL_AB` **PASS** (bit-identical),
+speed ≈ 3× per GPU, memory 18.5 GB; **`TRAIN_EQUIV` FAIL** — the v1 sampler's length-homogeneous
+steps changed the optimisation (overall +33 %, framework +50 %, cdr3 −14 % at step 2000; cause and
+numbers in `~/Documents/ACS/quest-cpt/findings.md` §9.3). Sampler v2 (mixed steps, row-weighted
+loss) built, 21 tests, 6/6 verifier mutants; its GPU re-test `TRAIN_EQUIV_V2` runs as phase 3 of
+the same box visit, after wave 1. `RESUME` pending (resumed correctly at step 1000) ·
+**Depends on:** nothing (engineering) · **Knowledge:** `findings.md` §9.2 (efficiency) and §9.3.
 
 ## Built (2026-10-05/06) — what exists and what has been checked
 - Changes 1–3 (cached eval, `TokenBudgetStepSampler` + `no_sync` + rank-plan check, rows/s and

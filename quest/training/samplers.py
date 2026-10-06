@@ -31,25 +31,34 @@ class TokenBudgetStepSampler(Sampler):
     step — otherwise DDP all-reduces mismatched counts and hangs or mis-averages. The old
     sampler stride-shards one flat index list, so it cannot give that guarantee.
 
-    Design (deterministic in ``seed + epoch``, so every rank computes the same global plan):
-      1. Shuffle rows within each length bucket, then concatenate buckets shortest-first.
-      2. Chunk that sequence into global step-batches of exactly ``rows_per_step`` rows. Only the
-         final partial chunk is dropped (< ``rows_per_step`` rows per epoch in total) — never a
-         whole sparse bucket of long rows, which would silently discard the full-MHC rows.
-      3. Each step-batch's micro-batch size comes from its GLOBAL max length: the largest divisor
-         ``d`` of ``rows_per_step // world_size`` with ``d * max_len <= token_budget``. All ranks
-         see the same step-batch, so all derive the same ``d`` and the same accumulation count.
-      4. Shuffle rows within the step-batch (balances long rows across ranks), give rank ``r``
-         its contiguous slice, split that slice into micro-batches of ``d`` rows.
-      5. Shuffle the order of step-batches.
+    Design v2 (2026-10-06; deterministic in ``seed + epoch``, so every rank computes the same plan):
+      1. One global permutation of all rows, chunked into step-batches of exactly ``rows_per_step``
+         rows. A step is therefore a proportional random MIX of lengths — the same composition the
+         Stage 4.1 sampler gave each step. Only the epoch remainder (< ``rows_per_step`` rows) is
+         dropped, and it is taken from the shortest bucket, never from the sparse long tail.
+      2. Within a step the rows are sorted longest-first and dealt to ranks round-robin, so rank
+         ``r`` holds rows ``s[r], s[r+W], ...``: every rank gets the same length profile.
+      3. The micro-batch cut points are computed ONCE from the step's global row lengths at every
+         ``W``-th position (the longest of each group of ``W``, which bounds all ranks' rows at that
+         position): starting at position ``i`` with length ``L``, take ``min(max_micro_rows,
+         token_budget // L)`` rows. All ranks apply the same cuts, so the accumulation count is
+         identical everywhere and ``no_sync()`` on all but the last micro-batch is safe.
+
+    Why v1 (shortest-first concatenation, length-homogeneous steps) was replaced: in this data
+    length IS content — a row is long because it carries the full MHC chain — so homogeneous
+    steps delivered the MHC signal in a few dozen concentrated bursts instead of as a steady
+    component of every update. Measured on 2026-10-06 against Stage 4.1 arm D at matched steps:
+    cdr3 10–13 % better, framework/pocket/overall 17–31 % worse. Same data, same rows per step;
+    only the ordering differed, and ordering was enough.
 
     Use as ``DataLoader(ds, batch_sampler=sampler, ...)``. The trainer must step the optimizer
     by ``step_plan()`` (micro-batches per optimizer step, in yield order), not by a fixed
-    ``gradient_accumulation_steps``.
-
-    Loss weighting note: the trainer keeps the existing mean-of-micro-batch-means, so changing
-    the micro-batch partition reweights rows slightly versus Stage 4.1. The Stage 4.3
-    equivalence run (within 2 % at step 2000) is the check that this is immaterial.
+    ``gradient_accumulation_steps``, and must weight each micro-batch's loss by its ROW share of
+    the rank's step (``rows / rows_per_rank``). That reproduces the fixed-batch weighting exactly
+    when micro-batches are equal, and when they are not it stops a 16-row micro-batch from
+    carrying the weight of a 256-row one; within a micro-batch tokens are still averaged, as
+    before. A single row longer than ``token_budget`` forms a 1-row micro-batch that exceeds the
+    budget (cannot happen while ``max_length <= token_budget``).
     """
 
     def __init__(
@@ -96,36 +105,45 @@ class TokenBudgetStepSampler(Sampler):
                 if d <= self.max_micro_rows and d * max(int(max_len), 1) <= self.token_budget]
         return fits[-1] if fits else 1
 
+    def _cuts(self, rep: np.ndarray) -> List[tuple]:
+        """Micro-batch boundaries ``[(start, end), ...]`` over a rank's ``rows_per_rank`` positions,
+        from the position-wise length bound ``rep`` (longest-first). Pure function of the global
+        step, hence identical on every rank."""
+        cuts, i, n = [], 0, len(rep)
+        while i < n:
+            L = max(int(rep[i]), 1)
+            d = max(1, min(self.max_micro_rows, self.token_budget // L, n - i))
+            cuts.append((i, i + d))
+            i += d
+        return cuts
+
     def _plan(self):
         key = (self.epoch, self.rank)
         if self._cache_key == key:
             return self._cache
         rng = np.random.default_rng(self.seed + self.epoch)
-        ordered = []
-        for idx in self.bucket_indices:
-            idx = idx.copy()
-            if self.shuffle:
-                rng.shuffle(idx)
-            ordered.append(idx)
-        flat = np.concatenate(ordered) if ordered else np.array([], dtype=np.int64)
-        # Drop the epoch remainder from the SHORT end. The sequence is shortest-first, so cutting
-        # the tail would drop the longest (full-MHC) rows every epoch — caught by a test.
-        flat = flat[len(flat) % self.rows_per_step:]
-        n_steps = len(flat) // self.rows_per_step
-        steps = [flat[i * self.rows_per_step:(i + 1) * self.rows_per_step].copy() for i in range(n_steps)]
-        for s in steps:
-            if self.shuffle:
-                rng.shuffle(s)
-        if self.shuffle:
-            order = rng.permutation(n_steps)
-            steps = [steps[i] for i in order]
+        n = len(self.lengths)
+        perm = rng.permutation(n) if self.shuffle else np.arange(n)
+        rem = n % self.rows_per_step
+        if rem:
+            # Drop the epoch remainder from the SHORTEST rows in the epoch — never the sparse long
+            # (full-MHC) rows, which a plain tail cut could discard every epoch (caught by a test).
+            # "Shortest rows", not "shortest bucket": a dataset with few rows under the first
+            # boundary must still lose only its shortest rows (verifier finding, 2026-10-06).
+            keep = np.ones(n, dtype=bool)
+            keep[np.argsort(self.lengths[perm], kind="stable")[:rem]] = False
+            perm = perm[keep]
+        n_steps = len(perm) // self.rows_per_step
         micro_batches, plan = [], []
-        lo, hi = self.rank * self.rows_per_rank, (self.rank + 1) * self.rows_per_rank
-        for s in steps:
-            d = self.micro_rows_for(int(self.lengths[s].max()))
-            mine = s[lo:hi]
-            micro_batches.extend(mine[j:j + d].tolist() for j in range(0, self.rows_per_rank, d))
-            plan.append(self.rows_per_rank // d)
+        W = self.num_replicas
+        for k in range(n_steps):
+            s = perm[k * self.rows_per_step:(k + 1) * self.rows_per_step]
+            s = s[np.argsort(-self.lengths[s], kind="stable")]     # longest first
+            mine = s[self.rank::W]                                   # this rank's round-robin share
+            rep = self.lengths[s[::W]]                               # >= every rank's length, per position
+            cuts = self._cuts(rep)
+            micro_batches.extend(mine[a:b].tolist() for a, b in cuts)
+            plan.append(len(cuts))
         self._cache_key, self._cache = key, (micro_batches, plan)
         return self._cache
 

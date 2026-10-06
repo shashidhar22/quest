@@ -158,6 +158,24 @@ or the project memory, not in this log.
   + a new launch path (~1–2 days) — worth building before 4.7, not for a USD 5–55 job. Instead the
   poll interval moved to `loop.conf` (POLL_SECONDS=300, MAX_HOURS=24), re-read every attempt like
   the type list, so short capacity windows are not missed.
+- **21:26 UTC: a g6.2xlarge (1× L4) started; the Stage 4.3 job launched at 21:32.** On-box tests
+  18/18. `eval_old` 403 s, `eval_new` 378 s, **`EVAL_AB` PASS (exactly equal)** — the eval rewrite's
+  "bit-identical" claim is now verified. **`judge_smoke` rc=0** — the Stage 4.2 judge ran end to
+  end for the first time. The equivalence run R did ≈ 1,400 steps/h on one L4 (Stage 4.1: 453 per
+  GPU), 100 % utilisation, 18.5 of 23 GB. **`TRAIN_EQUIV` FAIL** at step 2000: overall 2.971 vs
+  2.241 (+32.6 %), cdr3 4.176 vs 4.861 (−14.1 %), pocket 3.324 vs 2.569 (+29.4 %); the gap had the
+  same sign at steps 500/1000/1500 and widened. Cause: the v1 sampler's length-homogeneous steps
+  (4.12 micro-batches/step on average = almost every step pure short rows) concentrated the
+  full-MHC rows into a few dozen steps — ordering, not data. Written up as `findings.md` §9.3.
+- **Sampler v2 built the same evening** (global-permutation steps, longest-first round-robin
+  dealing, rank-identical token-budget cuts, row-weighted loss; epoch remainder = globally
+  shortest rows): 21 laptop tests (4 new) and a `verifier` pass — 6/6 mutants caught, invariants
+  confirmed on two length profiles; it found the remainder fallback could drop long rows on data
+  with few sub-64 rows (fixed) and restored the Stage 4.1 path's exact division. Not GPU-verified.
+  **Phase 3** (`phase3_v2.sh`, handed off by `wave1.sh`) re-runs the equivalence test under v2 on
+  the same box after wave 1 → `TRAIN_EQUIV_V2` and `V2_VS_V1`. Only not-yet-running files were
+  swapped on the box (bash reads a running script incrementally; `run_s43.sh`/`run_all.sh` were
+  verified untouched). S (resume) resumed correctly at step 1000 at 23:22 UTC.
 - **Retry loop stopped by Yuexin ≈18:55 UTC** (attempts 1–3 from 18:18, no capacity) so the next
   launch uses the repo's `launch_s43.sh` (watchdog 4 h, OS timer 300 min, publishes
   `resume_training.log`); `gpu_retry_loop.sh` now reads that file instead of a dead scratchpad

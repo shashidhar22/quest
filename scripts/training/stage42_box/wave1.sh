@@ -94,3 +94,7 @@ fi
 $PY $CHECK report --dir $O >> $O/wave1.log 2>&1
 say "wave 1 done"
 publish
+
+# Hand the box to phase 3 (the v2-sampler equivalence re-test) if the kit shipped one.
+PHASE3=${PHASE3:-/home/ubuntu/phase3_v2.sh}
+if [ -f "$PHASE3" ] && [ -z "${NO_PHASE3:-}" ]; then say "handing over to $PHASE3"; bash "$PHASE3"; fi

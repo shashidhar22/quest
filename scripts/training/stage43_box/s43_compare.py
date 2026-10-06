@@ -74,6 +74,11 @@ if __name__ == "__main__":
         eval_ab()
     if what in ("equiv", "all"):
         compare("TRAIN_EQUIV", f"{Q}/s43_equiv_pointD", f"{Q}/cpt_stage41_pointD_run05")
+    if what in ("equiv_v2", "all"):
+        # v2 sampler (mixed-composition steps + row-weighted loss) vs Stage 4.1 — the real test —
+        # and vs the v1 run for the record (how much the fix moved things).
+        compare("TRAIN_EQUIV_V2", f"{Q}/s43_equiv_v2_pointD", f"{Q}/cpt_stage41_pointD_run05")
+        compare("V2_VS_V1", f"{Q}/s43_equiv_v2_pointD", f"{Q}/s43_equiv_pointD")
     if what in ("resume", "all"):
         resume_happened(f"{Q}/s43_resume_pointD")
         compare("RESUME", f"{Q}/s43_resume_pointD", f"{Q}/s43_equiv_pointD")

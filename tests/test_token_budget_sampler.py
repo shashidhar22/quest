@@ -76,12 +76,17 @@ def test_short_rows_get_large_micro_batches():
     assert set(s.step_plan()) == {1}, "one micro-batch per rank per step for short rows"
 
 
-def test_long_rows_fall_back_to_proven_size():
-    """Failure: a 600-token step not at 16 rows (the size Stage 4.1 proved fits in memory)."""
-    s = TokenBudgetStepSampler(np.full(4096, 600), rows_per_step=STEP, token_budget=BUDGET,
-                               num_replicas=WORLD, rank=0)
-    assert set(len(mb) for mb in s) == {16}
-    assert set(s.step_plan()) == {16}
+def test_long_rows_stay_within_the_memory_budget():
+    """Failure: a 600-token micro-batch exceeding the token budget that Stage 4.1 proved fits in
+    memory (16 rows x 1024 = 16,384 tokens), or ranks disagreeing on the cut plan."""
+    samplers = [TokenBudgetStepSampler(np.full(4096, 600), rows_per_step=STEP, token_budget=BUDGET,
+                                       num_replicas=WORLD, rank=r) for r in range(WORLD)]
+    for s in samplers:
+        for mb in s:
+            assert len(mb) * 600 <= BUDGET, len(mb)
+        assert all(n >= 1 for n in s.step_plan())
+    assert all(s.step_plan() == samplers[0].step_plan() for s in samplers)
+    assert set(len(mb) for mb in samplers[0]) == {27, 256 - 9 * 27}, "budget // 600 = 27 rows, then the tail"
 
 
 def test_deterministic_per_epoch_and_reshuffled_across_epochs():
@@ -120,9 +125,58 @@ def test_naive_per_rank_sizing_would_desync():
     plans = [TokenBudgetStepSampler(lengths, rows_per_step=STEP, token_budget=BUDGET,
                                     num_replicas=WORLD, rank=r, shuffle=False).step_plan()
              for r in range(WORLD)]
-    assert all(p == plans[0] == [16] for p in plans), plans
+    assert all(p == plans[0] for p in plans), plans
+    # The one 600-token row bounds the first cut (16384 // 600 = 27 rows) on EVERY rank, even the
+    # three ranks that do not hold it; the remaining 229 short rows form one 256-capped micro-batch.
+    assert plans[0] == [2], plans[0]
 
 
 def test_rejects_indivisible_world_size():
     with pytest.raises(ValueError):
         TokenBudgetStepSampler(np.full(100, 20), rows_per_step=1024, num_replicas=3, rank=0)
+
+
+def test_steps_are_content_mixed_not_length_homogeneous():
+    """The v2 fix. Failure: the sparse long rows are concentrated into one or two steps (v1 put
+    all of them into a single length-homogeneous step; measured 2026-10-06, that concentration
+    cost 17-31 % on framework/pocket perplexity at matched steps). With a global permutation the
+    9 long rows should land in ~9 distinct steps out of 39."""
+    lengths = _lengths()
+    s = TokenBudgetStepSampler(lengths, rows_per_step=STEP, token_budget=BUDGET, num_replicas=1, rank=0)
+    rows, cur, steps_with_long = list(iter(s)), 0, 0
+    for n in s.step_plan():
+        step_rows = [i for mb in rows[cur:cur + n] for i in mb]
+        steps_with_long += any(lengths[i] >= 512 for i in step_rows)
+        cur += n
+    assert steps_with_long >= 7, f"long rows concentrated into {steps_with_long} step(s)"
+
+
+def test_within_a_step_ranks_are_dealt_round_robin_longest_first():
+    """Failure: the round-robin deal is wrong, so some rank's row at position k is longer than the
+    global bound used for the cut at k — the token budget would then be violated on that rank.
+    Checks the invariant directly: for every step and position, max over ranks == the bound."""
+    lengths = _lengths()
+    samplers = _ranks(lengths)
+    per_rank = [list(iter(s)) for s in samplers]
+    plan = samplers[0].step_plan()
+    cur = 0
+    for n in plan:
+        shares = [[i for mb in per_rank[r][cur:cur + n] for i in mb] for r in range(WORLD)]
+        assert len(set(map(len, shares))) == 1
+        step_rows = sorted((i for sh in shares for i in sh), key=lambda i: -lengths[i])
+        bound = [lengths[step_rows[k * WORLD]] for k in range(len(shares[0]))]
+        for k in range(len(shares[0])):
+            assert max(lengths[sh[k]] for sh in shares) == bound[k], (k, bound[k])
+        cur += n
+
+
+def test_micro_batch_loss_scale_reproduces_fixed_batch_weighting():
+    """Failure: row-weighting disagrees with 1/n_acc on equal micro-batches, or a micro-batch's
+    weight does not scale with its rows under the token-budget path."""
+    import os, sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "training"))
+    from cpt_training_lib import micro_batch_loss_scale as w
+    assert w(16, 256, 16, token_mode=True) == pytest.approx(w(16, 256, 16, token_mode=False)) == pytest.approx(1 / 16)
+    assert w(256, 256, 1, True) == pytest.approx(1.0)
+    assert w(27, 256, 2, True) + w(229, 256, 2, True) == pytest.approx(1.0)   # a step's weights sum to 1
+    assert w(27, 256, 2, True) / w(229, 256, 2, True) == pytest.approx(27 / 229)
