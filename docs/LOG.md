@@ -176,6 +176,13 @@ or the project memory, not in this log.
   the same box after wave 1 → `TRAIN_EQUIV_V2` and `V2_VS_V1`. Only not-yet-running files were
   swapped on the box (bash reads a running script incrementally; `run_s43.sh`/`run_all.sh` were
   verified untouched). S (resume) resumed correctly at step 1000 at 23:22 UTC.
+- **Timeline and ceiling (23:50 UTC):** measured rates put the whole visit at 8–17 h (finish
+  05:30–14:30 UTC 10-07) against a 22 h watchdog — adequate, and not re-armed (fixed at arm time;
+  re-arming on a live box is the one risky operation). To protect the v2 verdict in the tail
+  case, `wave1.sh` on one GPU now runs phase 3 between the paired cells and the trb cells; the
+  reordered script was swapped onto the box at 23:46, before wave 1 started. Session closed with
+  S in its step-2000 eval and wave 1 not yet started. Memory consolidated (both project files
+  under 300 words).
 - **Retry loop stopped by Yuexin ≈18:55 UTC** (attempts 1–3 from 18:18, no capacity) so the next
   launch uses the repo's `launch_s43.sh` (watchdog 4 h, OS timer 300 min, publishes
   `resume_training.log`); `gpu_retry_loop.sh` now reads that file instead of a dead scratchpad
