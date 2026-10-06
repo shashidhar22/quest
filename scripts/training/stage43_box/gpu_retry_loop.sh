@@ -4,13 +4,16 @@
 # the launch can't be verified, THIS script stops the instance before exiting.
 export AWS_PROFILE=DataUserAccess-953915750371 AWS_REGION=us-west-2
 B=i-0030c1a9c845b3714; W=/Users/yxu2/Documents/ACS/AWSconnection/warren-gpu.sh
-# Cheapest-first within each tier; run_s43.sh lays itself out by GPU count, so any of these works.
-# 4-GPU tier finishes in ~2-4 h; the 1-GPU tier takes ~5-10 h but at ~1/5 the hourly rate and has
-# capacity when the big types do not. The 4-vCPU/16-GB xlarge sizes are last: tokenizing 10M rows
-# is tight there. No 2-GPU shape exists in these families (AWS sells 1, 4 or 8).
-TYPES=${TYPES:-"g6.12xlarge g5.12xlarge g6.24xlarge g6.4xlarge g6.2xlarge g5.4xlarge g5.2xlarge g6.xlarge g5.xlarge"}
+# The instance types live in gpu_types.txt (ordered, commented) and are RE-READ on every attempt,
+# so that list can be edited while the loop runs. $TYPES overrides it for a one-off run.
+TYPES_FILE=${TYPES_FILE:-"$(cd "$(dirname "$0")" && pwd)/gpu_types.txt"}
+read_types(){
+  if [ -n "${TYPES:-}" ]; then echo "$TYPES"; return; fi
+  sed 's/#.*//' "$TYPES_FILE" 2>/dev/null | tr -s '[:space:]' ' '
+}
 B64=$(base64 < "$(dirname "$0")/launch_s43.sh" | tr -d '\n')   # the repo copy, read once at start
 log(){ echo "[$(date -u '+%F %T')] $*"; }
+[ -n "$(read_types)" ] || { log "no instance types in $TYPES_FILE — nothing to try"; exit 2; }
 for attempt in $(seq 1 96); do                # 96 x 15 min = 24 h
   aws sts get-caller-identity >/dev/null 2>&1 || { log "SSO_EXPIRED — run: aws sso login --profile $AWS_PROFILE"; exit 3; }
   st=$(aws ec2 describe-instances --instance-ids $B --query 'Reservations[].Instances[].State.Name' --output text 2>/dev/null)
@@ -22,12 +25,12 @@ for attempt in $(seq 1 96); do                # 96 x 15 min = 24 h
   errs=0
   [ "$st" = stopping ] && { sleep 60; continue; }
   [ "$st" = stopped ] || { log "box is '$st', not stopped — someone else is using it; aborting without touching it"; exit 4; }
-  started=""
-  for T in $TYPES; do
+  started=""; types=$(read_types)
+  for T in $types; do
     aws ec2 modify-instance-attribute --instance-id $B --instance-type "{\"Value\":\"$T\"}" 2>/dev/null
     if aws ec2 start-instances --instance-ids $B >/dev/null 2>/tmp/gpuretry.err; then started=$T; break; fi
   done
-  if [ -z "$started" ]; then log "attempt $attempt: no capacity for $TYPES"; sleep 900; continue; fi
+  if [ -z "$started" ]; then log "attempt $attempt: no capacity for $types"; sleep 900; continue; fi
   log "attempt $attempt: STARTED as $started"
   aws ec2 wait instance-running --instance-ids $B
   ok=""

@@ -129,6 +129,12 @@ or the project memory, not in this log.
   across processes, and halves S's training. Retry list extended with
   `g6.4xlarge g6.2xlarge g5.4xlarge g5.2xlarge g6.xlarge g5.xlarge`; the 4-vCPU xlarge sizes last
   because tokenizing 10M rows is tight at 16 GB RAM. Kit re-uploaded 20:13 UTC (code unchanged).
+- **Shortage is family-wide:** with the 1-GPU types added, attempt 1 of the 20:26 UTC loop was
+  refused on **all nine** g5/g6 types in us-west-2a. Added the 4 L40S (`g6e.*`) types as tier 3 —
+  a separate pool, offered in 2a, but several times the rate (`g6e.xlarge` spot USD 1.86/h vs
+  `g6.xlarge` 0.46 on 2026-10-06; on-demand is higher, Pricing API denied to this role). The type
+  list moved to `scripts/training/stage43_box/gpu_types.txt` and is **re-read every attempt**, so
+  future list edits need no restart (this change itself needed one).
 - **Retry loop stopped by Yuexin ≈18:55 UTC** (attempts 1–3 from 18:18, no capacity) so the next
   launch uses the repo's `launch_s43.sh` (watchdog 4 h, OS timer 300 min, publishes
   `resume_training.log`); `gpu_retry_loop.sh` now reads that file instead of a dead scratchpad

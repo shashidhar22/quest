@@ -1,0 +1,31 @@
+# Instance types the retry loop will try, in order, on every attempt.
+# Edited here, picked up at the NEXT attempt — no restart needed.
+# Blank lines and #-comments are ignored; everything else must be one type per line.
+#
+# run_s43.sh lays itself out by GPU count, so any of these runs the job:
+#   4-GPU  evals + equivalence run + resume run in parallel, ~2-4 h, watchdog 4 h
+#   1-GPU  the same phases sequentially, ~5-10 h at a far lower hourly rate, watchdog 10 h
+# There is no 2-GPU shape: g5/g6/g6e sell 1, 4 or 8 GPUs (checked via describe-instance-types).
+# All GPUs listed support bf16 + flash-attention 2; T4/V100 types (g4dn, p3) do not and are excluded.
+
+# --- tier 1: 4x L4 / A10G. Cheapest per GPU-hour and the fastest wall time.
+g6.12xlarge
+g5.12xlarge
+g6.24xlarge
+
+# --- tier 2: 1x L4 / A10G, 22 GB VRAM. ~1/5 the hourly rate; the 4-vCPU xlarge sizes are last
+# because tokenizing 10M rows is tight in their 16 GB of RAM.
+g6.4xlarge
+g6.2xlarge
+g5.4xlarge
+g5.2xlarge
+g6.xlarge
+g5.xlarge
+
+# --- tier 3: L40S, 44 GB VRAM. A separate capacity pool (offered in us-west-2a, where the box
+# lives) and a faster GPU, but several times the hourly rate: g6e.xlarge spot was USD 1.86/h on
+# 2026-10-06 against USD 0.46 for g6.xlarge, and on-demand is higher than spot. Last resort.
+g6e.4xlarge
+g6e.2xlarge
+g6e.xlarge
+g6e.12xlarge
