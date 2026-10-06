@@ -135,6 +135,23 @@ or the project memory, not in this log.
   `g6.xlarge` 0.46 on 2026-10-06; on-demand is higher, Pricing API denied to this role). The type
   list moved to `scripts/training/stage43_box/gpu_types.txt` and is **re-read every attempt**, so
   future list edits need no restart (this change itself needed one).
+- **First launch, and a 4-minute failure:** the 20:26 UTC loop got a **g5.2xlarge** at 20:34 (the
+  first start since the outage began). Every ESM-C call died with `cudaErrorNoKernelImageForDevice`
+  in `flash_attn_varlen_forward`: the box's flash-attn is compiled for sm_89 (L4) only and the A10G
+  is sm_86. The watchdog fired DONE at 20:40 and published; cost ≈ USD 0.30. **g5 removed from
+  `gpu_types.txt`** (L40S is sm_89 and stays). The loop also used to label every refusal "no
+  capacity"; it now logs the AWS error class per type and says "refused" when any is not
+  InsufficientInstanceCapacity. Confirmed the shortage is real: last error text was
+  InsufficientInstanceCapacity, no other GPU instance runs in the account, spot placement scores
+  1/10 for 4-GPU types in all four zones and 4–5 for 1-GPU types in 2a/2b/2c.
+- **Stage 4.2 wave 1 launcher built** (`scripts/training/stage42_box/wave1.sh` + `s42_check.py`):
+  4 cells in decision order (base/arm D × as_paired_i first, then as_trb_i), both serialized
+  cdr3 × full as arm D was trained; harness gate after cell 1 (base Recall@10 on test_iid must
+  clear the random rate with its CI, else stop — the judge is broken); 5,000-query cap, n ≥ 500;
+  paired bootstrap compare; publish after every cell; 3 cells in parallel on a 4-GPU box.
+  Because the box had to be relaunched anyway, 4.3 and wave 1 now run as ONE job under one
+  watchdog (`run_all.sh`), replacing a live-watchdog swap. Dry runs: 4.2 flow 5/5 scenarios, 4.3
+  kit both layouts 8/8 verdicts. Kits re-uploaded. Not yet run on a GPU.
 - **Retry loop stopped by Yuexin ≈18:55 UTC** (attempts 1–3 from 18:18, no capacity) so the next
   launch uses the repo's `launch_s43.sh` (watchdog 4 h, OS timer 300 min, publishes
   `resume_training.log`); `gpu_retry_loop.sh` now reads that file instead of a dead scratchpad

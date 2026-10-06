@@ -3,7 +3,7 @@
 | Stage | Plan | Status | Result or gate |
 |---|---|---|---|
 | 4.1 | `stage4-1.md` | **DONE** 2026-10-03 | `pocket_ppl` A 3.368 / D 1.862 / F 2.090, all 7,800 steps; `docs/cpt_stage4.1/README.md` §10 |
-| 4.2 | `stage4-2.md` | **code ready**, smoke queued on GPU retry loop (2026-10-05) | downstream SFT judge; wave 1 (base vs arm D, 4 cells) is **the gate for 4.4–4.7** |
+| 4.2 | `stage4-2.md` | **wave 1 launcher built** (2026-10-06, `stage42_box/wave1.sh`, dry-run 5/5); runs after 4.3 in the same box visit | downstream SFT judge; wave 1 (base vs arm D, 4 cells, decision order, harness gate after cell 1) is **the gate for 4.4–4.7** |
 | 4.3 | `stage4-3.md` | **code complete** incl. resume (2026-10-06, laptop-verified); GPU verification queued | trainer efficiency + mid-run resume; its equivalence run is 4.4's control; one box job yields `EVAL_AB` / `TRAIN_EQUIV` / `RESUME` |
 | 4.6 | `stage4-6.md` | step 1 free, run with 4.2 | allele-frequency diagnostic; decides whether `pocket_ppl` means biochemistry or HLA recall |
 | 4.4 | `stage4-4.md` | after 4.2 + 4.3 | balanced vs proportional; step 1 needs **no build** (run06 vs 4.1 arm A) |
