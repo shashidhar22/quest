@@ -117,8 +117,8 @@ or the project memory, not in this log.
   equivalence run holds 2/3; `TRAIN_EQUIV` is written as soon as that run stops; new verdicts
   `RESUME_LOG` + `RESUME`. `dryrun.sh` exercises the whole flow on the laptop with stubs (passes).
   New `s43.tgz` + `s43box.tgz` uploaded 18:49 UTC (originals kept in the session scratchpad).
-- **Retry loop left running untouched** (the permission classifier declined stopping it): it will
-  launch with the OLD in-memory launch script (watchdog 3 h, OS timer 240 min, PUB without
-  `resume_training.log` — but `s43_out/` is synced, and the resume log is copied there). The repo's
-  `launch_s43.sh` has 4 h / 300 min; `gpu_retry_loop.sh` still points at a dead scratchpad path —
-  fix both at the next restart (NEXT.md item 1).
+- **Retry loop stopped by Yuexin ≈18:55 UTC** (attempts 1–3 from 18:18, no capacity) so the next
+  launch uses the repo's `launch_s43.sh` (watchdog 4 h, OS timer 300 min, publishes
+  `resume_training.log`); `gpu_retry_loop.sh` now reads that file instead of a dead scratchpad
+  copy. Not restarted by the assistant (safety classifier withheld the relaunch); the start
+  command is NEXT.md item 1. Nothing is running on AWS; the box is stopped.
