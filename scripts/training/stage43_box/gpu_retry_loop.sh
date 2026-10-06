@@ -4,7 +4,11 @@
 # the launch can't be verified, THIS script stops the instance before exiting.
 export AWS_PROFILE=DataUserAccess-953915750371 AWS_REGION=us-west-2
 B=i-0030c1a9c845b3714; W=/Users/yxu2/Documents/ACS/AWSconnection/warren-gpu.sh
-TYPES="g6.12xlarge g5.12xlarge g6.24xlarge"   # run_s43 lays out work across 4 GPUs
+# Cheapest-first within each tier; run_s43.sh lays itself out by GPU count, so any of these works.
+# 4-GPU tier finishes in ~2-4 h; the 1-GPU tier takes ~5-10 h but at ~1/5 the hourly rate and has
+# capacity when the big types do not. The 4-vCPU/16-GB xlarge sizes are last: tokenizing 10M rows
+# is tight there. No 2-GPU shape exists in these families (AWS sells 1, 4 or 8).
+TYPES=${TYPES:-"g6.12xlarge g5.12xlarge g6.24xlarge g6.4xlarge g6.2xlarge g5.4xlarge g5.2xlarge g6.xlarge g5.xlarge"}
 B64=$(base64 < "$(dirname "$0")/launch_s43.sh" | tr -d '\n')   # the repo copy, read once at start
 log(){ echo "[$(date -u '+%F %T')] $*"; }
 for attempt in $(seq 1 96); do                # 96 x 15 min = 24 h
@@ -33,7 +37,7 @@ for attempt in $(seq 1 96); do                # 96 x 15 min = 24 h
   out=$(WARREN_BOX=$B $W exec "echo $B64 | base64 -d > /tmp/launch_s43.sh; sudo -u ubuntu bash /tmp/launch_s43.sh; sleep 2" 240 2>&1)
   echo "$out" | grep -E 'LAUNCH_|s43:|autostop:|armed' | sed 's/^/    /'
   if echo "$out" | grep -q 'LAUNCH_OK' && echo "$out" | grep -q 'autostop:' && echo "$out" | grep -q 's43:'; then
-    log "LAUNCHED on $started; watchdog armed (MAX_HOURS=4) + OS timer 300 min. Results -> s3://fh-pi-warren-h-eco/quest/tcrbench2/checkpoints/stage43_check/"
+    log "LAUNCHED on $started; ceilings are in the LAUNCH_OK line above (the box sets them from its GPU count). Results -> s3://fh-pi-warren-h-eco/quest/tcrbench2/checkpoints/stage43_check/"
     exit 0
   fi
   log "launch NOT verified — STOPPING the box"; aws ec2 stop-instances --instance-ids $B >/dev/null; exit 6

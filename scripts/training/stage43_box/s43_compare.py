@@ -4,8 +4,11 @@ published logs: Q=<dir holding checkpoints/> O=<s43_out> python s43_compare.py a
   equiv   TRAIN_EQUIV  pre-registered: overall and cdr3 at step 2000 within 2 % of Stage 4.1 arm 2;
                        pocket reported, flagged > 5 %.
   resume  RESUME_LOG   the log must show the resume happened at global_step=1000;
-          RESUME       the killed-at-1000-and-resumed run's step-2000 eval within 2 % (overall,
-                       cdr3) of the uninterrupted equivalence run's; pocket flagged > 5 %.
+          RESUME       the run resumed from the equivalence run's step-1000 checkpoint must reach
+                       a step-2000 eval within 2 % (overall, cdr3) of that uninterrupted run's;
+                       pocket flagged > 5 %.
+Both runs evaluate every 500 steps, so entry 3 of early_stop_history.json is step 2000 in each —
+for the resumed run too, because resume restores the plateau history along with the optimizer.
 """
 import json, os, re, sys
 O = os.environ.get("O", "/home/ubuntu/s43_out")

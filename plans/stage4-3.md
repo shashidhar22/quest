@@ -19,12 +19,20 @@ loop (2026-10-06) · **Depends on:** nothing (engineering)
   over an older checkpoint never leaves mixed state. Independent mutation check: 6/6 deliberate
   bugs caught. Also fixed: step-checkpoint cleanup sorted by name (would have deleted
   `step_10000` before `step_8000`).
-- **On-box harness** `scripts/training/stage43_box/`: one 4-GPU job runs the eval A/B + judge
-  smoke, the 2,000-step equivalence run, and the resume check (train to step 1000, kill,
-  `--resume_from auto`, stop after step 2000) → verdicts `EVAL_AB`, `TRAIN_EQUIV`, `RESUME_LOG`,
-  `RESUME` in `run.log`. `dryrun.sh` exercises the whole flow on a laptop with stubs (passes).
-  The first kit never stopped the run after 4 evals (it waited on a `training.log` only the
-  Stage 4.1 driver writes) — fixed before any GPU launch.
+- **On-box harness** `scripts/training/stage43_box/`: one job yields `EVAL_AB`, `TRAIN_EQUIV`,
+  `RESUME_LOG`, `RESUME` in `run.log`. It lays itself out by GPU count (2026-10-06), so it runs on
+  whatever type has capacity — 4 GPUs: evals + judge on 0/1, equivalence run R on 2,3, resume run S
+  on 0,1, ~2–4 h; 1 GPU: the same phases sequentially at world size 1, ~5–10 h but ~1/5 the hourly
+  rate. An optimizer step is 1024 rows either way (batch 16 × 64/world × world). `dryrun.sh`
+  exercises **both** layouts on a laptop with stubs (8/8 verdicts).
+  Two kit bugs fixed before any GPU launch: the run was never stopped after 4 evals (it watched a
+  `training.log` only the Stage 4.1 driver writes), and the loop read its launch script from a dead
+  scratchpad path.
+- **Resume-check deviation from the Verification section below:** S resumes from a copy of R's own
+  `checkpoint_step_1000` instead of re-running and killing at 1000. Same claim ("the resumed run's
+  step-2000 eval matches an uninterrupted run's within 2 %"), same checkpoint (saves are atomic and
+  complete before any kill), it additionally tests resume across processes — which is the real spot
+  case — and it halves S's training.
 - **Not yet checked on a GPU:** everything above (the retry loop has had no g6 capacity since
   2026-10-05 19:50 UTC).
 

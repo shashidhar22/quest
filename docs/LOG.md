@@ -117,6 +117,18 @@ or the project memory, not in this log.
   equivalence run holds 2/3; `TRAIN_EQUIV` is written as soon as that run stops; new verdicts
   `RESUME_LOG` + `RESUME`. `dryrun.sh` exercises the whole flow on the laptop with stubs (passes).
   New `s43.tgz` + `s43box.tgz` uploaded 18:49 UTC (originals kept in the session scratchpad).
+- **GPU outage continued** (attempts through 19:46 UTC, no capacity on any 4-GPU type). Checked
+  with `describe-instance-types`: g5/g6/g6e sell **1, 4 or 8 GPUs — there is no 2-GPU shape**, so
+  "smaller" means one GPU. The job now lays itself out by GPU count: 4 GPUs run the evals, the
+  equivalence run R (2,000 steps, world size 2) and the resume run S in parallel (~2–4 h); 1 GPU
+  runs the same phases sequentially at world size 1 (~5–10 h at ~1/5 the hourly rate). An optimizer
+  step is 1024 rows either way (16 × 64/world × world). The box reads its own GPU count and sets
+  the watchdog and OS timer from it (4 h/300 min vs 10 h/660 min). `dryrun.sh` now exercises both
+  layouts (8/8 verdicts). S also changed: it resumes from a copy of R's own `checkpoint_step_1000`
+  instead of re-training and killing at 1000 — same pre-registered claim, additionally tests resume
+  across processes, and halves S's training. Retry list extended with
+  `g6.4xlarge g6.2xlarge g5.4xlarge g5.2xlarge g6.xlarge g5.xlarge`; the 4-vCPU xlarge sizes last
+  because tokenizing 10M rows is tight at 16 GB RAM. Kit re-uploaded 20:13 UTC (code unchanged).
 - **Retry loop stopped by Yuexin ≈18:55 UTC** (attempts 1–3 from 18:18, no capacity) so the next
   launch uses the repo's `launch_s43.sh` (watchdog 4 h, OS timer 300 min, publishes
   `resume_training.log`); `gpu_retry_loop.sh` now reads that file instead of a dead scratchpad
