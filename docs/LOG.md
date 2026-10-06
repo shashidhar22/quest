@@ -152,6 +152,12 @@ or the project memory, not in this log.
   Because the box had to be relaunched anyway, 4.3 and wave 1 now run as ONE job under one
   watchdog (`run_all.sh`), replacing a live-watchdog swap. Dry runs: 4.2 flow 5/5 scenarios, 4.3
   kit both layouts 8/8 verdicts. Kits re-uploaded. Not yet run on a GPU.
+- 21:14 UTC loop attempt 1: all nine L4/L40S types refused, every one InsufficientInstanceCapacity.
+  Spot discussed again and declined for now: it draws from the same spare pool (scores 1–5/10),
+  is reclaimed first in a shortage, and needs an image + S3 checkpoint sync + interruption handler
+  + a new launch path (~1–2 days) — worth building before 4.7, not for a USD 5–55 job. Instead the
+  poll interval moved to `loop.conf` (POLL_SECONDS=300, MAX_HOURS=24), re-read every attempt like
+  the type list, so short capacity windows are not missed.
 - **Retry loop stopped by Yuexin ≈18:55 UTC** (attempts 1–3 from 18:18, no capacity) so the next
   launch uses the repo's `launch_s43.sh` (watchdog 4 h, OS timer 300 min, publishes
   `resume_training.log`); `gpu_retry_loop.sh` now reads that file instead of a dead scratchpad
