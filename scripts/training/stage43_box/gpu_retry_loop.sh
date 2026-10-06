@@ -9,7 +9,13 @@ B64=$(base64 < /private/tmp/claude-501/-Users-yxu2-Documents-ACS/a8ebc35a-664e-4
 log(){ echo "[$(date -u '+%F %T')] $*"; }
 for attempt in $(seq 1 96); do                # 96 x 15 min = 24 h
   aws sts get-caller-identity >/dev/null 2>&1 || { log "SSO_EXPIRED — run: aws sso login --profile $AWS_PROFILE"; exit 3; }
-  st=$(aws ec2 describe-instances --instance-ids $B --query 'Reservations[].Instances[].State.Name' --output text)
+  st=$(aws ec2 describe-instances --instance-ids $B --query 'Reservations[].Instances[].State.Name' --output text 2>/dev/null)
+  if [ -z "$st" ]; then                      # API/auth error (seen after laptop wake): retry, never abort on it
+    errs=$((${errs:-0} + 1)); log "describe-instances failed (API/auth error $errs/5) — retrying in 60 s"
+    [ "$errs" -ge 5 ] && { log "SSO_EXPIRED or AWS unreachable — run: aws sso login --profile $AWS_PROFILE"; exit 3; }
+    sleep 60; continue
+  fi
+  errs=0
   [ "$st" = stopping ] && { sleep 60; continue; }
   [ "$st" = stopped ] || { log "box is '$st', not stopped — someone else is using it; aborting without touching it"; exit 4; }
   started=""
