@@ -52,6 +52,13 @@ cell(){
   return $rc
 }
 
+# Hand the box to phase 3 (the v2-sampler equivalence re-test) if the kit shipped one; runs once.
+PHASE3=${PHASE3:-/home/ubuntu/phase3_v2.sh}; PHASE3_DONE=""
+run_phase3(){
+  [ -f "$PHASE3" ] && [ -z "${NO_PHASE3:-}" ] && [ -z "$PHASE3_DONE" ] || return 0
+  PHASE3_DONE=1; say "handing over to $PHASE3"; bash "$PHASE3"; say "phase 3 returned rc=$?"
+}
+
 compare(){   # compare <base_cell> <cpt_cell> <label>
   local a=$O/$1/eval.json
   local b=$O/$2/eval.json
@@ -86,6 +93,10 @@ if [ "$NGPU" -ge 4 ]; then
 else
   cell armD_paired as_paired_i "$ADAPTER_D" 0 || say "WARN: armD/as_paired_i failed"
   compare base_paired armD_paired paired
+  # On one GPU, phase 3 (the v2-sampler equivalence re-test, ~1.7 h) goes HERE, before the
+  # secondary beta-chain cells: if the box's ceiling fires in a long wave 1, it should cost
+  # the trb cells, not the verdict that decides whether the trainer is usable.
+  run_phase3
   cell base_trb    as_trb_i    none         0 || say "WARN: base/as_trb_i failed"
   cell armD_trb    as_trb_i    "$ADAPTER_D" 0 || say "WARN: armD/as_trb_i failed"
   compare base_trb armD_trb trb
@@ -94,7 +105,4 @@ fi
 $PY $CHECK report --dir $O >> $O/wave1.log 2>&1
 say "wave 1 done"
 publish
-
-# Hand the box to phase 3 (the v2-sampler equivalence re-test) if the kit shipped one.
-PHASE3=${PHASE3:-/home/ubuntu/phase3_v2.sh}
-if [ -f "$PHASE3" ] && [ -z "${NO_PHASE3:-}" ]; then say "handing over to $PHASE3"; bash "$PHASE3"; fi
+run_phase3   # 4-GPU layout (all GPUs were busy until now), or a no-op if it already ran
