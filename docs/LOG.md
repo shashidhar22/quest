@@ -83,3 +83,15 @@ or the project memory, not in this log.
   `sys.modules` before `exec_module` or dataclasses fail; ESM-C on CPU needs
   `esm.models.esmc.is_flash_attn_available = False` before construction (the flash path makes
   CUDA calls); SSM lands as a user who cannot `cd` into `/home/ubuntu/quest`.
+
+## 2026-10-06
+
+- The first GPU retry loop ran attempts 1–4 (20:39–21:25 UTC, no capacity), then the laptop slept
+  until 08:12. On wake `describe-instances` failed with AuthFailure, returned an empty state, and
+  the loop aborted as if another user held the box (exit 4). Box never started — fail-safe, but
+  for the wrong reason. Fixed: an empty result is now a transient API error, retried every 60 s,
+  exit as SSO-expired after 5 in a row (commit `c5bf690`). Restarted 18:18 UTC (attempt 1: no
+  capacity), caffeinate re-attached, SSO re-logged 18:19.
+- Cost review written to acs-notes `AWSconnection/cost-review-2026-10.md`: idle bill
+  USD 1,328/mo on 2026-08-01 (Cost Explorer actual, 16,600 GB gp3) → USD 973 on 09-30 → ≈ USD 295
+  now (projection until archive tiering completes) — −78 %, ≈ USD 12,400/yr.
