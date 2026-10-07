@@ -127,6 +127,12 @@ or the project memory, not in this log.
   18 GPU-h to ≈ 1–2.5 h. Paired class-I decisions rest on ~200 molecules — a benchmark property.
 - Kit: `s43_compare.py`/`run_s43.sh` carry the sampler generation in dir names and labels (`SUF`);
   `wave1.sh` probe pre-gate; dry runs 8/8 (4.3) and 6/6 scenarios (4.2) incl. probe-abort.
+- **Second visit launched 18:49 UTC** (g6.2xlarge after 4 attempts at the 5-min poll; the loop
+  exited on launch). `sampler=v2` confirmed in the start line; on-box tests 21/21; `judge_probe`
+  **PASS** — six candidates per query score 0.0159–0.0163, distinct in the 4th digit, exactly the
+  spread bf16 could not hold; `judge_smoke` rc=0 with its 20-query advisory gate at recall 0.05
+  (no longer 0.0; inconclusive at n=20 by design). Session closed with `eval_new` running and the
+  v2 equivalence run next; verdicts land in `run.log` and S3 at the visit's end.
 
 ## 2026-10-06 (afternoon) — Stage 4.3 mid-run resume built; launch kit bug fixed before launch
 
