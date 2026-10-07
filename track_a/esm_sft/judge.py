@@ -118,8 +118,14 @@ def n_trainable(model) -> int:
 
 # ---------------------------------------------------------------- data
 def load_split(task: str, split: str) -> pd.DataFrame:
+    """One row per MOLECULE. The benchmark splits are exploded across segment orderings
+    (`order_key`): as_paired_i test_iid is 6,696 rows for 201 `row_id`s, up to 120 orderings
+    each; train is 553,440 rows for 15,145. Scoring every ordering inflated n 25x, made the
+    bootstrap CI ~5x too narrow, and cost 10 GPU-hours per cell (2026-10-07). Keep the first
+    ordering of each `row_id`; `row_id` is also the paired-comparison key, so it must be unique."""
     df = load_as_class_i(task, split)  # ALL columns: MHC sequences, order_key, CDR1/2/3
-    return df[df["peptide"].notna() & df["trb_cdr3"].notna()].reset_index(drop=True)
+    df = df[df["peptide"].notna() & df["trb_cdr3"].notna()]
+    return df.drop_duplicates(subset="row_id", keep="first").reset_index(drop=True)
 
 
 def with_negatives(pos: pd.DataFrame, seed: int) -> pd.DataFrame:
@@ -144,7 +150,8 @@ def cmd_train(a):
     mk = lambda df, sh, bs: DataLoader(RowsDS(df, a.tcr_variant, a.mhc_variant, tok, a.max_len), batch_size=bs,
                                        shuffle=sh, num_workers=a.num_workers, collate_fn=collate(pid))
     tl, vl = mk(tr, True, a.batch_size), mk(va, False, a.batch_size * 2)
-    print(f"[judge] train rows {len(tr):,} val rows {len(va):,} trainable params {n_trainable(model):,}", flush=True)
+    print(f"[judge] train rows {len(tr):,} (molecules x 1+5 negatives) val rows {len(va):,} "
+          f"trainable params {n_trainable(model):,}", flush=True)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=a.lr, weight_decay=1e-5)
     bce = nn.BCEWithLogitsLoss()
     best, bad, hist = -1.0, 0, []
@@ -156,7 +163,9 @@ def cmd_train(a):
             opt.zero_grad(); loss.backward(); opt.step()
             s += loss.item() * len(y); n += len(y)
             if i % 500 == 0:
-                print(f"[judge]  ep{ep} step {i}/{len(tl)} loss {s / max(n, 1):.4f} ({time.time() - t0:.0f}s)", flush=True)
+                el = max(time.time() - t0, 1e-6)
+                print(f"[judge]  ep{ep} step {i}/{len(tl)} loss {s / max(n, 1):.4f} ({el:.0f}s, "
+                      f"{n / el:.1f} rows/s)", flush=True)
         model.eval(); P, Y = [], []
         with torch.no_grad():
             for ids, am, y in vl:
@@ -232,6 +241,46 @@ def cmd_eval(a):
     Path(a.out).write_text(json.dumps(result, indent=1))
 
 
+# ---------------------------------------------------------------- probe (the smoke gate)
+def cmd_probe(a):
+    """Does the scorer's output actually depend on the input? Three real rows, each scored with
+    its true peptide and 5 distractors, at full precision. Exit 1 if any logit is non-finite or
+    if any query's 6 candidates come out identical — that is exactly the failure wave 1 spent
+    18 GPU-hours discovering (every candidate tied, Recall@10 = 0). Also prints the spread of
+    the pooled vectors, so an input-independent ENCODER shows up as its own line."""
+    from track_a.esm_sft.encoders import encoder_forward
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, tok = build_model(a.adapter, dev); model.eval()
+    pid = int(tok.pad_token_id)
+    pool = load_candidate_pool(); pool = (pool["peptide"] if "peptide" in pool else pool.iloc[:, 0]).astype(str).tolist()
+    df = load_split(a.task, "test_iid").head(3)
+    ok = True
+    for _, r in df.iterrows():
+        row = _clean(r.to_dict()); true = str(row["peptide"])
+        rng = np.random.default_rng(_qseed(row["row_id"]))
+        cands = [true] + [p for p in rng.choice(pool, size=12, replace=False) if p != true][:5]
+        seqs = []
+        for p in cands:
+            row["peptide"] = p
+            seqs.append(torch.tensor(serialize(row, a.tcr_variant, a.mhc_variant, tok, a.max_len) or [tok.cls_token_id]))
+        ids, am = pad(seqs, pid)
+        with torch.no_grad():
+            emb = encoder_forward(model.loaded, ids.to(dev), am.to(dev)).float()
+            pooled = model.pool(emb, am.to(dev).bool())
+            sc = model(ids.to(dev), am.to(dev)).float().cpu().numpy()
+        n_distinct = len(set(np.round(sc, 6).tolist()))
+        pooled_spread = float((pooled - pooled.mean(0, keepdim=True)).abs().max())
+        lens = [int(x.sum()) for x in am]
+        print(f"[probe] row_id={row['row_id']} lens={lens} pooled_spread={pooled_spread:.3e} "
+              f"logits={np.array2string(sc, precision=6)} distinct={n_distinct}/{len(sc)}", flush=True)
+        if not np.all(np.isfinite(sc)):
+            print("[probe] FAIL: non-finite logit", flush=True); ok = False
+        if n_distinct < 2:
+            print("[probe] FAIL: every candidate scored identically — the scorer ignores its input", flush=True); ok = False
+    print(f"[probe] {'PASS' if ok else 'FAIL'}: scores {'vary' if ok else 'do not vary'} with the peptide", flush=True)
+    sys.exit(0 if ok else 1)
+
+
 # ---------------------------------------------------------------- paired comparison
 def cmd_compare(a):
     A, B = json.loads(Path(a.a).read_text()), json.loads(Path(a.b).read_text())
@@ -250,7 +299,7 @@ def cmd_compare(a):
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("train", "eval"):
+    for name in ("train", "eval", "probe"):
         p = sp.add_parser(name)
         p.add_argument("--task", required=True, choices=["as_paired_i", "as_trb_i"])
         p.add_argument("--adapter", required=True, help="'none' = fresh LoRA (fair base), else adapter dir")
@@ -272,13 +321,16 @@ def main():
     e.add_argument("--ckpt", required=True)
     e.add_argument("--out", required=True)
     e.add_argument("--conditions", nargs="+", default=["test_level4", "test_novel_pep", "test_iid"])
-    e.add_argument("--max_queries", type=int, default=2000)
-    e.add_argument("--min_queries", type=int, default=500)
+    e.add_argument("--max_queries", type=int, default=5000)
+    # 150, not 500: after de-duplication the paired class-I decision conditions hold ~200
+    # molecules (test_level4 202, test_iid 201). The plan's 500 was set when rows were mistaken
+    # for queries. Conditions below this are reported, flagged underpowered, never silently used.
+    e.add_argument("--min_queries", type=int, default=150)
     e.add_argument("--smoke_queries", type=int, default=20)
     c = sp.add_parser("compare")
     c.add_argument("--a", required=True); c.add_argument("--b", required=True)
     a = ap.parse_args()
-    {"train": cmd_train, "eval": cmd_eval, "compare": cmd_compare}[a.cmd](a)
+    {"train": cmd_train, "eval": cmd_eval, "probe": cmd_probe, "compare": cmd_compare}[a.cmd](a)
 
 
 if __name__ == "__main__":

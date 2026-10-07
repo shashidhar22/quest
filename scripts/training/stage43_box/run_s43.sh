@@ -28,7 +28,10 @@ if [ "${NGPU:-1}" -ge 4 ]; then PARALLEL=1; NPROC=2; R_GPUS=2,3; S_GPUS=0,1; EVA
 else PARALLEL=0; NPROC=1; R_GPUS=0; S_GPUS=0; EVAL2_GPU=0; fi
 GA=$((64 / NPROC))   # 16 rows x GA x NPROC = 1024 rows per optimizer step, any GPU count
 SAMPLER=$($PY -c 'from quest.training.samplers import TokenBudgetStepSampler as T; print("v2" if hasattr(T, "_cuts") else "v1")' 2>/dev/null || echo unknown)
-PHASES=${PHASES:-all}   # all = evals + judge + R + S;  R2 = only the equivalence run, against the v2 sampler
+PHASES=${PHASES:-all}   # all = evals + judge + R + S;  R2 = only the equivalence run (needs the v2 sampler)
+# Run dirs and verdict labels carry the sampler generation: v1 = s43_equiv_pointD / TRAIN_EQUIV
+# (the 2026-10-06 run, kept intact), v2 = s43_equiv_v2_pointD / TRAIN_EQUIV_V2 (+ V2_VS_V1).
+SUF=""; [ "$SAMPLER" = v2 ] && SUF="_v2"; export SUF
 say "start pid=$$ ngpu=$NGPU parallel=$PARALLEL world_size=$NPROC grad_accum=$GA sampler=$SAMPLER phases=$PHASES"
 
 EV="--adapter_dir $Q/checkpoints/cpt_stage41_pointD_run05/final --canonical_eval_path $Q/data/cpt_canonical_eval_v2 --base_model esmc_300m --tcr_variant cdr3 --mhc_variant full --eos_strategy raw --max_length 1024 --batch_size 16"
@@ -39,8 +42,7 @@ TRAIN="scripts/training/train_cpt_stage2_single.py --dataset_path $Q/data/cpt_da
   --lr 2e-4 --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 --eval_steps 500 --save_steps 500 --logging_steps 50 \
   --no_compile --attn_implementation sdpa --wandb_project tcrbench-v3-cpt-stage43 --report_to wandb \
   --early_stop_n_patience 3 --early_stop_min_rel 0.01 --early_stop_metric_path pocket overall _ perplexity"
-EQ=$Q/checkpoints/s43_equiv_pointD; RS=$Q/checkpoints/s43_resume_pointD
-if [ "$PHASES" = R2 ]; then EQ=$Q/checkpoints/s43_equiv_v2_pointD; fi   # keep the v1 result intact
+EQ=$Q/checkpoints/s43_equiv${SUF}_pointD; RS=$Q/checkpoints/s43_resume${SUF}_pointD
 
 # stop_after_evals <pid> <log> <n> <label>: TERM the torchrun 90 s after its n-th canonical eval.
 stop_after_evals(){
@@ -60,9 +62,15 @@ eval_old_and_judge(){
   CUDA_VISIBLE_DEVICES=0 $PY $OLD/cpt_stage3_eval_baseline.py $EV --output_json $O/eval_old.json > $O/eval_old.log 2>&1
   say "eval_old rc=$? secs=$(( $(date +%s)-t ))"
   local J=$O/judge_smoke; mkdir -p $J; t=$(date +%s)
+  # The probe is the real smoke: does the scorer's output depend on the input at all? On
+  # 2026-10-06 the smoke "passed" (rc=0) while scoring every candidate identically; wave 1 then
+  # spent 18 GPU-hours finding out. Its verdict line lands in run.log next to the others.
+  CUDA_VISIBLE_DEVICES=0 $PY -m track_a.esm_sft.judge probe --task as_paired_i --adapter none --tcr_variant cdr3 --mhc_variant full > $J/probe.log 2>&1
+  say "judge_probe rc=$? $(grep -h '^\[probe\] \(PASS\|FAIL\)' $J/probe.log | tail -1)"
   CUDA_VISIBLE_DEVICES=0 $PY -m track_a.esm_sft.judge train --task as_paired_i --adapter none --tcr_variant cdr3 --mhc_variant full --out_dir $J --smoke > $J/train.log 2>&1 \
   && CUDA_VISIBLE_DEVICES=0 $PY -m track_a.esm_sft.judge eval --task as_paired_i --adapter none --tcr_variant cdr3 --mhc_variant full --ckpt $J/best.pt --out $J/eval.json --smoke > $J/eval.log 2>&1
   say "judge_smoke rc=$? secs=$(( $(date +%s)-t ))"
+  $PY /home/ubuntu/s42_check.py gate --eval $J/eval.json 2>&1 | sed 's/^/    smoke /' >> $O/run.log   # advisory on 20 queries
 }
 eval_new(){
   local t=$(date +%s)
@@ -79,13 +87,8 @@ start_R(){
 }
 finish_R(){
   stop_after_evals $RPID $EQ/training.log 4 equivalence
-  if [ "$PHASES" = R2 ]; then
-    cp $EQ/training.log $O/train_v2.log 2>/dev/null; cp $EQ/early_stop_history.json $O/train_equiv_v2_early_stop_history.json 2>/dev/null
-    $PY $CMP equiv_v2 >> $O/run.log 2>&1
-  else
-    cp $EQ/training.log $O/train.log 2>/dev/null; cp $EQ/early_stop_history.json $O/train_equiv_early_stop_history.json 2>/dev/null
-    $PY $CMP equiv >> $O/run.log 2>&1
-  fi
+  cp $EQ/training.log $O/train${SUF}.log 2>/dev/null; cp $EQ/early_stop_history.json $O/train_equiv${SUF}_early_stop_history.json 2>/dev/null
+  $PY $CMP equiv >> $O/run.log 2>&1     # label TRAIN_EQUIV${SUF^^}; plus V2_VS_V1 when SUF=_v2
 }
 
 # --- S: resume from a COPY of R's step-1000 checkpoint, run to step 2000 ---
@@ -103,7 +106,7 @@ run_S(){
 }
 
 if [ "$PHASES" = R2 ]; then
-  # Phase 3 after wave 1 (or a standalone re-test): the equivalence run alone, under the v2 sampler.
+  # Standalone re-test: the equivalence run alone, under the v2 sampler.
   [ "$SAMPLER" = v2 ] || { say "R2 ABORT: installed sampler is '$SAMPLER', not v2"; exit 2; }
   rm -rf $EQ; start_R; finish_R; say "R2 done"; exit 0
 fi
@@ -125,6 +128,6 @@ else
   run_S
 fi
 
-cp $RS/training.log $O/resume_training.log 2>/dev/null; cp $RS/early_stop_history.json $O/resume_early_stop_history.json 2>/dev/null
-$PY $CMP resume >> $O/run.log 2>&1
+cp $RS/training.log $O/resume${SUF}_training.log 2>/dev/null; cp $RS/early_stop_history.json $O/resume${SUF}_early_stop_history.json 2>/dev/null
+$PY $CMP resume >> $O/run.log 2>&1     # label RESUME${SUF^^}
 say "all jobs done"

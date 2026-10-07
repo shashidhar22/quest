@@ -13,6 +13,10 @@ for the resumed run too, because resume restores the plateau history along with 
 import json, os, re, sys
 O = os.environ.get("O", "/home/ubuntu/s43_out")
 Q = os.path.join(os.environ.get("Q", "/home/ubuntu/quest"), "checkpoints")
+# SUF names the sampler generation of the run dirs: "" = the v1 run (s43_equiv_pointD),
+# "_v2" = the v2 sampler (s43_equiv_v2_pointD). Labels carry it in upper case.
+SUF = os.environ.get("SUF", "")
+LAB = SUF.upper()
 
 
 def regions(p):
@@ -72,13 +76,13 @@ if __name__ == "__main__":
     what = sys.argv[1] if len(sys.argv) > 1 else "all"
     if what in ("ab", "all"):
         eval_ab()
+    if what == "equiv_v2":            # alias kept for older kits
+        SUF, LAB = "_v2", "_V2"; what = "equiv"
+    eq, rs = f"{Q}/s43_equiv{SUF}_pointD", f"{Q}/s43_resume{SUF}_pointD"
     if what in ("equiv", "all"):
-        compare("TRAIN_EQUIV", f"{Q}/s43_equiv_pointD", f"{Q}/cpt_stage41_pointD_run05")
-    if what in ("equiv_v2", "all"):
-        # v2 sampler (mixed-composition steps + row-weighted loss) vs Stage 4.1 — the real test —
-        # and vs the v1 run for the record (how much the fix moved things).
-        compare("TRAIN_EQUIV_V2", f"{Q}/s43_equiv_v2_pointD", f"{Q}/cpt_stage41_pointD_run05")
-        compare("V2_VS_V1", f"{Q}/s43_equiv_v2_pointD", f"{Q}/s43_equiv_pointD")
+        compare(f"TRAIN_EQUIV{LAB}", eq, f"{Q}/cpt_stage41_pointD_run05")
+        if SUF:   # the fixed sampler vs the v1 run, for the record: how far the fix moved things
+            compare(f"{LAB.lstrip('_')}_VS_V1", eq, f"{Q}/s43_equiv_pointD")
     if what in ("resume", "all"):
-        resume_happened(f"{Q}/s43_resume_pointD")
-        compare("RESUME", f"{Q}/s43_resume_pointD", f"{Q}/s43_equiv_pointD")
+        resume_happened(rs)
+        compare(f"RESUME{LAB}", rs, eq)

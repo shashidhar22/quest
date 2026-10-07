@@ -1,6 +1,18 @@
 # CPT Stage 4.2 — downstream SFT judge
 
-**Status:** planned, do first · **Depends on:** Stage 4.1 adapters (available:
+**Status (2026-10-07):** first GPU cell ran and the harness gate **FAILED as designed** — base
+Recall@10 = 0.0 on every query (all 100 candidates tied: the pool + head ran in bf16 and candidates
+differing by a 9-residue peptide fell within one bf16 ulp). Fixed: pool + head now fp32
+(`tests/test_judge_scorer_fp32.py`). Also found: the benchmark splits are **exploded across
+segment orderings** — as_paired_i test_level4 is 4,872 rows for **202 molecules**, test_iid 6,696
+for 201, train 553,440 for 15,145 — so the judge now de-duplicates on `row_id` (one ordering per
+molecule), which also makes the paired key unique and cuts a cell from 18 GPU-h to under one.
+**Deviations from the text below, forced by that:** the 2,000→5,000 query cap is moot (≈ 200
+queries exist on the decision conditions); the n ≥ 500 floor is unattainable there and is now a
+reported flag at 150, not an abort; the paired class-I CI will be wide (n ≈ 200) and that is a
+property of the benchmark, to be stated with the result. New pre-gate (≈ 1 min, before any cell):
+`judge probe` — scores must vary with the peptide and be finite, for both arms. Wave 1 is
+otherwise unchanged and still unrun. · **Depends on:** Stage 4.1 adapters (available:
 `s3://fh-pi-warren-h-eco/quest/tcrbench2/checkpoints/cpt_stage41_point{A_run01,D_run05,F_run11}/final/`)
 · **Knowledge:** `~/Documents/ACS/quest-cpt/plan.md` step 1
 

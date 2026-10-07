@@ -20,7 +20,7 @@ Q=${Q:-/home/ubuntu/quest}; O=${O:-/home/ubuntu/s42_out}; PY=${PY:-python}
 CHECK=${CHECK:-/home/ubuntu/s42_check.py}
 ADAPTER_D=${ADAPTER_D:-$Q/checkpoints/cpt_stage41_pointD_run05/final}
 DST=${DST:-s3://fh-pi-warren-h-eco/quest/tcrbench2/checkpoints/stage42_wave1}
-MAXQ=${MAXQ:-5000}; MINQ=${MINQ:-500}; SMOKE=${SMOKE:-}
+MAXQ=${MAXQ:-5000}; MINQ=${MINQ:-150}; SMOKE=${SMOKE:-}   # 150: the de-duplicated paired class-I conditions hold ~200 molecules
 NGPU=${NGPU:-$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || echo 1)}
 export PYTHONPATH=$Q TOKENIZERS_PARALLELISM=false
 mkdir -p $O; cd $Q
@@ -29,6 +29,16 @@ publish(){ [ -n "${NO_PUBLISH:-}" ] || aws s3 sync $O $DST --only-show-errors; }
 
 say "wave 1 start: ngpu=$NGPU adapter_D=$ADAPTER_D max_queries=$MAXQ"
 [ -d "$ADAPTER_D" ] || { say "ABORT: arm D adapter not found at $ADAPTER_D"; publish; exit 2; }
+
+# PRE-GATE (≈ 1 min): the scorer's output must vary with the peptide and be finite, for both
+# arms. On 2026-10-07 every candidate tied and a cell burned 18 GPU-hours before the post-hoc
+# gate noticed; the smoke run had shown it from the start but only its exit code was checked.
+for arm in none "$ADAPTER_D"; do
+  CUDA_VISIBLE_DEVICES=0 $PY -m track_a.esm_sft.judge probe --task as_paired_i --adapter "$arm" \
+      --tcr_variant cdr3 --mhc_variant full > $O/probe_$([ "$arm" = none ] && echo base || echo armD).log 2>&1
+  rc=$?; say "probe $([ "$arm" = none ] && echo base || echo armD) rc=$rc"; grep -h '^\[probe\]' $O/probe_*.log | tail -1 | sed 's/^/    /' >> $O/wave1.log
+  [ $rc -eq 0 ] || { say "ABORT: probe failed — scorer output does not depend on the input; nothing below is worth running"; publish; exit 5; }
+done
 
 # cell <name> <task> <adapter> <gpu> ; trains, evaluates, publishes. Non-zero if either step fails.
 cell(){
@@ -50,13 +60,6 @@ cell(){
   rc=$?; say "$name eval rc=$rc secs=$(( $(date +%s)-t ))"
   publish
   return $rc
-}
-
-# Hand the box to phase 3 (the v2-sampler equivalence re-test) if the kit shipped one; runs once.
-PHASE3=${PHASE3:-/home/ubuntu/phase3_v2.sh}; PHASE3_DONE=""
-run_phase3(){
-  [ -f "$PHASE3" ] && [ -z "${NO_PHASE3:-}" ] && [ -z "$PHASE3_DONE" ] || return 0
-  PHASE3_DONE=1; say "handing over to $PHASE3"; bash "$PHASE3"; say "phase 3 returned rc=$?"
 }
 
 compare(){   # compare <base_cell> <cpt_cell> <label>
@@ -93,10 +96,6 @@ if [ "$NGPU" -ge 4 ]; then
 else
   cell armD_paired as_paired_i "$ADAPTER_D" 0 || say "WARN: armD/as_paired_i failed"
   compare base_paired armD_paired paired
-  # On one GPU, phase 3 (the v2-sampler equivalence re-test, ~1.7 h) goes HERE, before the
-  # secondary beta-chain cells: if the box's ceiling fires in a long wave 1, it should cost
-  # the trb cells, not the verdict that decides whether the trainer is usable.
-  run_phase3
   cell base_trb    as_trb_i    none         0 || say "WARN: base/as_trb_i failed"
   cell armD_trb    as_trb_i    "$ADAPTER_D" 0 || say "WARN: armD/as_trb_i failed"
   compare base_trb armD_trb trb
@@ -105,4 +104,3 @@ fi
 $PY $CHECK report --dir $O >> $O/wave1.log 2>&1
 say "wave 1 done"
 publish
-run_phase3   # 4-GPU layout (all GPUs were busy until now), or a no-op if it already ran

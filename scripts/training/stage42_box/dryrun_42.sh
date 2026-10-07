@@ -21,6 +21,7 @@ if [ "\$1" = "-m" ]; then
   for ((i=0;i<\${#args[@]};i++)); do case "\${args[i]}" in
     --out) out=\${args[i+1]};; --out_dir) outdir=\${args[i+1]};; --task) task=\${args[i+1]};; --adapter) adapter=\${args[i+1]};; esac; done
   case "\$sub" in
+    probe) echo "[probe] \${PROBE_VERDICT:-PASS}: scores vary with the peptide"; [ "\${PROBE_VERDICT:-PASS}" = PASS ] && exit 0 || exit 1;;
     train) sleep 0.3; echo x > \$outdir/best.pt; echo "{\"task\":\"\$task\"}" > \$outdir/train_summary.json; exit 0;;
     eval)  sleep 0.3
            if [ "\$adapter" = none ]; then R=0.42; LO=$2; HI=0.50; IID=$2; IIDLO=$3
@@ -71,6 +72,14 @@ expect "both compares written" "$(ls $W/out/compare_*.txt | wc -l | tr -d ' ')" 
 echo "=== D. re-run skips finished cells ==="
 Q=$PASSDIR/quest O=$PASSDIR/out PY=$PASSDIR/bin/python CHECK=$HERE/s42_check.py NO_PUBLISH=1 bash $HERE/wave1.sh >/dev/null 2>&1
 expect "all four cells skipped on re-run" "$(grep -c 'already done, skipping' $PASSDIR/out/wave1.log)" "4"
+
+echo "=== P. probe FAIL: scorer ignores its input -> abort BEFORE cell 1 (rc 5) ==="
+W=$(mktemp -d); mkdir -p $W/bin $W/quest/checkpoints/cpt_stage41_pointD_run05/final $W/out
+make_stub $W/bin 0.60 0.55
+PROBE_VERDICT=FAIL Q=$W/quest O=$W/out PY=$W/bin/python CHECK=$HERE/s42_check.py NO_PUBLISH=1 NGPU=1 bash $HERE/wave1.sh; rc=$?
+expect "wave1 exit code 5" "$rc" "5"
+expect "no cell ran" "$(ls $W/out | grep -c '^\(base\|armD\)_' || true)" "0"
+expect "abort logged" "$(grep -c 'ABORT: probe failed' $W/out/wave1.log)" "1"
 
 echo "=== B. gate FAIL: base at the random rate -> stop after cell 1 ==="
 run_wave1 fail 0.10 0.08

@@ -2,9 +2,11 @@
 
   gate --eval <base cell's eval.json>
       Exit 0 only if the base arm beats the analytic random Recall@10 on test_iid with its 95 %
-      CI clear of it, and the condition is not underpowered. This is the harness check from
-      plans/stage4-2.md: an in-distribution split the model has every chance on. Failing it means
-      the judge is broken, so no later number is worth the GPU time.
+      CI clear of it. This is the harness check from plans/stage4-2.md: an in-distribution split
+      the model has every chance on. Failing it means the judge is broken, so no later number is
+      worth the GPU time. (It caught exactly that on 2026-10-07: Recall@10 = 0.0 on every query.)
+      An underpowered flag is reported, not failed: after de-duplication the paired class-I
+      conditions hold ~200 molecules, which is the data, not a harness fault.
 
   report --dir <wave-1 out dir>
       One table of every cell that finished: n, Recall@10 with CI, MRR, and whether the cell is
@@ -39,8 +41,7 @@ def gate(args):
         print(f"[gate] ERROR: no recall/CI on test_iid (n={n})")
         return 1
     if m.get("underpowered"):
-        print(f"[gate] FAIL: test_iid underpowered, n={n} (<500): a CI here separates nothing")
-        return 1
+        print(f"[gate] note: test_iid flagged underpowered (n={n}); the harness check still applies")
     ok = lo > rnd
     print(f"[gate] {'PASS' if ok else 'FAIL'}: base test_iid n={n} recall@10={r:.4f} "
           f"CI=[{lo:.4f}, {hi:.4f}] vs random {rnd:.4f} "

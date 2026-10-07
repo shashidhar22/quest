@@ -73,14 +73,15 @@ class ESMScorer(nn.Module):
         )
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        if self._is_esmc:
-            # Match esmc_native_trainer: run the entire forward (encoder + pool + head)
-            # under bf16 autocast on CUDA, fp32 on CPU. Loss/grad accumulate in fp32.
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=input_ids.is_cuda):
-                h = encoder_forward(self.loaded, input_ids, attention_mask)
-                pooled = self.pool(h, attention_mask.bool())
-                logits = self.head(pooled).squeeze(-1)
-            return logits.float()  # cast back for loss math
-        h = encoder_forward(self.loaded, input_ids, attention_mask)  # (B, L, H)
-        pooled = self.pool(h, attention_mask.bool())  # (B, H)
-        return self.head(pooled).squeeze(-1)  # (B,)
+        # The ENCODER runs under bf16 autocast on CUDA (encoder_forward does that itself). The
+        # pool and head run in fp32, OUTSIDE autocast. Running them in bf16 (the previous
+        # "entire forward under autocast" fix for a dtype crash) quantised the final logit to
+        # ~3 significant digits: 100 retrieval candidates that differ only in a 9-residue
+        # peptide produced logits within one bf16 ulp of each other, every candidate tied, and
+        # ties count against the true peptide — Recall@10 = 0.0, MRR = 1/100 and AUC = 0.5
+        # exactly, on 15,000 queries (2026-10-07, wave-1 cell 1, 18 GPU-hours). A ranking head
+        # needs fp32 resolution; the fp32 cast of (B, L, H) costs nothing that matters.
+        h = encoder_forward(self.loaded, input_ids, attention_mask).float()  # (B, L, H) fp32
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            pooled = self.pool(h, attention_mask.bool())  # (B, H)
+            return self.head(pooled).squeeze(-1)  # (B,) fp32

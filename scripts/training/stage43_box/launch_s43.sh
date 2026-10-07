@@ -18,7 +18,7 @@ PID=$(cat /home/ubuntu/s43_out/run_all.pid 2>/dev/null)
 [ -n "$PID" ] || { echo "LAUNCH_FAIL no pid"; sudo shutdown -h +1; exit 1; }
 DST=s3://fh-pi-warren-h-eco/quest/tcrbench2/checkpoints/stage43_check
 DST42=s3://fh-pi-warren-h-eco/quest/tcrbench2/checkpoints/stage42_wave1
-PUB="aws s3 sync /home/ubuntu/s43_out $DST/s43_out --only-show-errors; aws s3 sync /home/ubuntu/s42_out $DST42 --only-show-errors; for d in s43_equiv_pointD s43_resume_pointD; do aws s3 cp /home/ubuntu/quest/checkpoints/\$d/training.log $DST/\${d}_training.log --only-show-errors; aws s3 cp /home/ubuntu/quest/checkpoints/\$d/early_stop_history.json $DST/\${d}_early_stop_history.json --only-show-errors; done"
+PUB="aws s3 sync /home/ubuntu/s43_out $DST/s43_out --only-show-errors; aws s3 sync /home/ubuntu/s42_out $DST42 --only-show-errors; for d in s43_equiv_pointD s43_resume_pointD s43_equiv_v2_pointD s43_resume_v2_pointD; do [ -d /home/ubuntu/quest/checkpoints/\$d ] || continue; aws s3 cp /home/ubuntu/quest/checkpoints/\$d/training.log $DST/\${d}_training.log --only-show-errors; aws s3 cp /home/ubuntu/quest/checkpoints/\$d/early_stop_history.json $DST/\${d}_early_stop_history.json --only-show-errors; done"
 # layer 1: watchdog on the job PID — DONE / IDLE 45 min / CEILING $MAXH h; publishes, then stops the
 # box. IDLE is 45 not 20 because the judge's process name does not match the watchdog's training
 # pattern, so during wave 1 only GPU utilisation keeps the idle guard from firing between cells.

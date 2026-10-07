@@ -96,6 +96,38 @@ or the project memory, not in this log.
   USD 1,328/mo on 2026-08-01 (Cost Explorer actual, 16,600 GB gp3) → USD 973 on 09-30 → ≈ USD 295
   now (projection until archive tiering completes) — −78 %, ≈ USD 12,400/yr.
 
+## 2026-10-07 — the box visit ended; 4.3 fully measured; 4.2's gate caught a broken scorer
+
+- **Visit:** 21:32 UTC 10-06 → 18:02 UTC 10-07 (20.5 h, ≈ USD 21 on g6.2xlarge). The watchdog
+  fired DONE one minute after the job's last process exited and stopped the box; nothing idled.
+  What LOOKED idle in the morning was wave-1 cell 1's evaluation (08:15–18:01), 9.8 h of
+  scoring ~200 molecules 25× each.
+- **4.3 final verdicts:** `EVAL_AB` PASS; `TRAIN_EQUIV` FAIL (v1 sampler, §9.3); `RESUME_LOG`
+  PASS (resumed at step 1000); **`RESUME` marginal FAIL**: overall 2.881 vs 2.971 (3.03 % against
+  the 2 % band), cdr3 0.86 %, pocket 1.84 % — the resumed run is better; a two-seed noise
+  baseline does not exist, so this is reported as a narrow fail. **The v2 re-test did not run:**
+  the wave-1 gate failure exits before the phase-3 hand-off (I had protected it against the
+  ceiling, not against that path). Fix: a fresh launch under the v2 code IS the re-test
+  (`s43_equiv_v2_pointD`, `TRAIN_EQUIV_V2`, `V2_VS_V1`, `RESUME_V2`); phase 3 retired.
+- **4.2 cell 1 (base, as_paired_i): 8.0 h train + 9.8 h eval, then `GATE FAIL`** — Recall@10 =
+  0.0 on all three conditions, every query rank 100 of 100, MRR = 0.01 and val AUC = 0.5 exactly,
+  train loss = the label-prior entropy: every candidate scored identically. Data path cleared on
+  the laptop (real rows serialize with the peptide and change with it). Cause (hypothesis fitting
+  all symptoms): the earlier dtype fix ran pool + head under bf16 autocast, so logits were
+  quantised to ~3 digits and candidates differing by 9 of ~400 tokens tied. **Fixed:** pool + head
+  fp32 (`track_a/esm_sft/model.py`; `tests/test_judge_scorer_fp32.py` reproduces the collapse with
+  a stub and shows the fix resolves it). **The smoke run had shown the same ranks 18 h earlier**;
+  only its exit code was checked → new `judge probe` (scores must vary and be finite) runs first
+  in the 4.3 smoke and as a hard pre-gate in wave 1 for both arms.
+- **Benchmark splits are exploded across segment orderings:** as_paired_i test_iid 6,696 rows =
+  201 `row_id`s (up to 120 orderings each), test_level4 4,872 = 202, test_novel_pep 49,776 =
+  1,589, train 553,440 = 15,145; as_trb_i test_level4 83,178 = 9,734. The judge scored 5,000
+  "queries" = ~200 molecules ×25, inflating n and narrowing the CI ~5×. **Fixed:** `load_split`
+  de-duplicates on `row_id`; `min_queries` 500 → 150 (reported flag, not abort); a cell drops from
+  18 GPU-h to ≈ 1–2.5 h. Paired class-I decisions rest on ~200 molecules — a benchmark property.
+- Kit: `s43_compare.py`/`run_s43.sh` carry the sampler generation in dir names and labels (`SUF`);
+  `wave1.sh` probe pre-gate; dry runs 8/8 (4.3) and 6/6 scenarios (4.2) incl. probe-abort.
+
 ## 2026-10-06 (afternoon) — Stage 4.3 mid-run resume built; launch kit bug fixed before launch
 
 - **Resume (change 4 of 4.3) built:** `checkpoint_step_N/training_state.pt` (optimizer, scheduler,
