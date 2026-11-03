@@ -19,12 +19,35 @@ work is interchangeable.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
-SPLITS_DIR = Path("/home/ubuntu/quest/benchmark_v2/splits")
+def _resolve_splits_dir() -> Path:
+    """Where benchmark_v2's AS splits live.
+
+    Resolved inside this checkout first, so the judge is runnable and testable off the
+    training box; the box layout stays as a fallback. Override with QUEST_SPLITS_DIR.
+    This was hardcoded to the box path until 2026-11-03, the same defect already fixed
+    in track_a/shared/negative_sampling.py.
+    """
+    env = os.environ.get("QUEST_SPLITS_DIR")
+    candidates = (
+        *((Path(env),) if env else ()),
+        Path(__file__).resolve().parents[2] / "benchmark_v2" / "splits",
+        Path("/home/ubuntu/quest/benchmark_v2/splits"),
+    )
+    for c in candidates:
+        if c.is_dir():
+            return c
+    # None present: return the first candidate so the loaders' FileNotFoundError names a
+    # path the caller can act on, rather than a path that was never going to exist.
+    return candidates[0]
+
+
+SPLITS_DIR = _resolve_splits_dir()
 
 CLASS_I_TASKS = {"as_trb_i", "as_tra_i", "as_paired_i"}
 CLASS_II_TASKS = {"as_trb_ii", "as_tra_ii", "as_paired_ii"}
@@ -101,8 +124,13 @@ def load_as_class_ii(task: str, columns: Optional[list[str]] = None) -> pd.DataF
 def load_candidate_pool() -> pd.DataFrame:
     """AS Class I peptide candidate pool (3,564 unique peptides).
 
-    Used for retrieval evaluation: each test row's true peptide is one
-    of these; the model ranks all 3,564 and we compute Recall@K, MRR.
+    The retrieval eval does NOT rank all of these. judge.cmd_eval draws a shortlist per
+    query (the true peptide plus POOL_SIZE - 1 distractors), so random Recall@10 is
+    10/POOL_SIZE, not 10/3564.
+
+    The pool is 76 % 9-mers (2,718 of 3,563 measured 2026-10-15). Drawing distractors
+    uniformly therefore leaks the true peptide's length: see judge._draw_distractors and
+    quest-cpt/findings.md 9.6.
     """
     return pd.read_csv(SPLITS_DIR / "as_class_i_candidate_pool.tsv", sep="\t")
 

@@ -87,11 +87,25 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--token_budget", type=int, default=0,
                     help="Stage 4.3: tokens per micro-batch for step-synchronised batching; "
                          "0 = off (fixed batch_size, the Stage 4.1 path)")
+    ap.add_argument("--loss_weighting", choices=("row", "token"), default="row",
+                    help="Stage 4.3: how a micro-batch's mean loss is weighted inside its step "
+                         "when --token_budget > 0. 'row' = row share (the shipped v2 behaviour; "
+                         "gives MHC-bearing tokens ~0.43x the gradient weight the Stage 4.1 path "
+                         "gave them, which is why v2 split better-overall/worse-pocket). "
+                         "'token' = token share, keeping per-token weight uniform and the "
+                         "objective where Stage 4.1 had it. No effect when token_budget = 0.")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="Constrain cuDNN/cuBLAS so two runs at the same seed are comparable. "
+                         "Costs throughput; used by 4.3-noise to tell float non-determinism "
+                         "from an unseeded component.")
     ap.add_argument("--resume_from", default=None,
                     help="Stage 4.3: a checkpoint_step_N dir to resume from, or 'auto' = the newest "
                          "resumable checkpoint_step_* under --output_dir (fresh start if none)")
     # Early stop
-    ap.add_argument("--early_stop_n_patience", type=int, default=3)
+    ap.add_argument("--early_stop_n_patience", type=int, default=3,
+                    help="0 or less turns early stopping OFF. Required for equivalence and "
+                         "single-configuration runs: an early-stopped run cannot be compared "
+                         "with one that ran its full budget (quest-cpt/findings.md 9.5).")
     ap.add_argument("--early_stop_min_rel", type=float, default=0.01)
     ap.add_argument(
         "--early_stop_metric_path",
@@ -143,12 +157,14 @@ def main() -> None:
         bucket_boundaries=list(args.bucket_boundaries),
         gradient_checkpointing=args.gradient_checkpointing,
         token_budget=args.token_budget,
+        loss_weighting=args.loss_weighting,
         resume_from=args.resume_from,
         region_eval=True,
         tcr_variant=args.tcr_variant,
         mhc_variant=args.mhc_variant,
         region_eval_batch_size=args.region_eval_batch_size,
         early_stop_n_patience=args.early_stop_n_patience,
+        deterministic=args.deterministic,
         early_stop_min_rel=args.early_stop_min_rel,
         early_stop_metric_path=tuple(args.early_stop_metric_path),
         wandb_project=args.wandb_project,

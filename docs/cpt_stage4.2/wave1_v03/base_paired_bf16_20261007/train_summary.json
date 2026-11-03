@@ -1,0 +1,36 @@
+{
+  "args": {
+    "cmd": "train",
+    "task": "as_paired_i",
+    "adapter": "none",
+    "tcr_variant": "cdr3",
+    "mhc_variant": "full",
+    "max_len": 1024,
+    "smoke": false,
+    "out_dir": "/home/ubuntu/s42_out/base_paired",
+    "max_train_pos": 50000,
+    "max_val_pos": 5000,
+    "epochs": 2,
+    "patience": 1,
+    "batch_size": 16,
+    "lr": 0.0001,
+    "seed": 42,
+    "num_workers": 4
+  },
+  "best_val_auc": 0.5,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.45151569626172383,
+      "val_auc": 0.5,
+      "secs": 14456.8
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.40522605177621046,
+      "val_auc": 0.2817328373134926,
+      "secs": 14413.7
+    }
+  ],
+  "trainable_params": 14992834
+}

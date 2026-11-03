@@ -1,0 +1,66 @@
+{
+ "args": {
+  "cmd": "eval",
+  "task": "as_paired_i",
+  "adapter": "none",
+  "tcr_variant": "cdr3",
+  "mhc_variant": "full",
+  "max_len": 1024,
+  "smoke": false,
+  "ckpt": "/home/ubuntu/s42_out/base_paired/best.pt",
+  "out": "/home/ubuntu/s42_out/base_paired/eval.json",
+  "conditions": [
+   "test_level4",
+   "test_novel_pep",
+   "test_iid"
+  ],
+  "max_queries": 5000,
+  "min_queries": 500,
+  "smoke_queries": 20
+ },
+ "pool_size": 100,
+ "conditions": {
+  "test_level4": {
+   "n_rows_condition": 4872,
+   "n_queries": 4872,
+   "recall_at_10": 0.0,
+   "recall_at_10_ci95": [
+    0.0,
+    0.0
+   ],
+   "mrr": 0.01,
+   "random_recall_at_10": 0.1,
+   "underpowered": false,
+   "n_truncated_seqs": 0,
+   "secs": 10858.6
+  },
+  "test_novel_pep": {
+   "n_rows_condition": 49776,
+   "n_queries": 5000,
+   "recall_at_10": 0.0,
+   "recall_at_10_ci95": [
+    0.0,
+    0.0
+   ],
+   "mrr": 0.01,
+   "random_recall_at_10": 0.1,
+   "underpowered": false,
+   "n_truncated_seqs": 0,
+   "secs": 11794.4
+  },
+  "test_iid": {
+   "n_rows_condition": 6696,
+   "n_queries": 5000,
+   "recall_at_10": 0.0,
+   "recall_at_10_ci95": [
+    0.0,
+    0.0
+   ],
+   "mrr": 0.01,
+   "random_recall_at_10": 0.1,
+   "underpowered": false,
+   "n_truncated_seqs": 0,
+   "secs": 12515.3
+  }
+ }
+}

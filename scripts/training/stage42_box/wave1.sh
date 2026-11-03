@@ -11,16 +11,29 @@
 # is the gate. Cells 3-4 add the beta-chain split. A ceiling that stops the box mid-way therefore
 # costs the least important half.
 #
-# GATE: after cell 1, base Recall@10 on test_iid must beat the analytic random rate (10 of a
-# 100-peptide pool) with its CI clear of it. If it does not, the harness is broken and no later
-# number means anything, so the run stops there rather than spending the box on noise.
+# GATE: after cell 1, s42_check decides on `test_level4` — the condition with signal — and returns
+# PASS, UNDERPOWERED or BROKEN. Only BROKEN stops the run. Gating on test_iid (its 201 molecules
+# after de-duplication) reported "the harness is broken" about a working harness on 2026-10-08 and
+# skipped cells 2-4 for nothing; test_level4 read 0.337, CI [0.267, 0.406], against random 0.10.
+# See quest-cpt/findings.md 9.6.
+#
+# DISTRACTORS are length-matched since 2026-11-03. The 10-08 cell drew them uniformly from a
+# pool that is 76 % 9-mers, so the true peptide's length leaked into the ranking: 9-mers scored
+# 0.553 and 14-mers 0.013 inside one condition. Numbers from this launcher are therefore NOT
+# comparable to the 10-08 cell; re-score the existing base checkpoint before reading cells 2-4
+# against it (eval only, no retraining — `cell()` skips any dir that already has an eval.json,
+# so delete base_paired/eval.json to force the re-score).
 set -u
 export PATH=/home/ubuntu/miniforge3/bin:/usr/local/bin:$PATH
 Q=${Q:-/home/ubuntu/quest}; O=${O:-/home/ubuntu/s42_out}; PY=${PY:-python}
 CHECK=${CHECK:-/home/ubuntu/s42_check.py}
 ADAPTER_D=${ADAPTER_D:-$Q/checkpoints/cpt_stage41_pointD_run05/final}
 DST=${DST:-s3://fh-pi-warren-h-eco/quest/tcrbench2/checkpoints/stage42_wave1}
-MAXQ=${MAXQ:-5000}; MINQ=${MINQ:-150}; SMOKE=${SMOKE:-}   # 150: the de-duplicated paired class-I conditions hold ~200 molecules
+MAXQ=${MAXQ:-5000}; MINP=${MINP:-100}; DRAW=${DRAW:-length_matched}; SMOKE=${SMOKE:-}
+# MINP: the power floor is DISTINCT TRUE PEPTIDES, not molecules — as_paired_i test_iid
+# holds 201 molecules over just 53 peptides, so a query count never gated anything.
+# DRAW: length_matched, because the 3,564-peptide pool is 76 % 9-mers and a uniform draw
+# leaks the true peptide's length (findings 9.6). `uniform` reproduces the 10-08 cell.
 NGPU=${NGPU:-$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || echo 1)}
 export PYTHONPATH=$Q TOKENIZERS_PARALLELISM=false
 mkdir -p $O; cd $Q
@@ -55,7 +68,8 @@ cell(){
   t=$(date +%s)
   CUDA_VISIBLE_DEVICES=$gpu $PY -m track_a.esm_sft.judge eval --task $task --adapter "$adapter" \
       --tcr_variant cdr3 --mhc_variant full $SMOKE --ckpt $C/best.pt --out $C/eval.json \
-      --conditions test_level4 test_novel_pep test_iid --max_queries $MAXQ --min_queries $MINQ \
+      --conditions test_level4 test_novel_pep test_iid --max_queries $MAXQ --min_peptides $MINP \
+      --distractor_draw $DRAW \
       > $C/eval.log 2>&1
   rc=$?; say "$name eval rc=$rc secs=$(( $(date +%s)-t ))"
   publish
@@ -74,9 +88,9 @@ compare(){   # compare <base_cell> <cpt_cell> <label>
 # --- cell 1: base on the paired split. Also carries the harness gate. ---
 cell base_paired as_paired_i none 0 || { say "ABORT: base/as_paired_i failed"; exit 3; }
 if $PY $CHECK gate --eval $O/base_paired/eval.json >> $O/wave1.log 2>&1; then
-  say "GATE PASS: base recall@10 on test_iid is above the random rate, CI clear"
+  say "GATE OK: the harness check on test_level4 did not come back BROKEN (its verdict line is above)."
 else
-  say "GATE FAIL: base is at or below the random rate on test_iid — the harness is broken."
+  say "GATE BROKEN: base scores at or below random on test_level4, the condition it should win."
   say "Not spending the box on cells 2-4. Fix the judge before any wave-1 number is reported."
   publish; exit 4
 fi

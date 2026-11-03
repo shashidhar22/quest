@@ -29,19 +29,33 @@ else PARALLEL=0; NPROC=1; R_GPUS=0; S_GPUS=0; EVAL2_GPU=0; fi
 GA=$((64 / NPROC))   # 16 rows x GA x NPROC = 1024 rows per optimizer step, any GPU count
 SAMPLER=$($PY -c 'from quest.training.samplers import TokenBudgetStepSampler as T; print("v2" if hasattr(T, "_cuts") else "v1")' 2>/dev/null || echo unknown)
 PHASES=${PHASES:-all}   # all = evals + judge + R + S;  R2 = only the equivalence run (needs the v2 sampler)
+# Objective. `--loss_weighting` DEFAULTS TO `row` in the trainer, kept that way so the 10-07/10-08
+# runs reproduce bit for bit -- which makes the default a landmine: this script used to pass
+# --token_budget with no weighting and so trained row-share silently. Row-share is rejected for
+# production (quest-cpt/findings.md 9.5: it gives MHC tokens 0.43x Stage 4.1's per-token gradient
+# weight). `token` is the objective adopted 2026-11-03 (quest-cpt/box-jobs/README.md 3.2). Set
+# LOSS_WEIGHTING=row only to reproduce a pre-decision run, never for a new one.
+LW=${LOSS_WEIGHTING:-token}
 # Run dirs and verdict labels carry the sampler generation: v1 = s43_equiv_pointD / TRAIN_EQUIV
 # (the 2026-10-06 run, kept intact), v2 = s43_equiv_v2_pointD / TRAIN_EQUIV_V2 (+ V2_VS_V1).
 SUF=""; [ "$SAMPLER" = v2 ] && SUF="_v2"; export SUF
-say "start pid=$$ ngpu=$NGPU parallel=$PARALLEL world_size=$NPROC grad_accum=$GA sampler=$SAMPLER phases=$PHASES"
+say "start pid=$$ ngpu=$NGPU parallel=$PARALLEL world_size=$NPROC grad_accum=$GA sampler=$SAMPLER phases=$PHASES loss_weighting=$LW"
 
 EV="--adapter_dir $Q/checkpoints/cpt_stage41_pointD_run05/final --canonical_eval_path $Q/data/cpt_canonical_eval_v2 --base_model esmc_300m --tcr_variant cdr3 --mhc_variant full --eos_strategy raw --max_length 1024 --batch_size 16"
 TRAIN="scripts/training/train_cpt_stage2_single.py --dataset_path $Q/data/cpt_datasets/run05_cdr3_fullmhc_proportional_10M \
   --tcr_variant cdr3 --mhc_variant full --max_length 1024 --batch_size 16 --gradient_accumulation_steps $GA \
-  --token_budget 16384 --bucket_boundaries 64 128 256 512 1024 \
+  --token_budget 16384 --bucket_boundaries 64 128 256 512 1024 --loss_weighting $LW \
   --base_model esmc_300m --canonical_eval_path $Q/data/cpt_canonical_eval_v2 --eos_strategy raw --num_epochs 1 \
   --lr 2e-4 --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 --eval_steps 500 --save_steps 500 --logging_steps 50 \
   --no_compile --attn_implementation sdpa --wandb_project tcrbench-v3-cpt-stage43 --report_to wandb \
-  --early_stop_n_patience 3 --early_stop_min_rel 0.01 --early_stop_metric_path pocket overall _ perplexity"
+  --early_stop_n_patience 0"
+# Early stopping OFF (patience 0). plan.md already required this for single-configuration and
+# equivalence runs and it was never applied: on 10-07 the v2 full run stopped at step 4000 of
+# 7800 on `pocket` — the one metric that had stalled — and was then scored against Stage 4.1 at
+# 7800, producing the artifact verdict `V2_FINAL DIVERGED-WORSE`. `pocket` wobbles ~7 % between
+# evals against a 1.31 % run-to-run noise floor, so the 1 % stop threshold sat inside the
+# measurement. Stage 4.6 separately established that pocket perplexity is largely recall of
+# training MHC chains, so it must not drive a stop even when early stopping is wanted.
 EQ=$Q/checkpoints/s43_equiv${SUF}_pointD; RS=$Q/checkpoints/s43_resume${SUF}_pointD
 
 # stop_after_evals <pid> <log> <n> <label>: TERM the torchrun 90 s after its n-th canonical eval.

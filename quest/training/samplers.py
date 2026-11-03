@@ -151,6 +151,23 @@ class TokenBudgetStepSampler(Sampler):
         """Micro-batches per optimizer step for the current epoch, in yield order."""
         return list(self._plan()[1])
 
+    def step_token_plan(self) -> List[List[int]]:
+        """Planned padded-token count of each micro-batch, grouped by optimizer step.
+
+        ``step_token_plan()[i][j]`` is the token count of the ``j``-th micro-batch of step ``i``
+        on this rank, taken from ``lengths`` (so it is deterministic and known before the epoch
+        runs, unlike the realised mask count). Used by token-share loss weighting, which needs a
+        micro-batch's share of its STEP's tokens, not of its rows: see
+        ``micro_batch_loss_scale``.
+        """
+        mbs, plan = self._plan()
+        out, i = [], 0
+        for n_acc in plan:
+            out.append([int(self.lengths[np.asarray(mb, dtype=np.int64)].sum())
+                        for mb in mbs[i:i + n_acc]])
+            i += n_acc
+        return out
+
     def __iter__(self):
         return iter(self._plan()[0])
 

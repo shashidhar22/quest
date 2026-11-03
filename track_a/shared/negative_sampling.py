@@ -15,12 +15,19 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_TRACK_B_PATH = Path("/home/ubuntu/quest/track_b/shared/negative_sampling.py")
+# Resolve inside this checkout first, so judge.py imports (and is testable) off the training box.
+# The absolute path is kept as a fallback for a box layout where track_b sits elsewhere.
+_CANDIDATES = (
+    Path(__file__).resolve().parents[2] / "track_b" / "shared" / "negative_sampling.py",
+    Path("/home/ubuntu/quest/track_b/shared/negative_sampling.py"),
+)
+_TRACK_B_PATH = next((c for c in _CANDIDATES if c.exists()), None)
 
-if not _TRACK_B_PATH.exists():
+if _TRACK_B_PATH is None:
     raise ImportError(
         "track_b/shared/negative_sampling.py is required for cross-track "
-        f"negative-sample parity but was not found at {_TRACK_B_PATH}"
+        "negative-sample parity but was not found at any of: "
+        + ", ".join(str(c) for c in _CANDIDATES)
     )
 
 _spec = importlib.util.spec_from_file_location(

@@ -1,0 +1,11 @@
+{
+  "arm": "D",
+  "device": "mps",
+  "tokens_mine": 26287,
+  "tokens_stored": 26287,
+  "ppl_mine": 1.8632091384542269,
+  "ppl_stored": 1.862336150388746,
+  "ppl_rel_pct": 0.04687596625876293,
+  "masks_identical": true,
+  "ppl_within_1pct": true
+}

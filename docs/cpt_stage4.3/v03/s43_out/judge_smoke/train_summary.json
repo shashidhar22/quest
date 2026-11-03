@@ -1,0 +1,30 @@
+{
+  "args": {
+    "cmd": "train",
+    "task": "as_paired_i",
+    "adapter": "none",
+    "tcr_variant": "cdr3",
+    "mhc_variant": "full",
+    "max_len": 1024,
+    "smoke": true,
+    "out_dir": "/home/ubuntu/s43_out/judge_smoke",
+    "max_train_pos": 50000,
+    "max_val_pos": 5000,
+    "epochs": 2,
+    "patience": 1,
+    "batch_size": 16,
+    "lr": 0.0001,
+    "seed": 42,
+    "num_workers": 4
+  },
+  "best_val_auc": 0.59352,
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.5681648604075114,
+      "val_auc": 0.59352,
+      "secs": 60.6
+    }
+  ],
+  "trainable_params": 14992834
+}

@@ -174,11 +174,13 @@ def cmd_train(a):
         auc = float(roc_auc_score(Y, P)) if len(set(Y)) > 1 else 0.5
         hist.append({"epoch": ep, "train_loss": s / max(n, 1), "val_auc": auc, "secs": round(time.time() - t0, 1)})
         print(f"[judge] epoch {ep} train_loss {s / max(n, 1):.4f} val_auc {auc:.4f}", flush=True)
+        sd = {k: v for k, v in model.state_dict().items() if any(t in k for t in TRAINABLE_KEYS)}
+        # Keep the latest epoch too: on 2026-10-07 a below-chance val AUC made selection keep the
+        # untrained epoch 1, and the epoch-2 weights were lost with nothing to re-evaluate.
+        torch.save({"args": vars(a), "epoch": ep, "val_auc": auc, "trainable_state_dict": sd}, out / "last.pt")
         if auc > best + 1e-4:
             best, bad = auc, 0
-            torch.save({"args": vars(a), "trainable_state_dict":
-                        {k: v for k, v in model.state_dict().items() if any(t in k for t in TRAINABLE_KEYS)}},
-                       out / "best.pt")
+            torch.save({"args": vars(a), "trainable_state_dict": sd}, out / "best.pt")
         else:
             bad += 1
             if bad >= a.patience:
@@ -188,8 +190,85 @@ def cmd_train(a):
 
 
 # ---------------------------------------------------------------- eval
+def cluster_bootstrap_ci(hits, peptides, n_boot: int = 2000, seed: int = 42, pct=(2.5, 97.5)):
+    """95 % CI for a mean, resampling PEPTIDES rather than queries.
+
+    Queries that share a true peptide are not independent draws for a peptide-retrieval metric:
+    `as_paired_i` test_iid holds 201 molecules over 53 peptides, 93 of them on three peptides. A
+    per-query bootstrap treated them as 201 independent trials and came out 3-4x too narrow,
+    which manufactured a "significantly below random" reading of test_novel_pep's 0.081
+    (2026-10-15, quest-cpt/findings.md 9.6). This is 9.4's rows-vs-molecules error one level up.
+
+    Returns ``(lo, hi, n_clusters)``.
+    """
+    hits = np.asarray(hits, dtype=float)
+    peptides = np.asarray(peptides)
+    if not len(hits):
+        return (0.0, 0.0, 0)
+    groups = [np.flatnonzero(peptides == v) for v in pd.unique(peptides)]
+    k = len(groups)
+    rng = np.random.default_rng(seed)
+    boots = np.empty(n_boot, dtype=float)
+    for b in range(n_boot):
+        idx = np.concatenate([groups[i] for i in rng.integers(0, k, k)])
+        boots[b] = hits[idx].mean()
+    lo, hi = np.percentile(boots, pct)
+    return (float(lo), float(hi), k)
+
+
 def _qseed(row_id) -> int:
     return int(hashlib.md5(str(row_id).encode()).hexdigest()[:8], 16)
+
+
+def _pool_by_length(pool) -> dict:
+    """Pool peptides indexed by length, for the length-matched distractor draw."""
+    by_len: dict = {}
+    for q in pool:
+        by_len.setdefault(len(q), []).append(q)
+    return {k: np.asarray(v, dtype=object) for k, v in by_len.items()}
+
+
+def _draw_distractors(pool, by_len, true, rng, n, mode):
+    """``n`` distractors for one query, and how many share the true peptide's length.
+
+    ``uniform`` is the draw wave 1 shipped on 2026-10-08. It confounds the metric: the
+    pool is 76 % 9-mers while the true peptide's length varies, so inside as_paired_i
+    test_level4 9-mers scored 0.553 and 14-mers 0.013 — an order of magnitude on peptide
+    length alone (quest-cpt/findings.md 9.6). A distractor five residues shorter than the
+    true peptide is separable with no receptor information at all, so a uniform draw
+    measures length as much as specificity.
+
+    ``length_matched`` draws only same-length peptides, falling back to the nearest
+    lengths when the pool holds too few. The shortfall is counted and reported per
+    condition rather than hidden: a query padded from other lengths stays partly
+    confounded, and the reader needs to know which queries those are.
+
+    Returns ``(others, n_same_length)``.
+    """
+    if mode == "uniform":
+        # Preserve wave 1's exact RNG call sequence, so --distractor_draw uniform
+        # reproduces the 2026-10-08 numbers bit for bit.
+        others = [q for q in rng.choice(pool, size=n + 9, replace=False) if q != true][:n]
+        return others, sum(1 for q in others if len(q) == len(true))
+
+    L = len(true)
+    same = [q for q in by_len.get(L, ()) if q != true]
+    if len(same) >= n:
+        picked = rng.choice(np.asarray(same, dtype=object), size=n, replace=False)
+        return list(picked), n
+
+    out = list(rng.permutation(np.asarray(same, dtype=object))) if same else []
+    n_same = len(out)
+    limit = max(by_len) if by_len else 0
+    for d in range(1, limit + 1):
+        if len(out) >= n:
+            break
+        near = [q for L2 in (L - d, L + d) for q in by_len.get(L2, ()) if q != true]
+        if not near:
+            continue
+        take = min(n - len(out), len(near))
+        out += list(rng.choice(np.asarray(near, dtype=object), size=take, replace=False))
+    return out[:n], n_same
 
 
 def cmd_eval(a):
@@ -201,6 +280,7 @@ def cmd_eval(a):
     pool_df = load_candidate_pool()
     pool = pool_df["peptide"].astype(str).tolist() if "peptide" in pool_df else pool_df.iloc[:, 0].astype(str).tolist()
     pool_set = set(pool)
+    by_len = _pool_by_length(pool)
     result = {"args": vars(a), "pool_size": POOL_SIZE, "conditions": {}}
     for cond in a.conditions:
         t0 = time.time()
@@ -210,11 +290,14 @@ def cmd_eval(a):
         cap = a.smoke_queries if a.smoke else a.max_queries
         if len(df) > cap:
             df = df.sample(n=cap, random_state=42).reset_index(drop=True)
-        ranks, rids, trunc = [], [], 0
+        ranks, rids, true_peps, same_len, trunc = [], [], [], [], 0
         for _, r in df.iterrows():
             row = _clean(r.to_dict()); true = str(row["peptide"])
+            true_peps.append(true)
             rng = np.random.default_rng(_qseed(row["row_id"]))
-            others = [p for p in rng.choice(pool, size=POOL_SIZE + 8, replace=False) if p != true][: POOL_SIZE - 1]
+            others, n_same = _draw_distractors(
+                pool, by_len, true, rng, POOL_SIZE - 1, a.distractor_draw)
+            same_len.append(n_same)
             seqs = []
             for p in [true] + others:
                 row["peptide"] = p
@@ -226,17 +309,42 @@ def cmd_eval(a):
                 sc = model(ids.to(dev), am.to(dev)).float().cpu().numpy()
             ranks.append(int(1 + (sc[1:] >= sc[0]).sum()))  # ties count against the true peptide
             rids.append(str(row["row_id"]))
+        peps = np.asarray(true_peps)
         rk = np.asarray(ranks)
-        rng = np.random.default_rng(42)
-        boots = [(rk[i] <= 10).mean() for i in (rng.integers(0, len(rk), len(rk)) for _ in range(1000))] if len(rk) else [0]
-        m = {"n_rows_condition": n_all, "n_queries": int(len(rk)), "recall_at_10": float((rk <= 10).mean()) if len(rk) else None,
-             "recall_at_10_ci95": [float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))],
+        # Cluster-bootstrap over PEPTIDES, not queries. Queries sharing a true peptide are not
+        # independent for a peptide-retrieval metric: as_paired_i test_iid is 201 molecules over
+        # 53 peptides, 93 of them in the top three. Resampling queries made the CI 3-4x too narrow
+        # and turned test_novel_pep's 0.081 into a spurious "significantly below random"
+        # (2026-10-15, quest-cpt/findings.md 9.6). Same error one level up from 9.4's rows-vs-
+        # molecules: molecules are not the unit of independence either.
+        hits = (rk <= 10).astype(float)
+        ci_lo, ci_hi, n_pep = cluster_bootstrap_ci(hits, peps)
+        m = {"n_rows_condition": n_all, "n_queries": int(len(rk)),
+             # the metric's real sample size: distinct true peptides, not queries
+             "n_peptides": n_pep,
+             "recall_at_10": float((rk <= 10).mean()) if len(rk) else None,
+             "recall_at_10_ci95": [ci_lo, ci_hi],
              "mrr": float((1.0 / rk).mean()) if len(rk) else None, "random_recall_at_10": 10 / POOL_SIZE,
-             "underpowered": bool(len(rk) < a.min_queries), "n_truncated_seqs": int(trunc),
-             "secs": round(time.time() - t0, 1), "ranks": dict(zip(rids, ranks))}
+             # power is set by distinct peptides, not queries (see the cluster bootstrap above)
+             "underpowered": bool(n_pep < a.min_peptides), "n_truncated_seqs": int(trunc),
+             # which draw produced this number: a length_matched score is NOT comparable
+             # to a uniform one, and the 2026-10-08 wave-1 cell was uniform
+             "distractor_draw": a.distractor_draw,
+             "frac_distractors_same_length": (
+                 float(np.mean(same_len) / (POOL_SIZE - 1)) if same_len else None),
+             "n_queries_fully_length_matched": int(
+                 sum(1 for v in same_len if v == POOL_SIZE - 1)),
+             "secs": round(time.time() - t0, 1), "ranks": dict(zip(rids, ranks)),
+             "true_peptides": dict(zip(rids, true_peps))}
         result["conditions"][cond] = m
-        print(f"[judge] {cond}: n={m['n_queries']} recall@10={m['recall_at_10']} CI={m['recall_at_10_ci95']} "
-              f"mrr={m['mrr']} truncated={trunc} ({m['secs']}s){' UNDERPOWERED' if m['underpowered'] else ''}", flush=True)
+        print(f"[judge] {cond}: n={m['n_queries']} molecules over {m['n_peptides']} peptides "
+              f"recall@10={m['recall_at_10']} CI={m['recall_at_10_ci95']} (peptide-clustered) "
+              f"mrr={m['mrr']} truncated={trunc} ({m['secs']}s)"
+              f"{' UNDERPOWERED' if m['underpowered'] else ''}", flush=True)
+        print(f"[judge] {cond}: draw={m['distractor_draw']} "
+              f"same-length distractors={m['frac_distractors_same_length']:.3f} "
+              f"fully matched queries={m['n_queries_fully_length_matched']}/{m['n_queries']}",
+              flush=True)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(result, indent=1))
 
@@ -322,10 +430,15 @@ def main():
     e.add_argument("--out", required=True)
     e.add_argument("--conditions", nargs="+", default=["test_level4", "test_novel_pep", "test_iid"])
     e.add_argument("--max_queries", type=int, default=5000)
-    # 150, not 500: after de-duplication the paired class-I decision conditions hold ~200
-    # molecules (test_level4 202, test_iid 201). The plan's 500 was set when rows were mistaken
-    # for queries. Conditions below this are reported, flagged underpowered, never silently used.
-    e.add_argument("--min_queries", type=int, default=150)
+    # The power floor is distinct true peptides, not queries: as_paired_i test_iid has only
+    # 53, so its CI is 0.33 wide however many molecules are scored (2026-10-15). The old
+    # --min_queries knob was unused after that change and is gone, so nothing can pass it
+    # and believe a query count still gates anything.
+    e.add_argument("--min_peptides", type=int, default=100)
+    # length_matched by default: a uniform draw leaks the true peptide's length against a
+    # 76 %-9-mer pool (see _draw_distractors). `uniform` reproduces the 2026-10-08 cell.
+    e.add_argument("--distractor_draw", choices=["length_matched", "uniform"],
+                   default="length_matched")
     e.add_argument("--smoke_queries", type=int, default=20)
     c = sp.add_parser("compare")
     c.add_argument("--a", required=True); c.add_argument("--b", required=True)

@@ -1259,6 +1259,15 @@ class CdrPplPlateauCallback:
         return float(cur)
 
     def __call__(self, buckets: dict) -> bool:
+        if self.n_patience <= 0:
+            # Explicitly OFF. plan.md forbids early stopping in single-configuration runs, and
+            # Stage 4.3 was read wrong because an early stop at step 4000/7800 was compared with a
+            # run that went to 7800 (quest-cpt/findings.md 9.5). `n_patience <= 0` happened to
+            # never fire before, because the first eval always counts as an improvement against
+            # an infinite best; relying on that was fragile, so it is now stated.
+            self.history.append({"metric": self._get_metric(buckets), "best": self.best,
+                                 "improved": False, "disabled": True})
+            return False
         m = self._get_metric(buckets)
         if m is None or not math.isfinite(m):
             self.history.append({"metric": None, "best": self.best, "improved": False})
@@ -1312,20 +1321,47 @@ _RESUME_MATCH_KEYS = (
 _RESUME_MATCH_KEYS_LEGACY = ("batch_size", "gradient_accumulation_steps", "world_size")
 
 
-def micro_batch_loss_scale(n_rows: int, rows_per_rank: int, n_acc: int, token_mode: bool) -> float:
+def micro_batch_loss_scale(n_rows: int, rows_per_rank: int, n_acc: int, token_mode: bool,
+                           weighting: str = "row", mb_tokens: int = 0,
+                           step_tokens: int = 0) -> float:
     """Weight of one micro-batch's mean loss within the optimizer step.
 
-    Fixed-batch path: ``1 / n_acc`` (the mean of ``n_acc`` equal micro-batch means).
-    Token-budget path: ``n_rows / rows_per_rank`` — the micro-batch's ROW share of the rank's step.
-    The two coincide whenever micro-batches are equal (``n_rows * n_acc == rows_per_rank``), so
-    the fixed-batch weighting of Stage 4.1 is reproduced exactly, and a step whose micro-batches
-    differ in size (a few long rows beside many short ones) weights each row the same regardless
-    of how the rows were partitioned. With ``1 / n_acc`` a 16-row micro-batch would have carried
-    the same weight as a 256-row one.
+    ``raw_loss`` is already a mean over the micro-batch's MASKED TOKENS, so this scale decides how
+    much each token ends up contributing to the step's gradient.
+
+    Fixed-batch path (Stage 4.1): ``1 / n_acc``, the mean of ``n_acc`` equal micro-batch means.
+    Its micro-batches hold 16 randomly chosen rows, so each one's token mix is close to the global
+    mix and per-token weight comes out near uniform.
+
+    Token-budget paths, selected by ``weighting``:
+
+    ``"row"`` — ``n_rows / rows_per_rank``, the micro-batch's ROW share of the rank's step. Weights
+      every row alike. **This is not equivalent to the fixed-batch path**, because the v2 cuts are
+      length-homogeneous: full-MHC rows land in their own small, token-rich micro-batch and their
+      tokens are divided down. Measured against the real sampler at the Stage 4.1 length mix
+      (99.5 % of rows ~17 tokens), MHC-bearing tokens receive **0.43x** the per-token gradient
+      weight they had under the fixed-batch path, while short rows keep theirs. That is the
+      mechanism behind Stage 4.3's better-overall-worse-pocket split (quest-cpt/findings.md 9.5).
+      Kept as the default only so existing runs stay reproducible.
+
+    ``"token"`` — ``mb_tokens / step_tokens`` from ``TokenBudgetStepSampler.step_token_plan()``,
+      the micro-batch's TOKEN share of the rank's step. Per-token weight is then uniform across
+      the step however the rows were partitioned, which is what the fixed-batch path approximated.
+      Use this to keep the token-budget speedup without moving the objective.
+
+    Both token-budget paths coincide with ``1 / n_acc`` when micro-batches are equal in rows and
+    tokens (``n_rows * n_acc == rows_per_rank``).
     """
-    if token_mode:
-        return n_rows / float(rows_per_rank)
-    return 1.0 / n_acc
+    if not token_mode:
+        return 1.0 / n_acc
+    if weighting == "token":
+        if step_tokens <= 0:
+            raise ValueError("token-share weighting needs step_tokens > 0 "
+                             "(from TokenBudgetStepSampler.step_token_plan())")
+        return mb_tokens / float(step_tokens)
+    if weighting != "row":
+        raise ValueError(f"unknown weighting {weighting!r}; expected 'row' or 'token'")
+    return n_rows / float(rows_per_rank)
 
 
 class _SkipSampler(Sampler):
@@ -1447,6 +1483,11 @@ class CPTConfig:
     # When > 0, micro-batches fill this many tokens and every optimizer step is exactly
     # batch_size * gradient_accumulation_steps * world_size rows (the effective batch).
     token_budget: int = 0
+    # How a micro-batch's mean loss is weighted inside its optimizer step when token_budget > 0.
+    # "row" is the shipped v2 behaviour and the default so earlier runs stay reproducible; it
+    # down-weights MHC-bearing tokens ~2.3x relative to the Stage 4.1 path. "token" keeps
+    # per-token weight uniform. See micro_batch_loss_scale and quest-cpt/findings.md 9.5.
+    loss_weighting: str = "row"
     bucket_boundaries: list[int] = field(default_factory=lambda: [32, 48, 64, 96, 128])
     dataloader_num_workers: int = 4
     eval_batch_size: int = 64
@@ -1466,7 +1507,11 @@ class CPTConfig:
     # When region_eval is True, the early-stop callback is CdrPplPlateauCallback
     # monitoring the metric at ``early_stop_metric_path`` (default cdr3 ppl).
     early_stop_metric_path: tuple = ("cdr3", "overall", "_", "perplexity")
+    # 0 or less = early stopping OFF, which is what plan.md requires of any single-configuration
+    # or equivalence run.
     early_stop_n_patience: int = 3
+    # Constrain cuDNN/cuBLAS so two runs at one seed can be compared (see _setup, 4.3-noise).
+    deterministic: bool = False
     early_stop_min_rel: float = 0.01
 
     # Wandb
@@ -1512,10 +1557,22 @@ class CPTTrainer:
 
         torch.set_float32_matmul_precision("high")
         torch.manual_seed(cfg.seed + self.global_rank)
+        if getattr(cfg, "deterministic", False):
+            # Two runs at one seed differed 1.31 % at step 2000 (V2_DETERMINISM, 2026-10-08) with
+            # nothing here constraining cuDNN algorithm choice or reduction order; over 2,000 steps
+            # float non-associativity amplifies. Turning this on narrows the cause: if two runs
+            # still differ, something is genuinely unseeded.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            self._log("  deterministic mode: cudnn.benchmark off, deterministic algorithms "
+                      "(warn_only), CUBLAS_WORKSPACE_CONFIG=:4096:8 — expect a throughput cost")
 
         # Stage 4.3 resume: resolve and validate BEFORE any heavy loading so a bad
         # checkpoint or a config mismatch fails in seconds, on every rank alike.
         self._token_mode = cfg.token_budget > 0
+        self._loss_weighting = getattr(cfg, "loss_weighting", "row")
         self._resume_dir = resolve_resume_dir(cfg.resume_from, cfg.output_dir)
         self._resume_state: dict | None = None
         if self._resume_dir is not None:
@@ -1851,7 +1908,13 @@ class CPTTrainer:
         cfg = self.cfg
         self.model.train()
         token_mode = getattr(self, "_token_mode", False)
+        weighting = getattr(self, "_loss_weighting", "row")
         plan = self.train_sampler.step_plan() if token_mode else None
+        # Token-share weighting needs each micro-batch's share of its STEP's tokens, which the
+        # sampler knows in advance (see micro_batch_loss_scale). Row-share needs nothing extra.
+        token_plan = (self.train_sampler.step_token_plan()
+                      if token_mode and weighting == "token" else None)
+        step_tokens = [sum(s) for s in token_plan] if token_plan is not None else None
         if plan is not None and self.is_distributed:
             # Every rank must run the same micro-batch count per step, or DDP desyncs.
             sig = torch.tensor([len(plan), sum(plan), sum((i + 1) * n for i, n in enumerate(plan)) % 2_000_000_011],
@@ -1913,7 +1976,10 @@ class CPTTrainer:
                     loss = raw_loss / n_acc            # Stage 4.1 path, bit-identical to before
                 else:
                     loss = raw_loss * micro_batch_loss_scale(
-                        int(input_ids.size(0)), self._rows_per_rank, n_acc, token_mode=True)
+                        int(input_ids.size(0)), self._rows_per_rank, n_acc, token_mode=True,
+                        weighting=weighting,
+                        mb_tokens=(token_plan[step_i][micro_i] if token_plan is not None else 0),
+                        step_tokens=(step_tokens[step_i] if step_tokens is not None else 0))
               loss.backward()  # outside autocast, as before; inside no_sync when deferring
             accum_loss += loss.item()
             micro_i += 1

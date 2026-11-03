@@ -1,0 +1,33 @@
+{
+  "n_patience": 3,
+  "min_rel_improvement": 0.01,
+  "metric_path": [
+    "pocket",
+    "overall",
+    "_",
+    "perplexity"
+  ],
+  "best": 1.9510762120451433,
+  "history": [
+    {
+      "metric": 3.139753455189946,
+      "best": 3.139753455189946,
+      "improved": true
+    },
+    {
+      "metric": 2.2192546771249044,
+      "best": 2.2192546771249044,
+      "improved": true
+    },
+    {
+      "metric": 1.9981639658571186,
+      "best": 1.9981639658571186,
+      "improved": true
+    },
+    {
+      "metric": 1.9510762120451433,
+      "best": 1.9510762120451433,
+      "improved": true
+    }
+  ]
+}

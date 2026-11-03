@@ -1,0 +1,58 @@
+{
+  "n_patience": 3,
+  "min_rel_improvement": 0.01,
+  "metric_path": [
+    "pocket",
+    "overall",
+    "_",
+    "perplexity"
+  ],
+  "best": 2.0814434117503815,
+  "history": [
+    {
+      "metric": 3.0988705399973715,
+      "best": 3.0988705399973715,
+      "improved": true
+    },
+    {
+      "metric": 2.2187533419821914,
+      "best": 2.2187533419821914,
+      "improved": true
+    },
+    {
+      "metric": 2.283947794179881,
+      "best": 2.2187533419821914,
+      "improved": false
+    },
+    {
+      "metric": 2.123733950229938,
+      "best": 2.123733950229938,
+      "improved": true
+    },
+    {
+      "metric": 2.0921172318650108,
+      "best": 2.0921172318650108,
+      "improved": true
+    },
+    {
+      "metric": 2.0814434117503815,
+      "best": 2.0814434117503815,
+      "improved": false
+    },
+    {
+      "metric": 2.223024519352174,
+      "best": 2.0814434117503815,
+      "improved": false
+    },
+    {
+      "metric": 2.1033405604291078,
+      "best": 2.0814434117503815,
+      "improved": false
+    },
+    {
+      "metric": 2.1033405604291078,
+      "best": 2.0814434117503815,
+      "improved": false
+    }
+  ]
+}
