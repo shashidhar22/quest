@@ -138,6 +138,7 @@ def _readability_gate(args, cs):
     print(f"[gate] READABILITY: one lambda={lam:.3f} (= {100*(lam-1):.0f}% rank gain) fixed on "
           f"{args.condition} at the pre-registered {args.prereg_delta:+.3f} Recall@10")
     best = None
+    per_pair = {}
     for cond, m in cs.items():
         ranks_d = m.get("ranks")
         if not ranks_d:
@@ -158,21 +159,38 @@ def _readability_gate(args, cs):
                 eff = R.effect_under_lambda(rk, uu, pool, lam, metric)
                 rho = next((x for x in (0.0, 0.5, 0.8, 0.9, 0.95)
                             if eff >= R.paired_mde(se, x)), None)
+                be = R.breakeven_rho(se, eff)
+                per_pair[(cond, uname, metric)] = (eff, se, be)
                 print(f"[gate]   {cond:15s} {uname:11s} n={len(set(uu)):4d} {metric:12s} "
                       f"effect={eff:+.4f} MDE(rho=.8)={R.paired_mde(se, 0.8):.4f} "
-                      f"readable at rho>={rho}")
+                      f"breakeven rho={'n/a' if be is None else format(be, '.3f')}")
                 if rho is not None and (best is None or rho < best[0]):
                     best = (rho, cond, uname, metric)
-    if best is None:
-        print("[gate] READABILITY UNREADABLE: no condition, unit and metric resolves the "
-              "pre-registered effect even at rho=0.95. A comparison must not be read, and the "
-              "remaining cells cannot answer the question as specified.")
+    # The LOCKED primary read decides the gate. "Something is readable" across twelve pairings is
+    # a post-hoc selection surface; the pairing was locked on 2026-11-04 on pre-cell power, with no
+    # CPT cell in existence. box-jobs/README.md 3.4.
+    pc, pu, pm = args.primary_condition, args.primary_unit, args.primary_metric
+    prim = per_pair.get((pc, pu, pm))
+    if prim is None:
+        print(f"[gate] READABILITY ERROR: the locked primary read {pc}/{pu}/{pm} is not present "
+              f"in this eval. Not substituting another pairing — that is the selection surface "
+              f"the lock exists to close.")
         return 1
-    rho, cond, uname, metric = best
-    verdict = "READABLE" if rho <= 0.9 else "MARGINAL"
-    print(f"[gate] READABILITY {verdict}: best pairing is {cond} / {uname} / {metric}, "
-          f"readable at rho>={rho}. Read the comparison THERE, not on the harness condition.")
-    return 0 if rho <= 0.9 else 1
+    eff, se, be = prim
+    floor = args.rho_floor
+    ok = be is not None and be <= floor
+    print(f"[gate] READABILITY {'PASS' if ok else 'FAIL'} on the LOCKED primary read "
+          f"{pc} / {pu} / {pm}: effect={eff:+.4f} SE={se:.4f} breakeven rho={be:.3f} "
+          f"vs floor {floor:.2f}")
+    if not ok:
+        print(f"[gate]   the comparison is NOT readable unless cross-arm correlation exceeds "
+              f"{be:.3f}. Nothing may be read off it, and the comparison cells cannot answer "
+              f"the question. Refusing them is the correct outcome, not a failure of the run.")
+    if best is not None and best[1:] != (pc, pu, pm):
+        print(f"[gate]   note: {best[1]}/{best[2]}/{best[3]} clears at a lower rho ({best[0]}). "
+              f"Secondary only. Changing the primary read requires writing it into "
+              f"box-jobs/README.md first.")
+    return 0 if ok else 1
 
 
 def report(args):
@@ -222,6 +240,14 @@ if __name__ == "__main__":
                                    "readability condition")
     g.add_argument("--prereg-delta", dest="prereg_delta", type=float, default=0.05,
                    help="pre-registered Recall@10 effect; see box-jobs/prereg-4.2-effect.md")
+    g.add_argument("--primary-condition", dest="primary_condition", default="test_novel_pep")
+    g.add_argument("--primary-unit", dest="primary_unit", default="peptide",
+                   choices=("peptide", "pep_cluster"))
+    g.add_argument("--primary-metric", dest="primary_metric", default="norm_rank",
+                   choices=("recall_at_10", "mrr", "norm_rank"))
+    g.add_argument("--rho-floor", dest="rho_floor", type=float, default=0.8,
+                   help="the cross-arm correlation we are willing to assume; the locked read "
+                        "must have a breakeven at or below this")
     r = sp.add_parser("report"); r.add_argument("--dir", required=True)
     a = ap.parse_args()
     sys.exit({"gate": gate, "report": report}[a.cmd](a))
