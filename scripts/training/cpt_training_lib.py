@@ -1564,9 +1564,16 @@ class CPTTrainer:
             # "if two runs still differ, something is genuinely unseeded". THAT INFERENCE IS
             # INVALID and would send the next reader hunting a seeding bug that does not exist.
             # Two runs WILL still differ with this flag on, because:
-            #   - the data path is already fully seeded: the sampler draws from
-            #     np.random.default_rng(seed + epoch) and the masking collator from an explicit
-            #     torch.Generator(mask_seed), so order and mask pattern are reproducible;
+            #   - the sampler ORDER is seeded: it draws from np.random.default_rng(seed + epoch).
+            #     The MASK PATTERN is NOT. Corrected again 2026-11-04 (second pass) after an
+            #     external audit caught this very comment: the explicit torch.Generator(mask_seed)
+            #     belongs to EVALUATION masking only. Training builds DataCollatorForMLMDynamic
+            #     below, and quest/training/collators.py masks with bare torch.rand / torch.randint
+            #     off the global RNG -- no generator argument, no worker_init_fn, no DataLoader
+            #     generator across its 4 persistent workers -- and resume restores no masking RNG
+            #     state. torch.manual_seed above may still make two fresh same-seed runs agree,
+            #     but nothing here guarantees it, so the 1.31 % cannot be attributed to flash-attn
+            #     by elimination. Measure the residual; do not infer it from this comment;
             #   - ESM-C runs varlen FLASH ATTENTION whatever --attn_implementation says (that arg
             #     is inert on this model, findings 9.2), and flash-attn's backward accumulates dQ
             #     with atomics, so its reduction order is non-deterministic by construction. It is

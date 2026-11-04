@@ -35,10 +35,14 @@ import sys
 
 KEYS = ("objective", "token_budget", "bucket_boundaries", "steps", "early_stop",
         "draw", "pool_size", "pool_id", "dataset", "seed", "cotenants")
-# Keys a comparison is ALLOWED to differ on, per comparison kind.
+# Keys a comparison is ALLOWED to differ on, per comparison kind. A waiver is never silent:
+# check() reports which waived keys actually differed, so a tolerated difference appears in the
+# run log next to the result it licensed.
 WAIVED = {
     "band": ("seed", "cotenants"),          # a band is built FROM differing seeds
     "arms": ("dataset", "seed", "cotenants"),   # arm A vs arm D differ by dataset by construction
+    "cells": ("cotenants",),    # GPU 3's neighbour differs between P1 and P2 by construction;
+                                # everything else, dataset and seed included, must match
     "strict": (),
 }
 
@@ -57,15 +61,15 @@ def load(path):
 
 
 def check(a, b, kind="strict"):
-    """Returns [] when comparable, else the list of offending keys."""
+    """Returns (offending keys, tolerated differences). Comparable when the first is empty."""
     waived = set(WAIVED[kind])
-    bad = []
+    bad, tolerated = [], []
     for k in KEYS:
-        if k in waived:
+        if a.get(k) == b.get(k):
             continue
-        if a.get(k) != b.get(k):
-            bad.append(f"{k}: {a.get(k)!r} vs {b.get(k)!r}")
-    return bad
+        line = f"{k}: {a.get(k)!r} vs {b.get(k)!r}"
+        (tolerated if k in waived else bad).append(line)
+    return bad, tolerated
 
 
 def pool_fingerprint(path):
@@ -94,13 +98,15 @@ def main():
     if a.cmd == "fingerprint":
         print(pool_fingerprint(a.path))
         return 0
-    bad = check(load(a.a), load(a.b), a.kind)
+    bad, tolerated = check(load(a.a), load(a.b), a.kind)
     if bad:
         print(f"[prov] REFUSED ({a.kind}): these runs are not comparable")
         for line in bad:
             print(f"[prov]   {line}")
         return 1
     print(f"[prov] comparable ({a.kind}): {a.a} vs {a.b}")
+    for line in tolerated:
+        print(f"[prov]   TOLERATED by kind={a.kind}: {line}")
     return 0
 
 

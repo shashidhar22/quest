@@ -1,23 +1,54 @@
 # NEXT — quest (updated 2026-11-04) · history: `docs/LOG.md` · stages: `plans/README.md` · knowledge: `~/Documents/ACS/quest-cpt/`
 
+**DO NOT LAUNCH V04 YET.** An external Stage-4 audit on 2026-11-04 found the launcher broken in a
+way that would have destroyed the visit, and the repair is only partly done. Verdicts and evidence:
+`~/Documents/ACS/quest-cpt/audits/2026-11-04/triage.md`. Remaining work and its order:
+`plans/v04-audit-repair.md`.
+
+Why the previous instruction here was dangerous, kept because it is the lesson: it said to launch
+`run_v04.sh` and arm `autostop_when_done.sh` on the driver PID. Trainers were started through
+command substitution, so every `wait` failed with "not a child of this shell", the driver printed
+`V04 complete` within seconds, and the watchdog would have stopped the instance on top of six live
+trainings. A dry run with an instant trainer stub could not see it.
+
 **No box is running.** `i-0030c1a9c845b3714` is stopped and sized **g6.2xlarge**; V04 needs
 **g6.12xlarge** on the same volume `vol-08f5626ccf18fdd4c`. Decision gates and all Stage 4.2/4.3
 detail: `quest-cpt/box-jobs/README.md` §3.2–3.4.
 
-1. **`aws sso login --profile DataUserAccess-953915750371`** — the token expires; nothing touching
-   the box or S3 runs without it.
-2. **`git push`** the one local commit. Claude's sandbox refuses push as a public-surface action, so
+1. **`git push`** the local commits. Claude's sandbox refuses push as a public-surface action, so
    Yuexin runs it.
-3. **First minutes on the box, before any job writes:** read-only copy of `/home/ubuntu/v2_full.sh`
-   and any surviving uncommitted `track_a/` off `vol-08f5626ccf18fdd4c`, hashed and committed. It is
-   the only record of what computed the two failed V03 verdicts.
-4. **Resize to g6.12xlarge, then launch `scripts/training/v04_box/run_v04.sh`** and arm
-   `autostop_when_done.sh` on its PID with `MAX_HOURS`. It encodes the chain: P1 arm A × 3 seeds +
-   base re-score under the length-matched draw → **G1** locked-read readability gate on the NEW-draw
-   ranks → P2 arm D × 3 seeds, comparison cells **only on a G1 pass**. ≈10 h, ≈USD 46 on-demand.
+2. **Decide the loss-normalization contract** — input-length approximation as shipped, or an exact
+   global masked-target mean. This gates the GPU spend rather than following it: V04's six
+   re-baselines *are* the new baselines, so buying them under an objective about to change wastes
+   the visit. `step_token_plan()` sums input lengths while `raw_loss` is a mean over realized
+   masked targets, and the normalization is per-rank with no all-reduce.
+3. **Finish the repair, off-box, in this order:** gate fail-closed · one comparator for the locked
+   endpoint, then actually invoke it · provenance over real artifacts · objective locked across
+   resume once step 2 is decided · run spec and plan reconciliation. Steps needing torch and peft
+   cannot be verified on the laptop.
+4. **Then, before any long visit:** `aws sso login --profile DataUserAccess-953915750371`, a
+   read-only hashed copy of `/home/ubuntu/v2_full.sh` and any surviving uncommitted `track_a/` off
+   `vol-08f5626ccf18fdd4c` (the only record of what computed the two failed V03 verdicts), resize,
+   then a bounded preflight of the exact V04 command recording backend version, input and mask
+   hashes, memory and throughput. Launch only after that reads clean.
 
-**Open:** ρ is assumed 0.8 against a measured breakeven **0.765** — the first comparison cell must
-report measured ρ against both · every readability number is power under the **uniform** draw until
-G1 recomputes it · `4.3-noise-det` not run, so the flash-attn share of the 1.31 % is unapportioned ·
-arm A has never been judge-scored · §9.6's length finding still needs restating per peptide in the
-findings text itself.
+**Done 2026-11-04 (tested, `tests/test_v04_launcher.py`, 16 tests):** process ownership and failure
+propagation · orphan-free aborts · dry-run isolation, so it can no longer delete
+`checkpoints/v04_arm*_seed*` · four-GPU requirement, removing the GPU-0 port collision · per-cell
+task selection, so both `*_trb` cells stop running `as_paired_i` · a missing candidate pool aborts
+instead of becoming a sentinel that matches itself · provenance waivers are printed, never silent ·
+a comparison cell with no trained checkpoint refuses instead of scoring an untrained head.
+
+**Open:** the launcher still invokes **no comparison** — `judge compare` is called nowhere, and its
+estimator is query-level Recall@10 with a row bootstrap, not the locked peptide-clustered
+normalized-rank read the gate enforces · cells 2-4 have no trained checkpoints and training them is
+GPU time the ≈10 h / ≈USD 46 estimate does not include · the gate still returns 0 when a requested
+readability read has no ranks · `STEPS` is recorded in manifests and enforced nowhere, and the
+trainer takes `--resume_from` and `--gradient_checkpointing` which the launcher never passes · ρ is
+assumed 0.8 against a measured breakeven **0.765** · every readability number is power under the
+**uniform** draw until G1 recomputes it · **the 1.31 % is unapportioned**: training-time MLM masking
+is unseeded (bare `torch.rand` in `quest/training/collators.py`; only eval masking takes an explicit
+Generator), so the earlier flash-attn attribution rested on a comment that was wrong and is now
+corrected in place · arm A has never been judge-scored · `plans/README.md` still calls 4.3 OPEN
+while the ACS record closes it on token-share · §9.6's length finding still needs restating per
+peptide in the findings text itself.
