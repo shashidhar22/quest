@@ -126,7 +126,19 @@ Everything local that 4.2 needed is now done, so the next moves are a decision a
    written, and this was not built here because it cannot be verified off the box** (no `peft`
    locally, so the trainer will not even import). Build it as the first V04 action, or extend the
    4.1 driver with pass-through knobs and leave its defaults alone.
-2. **Re-score the base cell first, on the same visit (≈1.25 h, eval only, no retraining).** Move
+1b. **DONE 2026-11-04 — the comparison is not readable where the gate reads it.**
+   `box-jobs/README.md` §3.3, code `scripts/training/stage42_box/readability.py` (+11 tests),
+   effect pre-registered first in `box-jobs/prereg-4.2-effect.md`. `test_level4` + Recall@10 needs
+   a **+0.257** Recall@10 effect to be detectable at ρ=0.8 against a pre-registered **+0.050**, so
+   cells 2–4 as specified could not have answered. `test_novel_pep` + norm_rank resolves **+0.017**
+   and comes out of the **same eval pass**, so the fix is free and no task switch is needed. Read
+   the comparison there; keep the harness check on `test_level4`. Also: `test_level4`'s 108 peptides
+   are only **18 pep_clusters**, so the independence unit is still not settled; and `as_trb_i`
+   level4 is 335 peptides / 131 clusters, not the 48× its 9,734 molecules imply.
+
+2. **Re-score the base cell first, on the same visit (≈1.25 h, eval only, no retraining).**
+   **Recompute the readability numbers from it** — everything in §3.3 is power under the *uniform*
+   draw, and the length-matched draw changes the pool. Move
    `base_paired/eval.json` aside so `cell()` stops skipping it, then let `wave1.sh` re-evaluate the
    existing `best.pt` under the length-matched draw. Doing this before cells 2–4 is what keeps the
    base-vs-arm-D comparison on one footing; doing it after means re-running three trainings.
@@ -148,6 +160,9 @@ Everything local that 4.2 needed is now done, so the next moves are a decision a
 ## 4. Open and unverified
 
 - **The 1.31 % non-determinism** — cause unknown; blocks every tight equivalence claim.
+- **ρ, the cross-arm peptide-level correlation** — unmeasurable from the base arm alone, so every
+  readability number is reported against it. The first CPT cell to land measures it and pins the
+  predicate.
 - **The peptide-length confound is coded but unmeasured** — the length-matched draw landed
   2026-11-03 and no number has been produced under it. Which way the headline moves is an open
   empirical question: 9-mers were never helped by the uniform draw, while long peptides were
