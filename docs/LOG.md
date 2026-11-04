@@ -226,3 +226,65 @@ or the project memory, not in this log.
   `resume_training.log`); `gpu_retry_loop.sh` now reads that file instead of a dead scratchpad
   copy. Not restarted by the assistant (safety classifier withheld the relaunch); the start
   command is NEXT.md item 1. Nothing is running on AWS; the box is stopped.
+
+## 2026-11-03/04 — Stage 4.3 objective decided; Stage 4.2 shown unreadable where it was gated; V04 launcher built
+
+Laptop-only session. No GPU spend. Branch pushed for the first time since it was created.
+
+- **`4.3-objective` DECIDED: `--loss_weighting token`.** `--token_budget 0` rejected. One-time costs
+  of the two branches are comparable since both owe a noise band, but `--token_budget 0` pays ≈3.9×
+  on every remaining 4.4–4.7 run — ≈USD 350–460, and at that factor neither `4.4-s2` nor `4.7-run`
+  fits one visit — to stay continuous with a weighting that is an artifact of batch size 16, on a
+  metric `4.6-s1` had already demoted. **Stage 4.3 CLOSED.** Re-baseline scoped to arms **A and D**;
+  arm F controls nothing downstream (checked against `stage4-4/5/7.md` and `tests.md`). `4.3-tokw`
+  and `4.3-noise` folded into it: arm D × 3 seeds, 7,800 steps, no early stop, which puts the band
+  at the step comparisons are read at and doubles as `4.4-s2`'s control. Detail:
+  `quest-cpt/box-jobs/README.md` §3.2.
+- **Landmine fixed:** `--loss_weighting` defaults to `row`, the rejected objective, and **no launcher
+  passed the flag** — `run_s43.sh` passed `--token_budget 16384` and nothing else, so it would have
+  trained row-share silently. Now explicit and logged, verified via `stage43_box/dryrun.sh` in all
+  three layouts.
+- **Stage 4.2: the comparison was not readable where the gate read it.** Effect pre-registered first
+  in its own commit (`quest-cpt/box-jobs/prereg-4.2-effect.md`), then computed from the V03 base
+  cell's shipped per-query ranks. Smallest detectable effect at ρ=0.8 in Recall@10 points against a
+  pre-registered **+0.050**: `test_level4`/peptide **+0.2574**, `test_level4`/pep_cluster **+0.3614**,
+  `test_novel_pep`/norm_rank **+0.0170**. So cells 2–4 as specified would have returned an
+  uninterpretable number, while the readable condition was **already in the same eval pass** — no
+  task switch needed. `test_level4`'s 108 peptides collapse into **18 pep_clusters**, so the
+  independence unit is not settled at the peptide. `as_trb_i` level4 is **335 peptides / 131
+  clusters**, not the 48× its 9,734 molecules imply. Detail: `box-jobs/README.md` §3.3.
+- **Primary read LOCKED** at `test_novel_pep` × `norm_rank` × peptide, chosen on pre-cell power with
+  no CPT cell in existence, the other eleven pairings secondary. **Breakeven ρ = 0.765** against the
+  0.8 assumed — this corrected an overclaim of mine that had called the margin threefold by
+  converting a 1.6 % margin in λ into Recall@10 points. Nothing in the cell is readable unpaired.
+  **§9.6's length finding needs restating per peptide:** every non-9 stratum holds 1–24 peptides, the
+  12-mer row is one peptide carrying 48 molecules, and the homogeneous 9-mer stratum puts base
+  **below chance** (0.0416). Direction of the length effect flips between conditions. §3.4.
+- **New committed code.** `stage42_box/readability.py` (stdlib only: paired, peptide-clustered,
+  metric-parameterised, breakeven ρ, length stratification) + 23 tests pinned to the real cell,
+  independently reproducing §9.6's corrected intervals to within 0.01. `s42_check.py` emits two gate
+  conditions separately and enforces the locked pairing. `v04_box/` — `run_v04.sh` (the gate chain),
+  `provenance.py` (refuses a comparison across an objective/draw/pool-id/step/seed-set/batching
+  mismatch), `dryrun.sh` (both gate branches on the real ranks, plus the row-share abort).
+  `scripts/smoke_stdlib.sh` proves the no-dependency property on a fresh clone.
+- **Seed-path audit (findings §9.8).** The data path is fully seeded — sampler
+  `np.random.default_rng(seed+epoch)`, masking `torch.Generator(mask_seed)`, `manual_seed` before
+  model load. The 1.31 % is **flash attention's backward**, which accumulates `dQ` with atomics,
+  sits outside PyTorch's determinism registry and is active on every arm regardless of
+  `--attn_implementation` (inert here). **The `--deterministic` comment had inverted the inference**
+  — it said a residual difference means something is unseeded, which would have sent the next
+  session hunting a non-existent bug. Consequence: the three-seed band is **not a seed band**.
+- **Two latent repo faults found.** `*.csv` in `.gitignore` was swallowing test fixtures, so
+  `test_judge_cluster_ci.py`'s 12 tests had been pinned only on this laptop; rule fixed, both
+  fixtures tracked. And `test_micro_batch_loss_scale_reproduces_fixed_batch_weighting` was renamed —
+  its assertions are sound but cover only equal micro-batches, while the name states the claim §9.5
+  refuted.
+- **Incidents, mine.** A regression comparison that silently did nothing because zsh does not
+  word-split unquoted variables; a `local` statement deriving a path from variables assigned in the
+  same statement, which tripped `set -u` and failed both launcher phases silently past `bash -n`;
+  three-decimal rounding that put a pass and a fail on the same displayed value at the decision
+  threshold; and a non-stdlib test file listed in the smoke subset. The dryrun and smoke targets
+  caught the last two, which is what they are for.
+- **Approach extracted:** `~/Documents/ACS/learnings/2026-11-04-can-this-measurement-answer-the-question.md`.
+- **Cost:** idle spend measured at **USD 298/mo**, confirming the filed 295 rather than contradicting
+  it; October's higher figure was a transition month. Both boxes stopped all session.
