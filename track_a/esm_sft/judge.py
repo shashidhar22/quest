@@ -391,17 +391,25 @@ def cmd_probe(a):
 
 # ---------------------------------------------------------------- paired comparison
 def cmd_compare(a):
-    A, B = json.loads(Path(a.a).read_text()), json.loads(Path(a.b).read_text())
-    for cond in sorted(set(A["conditions"]) & set(B["conditions"])):
-        ra, rb = A["conditions"][cond]["ranks"], B["conditions"][cond]["ranks"]
-        q = sorted(set(ra) & set(rb))
-        d = np.array([(rb[k] <= 10) - (ra[k] <= 10) for k in q], dtype=float)
-        rng = np.random.default_rng(42)
-        boots = [d[i].mean() for i in (rng.integers(0, len(d), len(d)) for _ in range(2000))] if len(d) else [0]
-        lo, hi = np.percentile(boots, [2.5, 97.5])
-        verdict = "B > A" if lo > 0 else ("B < A" if hi < 0 else "no difference resolved")
-        print(f"{cond}: paired n={len(q)}  delta recall@10 (B-A) = {d.mean() if len(d) else float('nan'):+.4f}  "
-              f"95% CI [{lo:+.4f}, {hi:+.4f}]  -> {verdict}")
+    """Thin consumer of scripts/training/stage42_box/paired_compare.py.
+
+    What used to live here measured the wrong thing (audit finding 4, 2026-11-04): it
+    intersected row IDs silently, differenced Recall@10 indicators, and bootstrapped over ROWS.
+    The gate licenses `test_novel_pep / peptide / norm_rank`; a row bootstrap on a different
+    metric is both the wrong estimand and an interval too narrow by construction, because
+    molecules of one peptide are not independent observations.
+
+    The statistics now live in a stdlib-only module beside readability.py, so the whole
+    contract is testable without torch or peft (tests/test_paired_compare.py). This wrapper
+    exists only so `judge compare` keeps working; it adds nothing of its own.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] /
+                           "scripts" / "training" / "stage42_box"))
+    import paired_compare as PC
+
+    rc, _ = PC.compare(a.a, a.b, a.units, primary=(a.pc, a.pu, a.pm), out=a.out,
+                       allow_partial_pairing=a.allow_partial_pairing)
+    sys.exit(rc)
 
 
 def main():
@@ -441,7 +449,20 @@ def main():
                    default="length_matched")
     e.add_argument("--smoke_queries", type=int, default=20)
     c = sp.add_parser("compare")
-    c.add_argument("--a", required=True); c.add_argument("--b", required=True)
+    c.add_argument("--a", required=True, help="arm A eval.json (the base)")
+    c.add_argument("--b", required=True, help="arm B eval.json (the CPT arm)")
+    c.add_argument("--units", required=True,
+                   help="csv: condition,row_id,peptide,pep_cluster. Required: the resampling "
+                        "unit is the peptide, so the comparison cannot be computed without it.")
+    c.add_argument("--out", help="write the result as json")
+    c.add_argument("--primary-condition", dest="pc", default="test_novel_pep")
+    c.add_argument("--primary-unit", dest="pu", default="peptide",
+                   choices=["peptide", "pep_cluster"])
+    c.add_argument("--primary-metric", dest="pm", default="norm_rank",
+                   choices=["norm_rank", "recall_at_10", "mrr"])
+    c.add_argument("--allow-partial-pairing", action="store_true",
+                   help="exclude rows missing from one arm ON PURPOSE; they are counted in the "
+                        "output. Without this an unequal query set refuses.")
     a = ap.parse_args()
     {"train": cmd_train, "eval": cmd_eval, "probe": cmd_probe, "compare": cmd_compare}[a.cmd](a)
 

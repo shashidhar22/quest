@@ -91,7 +91,22 @@ grep -q "G1 PASSED: running comparison cells" $TMP/pass/run.log || fail "cells n
 [ -f $TMP/pass/armD_paired/eval.json ] || fail "comparison cell produced no eval"
 [ -f $TMP/pass/armD_paired/manifest.json ] || fail "comparison cell wrote no manifest"
 grep -q "V04 complete" $TMP/pass/run.log || fail "the passing branch did not complete"
-echo "[dryrun]     PASS branch ok: gate passed, 3 cells ran, manifests written, visit completed"
+grep -q "PRIMARY (locked before any CPT cell existed)" $TMP/pass/run.log \
+  || fail "the visit produced no paired comparison"
+[ -f $TMP/pass/comparison.json ] || fail "no comparison.json artifact"
+$PYREAL -c "
+import json
+r = json.load(open('$TMP/pass/comparison.json'))
+p = r['primary']
+assert (p['condition'], p['unit'], p['metric']) == ('test_novel_pep','peptide','norm_rank'), p
+assert p['n_units'] > 1, p
+assert r['cluster_sensitivity']['unit'] == 'pep_cluster', r['cluster_sensitivity']
+assert r['utility_target']['established'] is False, r['utility_target']
+" || fail "comparison.json does not carry the locked primary read"
+grep -q "does not establish" $TMP/pass/run.log \
+  || fail "the report does not separate the utility target from the primary endpoint"
+echo "[dryrun]     PASS branch ok: gate passed, 3 cells ran, manifests written, locked"
+echo "[dryrun]     comparison produced on test_novel_pep/peptide/norm_rank, visit completed"
 
 echo "[dryrun] --- the trb cells must select the trb task, not the paired one"
 grep -q "judge base_trb rc=0 task=as_trb_i" $TMP/pass/run.log \

@@ -62,6 +62,7 @@ PREREG=${PREREG_DELTA:-0.05}
 UNITS=${UNITS:-$Q/tests/fixtures/s42_as_paired_i_units.csv}
 PROV=$Q/scripts/training/v04_box/provenance.py
 S42=$Q/scripts/training/stage42_box/s42_check.py
+CMP=$Q/scripts/training/stage42_box/paired_compare.py
 POOL=${POOL_FILE:-$Q/benchmark_v2/splits/as_class_i_candidate_pool.tsv}
 CANON=${CANONICAL_EVAL:-$Q/data/cpt_canonical_eval_v2}
 BASE_SRC=${BASE_CKPT:-/home/ubuntu/s42_out/base_paired/best.pt}
@@ -156,7 +157,7 @@ preflight(){
   for p in "$Q/data/cpt_datasets/$ARM_A_DS" "$Q/data/cpt_datasets/$ARM_D_DS" "$CANON"; do
     [ -d "$p" ] || { say "  preflight: missing directory $p"; bad=1; }
   done
-  for p in "$UNITS" "$PROV" "$S42"; do
+  for p in "$UNITS" "$PROV" "$S42" "$CMP"; do
     [ -f "$p" ] || { say "  preflight: missing file $p"; bad=1; }
   done
   [ -f "$O/base_paired/best.pt" ] || [ -f "$BASE_SRC" ] || {
@@ -321,7 +322,25 @@ if [ "$G1" -eq 0 ]; then
     # differs between P1 and P2 by construction, every other key must match.
     $PY $PROV check --a $BASE/manifest.json --b $O/armD_paired/manifest.json --kind cells \
       2>&1 | tee -a $O/run.log
-    [ "${PIPESTATUS[0]}" -eq 0 ] || { say "provenance refused the base-vs-armD comparison"; FAILED=1; }
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+      say "provenance refused the base-vs-armD comparison"
+      FAILED=1
+    else
+      # THE COMPARISON. Previously this visit ended here, having produced eval files and no
+      # comparison at all: `judge compare` was invoked nowhere, and its estimator was
+      # query-level Recall@10 with a row bootstrap rather than the locked peptide-clustered
+      # normalized-rank read the gate enforces. The result is a required artifact now.
+      say "C1: paired comparison on the locked primary read"
+      $PY $CMP --a $BASE/eval.json --b $O/armD_paired/eval.json --units $UNITS \
+        --out $O/comparison.json --primary-condition test_novel_pep --primary-unit peptide \
+        --primary-metric norm_rank 2>&1 | tee -a $O/run.log
+      CMP_RC=${PIPESTATUS[0]}
+      say "C1 exit=$CMP_RC"
+      if [ "$CMP_RC" -ne 0 ] || [ ! -f $O/comparison.json ]; then
+        say "the comparison could not be produced; this visit has no usable result"
+        FAILED=1
+      fi
+    fi
   else
     say "a comparison cell failed or refused; the comparison is not certified"
     FAILED=1
@@ -341,6 +360,8 @@ if [ $FAILED -ne 0 ]; then
 fi
 say "V04 complete. Band: seeds $SEEDS per arm; read every verdict against the measured band,"
 say "  and report measured cross-arm rho against the assumed $RHO_FLOOR and the breakeven in G1."
-# Still missing before a verdict can be read off this visit: the launcher runs no paired
-# comparison. `judge compare` is never invoked, and its estimator is query-level Recall@10 with a
-# row bootstrap, not the locked peptide-clustered normalized-rank read the gate enforces.
+# The comparison now runs and is required: $O/comparison.json carries the locked primary read,
+# its interval, peptide counts, the measured cross-arm rho and the pep_cluster sensitivity. Still
+# missing before this visit is worth buying: cells 2-4 have no trained checkpoints of their own,
+# so the comparison above reads the LEGACY Stage-4.1 arm-D adapter, not an arm trained under the
+# adopted objective. See plans/v04-audit-repair.md step 7.

@@ -61,7 +61,7 @@ if [ "$1" = "-m" ] && [ "$2" = "track_a.esm_sft.judge" ]; then
       rc=${STUB_BASE_EVAL_RC:-0}
       src=${STUB_BASE_EVAL_FIXTURE:-$RANKS_FIXTURE}
       sleep "${STUB_BASE_EVAL_SLEEP:-0}" ;;
-    *) rc=${STUB_CELL_EVAL_RC:-0} ;;
+    *) rc=${STUB_CELL_EVAL_RC:-0}; src=${STUB_CELL_EVAL_FIXTURE:-$RANKS_FIXTURE} ;;
   esac
   if [ "$rc" -eq 0 ]; then cp "$src" "$out"; fi
   echo "judge $out rc=$rc" >> "$EVENTS"
@@ -381,6 +381,45 @@ def test_trb_cells_select_the_trb_task(box):
     assert "judge armD_trb rc=0 task=as_trb_i" in log, log[-2000:]
     m = json.loads((box.out / "base_trb" / "manifest.json").read_text())
     assert m["dataset"] == "as_trb_i", m
+
+
+# --------------------------------------------------------------- audit finding 4
+def test_the_visit_produces_a_paired_comparison(box):
+    """A completed visit used to end with eval files and no comparison at all.
+
+    `judge compare` was invoked nowhere in the launcher, so the question the visit exists
+    to answer was never computed. The comparison is a required artifact now.
+    """
+    box.seed_cells()
+    r = box.run()
+    assert r.returncode == 0, box.run_log()[-3000:]
+    out = box.out / "comparison.json"
+    assert out.exists(), "the visit completed without producing a comparison"
+    res = json.loads(out.read_text())
+    assert res["primary"]["condition"] == "test_novel_pep"
+    assert res["primary"]["unit"] == "peptide"
+    assert res["primary"]["metric"] == "norm_rank"
+    assert res["primary"]["n_units"] > 1, "the comparison resampled fewer than two peptides"
+    assert res["cluster_sensitivity"]["unit"] == "pep_cluster"
+    assert res["utility_target"]["established"] is False
+    log = box.run_log()
+    assert "PRIMARY" in log and "SECONDARY" in log
+    assert "does not establish" in log.lower()
+
+
+def test_a_refused_comparison_fails_the_visit(box):
+    """An uncertified comparison is not a result, so it cannot leave a successful visit."""
+    box.seed_cells()
+    src = json.loads((box.root / "tests/fixtures" / RANKS_FIXTURE.name).read_text())
+    src.setdefault("args", {})["distractor_draw"] = "uniform"   # the base cell is length_matched
+    bad = box.root / "tests" / "fixtures" / "cell_uniform_draw.json"
+    bad.write_text(json.dumps(src))
+    r = box.run(STUB_CELL_EVAL_FIXTURE=str(bad))
+    assert r.returncode != 0, "a comparison across a draw mismatch left a successful visit"
+    assert not (box.out / "comparison.json").exists(), "a refused comparison wrote a result"
+    log = box.run_log()
+    assert "draw" in log, log[-2000:]
+    assert "V04 complete" not in log
 
 
 # --------------------------------------------------------------- audit finding 5
