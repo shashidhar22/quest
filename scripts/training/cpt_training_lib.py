@@ -52,6 +52,12 @@ from transformers import AutoModelForMaskedLM, AutoTokenizer
 import wandb
 
 from quest.training.callbacks import EarlyStopping
+from quest.training.resume_compat import (
+    LOSS_WEIGHTING_SEMANTICS,
+    RESUME_MATCH_KEYS,
+    RESUME_MATCH_KEYS_LEGACY,
+)
+from quest.training.resume_compat import check_resume_config as _check_resume_config
 from quest.training.collators import DataCollatorForMLMDynamic
 from contextlib import nullcontext
 import time
@@ -1305,20 +1311,11 @@ class CdrPplPlateauCallback:
 
 RESUME_STATE_FILE = "training_state.pt"
 
-# Config fields that fix the data order or the optimization; a resume must match
-# the checkpoint on all of them. Cadence (eval/save/logging) and output/wandb
-# names may differ. ``rows_per_step`` is checked separately so a token-budget run
-# can resume on a different GPU count (the sampler is world-size invariant).
-_RESUME_MATCH_KEYS = (
-    "base_model", "dataset_path", "canonical_eval_path", "lora_r", "lora_alpha", "lora_dropout",
-    "lora_target_modules", "learning_rate", "weight_decay", "adam_beta1", "adam_beta2",
-    "warmup_ratio", "gradient_clip", "num_epochs", "max_length", "mlm_probability",
-    "eos_strategy", "token_budget", "bucket_boundaries", "use_length_bucketing",
-    "region_eval", "tcr_variant", "mhc_variant", "early_stop_metric_path",
-    "early_stop_n_patience", "early_stop_min_rel", "seed",
-)
-# The Stage 4.1 sampler stride-shards per rank, so its data order also depends on these.
-_RESUME_MATCH_KEYS_LEGACY = ("batch_size", "gradient_accumulation_steps", "world_size")
+# The resume rule now lives in quest/training/resume_compat.py, which imports no torch, peft or
+# esm, so it can be tested on a laptop (tests/test_resume_objective_guard.py). It gained the
+# training objective, which this check used to omit while restoring optimizer state.
+_RESUME_MATCH_KEYS = RESUME_MATCH_KEYS
+_RESUME_MATCH_KEYS_LEGACY = RESUME_MATCH_KEYS_LEGACY
 
 
 def micro_batch_loss_scale(n_rows: int, rows_per_rank: int, n_acc: int, token_mode: bool,
@@ -1425,15 +1422,7 @@ def resolve_resume_dir(resume_from: str | None, output_dir: str) -> str | None:
     return resume_from
 
 
-def check_resume_config(saved: dict, current: dict, *, token_mode: bool) -> None:
-    """Raise ``ValueError`` naming every field on which the checkpoint and the current run
-    disagree. Values are compared through JSON so tuple/list spellings are equal."""
-    keys = _RESUME_MATCH_KEYS + ("rows_per_step",) + (() if token_mode else _RESUME_MATCH_KEYS_LEGACY)
-    norm = lambda v: json.dumps(v, sort_keys=True, default=str)
-    bad = [k for k in keys if norm(saved.get(k)) != norm(current.get(k))]
-    if bad:
-        detail = ", ".join(f"{k}: checkpoint={saved.get(k)!r} now={current.get(k)!r}" for k in bad)
-        raise ValueError(f"resume config mismatch on {len(bad)} field(s) — {detail}")
+check_resume_config = _check_resume_config
 
 
 # ---------------------------------------------------------------------------
@@ -1525,6 +1514,10 @@ class CPTConfig:
     # Stage 4.3 mid-run resume: a checkpoint_step_N dir, or "auto" (newest resumable
     # checkpoint under output_dir; fresh start if none). None = fresh start.
     resume_from: str | None = None
+    # The one explicit route past a checkpoint that records no objective semantics: state what
+    # it was trained under as "<weighting>:<semantics>". It is verified against whatever the
+    # checkpoint does record, and it can never license an actual change of objective.
+    resume_assume_objective: str | None = None
 
 
 class CPTTrainer:
@@ -1560,30 +1553,38 @@ class CPTTrainer:
         if getattr(cfg, "deterministic", False):
             # Two runs at one seed differed 1.31 % at step 2000 (V2_DETERMINISM, 2026-10-08).
             #
-            # CORRECTED 2026-11-04 after auditing the seed path. The previous comment here said
-            # "if two runs still differ, something is genuinely unseeded". THAT INFERENCE IS
-            # INVALID and would send the next reader hunting a seeding bug that does not exist.
-            # Two runs WILL still differ with this flag on, because:
-            #   - the sampler ORDER is seeded: it draws from np.random.default_rng(seed + epoch).
-            #     The MASK PATTERN is NOT. Corrected again 2026-11-04 (second pass) after an
-            #     external audit caught this very comment: the explicit torch.Generator(mask_seed)
-            #     belongs to EVALUATION masking only. Training builds DataCollatorForMLMDynamic
-            #     below, and quest/training/collators.py masks with bare torch.rand / torch.randint
-            #     off the global RNG -- no generator argument, no worker_init_fn, no DataLoader
-            #     generator across its 4 persistent workers -- and resume restores no masking RNG
-            #     state. torch.manual_seed above may still make two fresh same-seed runs agree,
-            #     but nothing here guarantees it, so the 1.31 % cannot be attributed to flash-attn
-            #     by elimination. Measure the residual; do not infer it from this comment;
+            # This comment has now been wrong twice, in opposite directions, so it states only
+            # what has been read in code and marks the rest as unmeasured.
+            #
+            # It first said "if two runs still differ, something is genuinely unseeded", which
+            # does not follow: this flag constrains cuDNN and cuBLAS only. The correction then
+            # overshot and called training masking unseeded, which also does not follow.
+            #
+            # What the code says:
+            #   - sampler ORDER is seeded from np.random.default_rng(seed + epoch), and
+            #     torch.manual_seed(cfg.seed + rank) above fixes LoRA init.
+            #   - training masking uses the GLOBAL and DataLoader-WORKER torch RNG, not
+            #     evaluation's dedicated torch.Generator(mask_seed): training builds
+            #     DataCollatorForMLMDynamic below and quest/training/collators.py calls bare
+            #     torch.rand / torch.randint. PyTorch seeds each worker's torch RNG from the
+            #     parent's generator, so this stream is seeded but not DEDICATED -- it is
+            #     coupled to any other global RNG use before the iterator is created. Fresh-run
+            #     mask reproducibility has not been measured on this stack.
+            #   - resume does not restore the masking stream, so exact replay across an
+            #     interruption is not established.
             #   - ESM-C runs varlen FLASH ATTENTION whatever --attn_implementation says (that arg
             #     is inert on this model, findings 9.2), and flash-attn's backward accumulates dQ
             #     with atomics, so its reduction order is non-deterministic by construction. It is
             #     a custom CUDA op outside PyTorch's determinism registry, so neither
             #     use_deterministic_algorithms nor the cuDNN flags below can constrain it, and
-            #     warn_only=True means it is not even reported.
-            # So this flag constrains cuDNN/cuBLAS only. A residual difference is the EXPECTED
-            # outcome and proves nothing about seeding. The test that WOULD separate them is
-            # `4.3-noise-det` (box-jobs/tests.md): same seed twice with this flag AND flash
-            # disabled, against same seed twice with this flag alone.
+            #     warn_only=True means it is not even reported. flash-attn 2.8.3 reportedly
+            #     exposes deterministic=True for the varlen call ESM uses; the installed build
+            #     has not been inspected.
+            # So a residual difference under this flag is permitted, not mandated, and the source
+            # of the observed 1.31 % remains UNAPPORTIONED. Do not read an attribution off this
+            # comment in either direction. Measure it: hash the first batches, labels and masks
+            # and repeat at one seed (`4.3-noise-det`, box-jobs/tests.md), which separates the
+            # masking stream from the kernel without disabling flash attention.
             os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
@@ -1602,7 +1603,9 @@ class CPTTrainer:
                 os.path.join(self._resume_dir, RESUME_STATE_FILE), map_location="cpu", weights_only=True
             )
             check_resume_config(
-                self._resume_state["config"], self._config_for_resume(), token_mode=self._token_mode
+                self._resume_state["config"], self._config_for_resume(),
+                token_mode=self._token_mode,
+                assume_saved_objective=cfg.resume_assume_objective,
             )
 
         self._setup_tokenizer_and_model()
@@ -1640,6 +1643,9 @@ class CPTTrainer:
         d = {k: v for k, v in self.cfg.__dict__.items() if not callable(v)}
         d["rows_per_step"] = self.cfg.batch_size * self.cfg.gradient_accumulation_steps * self.world_size
         d["world_size"] = self.world_size
+        # What `loss_weighting` MEANS in this revision, recorded so that redefining the word
+        # later cannot slip past a resume check. See quest/training/resume_compat.py.
+        d["loss_weighting_semantics"] = LOSS_WEIGHTING_SEMANTICS.get(self.cfg.loss_weighting)
         return d
 
     def _apply_resume_state(self) -> None:

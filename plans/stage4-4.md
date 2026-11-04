@@ -8,8 +8,11 @@ Test whether balanced subset sampling fixes the class-I weakness, judged downstr
 variable, matched rows, matched steps.
 
 ## Evidence
-Stage 1 (matched, `max_length` 128 in both arms): class-I perplexity **25.1 proportional → 4.1
-balanced**, and every class-II stratum improved too. Never carried forward: Stages 2, 3, 4 and
+Stage 1 (matched, `max_length` 128 in both arms, **ESM2-150M not ESM-C**): class-I perplexity
+**25.145 proportional → 4.091 balanced** on `canonical_buckets/mhc_class/I` at `checkpoint_best`,
+**23 rows / 155 masked tokens**. The same comparison reads 24.094 → 4.693 and 24.887 → 3.594 on the
+final checkpoint's region-restricted v2 eval; all three agree on a 5–6× fall (findings §9.9 names
+each source). Every class-II stratum improved too. Never carried forward: Stages 2, 3, 4 and
 4.1 all used `*_proportional_10M`. Class I remains the weak regime (Stage 4.1: 7.6–8.5 vs
 1.3–2.5 for class II).
 

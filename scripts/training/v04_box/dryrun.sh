@@ -26,11 +26,23 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 CKPT=$TMP/checkpoints
 fail(){ echo "[dryrun] FAIL: $*"; exit 1; }
 
+# Inventory the repo checkpoint tree before anything runs, so the end-of-run check can compare
+# rather than assume emptiness. `.t0` is the reference for "modified since we started".
+ckpt_paths(){ find "$REPO/checkpoints" -mindepth 1 2>/dev/null | sort; }
+BEFORE_PATHS=$(ckpt_paths)
+touch "$TMP/.t0"
+sleep 1              # so any later write is strictly newer than the marker
+
 # A candidate pool, because an absent pool is no longer a runnable visit: it used to become the
 # string POOL_FILE_MISSING in every manifest and so matched itself.
 POOL=$TMP/pool.tsv
 printf 'peptide\n' > $POOL
 for i in $(seq 1 120); do printf 'PEPTIDE%03d\n' "$i" >> $POOL; done
+
+# A stand-in base SFT checkpoint. This used to be /dev/null, which preflight rightly rejects:
+# a character device is not a checkpoint, and the launcher should not have to accept one.
+BASE_STUB=$TMP/base_best.pt
+: > $BASE_STUB
 
 cat > $TMP/stub_torchrun <<'EOF'
 #!/bin/bash
@@ -56,7 +68,7 @@ chmod +x $TMP/stub_torchrun $TMP/stub_python
 run_v04(){   # run_v04 <floor> <outdir>
   mkdir -p "$2"
   Q=$REPO O="$2" CKPT_ROOT=$CKPT PY=$TMP/stub_python TORCHRUN=$TMP/stub_torchrun NGPU=4 \
-    SEEDS="1 2 3" RHO_FLOOR=$1 BASE_CKPT=/dev/null POOL_FILE=$POOL \
+    SEEDS="1 2 3" RHO_FLOOR=$1 BASE_CKPT=$BASE_STUB POOL_FILE=$POOL \
     bash "$HERE/run_v04.sh" > "$2/stdout.log" 2>&1
   echo $?
 }
@@ -132,10 +144,19 @@ done
 echo "[dryrun]     6 arm manifests ok: objective=token, early_stop=off, seed and co-tenancy recorded"
 
 echo "[dryrun] --- nothing may have been written into the repo checkpoint tree"
-if compgen -G "$REPO/checkpoints/v04_arm*_seed*" >/dev/null; then
-  fail "the dry run wrote into $REPO/checkpoints: $(echo $REPO/checkpoints/v04_arm*_seed*)"
+# Compare an inventory, not mere existence. A checkout that already holds v04 checkpoints is the
+# NORMAL case after a visit, and the first version of this check read their presence as proof the
+# dry run had written them, turning a safe run into a false failure. `-newer` catches content and
+# metadata changes without hashing a 282 MB adapter tree on every run.
+AFTER_PATHS=$(ckpt_paths)
+if [ "$BEFORE_PATHS" != "$AFTER_PATHS" ]; then
+  fail "the dry run added or removed paths under $REPO/checkpoints:
+$(printf '%s\n' "$BEFORE_PATHS" > $TMP/b; printf '%s\n' "$AFTER_PATHS" > $TMP/a; diff $TMP/b $TMP/a)"
 fi
-echo "[dryrun]     repo checkpoint tree untouched"
+TOUCHED=$(find "$REPO/checkpoints" -newer "$TMP/.t0" 2>/dev/null)
+[ -z "$TOUCHED" ] && echo "[dryrun]     repo checkpoint tree untouched: $(printf '%s\n' "$BEFORE_PATHS" | grep -c . ) paths unchanged" \
+  || fail "the dry run modified paths under $REPO/checkpoints:
+$TOUCHED"
 
 echo "[dryrun] --- provenance must refuse a draw mismatch"
 $PYREAL $HERE/provenance.py write --out $TMP/u.json --draw uniform --pool-size 100 --objective token >/dev/null

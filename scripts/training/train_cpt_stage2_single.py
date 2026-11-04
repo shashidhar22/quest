@@ -101,6 +101,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--resume_from", default=None,
                     help="Stage 4.3: a checkpoint_step_N dir to resume from, or 'auto' = the newest "
                          "resumable checkpoint_step_* under --output_dir (fresh start if none)")
+    ap.add_argument("--resume_assume_objective", default=None,
+                    help="Only for a checkpoint that records no objective semantics, e.g. "
+                         "'token:input-length-share/v1'. Resume refuses such a checkpoint by "
+                         "default rather than adopting the current objective and mixing two in "
+                         "one run. The value is verified against what the checkpoint does "
+                         "record and cannot license an actual change of objective.")
     # Early stop
     ap.add_argument("--early_stop_n_patience", type=int, default=3,
                     help="0 or less turns early stopping OFF. Required for equivalence and "
@@ -159,6 +165,7 @@ def main() -> None:
         token_budget=args.token_budget,
         loss_weighting=args.loss_weighting,
         resume_from=args.resume_from,
+        resume_assume_objective=args.resume_assume_objective,
         region_eval=True,
         tcr_variant=args.tcr_variant,
         mhc_variant=args.mhc_variant,

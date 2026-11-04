@@ -22,7 +22,9 @@ A scientific refusal by the G1 gate is NOT one of these failures and must stay e
 import json
 import os
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -54,7 +56,7 @@ if [ "$1" = "-m" ] && [ "$2" = "track_a.esm_sft.judge" ]; then
   for ((i=0;i<${#args[@]};i++)); do [ "${args[i]}" = --out ] && out=${args[i+1]}; done
   mkdir -p "$(dirname "$out")"
   case "$out" in
-    *base_paired*) rc=${STUB_BASE_EVAL_RC:-0} ;;
+    *base_paired*) rc=${STUB_BASE_EVAL_RC:-0}; sleep "${STUB_BASE_EVAL_SLEEP:-0}" ;;
     *)             rc=${STUB_CELL_EVAL_RC:-0} ;;
   esac
   if [ "$rc" -eq 0 ]; then cp "$RANKS_FIXTURE" "$out"; fi
@@ -85,6 +87,18 @@ def box(tmp_path):
     pool.parent.mkdir(parents=True)
     pool.write_text("peptide\n" + "".join(f"PEPTIDE{i:03d}\n" for i in range(1, 121)))
 
+    # Preflight requires the dataset and canonical-eval directories to exist before it starts a
+    # GPU job. The trainer is stubbed, so empty marker directories are the honest stand-in.
+    for d in ("data/cpt_datasets/run01_cdr3_pocket_proportional_10M",
+              "data/cpt_datasets/run05_cdr3_fullmhc_proportional_10M",
+              "data/cpt_canonical_eval_v2"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+
+    # A stand-in base SFT checkpoint. /dev/null will not do: preflight requires a regular file,
+    # and a character device is not a checkpoint.
+    base_stub = tmp_path / "base_best.pt"
+    base_stub.touch()
+
     events = tmp_path / "events.log"
     events.touch()
     bin_dir = tmp_path / "bin"
@@ -99,6 +113,7 @@ def box(tmp_path):
             self.root = root
             self.events = events
             self.out = tmp_path / "out"
+            self._live = []
 
         def seed_cells(self):
             """Supply the comparison checkpoints no launcher step builds yet.
@@ -121,7 +136,7 @@ def box(tmp_path):
                 NGPU="4",
                 SEEDS="1 2 3",
                 RHO_FLOOR="0.8",
-                BASE_CKPT="/dev/null",
+                BASE_CKPT=str(base_stub),
                 EVENTS=str(events),
                 PYREAL="python3",
                 RANKS_FIXTURE=str(root / "tests/fixtures" / RANKS_FIXTURE.name),
@@ -139,6 +154,41 @@ def box(tmp_path):
                 capture_output=True, text=True, timeout=timeout,
             )
 
+        def popen_until_started(self, n_starts, settle=15, **env):
+            """Launch the driver in its own session and wait until n trainers report in.
+
+            Returns (process, [stub pids]). The caller must terminate it; the fixture
+            kills the whole session afterwards whatever happens.
+            """
+            e = dict(os.environ)
+            e.update(
+                Q=str(root), O=str(self.out), PY=str(bin_dir / "python"),
+                TORCHRUN=str(bin_dir / "torchrun"), NGPU="4", SEEDS="1 2 3",
+                RHO_FLOOR="0.8", BASE_CKPT=str(base_stub), EVENTS=str(events),
+                PYREAL="python3",
+                RANKS_FIXTURE=str(root / "tests/fixtures" / RANKS_FIXTURE.name),
+                PATH=f"{bin_dir}:{os.environ['PATH']}",
+            )
+            e.update({k: str(v) for k, v in env.items()})
+            log = (self.out.parent / "driver.log")
+            self.out.mkdir(parents=True, exist_ok=True)
+            fh = log.open("w")
+            p = subprocess.Popen(
+                ["bash", str(root / "scripts/training/v04_box/run_v04.sh")],
+                env=e, stdout=fh, stderr=fh, start_new_session=True,
+            )
+            self._live.append(p)
+            deadline = time.monotonic() + settle
+            while time.monotonic() < deadline:
+                if len([l for l in self.event_lines() if l.startswith("START")]) >= n_starts:
+                    break
+                time.sleep(0.05)
+            pids = [int(l.split()[2]) for l in self.event_lines() if l.startswith("START")]
+            assert len(pids) >= n_starts, (
+                f"only {len(pids)} trainers started within {settle}s: {log.read_text()[-2000:]}"
+            )
+            return p, pids
+
         def event_lines(self):
             return [l for l in self.events.read_text().splitlines() if l.strip()]
 
@@ -151,7 +201,25 @@ def box(tmp_path):
             ended = {l.split()[1] for l in self.event_lines() if l.startswith("END")}
             return sorted(started - ended)
 
-    return Box()
+    b = Box()
+    yield b
+    # Whatever a test did, leave no stray session behind.
+    for p in b._live:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _alive(pid):
+    """True if the pid is still a live process. Zombies are reaped by init here."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 # --------------------------------------------------------------- audit finding 2
@@ -205,6 +273,54 @@ def test_phase_two_does_not_overlap_phase_one(box):
         "arm D started on GPUs 0-2 while arm A was still training there:\n"
         + "\n".join(lines)
     )
+
+
+def test_sigterm_during_training_leaves_no_live_trainer(box):
+    """TERM to the driver must take the training with it.
+
+    Signalling the background function shell never reached the trainer, which was its
+    child: the driver exited 130 while three trainers kept running on the GPUs. On the
+    box that is the cost of the visit still being spent with nobody waiting for it.
+    """
+    box.seed_cells()
+    p, pids = box.popen_until_started(3, STUB_SLEEP="30")
+    p.send_signal(signal.SIGTERM)
+    rc = p.wait(timeout=60)
+    time.sleep(0.5)
+    live = [q for q in pids if _alive(q)]
+    assert rc != 0, "a terminated visit reported success"
+    assert not live, f"these trainers outlived the signalled driver: {live}"
+
+
+def test_sigterm_during_base_eval_leaves_no_live_child(box):
+    """The same must hold when the signal lands while an evaluation is running.
+
+    Bash defers a trap until the running foreground command finishes, so a foreground
+    evaluation delayed cleanup by its own full duration. The trainer outlives the eval
+    here on purpose: if cleanup waits for the eval, the trainers are still alive when
+    the driver returns.
+    """
+    box.seed_cells()
+    p, pids = box.popen_until_started(3, STUB_SLEEP="60", STUB_BASE_EVAL_SLEEP="8")
+    p.send_signal(signal.SIGTERM)
+    rc = p.wait(timeout=45)
+    time.sleep(0.5)
+    live = [q for q in pids if _alive(q)]
+    assert rc != 0
+    assert not live, f"these children outlived the signalled driver: {live}"
+
+
+def test_sigterm_writes_no_success_artifact(box):
+    """A killed visit must not leave anything a later reader takes for a result.
+
+    Guard only: this already held before the lifecycle repair, so it is not evidence of
+    it. It is here to catch a future change that announces completion on a killed run.
+    """
+    box.seed_cells()
+    p, _ = box.popen_until_started(3, STUB_SLEEP="30")
+    p.send_signal(signal.SIGTERM)
+    p.wait(timeout=60)
+    assert "V04 complete" not in box.run_log()
 
 
 def test_abort_waits_for_live_children_instead_of_orphaning_them(box):
@@ -325,6 +441,34 @@ def test_dryrun_preserves_checkpoints_it_did_not_create(box):
         f"{r.stdout[-2000:]}"
     )
     assert sentinel.read_bytes() == before, "the dry run modified a real checkpoint"
+    # Without this the test passed while the dry run failed, which is how the
+    # false-failure below went unnoticed.
+    assert r.returncode == 0, f"the dry run itself failed:\n{r.stdout[-3000:]}"
+
+
+def test_dryrun_passes_with_pre_existing_checkpoints(box):
+    """A checkout that already holds V04 checkpoints is the normal case after a visit.
+
+    The repaired dry run writes nothing there, so their mere presence is not evidence
+    that it did. Asserting on existence alone turned a safe run into a false failure.
+    """
+    expected = {}
+    for arm in ("armA", "armD"):
+        for seed in (1, 2, 3):
+            d = box.root / "checkpoints" / f"v04_{arm}_seed{seed}"
+            d.mkdir(parents=True)
+            f = d / "adapter_model.safetensors"
+            f.write_bytes(f"trained {arm} seed {seed}".encode())
+            expected[f] = f.read_bytes()
+
+    r = box.run_dryrun()
+
+    assert r.returncode == 0, (
+        f"the dry run failed merely because checkpoints existed:\n{r.stdout[-3000:]}"
+    )
+    for f, content in expected.items():
+        assert f.exists(), f"{f.name} was removed"
+        assert f.read_bytes() == content, f"{f.name} was modified"
 
 
 def test_dryrun_writes_no_artifacts_into_the_checkpoint_tree(box):

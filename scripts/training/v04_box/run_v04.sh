@@ -1,6 +1,7 @@
 #!/bin/bash
 # V04 on the one volume. Encodes the decision chain so no step can be skipped by hand.
 #
+#   P0  CPU        preflight: every path, checkpoint and config the visit needs
 #   P1  GPU 0,1,2  arm A re-baseline, one seed each, token-share, 7800 steps, NO early stop
 #       GPU 3      cell 1 base judge re-score under the length-matched draw (eval only)
 #   G1  CPU        locked-read readability gate on cell 1's NEW-draw per-peptide ranks
@@ -18,21 +19,36 @@
 # P1 and P2; that asymmetry is recorded in each manifest rather than planned away, and the
 # comparison kind `cells` waives co-tenancy and nothing else, printing the waiver it used.
 #
-# PROCESS OWNERSHIP (repaired 2026-11-04 after the external Stage-4 audit). Trainers are started
-# from THIS shell with `&`, and `$!` is captured here. The previous version called train_arm through
-# command substitution, so the PID it echoed belonged to the substitution subshell: every `wait`
-# failed with "not a child of this shell", the driver reached "V04 complete" within seconds, and
-# `autostop_when_done.sh` -- which waits on the driver PID written below -- would have stopped the
-# instance on top of six live trainings. The driver outliving its children is what makes that
-# watchdog safe, so no child may ever be started from a subshell again.
+# ---------------------------------------------------------------------------------------------
+# PROCESS LIFECYCLE. Repaired 2026-11-04 in two passes, both after external audit.
 #
-# Failure handling is explicit, not `set -e`: a failing trainer or evaluator used to be followed by
-# a successful `say`, which swallowed its status and produced a visit that exited 0 with no result.
-# Every child status is now collected, logged by label, and propagated. The driver still waits for
-# all live children before exiting on an abort, so a failure never orphans a training job.
+# Pass 1, normal completion. `train_arm` used to be called through command substitution, so the
+# PID it echoed belonged to the substitution subshell: every `wait` failed with "not a child of
+# this shell", the driver reached "V04 complete" within seconds, and `autostop_when_done.sh` --
+# which waits on the driver PID written below -- would have stopped the instance on top of six
+# live trainings. The driver outliving its children is what makes that watchdog safe.
+#
+# Pass 2, abnormal completion. Signalling the driver still left the trainers running, because the
+# tracked PID was the background *function shell* and torchrun was its child. So:
+#   - `set -m` gives every background job its own process group, and cleanup signals the GROUP,
+#     which reaches torchrun's workers too. A freshly forked child's PID can never equal the
+#     driver's own process-group ID, so the negative form cannot signal the caller's group.
+#   - jobs are started with `exec`, so no intermediate shell sits between the tracked PID and the
+#     real process.
+#   - evaluations are tracked like trainers rather than run in the foreground. Bash defers a trap
+#     until the running foreground command finishes, so a foreground eval delayed cleanup by its
+#     own full duration; an eval the driver `wait`s on interrupts immediately.
+#   - cleanup is bounded: TERM the group, wait up to SHUTDOWN_GRACE, KILL, then reap. The driver
+#     stays alive until that finishes.
+# Group cleanup of a real torchrun's workers is NOT exercised by the stub tests; it needs a Linux
+# check on the box before the visit.
+#
+# Failure handling is explicit, not `set -e`: a failing trainer or evaluator used to be followed
+# by a successful `say`, which swallowed its status and produced a visit that exited 0 with no
+# result. Every child status is now collected, logged by label, and propagated.
 #
 # Overridable so dryrun.sh can exercise the whole chain on a laptop with stubs.
-set -u
+set -u -m
 export PATH=/home/ubuntu/miniforge3/bin:/usr/local/bin:$PATH
 Q=${Q:-/home/ubuntu/quest}; O=${O:-/home/ubuntu/v04_out}
 PY=${PY:-python}; TORCHRUN=${TORCHRUN:-torchrun}
@@ -47,6 +63,11 @@ UNITS=${UNITS:-$Q/tests/fixtures/s42_as_paired_i_units.csv}
 PROV=$Q/scripts/training/v04_box/provenance.py
 S42=$Q/scripts/training/stage42_box/s42_check.py
 POOL=${POOL_FILE:-$Q/benchmark_v2/splits/as_class_i_candidate_pool.tsv}
+CANON=${CANONICAL_EVAL:-$Q/data/cpt_canonical_eval_v2}
+BASE_SRC=${BASE_CKPT:-/home/ubuntu/s42_out/base_paired/best.pt}
+ARM_A_DS=run01_cdr3_pocket_proportional_10M
+ARM_D_DS=run05_cdr3_fullmhc_proportional_10M
+SHUTDOWN_GRACE=${SHUTDOWN_GRACE:-15}
 # Checkpoints go here. Separable so a test can never write into, or clean up, the real tree:
 # dryrun.sh used to point $Q at the live checkout and then remove `checkpoints/v04_arm*_seed*`,
 # which after a real visit is exactly the six trained adapters the visit was bought to produce.
@@ -56,14 +77,36 @@ mkdir -p $O $CKPT_ROOT; cd $Q
 say(){ echo "[$(date -u '+%F %T')] $*" | tee -a $O/run.log; }
 echo $$ > $O/run_v04.pid       # the watchdog waits on THIS pid, never a name pattern
 
-JOBS=""        # space-separated "<pid>=<label>" tokens for children of THIS shell
+JOBS=""        # space-separated "<pid>=<label>" for LIVE children of this shell
 FAILED=0       # sticky: any child or cell failure makes the visit fail
 
-kill_jobs(){ local t; for t in $JOBS; do kill "${t%%=*}" 2>/dev/null; done; }
-trap 'say "signal received: terminating children"; kill_jobs; exit 130' INT TERM
+register(){ JOBS="$JOBS $1=$2"; }
+unregister(){ local keep="" t; for t in $JOBS; do [ "${t%%=*}" = "$1" ] || keep="$keep $t"; done; JOBS=$keep; }
 
-# wait_all <phase>  -- waits for every child started since the last call. Never returns while a
-# training job is alive, because the watchdog reads driver liveness as visit liveness.
+# signal_tree <pid> <signal>. Under `set -m` the job leads its own process group, so the negative
+# form reaches its descendants; the plain form is the fallback if job control was unavailable.
+signal_tree(){ kill -"$2" -"$1" 2>/dev/null || kill -"$2" "$1" 2>/dev/null || true; }
+
+cleanup(){
+  local t p waited=0 still
+  [ -n "${JOBS// /}" ] || return 0
+  say "cleanup: terminating$JOBS"
+  for t in $JOBS; do signal_tree "${t%%=*}" TERM; done
+  while [ "$waited" -lt "$SHUTDOWN_GRACE" ]; do
+    still=0
+    for t in $JOBS; do p=${t%%=*}; kill -0 "$p" 2>/dev/null && still=1; done
+    [ "$still" -eq 0 ] && break
+    sleep 1; waited=$((waited+1))
+  done
+  for t in $JOBS; do signal_tree "${t%%=*}" KILL; done
+  for t in $JOBS; do wait "${t%%=*}" 2>/dev/null || true; done
+  say "cleanup: children gone after ${waited}s"
+  JOBS=""
+}
+trap 'say "signal received: cleaning up before exit"; cleanup; say "V04 TERMINATED"; exit 130' INT TERM
+
+# wait_all <phase>. Never returns while a training job is alive, because the watchdog reads
+# driver liveness as visit liveness.
 wait_all(){
   local phase=$1 t p l rc=0 st
   for t in $JOBS; do
@@ -81,11 +124,11 @@ wait_all(){
   return $rc
 }
 
-# die <message>  -- abort, but never leave a training job orphaned.
+# die <message>. Abort, but never leave a child orphaned.
 die(){
   say "ABORT: $*"
   FAILED=1
-  if [ -n "$JOBS" ]; then
+  if [ -n "${JOBS// /}" ]; then
     say "waiting for live children before exiting, so none is orphaned"
     wait_all abort || true
   fi
@@ -96,17 +139,37 @@ die(){
 POOL_ID=$([ -f "$POOL" ] && $PY $PROV fingerprint --path "$POOL" || echo POOL_FILE_MISSING)
 say "V04 start pid=$$ ngpu=$NGPU objective=$LW draw=$DRAW seeds='$SEEDS' steps=$STEPS rho_floor=$RHO_FLOOR pool_id=$POOL_ID"
 [ "$LW" = row ] && { say "ABORT: --loss_weighting row is rejected for production (findings 9.5)"; exit 2; }
-# A missing pool file used to become the literal string POOL_FILE_MISSING in every manifest, so it
-# matched itself and every provenance check passed on an absent pool. The draw is built from this
-# file and random Recall@10 is k/pool, so an absent pool is not a runnable visit.
-[ "$POOL_ID" = POOL_FILE_MISSING ] && { say "ABORT: candidate pool not found at $POOL"; exit 2; }
-# The old fallback put concurrent jobs on GPU 0 and reused master_port 29800 for all of them. V04 is
-# specified for g6.12xlarge; refuse rather than silently run a different experiment.
-[ "$NGPU" -ge 4 ] || { say "ABORT: V04 needs 4 GPUs (g6.12xlarge); got $NGPU"; exit 2; }
+
+# ---------- P0: preflight ----------
+# Everything cheap that the visit needs, checked before a single GPU job starts. The point is not
+# tidiness: discovering an absent path after three trainers are running means draining a whole
+# phase to abort safely.
+preflight(){
+  local bad=0 p
+  # A missing pool file used to become the literal string POOL_FILE_MISSING in every manifest, so
+  # it matched itself and every provenance check passed on an absent pool. The draw is built from
+  # this file and random Recall@10 is k/pool, so an absent pool is not a runnable visit.
+  [ "$POOL_ID" = POOL_FILE_MISSING ] && { say "  preflight: candidate pool not found at $POOL"; bad=1; }
+  # The old fallback put concurrent jobs on GPU 0 and reused master_port 29800 for all of them.
+  # V04 is specified for g6.12xlarge; refuse rather than silently run a different experiment.
+  [ "$NGPU" -ge 4 ] || { say "  preflight: V04 needs 4 GPUs (g6.12xlarge); got $NGPU"; bad=1; }
+  for p in "$Q/data/cpt_datasets/$ARM_A_DS" "$Q/data/cpt_datasets/$ARM_D_DS" "$CANON"; do
+    [ -d "$p" ] || { say "  preflight: missing directory $p"; bad=1; }
+  done
+  for p in "$UNITS" "$PROV" "$S42"; do
+    [ -f "$p" ] || { say "  preflight: missing file $p"; bad=1; }
+  done
+  [ -f "$O/base_paired/best.pt" ] || [ -f "$BASE_SRC" ] || {
+    say "  preflight: no base SFT checkpoint to re-score (looked for $BASE_SRC)"; bad=1; }
+  return $bad
+}
+say "P0: preflight"
+preflight || { say "ABORT: preflight failed; nothing was started"; exit 2; }
+say "P0 ok"
 
 TRAIN_COMMON="--tcr_variant cdr3 --max_length 1024 --batch_size 16 \
   --token_budget 16384 --bucket_boundaries 64 128 256 512 1024 --loss_weighting $LW \
-  --base_model esmc_300m --canonical_eval_path $Q/data/cpt_canonical_eval_v2 --eos_strategy raw \
+  --base_model esmc_300m --canonical_eval_path $CANON --eos_strategy raw \
   --num_epochs 1 --lr 2e-4 --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 \
   --eval_steps 500 --save_steps 500 --logging_steps 50 --no_compile \
   --attn_implementation sdpa --early_stop_n_patience 0 --report_to wandb"
@@ -114,45 +177,60 @@ TRAIN_COMMON="--tcr_variant cdr3 --max_length 1024 --batch_size 16 \
 # _use_flash_attn=True itself and never consults this arg (findings 9.2), so every run here is on
 # varlen flash attention and the log line saying "sdpa" is misleading. Kept because Stage 4.1 and
 # 4.3 passed it, so removing it would change the recorded command without changing the numerics.
-# It matters for provenance: flash-attn's backward uses atomics, which is ONE candidate source of
-# the 1.31 % run-to-run difference the band measures. Training-time MLM masking is also unseeded
-# (quest/training/collators.py uses bare torch.rand; only EVAL masking takes an explicit
-# Generator), so the 1.31 % is not yet apportioned between the two. See the audit triage.
+# flash-attn's backward accumulates dQ with atomics, which is ONE candidate source of the 1.31 %
+# run-to-run difference the band measures. Training masking is another: it uses the global and
+# DataLoader-worker torch RNG rather than evaluation's dedicated Generator, so the stream is
+# seeded but not dedicated, and resume does not restore it. Neither source has been measured on
+# this stack, so the 1.31 % stays UNAPPORTIONED; hash the first batches, labels and masks on the
+# box before attributing it. `--gradient_checkpointing` is deliberately absent: the trainer
+# accepts the flag and never reads it (cpt_training_lib.py:1494), so passing it would change
+# nothing.
 #
 # NOTE on STEPS: it is recorded in every manifest but the trainer has no --max_steps; it derives
 # the optimizer and scheduler length from dataset size and --num_epochs. 7800 is what the current
 # 7,987,764 rows happen to yield at this effective batch size. Nothing here enforces that, so a
 # data or batching change makes the manifest's step count a claim rather than a fact.
 
-# train_arm <label> <dataset> <mhc_variant> <seed> <gpu> <cotenants>
-# Runs the trainer in the FOREGROUND of its own subshell, so its exit status is the subshell's and
-# the caller's `$!` names a child of the driver.
-train_arm(){
-  local lbl=$1 ds=$2 mhc=$3 seed=$4 gpu=$5 cot=$6
+# prepare_arm <label> <dataset> <seed> <cotenants>. Validation and manifest, in the FOREGROUND.
+prepare_arm(){
+  local lbl=$1 ds=$2 seed=$3 cot=$4
   local out=$CKPT_ROOT/v04_${lbl}_seed${seed}      # derived: own line, or set -u trips
   mkdir -p $out
   $PY $PROV write --out $out/manifest.json --objective $LW --token-budget 16384 \
     --bucket-boundaries "64,128,256,512,1024" --steps $STEPS --early-stop off \
     --draw n/a --pool-size n/a --pool-id n/a --dataset $ds --seed $seed \
-    --cotenants "$cot" >/dev/null || return 3
-  CUDA_VISIBLE_DEVICES=$gpu $TORCHRUN --nproc_per_node=1 --master_port=$((29800+gpu)) \
-    scripts/training/train_cpt_stage2_single.py --dataset_path $Q/data/cpt_datasets/$ds \
-    --mhc_variant $mhc --gradient_accumulation_steps 64 --seed $seed $TRAIN_COMMON \
-    --output_dir $out --wandb_run_name v04-${lbl}-s${seed} > $out/training.log 2>&1
+    --cotenants "$cot" >/dev/null
 }
 
-# start_arm <label> <dataset> <mhc_variant> <seed> <gpu> <cotenants>
+# start_arm <label> <dataset> <mhc_variant> <seed> <gpu>. `exec` so the tracked PID is torchrun
+# itself, and under `set -m` that PID also leads the job's process group.
 start_arm(){
-  train_arm "$1" "$2" "$3" "$4" "$5" "$6" &
-  JOBS="$JOBS $!=${1}_seed${4}"
+  local lbl=$1 ds=$2 mhc=$3 seed=$4 gpu=$5
+  local out=$CKPT_ROOT/v04_${lbl}_seed${seed}
+  (
+    export CUDA_VISIBLE_DEVICES=$gpu
+    exec $TORCHRUN --nproc_per_node=1 --master_port=$((29800+gpu)) \
+      scripts/training/train_cpt_stage2_single.py --dataset_path $Q/data/cpt_datasets/$ds \
+      --mhc_variant $mhc --gradient_accumulation_steps 64 --seed $seed $TRAIN_COMMON \
+      --output_dir $out --wandb_run_name v04-${lbl}-s${seed} > $out/training.log 2>&1
+  ) &
+  register $! "${lbl}_seed${seed}"
 }
 
-# run_eval <dir> <adapter> <gpu> <task> <label>
+# run_eval <dir> <adapter> <gpu> <task> <label>. Tracked, not foreground, so a signal during an
+# evaluation is not deferred behind it.
 run_eval(){
-  local d=$1 adapter=$2 gpu=$3 task=$4 lbl=$5 rc=0
-  CUDA_VISIBLE_DEVICES=$gpu $PY -m track_a.esm_sft.judge eval --task $task \
-    --adapter $adapter --tcr_variant cdr3 --mhc_variant full --ckpt $d/best.pt \
-    --distractor_draw $DRAW --min_peptides 100 --out $d/eval.json > $d/eval.log 2>&1 || rc=$?
+  local d=$1 adapter=$2 gpu=$3 task=$4 lbl=$5 rc=0 p
+  (
+    export CUDA_VISIBLE_DEVICES=$gpu
+    exec $PY -m track_a.esm_sft.judge eval --task $task \
+      --adapter $adapter --tcr_variant cdr3 --mhc_variant full --ckpt $d/best.pt \
+      --distractor_draw $DRAW --min_peptides 100 --out $d/eval.json > $d/eval.log 2>&1
+  ) &
+  p=$!
+  register "$p" "eval_${lbl// /_}"
+  wait "$p" || rc=$?
+  unregister "$p"
   say "judge $lbl rc=$rc task=$task"
   return $rc
 }
@@ -180,17 +258,20 @@ judge_cell(){
 
 # ---------- P1 ----------
 say "P1: arm A x seeds on GPUs 0-2, cell 1 base re-score on GPU 3"
+for s in $SEEDS; do
+  prepare_arm armA $ARM_A_DS $s "armA seeds $SEEDS" || die "could not write the armA seed $s manifest"
+done
 i=0
 for s in $SEEDS; do
-  start_arm armA run01_cdr3_pocket_proportional_10M pocket $s $i "armA seeds $SEEDS"
+  start_arm armA $ARM_A_DS pocket $s $i
   i=$((i+1))
 done
 G3=3
 # Cell 1 re-scores the EXISTING base checkpoint under the new draw. eval only, no retraining:
 # the 10-08 number was scored against the uniform draw and is not comparable to anything new.
 BASE=$O/base_paired; mkdir -p $BASE
-[ -f $BASE/best.pt ] || cp ${BASE_CKPT:-/home/ubuntu/s42_out/base_paired/best.pt} $BASE/best.pt 2>/dev/null
-[ -f $BASE/best.pt ] || die "no base SFT checkpoint to re-score (looked for ${BASE_CKPT:-/home/ubuntu/s42_out/base_paired/best.pt})"
+[ -f $BASE/best.pt ] || cp "$BASE_SRC" $BASE/best.pt 2>/dev/null
+[ -f $BASE/best.pt ] || die "the base SFT checkpoint vanished between preflight and use"
 $PY $PROV write --out $BASE/manifest.json --objective $LW --token-budget 16384 \
   --bucket-boundaries "64,128,256,512,1024" --steps n/a --early-stop n/a --draw $DRAW \
   --pool-size 100 --pool-id $POOL_ID --dataset as_paired_i --seed 42 --cotenants "armA" >/dev/null \
@@ -210,13 +291,17 @@ say "G1 exit=$G1"
 # KNOWN GAP (audit finding 7): s42_check.py returns 0 when `--units` was passed but the eval
 # carries no per-query ranks, and it uses one exit code for an affordability refusal and for a
 # software error. So a nonzero G1 is read here as the pre-agreed refusal, and a zero G1 does not
-# yet prove ranks existed. Making the gate fail closed is the next fix in this file's programme.
+# yet prove ranks existed. Making the gate fail closed, with distinct codes for proceed, refusal
+# and technical error, is the next fix in this file's programme.
 
 # ---------- P2 ----------
 say "P2: arm D x seeds on GPUs 0-2"
+for s in $SEEDS; do
+  prepare_arm armD $ARM_D_DS $s "armD seeds $SEEDS" || die "could not write the armD seed $s manifest"
+done
 i=0
 for s in $SEEDS; do
-  start_arm armD run05_cdr3_fullmhc_proportional_10M full $s $i "armD seeds $SEEDS"
+  start_arm armD $ARM_D_DS full $s $i
   i=$((i+1))
 done
 if [ "$G1" -eq 0 ]; then
