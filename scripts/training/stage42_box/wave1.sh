@@ -30,6 +30,7 @@ CHECK=${CHECK:-/home/ubuntu/s42_check.py}
 ADAPTER_D=${ADAPTER_D:-$Q/checkpoints/cpt_stage41_pointD_run05/final}
 DST=${DST:-s3://fh-pi-warren-h-eco/quest/tcrbench2/checkpoints/stage42_wave1}
 MAXQ=${MAXQ:-5000}; MINP=${MINP:-100}; DRAW=${DRAW:-length_matched}; SMOKE=${SMOKE:-}
+UNITS=${UNITS:-$Q/tests/fixtures/s42_as_paired_i_units.csv}   # the comparison's resampling unit
 # MINP: the power floor is DISTINCT TRUE PEPTIDES, not molecules — as_paired_i test_iid
 # holds 201 molecules over just 53 peptides, so a query count never gated anything.
 # DRAW: length_matched, because the 3,564-peptide pool is 76 % 9-mers and a uniform draw
@@ -79,10 +80,17 @@ cell(){
 compare(){   # compare <base_cell> <cpt_cell> <label>
   local a=$O/$1/eval.json
   local b=$O/$2/eval.json
+  local rc=0
   [ -f "$a" ] && [ -f "$b" ] || { say "$3: skipped (missing eval.json)"; return 0; }
-  $PY -m track_a.esm_sft.judge compare --a "$a" --b "$b" > $O/compare_$3.txt 2>&1
-  say "$3 compare rc=$?"; sed 's/^/    /' $O/compare_$3.txt >> $O/wave1.log
+  # --units is REQUIRED since 2026-11-04: the resampling unit is the peptide, so the comparison
+  # cannot be computed without the map. What this used to call differenced Recall@10 indicators
+  # and bootstrapped over ROWS, which is the wrong estimand on the wrong unit (audit finding 4).
+  # The rc was also swallowed by the following `say`, so a refused comparison read as a success.
+  $PY -m track_a.esm_sft.judge compare --a "$a" --b "$b" --units "$UNITS" \
+    --out $O/compare_$3.json > $O/compare_$3.txt 2>&1 || rc=$?
+  say "$3 compare rc=$rc"; sed 's/^/    /' $O/compare_$3.txt >> $O/wave1.log
   publish
+  return $rc
 }
 
 # --- cell 1: base on the paired split. Also carries the harness gate. ---
@@ -103,16 +111,16 @@ if [ "$NGPU" -ge 4 ]; then
   cell base_trb    as_trb_i    none         2 & P3=$!
   cell armD_trb    as_trb_i    "$ADAPTER_D" 3 & P4=$!
   wait $P2 || say "WARN: armD/as_paired_i failed"
-  compare base_paired armD_paired paired
+  compare base_paired armD_paired paired || say "WARN: the paired comparison was refused"
   wait $P3 || say "WARN: base/as_trb_i failed"
   wait $P4 || say "WARN: armD/as_trb_i failed"
-  compare base_trb armD_trb trb
+  compare base_trb armD_trb trb || say "WARN: the trb comparison was refused"
 else
   cell armD_paired as_paired_i "$ADAPTER_D" 0 || say "WARN: armD/as_paired_i failed"
-  compare base_paired armD_paired paired
+  compare base_paired armD_paired paired || say "WARN: the paired comparison was refused"
   cell base_trb    as_trb_i    none         0 || say "WARN: base/as_trb_i failed"
   cell armD_trb    as_trb_i    "$ADAPTER_D" 0 || say "WARN: armD/as_trb_i failed"
-  compare base_trb armD_trb trb
+  compare base_trb armD_trb trb || say "WARN: the trb comparison was refused"
 fi
 
 $PY $CHECK report --dir $O >> $O/wave1.log 2>&1

@@ -1,8 +1,9 @@
 """V04 launcher control-flow regression tests.
 
 These pin the failures found by the 2026-11-04 external audit of `run_v04.sh` and
-`dryrun.sh`. They are control-flow tests, not numerics: the trainer and the judge are
-stubs, so nothing here says anything about GPU results.
+`dryrun.sh`. The sandbox and the stubs live in conftest.py, shared with judge_first.sh.
+They are control-flow tests, not numerics: the trainer and the judge are stubs, so nothing
+here says anything about GPU results.
 
 Why each test exists, in the order the audit ranked them:
 
@@ -13,217 +14,20 @@ Why each test exists, in the order the audit ranked them:
    the substitution subshell and the driver could not `wait` on it. The driver therefore
    reached "V04 complete" and exited while six trainings were still running. The box
    watchdog waits on the driver PID, so driver exit means instance stop: the visit's own
-   launcher would have killed it.
+   launcher would have killed it. Signalling it left them running too.
 3. Every failing trainer and evaluator was followed by a successful `say`, so the visit
    exited 0 with no result.
+4. The launcher invoked no comparison at all.
 
 A scientific refusal by the G1 gate is NOT one of these failures and must stay exit 0.
 """
 import json
-import os
-import shutil
 import signal
-import subprocess
 import time
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-RANKS_FIXTURE = REPO / "tests" / "fixtures" / "s42_eval_base_paired_ranks_20261008.json"
-CELLS = ("armD_paired", "base_trb", "armD_trb")
-
-# A trainer stub that logs its own lifetime, so a test can see whether the driver waited
-# and whether two phases overlapped. $EVENTS is the shared event log.
-TORCHRUN_STUB = r"""#!/bin/bash
-out=""; args=("$@")
-for ((i=0;i<${#args[@]};i++)); do [ "${args[i]}" = --output_dir ] && out=${args[i+1]}; done
-lbl=$(basename "$out")
-mkdir -p "$out"
-echo "START $lbl $$" >> "$EVENTS"
-sleep "${STUB_SLEEP:-0}"
-echo "stub trainer" > "$out/training.log"
-echo "END $lbl $$" >> "$EVENTS"
-touch "$out/.stub_finished"
-exit "${STUB_TRAIN_RC:-0}"
-"""
-
-# Fakes only the judge; every other python call is the real interpreter, so the gate and
-# the readability predicate are exercised rather than mocked.
-PYTHON_STUB = r"""#!/bin/bash
-if [ "$1" = "-m" ] && [ "$2" = "track_a.esm_sft.judge" ]; then
-  out=""; args=("$@")
-  for ((i=0;i<${#args[@]};i++)); do [ "${args[i]}" = --out ] && out=${args[i+1]}; done
-  mkdir -p "$(dirname "$out")"
-  src=$RANKS_FIXTURE
-  case "$out" in
-    *base_paired*)
-      rc=${STUB_BASE_EVAL_RC:-0}
-      src=${STUB_BASE_EVAL_FIXTURE:-$RANKS_FIXTURE}
-      sleep "${STUB_BASE_EVAL_SLEEP:-0}" ;;
-    *) rc=${STUB_CELL_EVAL_RC:-0}; src=${STUB_CELL_EVAL_FIXTURE:-$RANKS_FIXTURE} ;;
-  esac
-  if [ "$rc" -eq 0 ]; then cp "$src" "$out"; fi
-  echo "judge $out rc=$rc" >> "$EVENTS"
-  exit "$rc"
-fi
-exec "$PYREAL" "$@"
-"""
-
-
-@pytest.fixture
-def box(tmp_path):
-    """A disposable copy of just what the launcher reads, with its own checkpoints tree.
-
-    The copy matters: `dryrun.sh` derives $REPO from its own location, so testing it in
-    place is the very destruction under test.
-    """
-    root = tmp_path / "quest"
-    for rel in ("scripts/training/v04_box", "scripts/training/stage42_box"):
-        shutil.copytree(REPO / rel, root / rel)
-    (root / "tests").mkdir(parents=True, exist_ok=True)
-    shutil.copytree(REPO / "tests" / "fixtures", root / "tests" / "fixtures")
-    (root / "checkpoints").mkdir()
-
-    # The candidate pool at the launcher's default path. An absent pool must abort, so the
-    # happy-path tests need a real one.
-    pool = root / "benchmark_v2" / "splits" / "as_class_i_candidate_pool.tsv"
-    pool.parent.mkdir(parents=True)
-    pool.write_text("peptide\n" + "".join(f"PEPTIDE{i:03d}\n" for i in range(1, 121)))
-
-    # Preflight requires the dataset and canonical-eval directories to exist before it starts a
-    # GPU job. The trainer is stubbed, so empty marker directories are the honest stand-in.
-    for d in ("data/cpt_datasets/run01_cdr3_pocket_proportional_10M",
-              "data/cpt_datasets/run05_cdr3_fullmhc_proportional_10M",
-              "data/cpt_canonical_eval_v2"):
-        (root / d).mkdir(parents=True, exist_ok=True)
-
-    # A stand-in base SFT checkpoint. /dev/null will not do: preflight requires a regular file,
-    # and a character device is not a checkpoint.
-    base_stub = tmp_path / "base_best.pt"
-    base_stub.touch()
-
-    events = tmp_path / "events.log"
-    events.touch()
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    (bin_dir / "torchrun").write_text(TORCHRUN_STUB)
-    (bin_dir / "python").write_text(PYTHON_STUB)
-    for f in bin_dir.iterdir():
-        f.chmod(0o755)
-
-    class Box:
-        def __init__(self):
-            self.root = root
-            self.events = events
-            self.out = tmp_path / "out"
-            self._live = []
-
-        def seed_cells(self):
-            """Supply the comparison checkpoints no launcher step builds yet.
-
-            Cells 2-4 refuse without them, so a test that wants the cell path exercised
-            has to stand in for the unfinished train-then-evaluate wiring.
-            """
-            for c in CELLS:
-                d = self.out / c
-                d.mkdir(parents=True, exist_ok=True)
-                (d / "best.pt").touch()
-
-        def run(self, *, timeout=120, **env):
-            e = dict(os.environ)
-            e.update(
-                Q=str(root),
-                O=str(self.out),
-                PY=str(bin_dir / "python"),
-                TORCHRUN=str(bin_dir / "torchrun"),
-                NGPU="4",
-                SEEDS="1 2 3",
-                RHO_FLOOR="0.8",
-                BASE_CKPT=str(base_stub),
-                EVENTS=str(events),
-                PYREAL="python3",
-                RANKS_FIXTURE=str(root / "tests/fixtures" / RANKS_FIXTURE.name),
-                PATH=f"{bin_dir}:{os.environ['PATH']}",
-            )
-            e.update({k: str(v) for k, v in env.items()})
-            return subprocess.run(
-                ["bash", str(root / "scripts/training/v04_box/run_v04.sh")],
-                capture_output=True, text=True, timeout=timeout, env=e,
-            )
-
-        def run_dryrun(self, timeout=600):
-            return subprocess.run(
-                ["bash", str(root / "scripts/training/v04_box/dryrun.sh"), "python3"],
-                capture_output=True, text=True, timeout=timeout,
-            )
-
-        def popen_until_started(self, n_starts, settle=15, **env):
-            """Launch the driver in its own session and wait until n trainers report in.
-
-            Returns (process, [stub pids]). The caller must terminate it; the fixture
-            kills the whole session afterwards whatever happens.
-            """
-            e = dict(os.environ)
-            e.update(
-                Q=str(root), O=str(self.out), PY=str(bin_dir / "python"),
-                TORCHRUN=str(bin_dir / "torchrun"), NGPU="4", SEEDS="1 2 3",
-                RHO_FLOOR="0.8", BASE_CKPT=str(base_stub), EVENTS=str(events),
-                PYREAL="python3",
-                RANKS_FIXTURE=str(root / "tests/fixtures" / RANKS_FIXTURE.name),
-                PATH=f"{bin_dir}:{os.environ['PATH']}",
-            )
-            e.update({k: str(v) for k, v in env.items()})
-            log = (self.out.parent / "driver.log")
-            self.out.mkdir(parents=True, exist_ok=True)
-            fh = log.open("w")
-            p = subprocess.Popen(
-                ["bash", str(root / "scripts/training/v04_box/run_v04.sh")],
-                env=e, stdout=fh, stderr=fh, start_new_session=True,
-            )
-            self._live.append(p)
-            deadline = time.monotonic() + settle
-            while time.monotonic() < deadline:
-                if len([l for l in self.event_lines() if l.startswith("START")]) >= n_starts:
-                    break
-                time.sleep(0.05)
-            pids = [int(l.split()[2]) for l in self.event_lines() if l.startswith("START")]
-            assert len(pids) >= n_starts, (
-                f"only {len(pids)} trainers started within {settle}s: {log.read_text()[-2000:]}"
-            )
-            return p, pids
-
-        def event_lines(self):
-            return [l for l in self.events.read_text().splitlines() if l.strip()]
-
-        def run_log(self):
-            p = self.out / "run.log"
-            return p.read_text() if p.exists() else ""
-
-        def unfinished_trainers(self):
-            started = {l.split()[1] for l in self.event_lines() if l.startswith("START")}
-            ended = {l.split()[1] for l in self.event_lines() if l.startswith("END")}
-            return sorted(started - ended)
-
-    b = Box()
-    yield b
-    # Whatever a test did, leave no stray session behind.
-    for p in b._live:
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-
-def _alive(pid):
-    """True if the pid is still a live process. Zombies are reaped by init here."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+from conftest import RANKS_FIXTURE, _alive
 
 
 # --------------------------------------------------------------- audit finding 2
