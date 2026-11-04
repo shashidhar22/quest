@@ -122,10 +122,13 @@ Everything local that 4.2 needed is now done, so the next moves are a decision a
    decision still owes V04 is a **launcher for the re-baseline**: `run_stage41_pipeline.py` holds
    arms A/D/F but hard-codes early stopping (patience 3, `min_rel` 0.01, metric `pocket` —
    precisely what produced the artifact verdict) and passes no `--token_budget`, while
-   `run_s43.sh` is hardwired to arm D and caps R at 4 evals. **Neither can run the re-baseline as
-   written, and this was not built here because it cannot be verified off the box** (no `peft`
-   locally, so the trainer will not even import). Build it as the first V04 action, or extend the
-   4.1 driver with pass-through knobs and leave its defaults alone.
+   `run_s43.sh` is hardwired to arm D and caps R at 4 evals. **BUILT 2026-11-04:**
+   `scripts/training/v04_box/` — `run_v04.sh` (P1 arm A ×3 + base re-score · G1 locked-read gate on
+   the new-draw ranks · P2 arm D ×3 + comparison cells only on a G1 pass), `provenance.py` (refuses
+   a comparison across an objective, draw, step, seed-set or batching mismatch), `dryrun.sh` (both
+   gate branches on the real ranks, plus the row-share abort). My earlier claim that this could not
+   be verified off the box was wrong: the trainer cannot run locally, but the launcher and its gate
+   logic can, exactly as `run_s43.sh` is verified by stubbing torchrun.
 1b. **DONE 2026-11-04 — the comparison is not readable where the gate reads it.**
    `box-jobs/README.md` §3.3, code `scripts/training/stage42_box/readability.py` (+11 tests),
    effect pre-registered first in `box-jobs/prereg-4.2-effect.md`. `test_level4` + Recall@10 needs
