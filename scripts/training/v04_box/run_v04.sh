@@ -288,11 +288,15 @@ $PY $S42 gate --eval $BASE/eval.json --units $UNITS --prereg-delta $PREREG \
   --primary-metric norm_rank 2>&1 | tee -a $O/run.log
 G1=${PIPESTATUS[0]}
 say "G1 exit=$G1"
-# KNOWN GAP (audit finding 7): s42_check.py returns 0 when `--units` was passed but the eval
-# carries no per-query ranks, and it uses one exit code for an affordability refusal and for a
-# software error. So a nonzero G1 is read here as the pre-agreed refusal, and a zero G1 does not
-# yet prove ranks existed. Making the gate fail closed, with distinct codes for proceed, refusal
-# and technical error, is the next fix in this file's programme.
+# Three outcomes, not two (s42_check.EXIT_*): 0 proceed, 1 SCIENTIFIC refusal, 2 TECHNICAL error.
+# The gate used to return 0 when `--units` was given but the eval carried no ranks, so the visit
+# proceeded on absent evidence; and one code meant both "the science says stop" and "the software
+# or the evidence is broken". A technical error must stop the visit here, BEFORE arm D is started,
+# rather than being spent and then reported as a refusal.
+if [ "$G1" -ge 2 ]; then
+  die "the gate reported a TECHNICAL error (exit $G1): missing or invalid evidence, not a refusal.
+  Nothing was read, so arm D is not being started. Fix the evidence and re-run."
+fi
 
 # ---------- P2 ----------
 say "P2: arm D x seeds on GPUs 0-2"
@@ -325,7 +329,8 @@ if [ "$G1" -eq 0 ]; then
 else
   say "G1 FAILED: comparison cells 2-4 SKIPPED. The locked primary read cannot resolve the"
   say "  pre-registered effect under the $DRAW draw, so no base-vs-CPT number from this task"
-  say "  would be interpretable. This is the pre-agreed refusal, not a run failure."
+  say "  would be interpretable. This is the pre-agreed refusal (exit 1), not a run failure:"
+  say "  a technical error would have exited 2 and stopped the visit above."
 fi
 wait_all P2 || say "an arm D re-baseline failed"
 say "P2 done"

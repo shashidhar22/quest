@@ -55,11 +55,15 @@ if [ "$1" = "-m" ] && [ "$2" = "track_a.esm_sft.judge" ]; then
   out=""; args=("$@")
   for ((i=0;i<${#args[@]};i++)); do [ "${args[i]}" = --out ] && out=${args[i+1]}; done
   mkdir -p "$(dirname "$out")"
+  src=$RANKS_FIXTURE
   case "$out" in
-    *base_paired*) rc=${STUB_BASE_EVAL_RC:-0}; sleep "${STUB_BASE_EVAL_SLEEP:-0}" ;;
-    *)             rc=${STUB_CELL_EVAL_RC:-0} ;;
+    *base_paired*)
+      rc=${STUB_BASE_EVAL_RC:-0}
+      src=${STUB_BASE_EVAL_FIXTURE:-$RANKS_FIXTURE}
+      sleep "${STUB_BASE_EVAL_SLEEP:-0}" ;;
+    *) rc=${STUB_CELL_EVAL_RC:-0} ;;
   esac
-  if [ "$rc" -eq 0 ]; then cp "$RANKS_FIXTURE" "$out"; fi
+  if [ "$rc" -eq 0 ]; then cp "$src" "$out"; fi
   echo "judge $out rc=$rc" >> "$EVENTS"
   exit "$rc"
 fi
@@ -403,6 +407,27 @@ def test_fewer_than_four_gpus_aborts(box):
     assert "needs 4 GPUs" in box.run_log()
 
 
+# --------------------------------------------------------------- audit finding 7
+def test_gate_technical_error_stops_the_visit_before_arm_d(box):
+    """A gate that cannot read its evidence must not be treated as a refusal.
+
+    The ranks-less eval is the real 2026-10-08 cell. With `--units` given, the gate used
+    to print SKIPPED and return 0, so the visit spent arm D and the comparison cells on a
+    read that never happened. It now exits 2, and the launcher stops before P2.
+    """
+    box.seed_cells()
+    ranksless = box.root / "tests" / "fixtures" / "s42_eval_base_paired_20261008.json"
+    r = box.run(STUB_BASE_EVAL_FIXTURE=str(ranksless))
+    log = box.run_log()
+    assert r.returncode != 0, "the visit proceeded although the gate could not read its evidence"
+    assert "TECHNICAL error" in log, log[-2000:]
+    started = [l.split()[1] for l in box.event_lines() if l.startswith("START")]
+    assert not [s for s in started if "armD" in s], (
+        f"arm D was started after a technical gate error: {started}"
+    )
+    assert not box.unfinished_trainers(), "the abort orphaned a trainer"
+
+
 # --------------------------------------------------------------- the refusal is not a bug
 def test_gate_refusal_is_not_a_run_failure(box):
     """A pre-agreed scientific refusal must stay exit 0 and skip the cells.
@@ -415,7 +440,7 @@ def test_gate_refusal_is_not_a_run_failure(box):
     )
     log = box.run_log()
     assert "G1 FAILED: comparison cells 2-4 SKIPPED" in log
-    assert "pre-agreed refusal, not a run failure" in log
+    assert "pre-agreed refusal" in log
     assert not (box.out / "armD_paired" / "eval.json").exists(), (
         "a comparison cell ran despite the refusal"
     )

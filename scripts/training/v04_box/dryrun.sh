@@ -58,7 +58,10 @@ if [ "\$1" = "-m" ] && [ "\$2" = "track_a.esm_sft.judge" ]; then
   out=""; args=("\$@")
   for ((i=0;i<\${#args[@]};i++)); do [ "\${args[i]}" = --out ] && out=\${args[i+1]}; done
   mkdir -p "\$(dirname "\$out")"
-  cp "$REPO/tests/fixtures/s42_eval_base_paired_ranks_20261008.json" "\$out"
+  src=\${BASE_EVAL_FIXTURE:-$REPO/tests/fixtures/s42_eval_base_paired_ranks_20261008.json}
+  case "\$out" in *base_paired*) cp "\$src" "\$out" ;;
+                   *) cp "$REPO/tests/fixtures/s42_eval_base_paired_ranks_20261008.json" "\$out" ;;
+  esac
   exit 0
 fi
 exec $PYREAL "\$@"
@@ -114,7 +117,7 @@ grep -q "READABILITY FAIL on the LOCKED primary read" $TMP/refuse/run.log \
   || fail "gate did not fail at floor 0.70"
 grep -q "G1 FAILED: comparison cells 2-4 SKIPPED" $TMP/refuse/run.log || fail "cells not skipped on a fail"
 [ -f $TMP/refuse/armD_paired/eval.json ] && fail "a comparison cell ran despite the refusal"
-grep -q "pre-agreed refusal, not a run failure" $TMP/refuse/run.log || fail "refusal not explained"
+grep -q "pre-agreed refusal" $TMP/refuse/run.log || fail "refusal not explained"
 echo "[dryrun]     REFUSE branch ok: gate failed, cells skipped, reason recorded, exit 0"
 
 echo "[dryrun] --- an unbuilt comparison cell must refuse, and fail the visit"
@@ -125,6 +128,15 @@ grep -q "REFUSED cell armD_paired: no trained comparison checkpoint" $TMP/nockpt
 grep -q "V04 FAILED" $TMP/nockpt/run.log || fail "the visit did not report failure"
 grep -q "V04 complete" $TMP/nockpt/run.log && fail "the visit announced completion as well as failure"
 echo "[dryrun]     an unbuilt cell refuses and the visit fails"
+
+echo "[dryrun] --- a gate that cannot read its evidence must stop the visit, not refuse it"
+rc=$(BASE_EVAL_FIXTURE=$REPO/tests/fixtures/s42_eval_base_paired_20261008.json \
+     run_v04 0.8 $TMP/noranks)
+[ "$rc" -ne 0 ] || fail "the visit proceeded on an eval with no per-query ranks"
+grep -q "TECHNICAL error" $TMP/noranks/run.log \
+  || fail "a missing-ranks gate was not reported as a technical error"
+grep -q "P2: arm D" $TMP/noranks/run.log && fail "arm D was started after a technical gate error"
+echo "[dryrun]     a ranks-less eval exits 2, and arm D is never started"
 
 echo "[dryrun] --- the arm re-baselines ran in every branch, with per-seed manifests"
 for s in 1 2 3; do

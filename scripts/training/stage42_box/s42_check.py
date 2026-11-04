@@ -37,23 +37,61 @@
 """
 import argparse
 import json
+import math
 import pathlib
 import sys
+
+# THREE outcomes, because two conflated a spending decision with a software fault. The audit of
+# 2026-11-04 found the consequence: with `--units` passed but no ranks in the eval, the readability
+# gate printed SKIPPED and returned 0, so a visit proceeded on absent evidence; and a technical
+# failure was indistinguishable from the pre-agreed refusal, so the launcher treated both as "the
+# science says stop". A caller must be able to tell them apart, and run_v04.sh now does.
+EXIT_OK = 0        # the locked read is available and affordable: proceed
+EXIT_REFUSED = 1   # SCIENTIFIC: the data cannot resolve the pre-registered effect, or retrieval
+                   # does not clear chance. A spending decision, not a bug.
+EXIT_ERROR = 2     # TECHNICAL: missing or malformed evidence, incompatible metadata, software
+                   # fault. Must stop the visit; must never read as a refusal.
 
 CELLS = [("base_paired", "base", "as_paired_i"), ("armD_paired", "arm D", "as_paired_i"),
          ("base_trb", "base", "as_trb_i"), ("armD_trb", "arm D", "as_trb_i")]
 CONDS = ["test_level4", "test_novel_pep", "test_iid"]
 
 
+def _load(path):
+    return json.loads(pathlib.Path(path).read_text())
+
+
 def _conds(path):
-    d = json.loads(pathlib.Path(path).read_text())
+    d = _load(path)
     return d.get("conditions", d)
 
 
-def _pool_size(path, default):
-    """POOL_SIZE the eval actually used; the tie signature is MRR == 1/pool."""
-    d = json.loads(pathlib.Path(path).read_text())
-    return d.get("pool_size") or default
+def _pool_size(path, cli_default):
+    """The pool the eval ACTUALLY used.
+
+    Previously this fell back to the CLI value, so the gate could score against a pool the eval
+    never used: random Recall@10 is k/pool and the tie signature is MRR == 1/pool, so both the
+    verdict and the fault check depend on it. It is now required, and a CLI value that disagrees
+    is a refusal to guess.
+    """
+    pool = _load(path).get("pool_size")
+    if not pool:
+        raise ValueError(
+            "this eval records no pool_size, so random Recall@10 and the tie signature cannot "
+            "be computed; re-score with an evaluator that records it"
+        )
+    if cli_default is not None and int(cli_default) != int(pool):
+        raise ValueError(
+            f"--pool-size {cli_default} disagrees with the pool the eval used ({pool}); "
+            "the eval's own value is authoritative, so fix the caller"
+        )
+    return int(pool)
+
+
+def _finite(**named):
+    """Names of the given statistics that are present but not finite."""
+    return [k for k, v in named.items()
+            if v is not None and isinstance(v, float) and not math.isfinite(v)]
 
 
 def gate(args):
@@ -63,7 +101,7 @@ def gate(args):
         m = cs[cond]
     except Exception as e:
         print(f"[gate] ERROR reading {cond} from {args.eval}: {e!r}")
-        return 1
+        return EXIT_ERROR
     rnd = m.get("random_recall_at_10") or 0.10
     r, n, mrr = m.get("recall_at_10"), m.get("n_queries"), m.get("mrr")
     npep = m.get("n_peptides")       # the real unit; absent on evals from before 2026-10-15
@@ -71,23 +109,38 @@ def gate(args):
     lo, hi = ci[0], ci[1]
     if r is None or lo is None or hi is None:
         print(f"[gate] ERROR: no recall/CI on {cond} (n={n})")
-        return 1
+        return EXIT_ERROR
+    bad = _finite(recall_at_10=r, ci_lo=lo, ci_hi=hi, mrr=mrr, random_recall_at_10=rnd)
+    if bad:
+        print(f"[gate] ERROR: non-finite statistic on {cond}: {', '.join(bad)}")
+        return EXIT_ERROR
+    try:
+        pool = _pool_size(args.eval, getattr(args, "pool_size", None))
+    except ValueError as e:
+        print(f"[gate] ERROR: {e}")
+        return EXIT_ERROR
 
-    # Every candidate tied is the 2026-10-07 bf16 failure: rank is always the pool size, so
-    # Recall@10 collapses to 0 and MRR to exactly 1/pool. Catch it by name, not by the CI.
-    pool = _pool_size(args.eval, args.pool_size)
-    tied = r == 0.0 or (mrr is not None and abs(mrr - 1.0 / pool) < 1e-6)
-    if tied:
-        verdict, rc = "BROKEN", 1
-        why = f"Recall@10={r:.4f}, MRR={mrr:.4f} ~ 1/{pool} — every candidate scored alike"
-    elif lo > rnd:
-        verdict, rc = "PASS", 0
+    # SOFTWARE check, kept narrow and direct. Every candidate tied is the 2026-10-07 bf16 failure:
+    # every rank equals the pool size, so MRR is EXACTLY 1/pool. That signature is a fault.
+    # Recall@10 == 0 is NOT: a working scorer can vary across candidates and still never place the
+    # true peptide in the top ten, so reading zero recall as "every score tied" licensed a false
+    # conclusion about the software (audit finding 7).
+    if mrr is not None and abs(mrr - 1.0 / pool) < 1e-6:
+        print(f"[gate] TIED: harness fault — base {cond} MRR={mrr:.4f} is exactly 1/{pool}, so "
+              f"every candidate scored alike and rank carries no information (Recall@10={r:.4f})")
+        return EXIT_ERROR
+
+    if lo > rnd:
+        verdict, rc = "PASS", EXIT_OK
         why = "CI lower bound clears random"
     elif hi <= rnd:
-        verdict, rc = "BROKEN", 1
-        why = "CI lies entirely at or below random"
+        # A working model can sit at or below chance, especially under a changed distractor draw.
+        # So this stops the chain as a SCIENTIFIC refusal, not as evidence of broken software.
+        verdict, rc = "BELOW-CHANCE", EXIT_REFUSED
+        why = ("CI lies entirely at or below random — a result, not a fault; no base-versus-CPT "
+               "read on this condition would be interpretable")
     else:
-        verdict, rc = "UNDERPOWERED", 0
+        verdict, rc = "UNDERPOWERED", EXIT_OK
         why = (f"CI straddles random; n={n} cannot resolve {r:.4f} from {rnd:.4f}. "
                "Reported, not failed — this is the data, not a harness fault")
 
@@ -106,7 +159,7 @@ def gate(args):
         print(f"[gate] {cond} is the harness condition — stopping before the remaining cells.")
         return rc
     if getattr(args, "units", None):
-        rc = max(rc, _readability_gate(args, cs))
+        rc = max(rc, _readability_gate(args, cs, pool))
     else:
         print("[gate] READABILITY not evaluated: pass --units to check whether any condition "
               "can resolve the pre-registered effect. Passing the harness check does not "
@@ -114,8 +167,12 @@ def gate(args):
     return rc
 
 
-def _readability_gate(args, cs):
-    """Second condition: is any (condition, metric) pairing able to see the pre-registered effect?"""
+def _readability_gate(args, cs, pool):
+    """Second condition: is any (condition, metric) pairing able to see the pre-registered effect?
+
+    `pool` is the eval's own recorded pool, passed in rather than read off the CLI: every metric
+    here divides by it.
+    """
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import csv as _csv
 
@@ -124,17 +181,38 @@ def _readability_gate(args, cs):
     with open(args.units) as f:
         for row in _csv.DictReader(f):
             units[(row["condition"], row["row_id"])] = (row["peptide"], row["pep_cluster"])
-    pool = args.pool_size
     # ONE lambda, fixed on the harness condition, so metrics are judged against one effect.
     anchor = cs.get(args.condition, {}).get("ranks") or {}
     if not anchor:
-        print("[gate] READABILITY SKIPPED: no per-query ranks in this eval.")
-        return 0
+        # THE 2026-11-04 fail-open. This printed SKIPPED and returned 0, so a visit that asked for
+        # the locked read proceeded without it. A requested read that cannot be performed is
+        # missing evidence, which is a technical error, not an affordability refusal.
+        print(f"[gate] ERROR: --units was given, so the locked read was requested, but "
+              f"{args.condition} carries no per-query ranks in {args.eval}. Re-score with an "
+              f"evaluator that emits ranks; this is missing evidence, not a refusal.")
+        return EXIT_ERROR
+    bad_ranks = [rid for rid, rk in anchor.items()
+                 if not isinstance(rk, (int, float)) or not math.isfinite(rk)
+                 or rk < 1 or rk > pool]
+    if bad_ranks:
+        print(f"[gate] ERROR: {len(bad_ranks)} rank(s) on {args.condition} are not in [1, {pool}] "
+              f"or are non-finite, e.g. {bad_ranks[:5]}")
+        return EXIT_ERROR
+    # Ranks absent from the unit map used to be dropped silently, shrinking the support of the read
+    # without saying so. Coverage is now required for every condition that carries ranks.
+    for cond, m in cs.items():
+        rd = m.get("ranks") or {}
+        missing = [rid for rid in rd if (cond, rid) not in units]
+        if rd and missing:
+            print(f"[gate] ERROR: unit map coverage is incomplete for {cond}: "
+                  f"{len(missing)} of {len(rd)} ranked rows have no peptide/cluster, "
+                  f"e.g. {missing[:5]}. Dropping them would shrink the read's support silently.")
+            return EXIT_ERROR
     lam = R.lambda_for_recall_delta(list(anchor.values()), pool, args.prereg_delta)
     if lam is None:
         print(f"[gate] READABILITY UNREACHABLE: {args.prereg_delta:+.3f} Recall@10 is not "
               f"attainable on {args.condition} by any rank improvement.")
-        return 1
+        return EXIT_REFUSED
     print(f"[gate] READABILITY: one lambda={lam:.3f} (= {100*(lam-1):.0f}% rank gain) fixed on "
           f"{args.condition} at the pre-registered {args.prereg_delta:+.3f} Recall@10")
     best = None
@@ -146,7 +224,7 @@ def _readability_gate(args, cs):
         rk, pp, cl = [], [], []
         for rid, rank in ranks_d.items():
             if (cond, rid) not in units:
-                continue
+                continue       # unreachable: coverage was validated above, kept as a guard
             rk.append(rank)
             p, k = units[(cond, rid)]
             pp.append(p)
@@ -172,11 +250,16 @@ def _readability_gate(args, cs):
     pc, pu, pm = args.primary_condition, args.primary_unit, args.primary_metric
     prim = per_pair.get((pc, pu, pm))
     if prim is None:
-        print(f"[gate] READABILITY ERROR: the locked primary read {pc}/{pu}/{pm} is not present "
+        print(f"[gate] ERROR: the locked primary read {pc}/{pu}/{pm} is not present "
               f"in this eval. Not substituting another pairing — that is the selection surface "
               f"the lock exists to close.")
-        return 1
+        return EXIT_ERROR
     eff, se, be = prim
+    nf = _finite(effect=eff, se=se, breakeven_rho=be)
+    if nf:
+        print(f"[gate] ERROR: the locked read produced non-finite {', '.join(nf)}; "
+              f"the estimate cannot be compared with a floor")
+        return EXIT_ERROR
     floor = args.rho_floor
     ok = be is not None and be <= floor
     print(f"[gate] READABILITY {'PASS' if ok else 'FAIL'} on the LOCKED primary read "
@@ -206,7 +289,10 @@ def _readability_gate(args, cs):
         print(f"[gate]   note: {best[1]}/{best[2]}/{best[3]} clears at a lower rho ({best[0]}). "
               f"Secondary only. Changing the primary read requires writing it into "
               f"box-jobs/README.md first.")
-    return 0 if ok else 1
+    # Affordability only. A pass licenses spending the comparison cells; it says nothing about the
+    # outcome, and the +0.05 Recall@10 utility target remains a separate claim on its own condition
+    # (decision 3, 2026-11-04). Reaching this line at all means the evidence was present and valid.
+    return EXIT_OK if ok else EXIT_REFUSED
 
 
 def report(args):
@@ -251,7 +337,11 @@ if __name__ == "__main__":
     sp = ap.add_subparsers(dest="cmd", required=True)
     g = sp.add_parser("gate"); g.add_argument("--eval", required=True)
     g.add_argument("--condition", default="test_level4", choices=CONDS)
-    g.add_argument("--pool-size", dest="pool_size", type=int, default=100)
+    g.add_argument("--pool-size", dest="pool_size", type=int, default=None,
+                   help="Optional cross-check only. The eval's own recorded pool_size is "
+                        "authoritative and required; passing a value that disagrees with it is a "
+                        "technical error rather than an override, because every metric here "
+                        "divides by the pool the eval actually used.")
     g.add_argument("--units", help="csv: condition,row_id,peptide,pep_cluster — enables the "
                                    "readability condition")
     g.add_argument("--prereg-delta", dest="prereg_delta", type=float, default=0.05,
