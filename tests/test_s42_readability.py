@@ -149,3 +149,81 @@ def test_unreachable_delta_is_reported_not_crashed(cell):
     ranks, peps, _, _ = conds["test_level4"]
     out = R.readability(ranks, peps, pool, 0.90, n_boot=200)
     assert out["verdict"] == "UNREACHABLE" and out["lambda"] is None
+
+
+def test_breakeven_rho_is_the_exact_failure_point(cell):
+    """MDE at the breakeven rho equals the effect, by construction."""
+    pool, conds = cell
+    ranks, peps, _, _ = conds["test_novel_pep"]
+    lvl, _, _, _ = conds["test_level4"]
+    lam = R.lambda_for_recall_delta(lvl, pool, PREREG_DELTA)
+    _, se, _, _, _, _ = R.cluster_bootstrap(ranks, peps, pool, "norm_rank")
+    eff = R.effect_under_lambda(ranks, peps, pool, lam, "norm_rank")
+    b = R.breakeven_rho(se, eff)
+    assert R.paired_mde(se, b) == pytest.approx(eff, rel=1e-9)
+
+
+def test_nothing_in_this_cell_is_readable_unpaired(cell):
+    """Every breakeven rho is above 0, so the whole conclusion rests on cross-arm correlation.
+    A negative breakeven anywhere would mean that pair needed no pairing assumption at all."""
+    pool, conds = cell
+    lvl, _, _, _ = conds["test_level4"]
+    lam = R.lambda_for_recall_delta(lvl, pool, PREREG_DELTA)
+    for name, (ranks, peps, _, _) in conds.items():
+        for metric in R.METRICS:
+            _, se, _, _, _, _ = R.cluster_bootstrap(ranks, peps, pool, metric)
+            eff = R.effect_under_lambda(ranks, peps, pool, lam, metric)
+            b = R.breakeven_rho(se, eff)
+            assert b is not None and 0.0 < b < 1.0, (name, metric, b)
+
+
+def test_the_best_pairing_has_little_margin_not_much(cell):
+    """Guards the claim this programme nearly shipped. test_novel_pep x norm_rank clears at
+    rho=0.8 but its breakeven is ~0.765, so the margin in rho is small. An earlier write-up
+    called it 'three times finer than the threshold', which converted a 1.6 % margin in lambda
+    into recall@10 points where the metric is steeply nonlinear."""
+    pool, conds = cell
+    ranks, peps, _, _ = conds["test_novel_pep"]
+    lvl, _, _, _ = conds["test_level4"]
+    lam = R.lambda_for_recall_delta(lvl, pool, PREREG_DELTA)
+    _, se, _, _, _, _ = R.cluster_bootstrap(ranks, peps, pool, "norm_rank")
+    eff = R.effect_under_lambda(ranks, peps, pool, lam, "norm_rank")
+    assert 0.70 < R.breakeven_rho(se, eff) < 0.80
+
+
+def test_iid_mrr_variance_is_one_peptide_not_an_estimator_fault(cell):
+    """test_iid's MRR MDE is 11.7x its norm_rank MDE. The cause is a single 20-molecule peptide
+    sitting almost entirely at rank 1, which a peptide-level bootstrap includes or drops whole."""
+    pool, conds = cell
+    ranks, peps, _, _ = conds["test_iid"]
+    groups = R.by_peptide(ranks, peps)
+    worst = max(groups.items(), key=lambda kv: sum(1.0 / r for r in kv[1]))
+    assert len(worst[1]) >= 15
+    assert sum(1.0 / r for r in worst[1]) / len(worst[1]) > 0.7
+    share = sum(1.0 / r for r in worst[1]) / sum(1.0 / r for r in ranks)
+    assert share > 0.5, share
+
+
+def test_length_strata_are_mostly_one_peptide_deep(cell):
+    """The length finding in 9.6 was computed on molecules. At the peptide unit, every non-9
+    stratum of the readable condition holds 1 to 24 peptides, so it cannot carry a comparison."""
+    pool, conds = cell
+    ranks, peps, _, _ = conds["test_novel_pep"]
+    st = R.stratify(ranks, peps, pool, "recall_at_10")
+    assert st[9][1] > 400
+    for length, (nmol, npep, _) in st.items():
+        if length != 9:
+            assert npep <= 24, (length, npep)
+    assert st[12][1] == 1 and st[12][0] >= 40      # 48 molecules, one peptide
+
+
+def test_nine_mer_stratum_sits_below_chance(cell):
+    """Removing the length confound by restricting to the homogeneous stratum takes the base
+    model below the random rate, so the above-chance appearance is partly carried by the tiny
+    long-peptide strata."""
+    pool, conds = cell
+    ranks, peps, _, _ = conds["test_novel_pep"]
+    st = R.stratify(ranks, peps, pool, "recall_at_10")
+    assert st[9][2] < 0.10
+    stn = R.stratify(ranks, peps, pool, "norm_rank")
+    assert stn[9][2] < 0.50

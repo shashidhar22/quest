@@ -128,6 +128,37 @@ def paired_mde(se_base, rho, power_z=POWER_Z):
     return power_z * math.sqrt(2.0 * (1.0 - rho)) * se_base
 
 
+def breakeven_rho(se_base, effect, power_z=POWER_Z):
+    """The rho at which MDE(rho) == effect. Retires most of the exposure to assuming rho.
+
+    Solving power_z * sqrt(2(1-rho)) * se == effect gives
+        rho = 1 - (effect / (power_z * se))^2 / 2
+    Below 0 the pair is readable even unpaired, so rho buys nothing and the answer is robust.
+    Above 1 it is unreadable at any correlation. In between it is the exact failure point, which
+    is a different object from "probably tolerates a lot of error".
+    """
+    if se_base <= 0 or effect <= 0:
+        return None
+    return 1.0 - (effect / (power_z * se_base)) ** 2 / 2.0
+
+
+def stratify(ranks, peptides, pool, metric="recall_at_10", k=10, key=len):
+    """The metric by a per-peptide key, default peptide LENGTH.
+
+    Recall tracks peptide length against a pool that is 76 % 9-mers (findings.md 9.6), so a
+    condition with enough peptides to stratify should be stratified in the same pass rather than
+    later. Returns {key: (n_molecules, n_peptides, value)}.
+    """
+    f = METRICS[metric]
+    buckets = {}
+    for r, p in zip(ranks, peptides):
+        buckets.setdefault(key(p), ([], set()))
+        v = f(r, pool, k) if metric == "recall_at_10" else f(r, pool)
+        buckets[key(p)][0].append(v)
+        buckets[key(p)][1].add(p)
+    return {kk: (len(vs), len(ps), weighted_mean(vs)) for kk, (vs, ps) in sorted(buckets.items())}
+
+
 # --- expressing ONE effect on every metric: the pre-registered lambda mechanism ---
 
 def apply_lambda(rank, lam):
@@ -187,6 +218,7 @@ def readability(ranks, peptides, pool, prereg_recall_delta, rhos=(0.0, 0.5, 0.8,
             "random": random_baseline(name, pool, k),
             "effect_under_lambda": eff, "mde": mdes,
             "min_rho_that_clears": clears[0] if clears else None,
+            "breakeven_rho": breakeven_rho(se, eff),
             "naive_se": naive_bootstrap_se(ranks, pool, name, k, n_boot, seed),
         }
         if clears and (best_rho is None or clears[0] < best_rho):
