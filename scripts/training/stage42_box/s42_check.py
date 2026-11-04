@@ -186,6 +186,22 @@ def _readability_gate(args, cs):
         print(f"[gate]   the comparison is NOT readable unless cross-arm correlation exceeds "
               f"{be:.3f}. Nothing may be read off it, and the comparison cells cannot answer "
               f"the question. Refusing them is the correct outcome, not a failure of the run.")
+    # Length stratification, in the SAME pass. Recall tracks peptide length against a pool that
+    # is 76 % 9-mers, so the confound has to be read off the condition that carries the decision,
+    # not checked later. 463 peptides is the first n in this programme that can be stratified --
+    # and at the peptide unit every non-9 stratum is thin, which is itself the finding.
+    rk, pp = [], []
+    for rid, rank in (cs.get(pc, {}).get("ranks") or {}).items():
+        if (pc, rid) in units:
+            rk.append(rank)
+            pp.append(units[(pc, rid)][0 if pu == "peptide" else 1])
+    if rk and pu == "peptide":
+        st = R.stratify(rk, pp, pool, pm)
+        print(f"[gate]   length strata of {pc} on {pm} (confound check, same pass):")
+        for length, (nmol, npep, val) in st.items():
+            thin = "  <-- too thin to compare" if npep < 30 else ""
+            print(f"[gate]     len {length:>2}: {nmol:5d} mol  {npep:4d} pep  {pm}={val:.4f}{thin}")
+
     if best is not None and best[1:] != (pc, pu, pm):
         print(f"[gate]   note: {best[1]}/{best[2]}/{best[3]} clears at a lower rho ({best[0]}). "
               f"Secondary only. Changing the primary read requires writing it into "

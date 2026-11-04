@@ -32,12 +32,14 @@ PREREG=${PREREG_DELTA:-0.05}
 UNITS=${UNITS:-$Q/tests/fixtures/s42_as_paired_i_units.csv}
 PROV=$Q/scripts/training/v04_box/provenance.py
 S42=$Q/scripts/training/stage42_box/s42_check.py
+POOL=${POOL_FILE:-$Q/benchmark_v2/splits/as_class_i_candidate_pool.tsv}
 export PYTHONPATH=$Q PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TOKENIZERS_PARALLELISM=false
 mkdir -p $O; cd $Q
 say(){ echo "[$(date -u '+%F %T')] $*" | tee -a $O/run.log; }
 echo $$ > $O/run_v04.pid       # the watchdog waits on THIS pid, never a name pattern
 
-say "V04 start pid=$$ ngpu=$NGPU objective=$LW draw=$DRAW seeds='$SEEDS' steps=$STEPS rho_floor=$RHO_FLOOR"
+POOL_ID=$([ -f "$POOL" ] && $PY $PROV fingerprint --path "$POOL" || echo POOL_FILE_MISSING)
+say "V04 start pid=$$ ngpu=$NGPU objective=$LW draw=$DRAW seeds='$SEEDS' steps=$STEPS rho_floor=$RHO_FLOOR pool_id=$POOL_ID"
 [ "$LW" = row ] && { say "ABORT: --loss_weighting row is rejected for production (findings 9.5)"; exit 2; }
 
 TRAIN_COMMON="--tcr_variant cdr3 --max_length 1024 --batch_size 16 \
@@ -46,6 +48,12 @@ TRAIN_COMMON="--tcr_variant cdr3 --max_length 1024 --batch_size 16 \
   --num_epochs 1 --lr 2e-4 --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 \
   --eval_steps 500 --save_steps 500 --logging_steps 50 --no_compile \
   --attn_implementation sdpa --early_stop_n_patience 0 --report_to wandb"
+# NOTE on `--attn_implementation sdpa`: it is INERT for ESM-C. ESMC.from_pretrained sets
+# _use_flash_attn=True itself and never consults this arg (findings 9.2), so every run here is on
+# varlen flash attention and the log line saying "sdpa" is misleading. Kept because Stage 4.1 and
+# 4.3 passed it, so removing it would change the recorded command without changing the numerics.
+# It matters for provenance: flash-attn's backward uses atomics, which is the irreducible source
+# of the 1.31 % run-to-run difference the band measures.
 
 # train_arm <label> <dataset> <mhc_variant> <seed> <gpu> <cotenants>
 train_arm(){
@@ -54,7 +62,8 @@ train_arm(){
   mkdir -p $out
   $PY $PROV write --out $out/manifest.json --objective $LW --token-budget 16384 \
     --bucket-boundaries "64,128,256,512,1024" --steps $STEPS --early-stop off \
-    --draw n/a --pool-size n/a --dataset $ds --seed $seed --cotenants "$cot" >/dev/null
+    --draw n/a --pool-size n/a --pool-id n/a --dataset $ds --seed $seed \
+    --cotenants "$cot" >/dev/null
   CUDA_VISIBLE_DEVICES=$gpu $TORCHRUN --nproc_per_node=1 --master_port=$((29800+gpu)) \
     scripts/training/train_cpt_stage2_single.py --dataset_path $Q/data/cpt_datasets/$ds \
     --mhc_variant $mhc --gradient_accumulation_steps 64 --seed $seed $TRAIN_COMMON \
@@ -69,7 +78,8 @@ judge_cell(){
   mkdir -p $d
   $PY $PROV write --out $d/manifest.json --objective $LW --token-budget 16384 \
     --bucket-boundaries "64,128,256,512,1024" --steps n/a --early-stop n/a \
-    --draw $DRAW --pool-size 100 --dataset as_paired_i --seed 42 --cotenants "armD" >/dev/null
+    --draw $DRAW --pool-size 100 --pool-id $POOL_ID --dataset as_paired_i --seed 42 \
+    --cotenants "armD" >/dev/null
   CUDA_VISIBLE_DEVICES=$gpu $PY -m track_a.esm_sft.judge eval --task as_paired_i \
     --adapter $adapter --tcr_variant cdr3 --mhc_variant full --ckpt $d/best.pt \
     --distractor_draw $DRAW --min_peptides 100 --out $d/eval.json > $d/eval.log 2>&1
@@ -91,7 +101,7 @@ BASE=$O/base_paired; mkdir -p $BASE
 [ -f $BASE/best.pt ] || cp ${BASE_CKPT:-/home/ubuntu/s42_out/base_paired/best.pt} $BASE/best.pt 2>/dev/null
 $PY $PROV write --out $BASE/manifest.json --objective $LW --token-budget 16384 \
   --bucket-boundaries "64,128,256,512,1024" --steps n/a --early-stop n/a --draw $DRAW \
-  --pool-size 100 --dataset as_paired_i --seed 42 --cotenants "armA" >/dev/null
+  --pool-size 100 --pool-id $POOL_ID --dataset as_paired_i --seed 42 --cotenants "armA" >/dev/null
 CUDA_VISIBLE_DEVICES=$G3 $PY -m track_a.esm_sft.judge eval --task as_paired_i --adapter none \
   --tcr_variant cdr3 --mhc_variant full --ckpt $BASE/best.pt --distractor_draw $DRAW \
   --min_peptides 100 --out $BASE/eval.json > $BASE/eval.log 2>&1

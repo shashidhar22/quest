@@ -20,6 +20,9 @@ Keys, and why each is here:
   draw               distractor pool construction; length_matched numbers are not comparable to
                      uniform ones
   pool_size          random Recall@10 is k/pool, so this is in every metric
+  pool_id            hash of the candidate pool file. pool_size alone cannot tell a regenerated
+                     pool from the original one, and the draw is built from this file, so a silent
+                     pool change would look like a model effect
   dataset            the arm
   seed               training is non-deterministic at 1.31 %, so a seed set is part of a band
   cotenants          which GPUs ran alongside; a cross-arm band comparison carries this asymmetry
@@ -31,7 +34,7 @@ import pathlib
 import sys
 
 KEYS = ("objective", "token_budget", "bucket_boundaries", "steps", "early_stop",
-        "draw", "pool_size", "dataset", "seed", "cotenants")
+        "draw", "pool_size", "pool_id", "dataset", "seed", "cotenants")
 # Keys a comparison is ALLOWED to differ on, per comparison kind.
 WAIVED = {
     "band": ("seed", "cotenants"),          # a band is built FROM differing seeds

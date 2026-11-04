@@ -170,8 +170,17 @@ def test_within_a_step_ranks_are_dealt_round_robin_longest_first():
         cur += n
 
 
-def test_micro_batch_loss_scale_reproduces_fixed_batch_weighting():
-    """Failure: row-weighting disagrees with 1/n_acc on equal micro-batches, or a micro-batch's
+def test_micro_batch_loss_scale_matches_fixed_batch_only_on_equal_micro_batches():
+    """Renamed 2026-11-04. Every assertion below is sound, but the old name --
+    ``..._reproduces_fixed_batch_weighting`` -- states the claim findings.md 9.5 REFUTED, and a
+    reader grepping for whether row-share equals the fixed-batch path would find a passing test
+    with that name and conclude it does. It does not: row-share coincides with 1/n_acc ONLY when
+    micro-batches are equal in rows and tokens, which is exactly what the token-budget sampler's
+    length-homogeneous cuts make them NOT. At the real length mix it gives MHC-bearing tokens
+    0.43x the fixed-batch per-token weight. The unequal case lives in
+    tests/test_micro_batch_loss_weighting.py, which pins all four weightings.
+
+    Failure: row-weighting disagrees with 1/n_acc on EQUAL micro-batches, or a micro-batch's
     weight does not scale with its rows under the token-budget path."""
     import os, sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "training"))

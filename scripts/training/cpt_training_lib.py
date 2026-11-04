@@ -1558,10 +1558,25 @@ class CPTTrainer:
         torch.set_float32_matmul_precision("high")
         torch.manual_seed(cfg.seed + self.global_rank)
         if getattr(cfg, "deterministic", False):
-            # Two runs at one seed differed 1.31 % at step 2000 (V2_DETERMINISM, 2026-10-08) with
-            # nothing here constraining cuDNN algorithm choice or reduction order; over 2,000 steps
-            # float non-associativity amplifies. Turning this on narrows the cause: if two runs
-            # still differ, something is genuinely unseeded.
+            # Two runs at one seed differed 1.31 % at step 2000 (V2_DETERMINISM, 2026-10-08).
+            #
+            # CORRECTED 2026-11-04 after auditing the seed path. The previous comment here said
+            # "if two runs still differ, something is genuinely unseeded". THAT INFERENCE IS
+            # INVALID and would send the next reader hunting a seeding bug that does not exist.
+            # Two runs WILL still differ with this flag on, because:
+            #   - the data path is already fully seeded: the sampler draws from
+            #     np.random.default_rng(seed + epoch) and the masking collator from an explicit
+            #     torch.Generator(mask_seed), so order and mask pattern are reproducible;
+            #   - ESM-C runs varlen FLASH ATTENTION whatever --attn_implementation says (that arg
+            #     is inert on this model, findings 9.2), and flash-attn's backward accumulates dQ
+            #     with atomics, so its reduction order is non-deterministic by construction. It is
+            #     a custom CUDA op outside PyTorch's determinism registry, so neither
+            #     use_deterministic_algorithms nor the cuDNN flags below can constrain it, and
+            #     warn_only=True means it is not even reported.
+            # So this flag constrains cuDNN/cuBLAS only. A residual difference is the EXPECTED
+            # outcome and proves nothing about seeding. The test that WOULD separate them is
+            # `4.3-noise-det` (box-jobs/tests.md): same seed twice with this flag AND flash
+            # disabled, against same seed twice with this flag alone.
             os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
