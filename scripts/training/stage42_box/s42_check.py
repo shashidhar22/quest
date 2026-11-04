@@ -18,9 +18,22 @@
       significantly below random by construction -- its distractors come from a training-dominated
       pool while its true peptide is unseen -- so gating there would always read BROKEN.
 
+      This condition tests the harness against CHANCE. It does NOT license reading a
+      base-versus-CPT comparison: test_level4 clears chance decisively and its interval is still
+      0.46 wide. That second question is the readability predicate below.
+
+  gate ... --units <row->peptide/cluster csv> [--prereg-delta 0.05]
+      The SECOND condition: can any (condition, metric) pairing in this eval resolve the
+      pre-registered effect? Paired, clustered over peptides, reported against the unmeasurable
+      cross-arm correlation rho. Returns nonzero when nothing is readable at rho <= 0.9, which is
+      the only honest reason to refuse the remaining cells. See readability.py and
+      quest-cpt/box-jobs/prereg-4.2-effect.md.
+
   report --dir <wave-1 out dir>
-      One table of every cell that finished: n, Recall@10 with CI, MRR, and whether the cell is
-      underpowered (n < 500 queries, where a bootstrap CI cannot separate anything).
+      One table of every cell that finished: molecules, PEPTIDES, Recall@10 with CI, MRR, and the
+      underpowered flag. The power floor is peptides, never queries -- `--min_queries` was removed
+      from the judge on 2026-11-03 and the old "n < 500 queries" floor here went with it, because
+      molecules nest within peptides (findings.md 9.6).
 """
 import argparse
 import json
@@ -53,6 +66,7 @@ def gate(args):
         return 1
     rnd = m.get("random_recall_at_10") or 0.10
     r, n, mrr = m.get("recall_at_10"), m.get("n_queries"), m.get("mrr")
+    npep = m.get("n_peptides")       # the real unit; absent on evals from before 2026-10-15
     ci = m.get("recall_at_10_ci95") or [None, None]
     lo, hi = ci[0], ci[1]
     if r is None or lo is None or hi is None:
@@ -77,8 +91,11 @@ def gate(args):
         why = (f"CI straddles random; n={n} cannot resolve {r:.4f} from {rnd:.4f}. "
                "Reported, not failed — this is the data, not a harness fault")
 
-    print(f"[gate] {verdict}: base {cond} n={n} recall@10={r:.4f} "
+    unit = f"n={n} molecules" + (f", {npep} peptides" if npep else ", peptides NOT REPORTED")
+    print(f"[gate] {verdict}: harness vs chance — base {cond} {unit} recall@10={r:.4f} "
           f"CI=[{lo:.4f}, {hi:.4f}] vs random {rnd:.4f} ({why})")
+    if not npep:
+        print("[gate]   note: this eval predates n_peptides; its CI unit cannot be confirmed here.")
     for other in (c for c in CONDS if c != cond and c in cs):
         o = cs[other]
         oci = o.get("recall_at_10_ci95") or [None, None]
@@ -87,7 +104,75 @@ def gate(args):
                   f"recall@10={o['recall_at_10']:.4f} CI=[{oci[0]:.4f}, {oci[1]:.4f}]")
     if rc:
         print(f"[gate] {cond} is the harness condition — stopping before the remaining cells.")
+        return rc
+    if getattr(args, "units", None):
+        rc = max(rc, _readability_gate(args, cs))
+    else:
+        print("[gate] READABILITY not evaluated: pass --units to check whether any condition "
+              "can resolve the pre-registered effect. Passing the harness check does not "
+              "license reading a base-versus-CPT comparison.")
     return rc
+
+
+def _readability_gate(args, cs):
+    """Second condition: is any (condition, metric) pairing able to see the pre-registered effect?"""
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import csv as _csv
+
+    import readability as R
+    units = {}
+    with open(args.units) as f:
+        for row in _csv.DictReader(f):
+            units[(row["condition"], row["row_id"])] = (row["peptide"], row["pep_cluster"])
+    pool = args.pool_size
+    # ONE lambda, fixed on the harness condition, so metrics are judged against one effect.
+    anchor = cs.get(args.condition, {}).get("ranks") or {}
+    if not anchor:
+        print("[gate] READABILITY SKIPPED: no per-query ranks in this eval.")
+        return 0
+    lam = R.lambda_for_recall_delta(list(anchor.values()), pool, args.prereg_delta)
+    if lam is None:
+        print(f"[gate] READABILITY UNREACHABLE: {args.prereg_delta:+.3f} Recall@10 is not "
+              f"attainable on {args.condition} by any rank improvement.")
+        return 1
+    print(f"[gate] READABILITY: one lambda={lam:.3f} (= {100*(lam-1):.0f}% rank gain) fixed on "
+          f"{args.condition} at the pre-registered {args.prereg_delta:+.3f} Recall@10")
+    best = None
+    for cond, m in cs.items():
+        ranks_d = m.get("ranks")
+        if not ranks_d:
+            continue
+        rk, pp, cl = [], [], []
+        for rid, rank in ranks_d.items():
+            if (cond, rid) not in units:
+                continue
+            rk.append(rank)
+            p, k = units[(cond, rid)]
+            pp.append(p)
+            cl.append(k)
+        if not rk:
+            continue
+        for uname, uu in (("peptide", pp), ("pep_cluster", cl)):
+            for metric in R.METRICS:
+                _, se, _, _, _, _ = R.cluster_bootstrap(rk, uu, pool, metric)
+                eff = R.effect_under_lambda(rk, uu, pool, lam, metric)
+                rho = next((x for x in (0.0, 0.5, 0.8, 0.9, 0.95)
+                            if eff >= R.paired_mde(se, x)), None)
+                print(f"[gate]   {cond:15s} {uname:11s} n={len(set(uu)):4d} {metric:12s} "
+                      f"effect={eff:+.4f} MDE(rho=.8)={R.paired_mde(se, 0.8):.4f} "
+                      f"readable at rho>={rho}")
+                if rho is not None and (best is None or rho < best[0]):
+                    best = (rho, cond, uname, metric)
+    if best is None:
+        print("[gate] READABILITY UNREADABLE: no condition, unit and metric resolves the "
+              "pre-registered effect even at rho=0.95. A comparison must not be read, and the "
+              "remaining cells cannot answer the question as specified.")
+        return 1
+    rho, cond, uname, metric = best
+    verdict = "READABLE" if rho <= 0.9 else "MARGINAL"
+    print(f"[gate] READABILITY {verdict}: best pairing is {cond} / {uname} / {metric}, "
+          f"readable at rho>={rho}. Read the comparison THERE, not on the harness condition.")
+    return 0 if rho <= 0.9 else 1
 
 
 def report(args):
@@ -108,13 +193,13 @@ def report(args):
             if not m:
                 continue
             r, ci = m.get("recall_at_10"), m.get("recall_at_10_ci95") or [None, None]
-            rows.append((arm, task, cond, str(m.get("n_queries")),
+            rows.append((arm, task, cond, f"{m.get('n_queries')}/{m.get('n_peptides') or '?'}",
                          "n/a" if r is None else f"{r:.4f}",
                          "" if ci[0] is None else f"[{ci[0]:.4f}, {ci[1]:.4f}]",
                          "UNDERPOWERED" if m.get("underpowered") else ""))
-    w = [max(len(str(r[i])) for r in rows + [("arm", "task", "condition", "n", "recall@10", "CI95", "flag")])
+    w = [max(len(str(r[i])) for r in rows + [("arm", "task", "condition", "mol/pep", "recall@10", "CI95", "flag")])
          for i in range(7)]
-    head = ("arm", "task", "condition", "n", "recall@10", "CI95", "flag")
+    head = ("arm", "task", "condition", "mol/pep", "recall@10", "CI95", "flag")
     print("  ".join(h.ljust(w[i]) for i, h in enumerate(head)))
     print("  ".join("-" * w[i] for i in range(7)))
     for r in rows:
@@ -133,6 +218,10 @@ if __name__ == "__main__":
     g = sp.add_parser("gate"); g.add_argument("--eval", required=True)
     g.add_argument("--condition", default="test_level4", choices=CONDS)
     g.add_argument("--pool-size", dest="pool_size", type=int, default=100)
+    g.add_argument("--units", help="csv: condition,row_id,peptide,pep_cluster — enables the "
+                                   "readability condition")
+    g.add_argument("--prereg-delta", dest="prereg_delta", type=float, default=0.05,
+                   help="pre-registered Recall@10 effect; see box-jobs/prereg-4.2-effect.md")
     r = sp.add_parser("report"); r.add_argument("--dir", required=True)
     a = ap.parse_args()
     sys.exit({"gate": gate, "report": report}[a.cmd](a))

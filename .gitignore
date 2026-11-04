@@ -87,6 +87,10 @@ keys/
 # CSV output files (add exceptions for important ones if needed)
 *.csv
 !config/*.csv
+# Test fixtures are code, not output. Without this, tests/test_judge_cluster_ci.py and
+# tests/test_s42_readability.py silently pass on the author's laptop and cannot run anywhere
+# else, which is the failure mode that cost this programme two visits (findings.md 9.5/9.6).
+!tests/fixtures/*.csv
 
 # Batch scripts
 batch_scripts/
