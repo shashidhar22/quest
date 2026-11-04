@@ -176,6 +176,7 @@ Everything local that 4.2 needed is now done, so the next moves are a decision a
   does not exist.
 - **A launcher that can actually run the re-baseline** — see first move 1. The decision is made;
   the means to execute it is not written, and it is the one thing standing between V04 and the box.
-- **Push decision, Yuexin's:** branch `yxu2/tcrbench2-continue` has never been pushed — this laptop
-  is still the only copy of the CPT code. Committed locally 2026-11-03 (first commit on this branch
-  since 10-07), so the work is at least in git history now, but still on one disk.
+- **~~Push decision~~ — PUSHED 2026-11-04** by Yuexin, after the sandbox refused it as a
+  public-surface action. `yxu2/tcrbench2-continue` now tracks `origin/yxu2/tcrbench2-continue` on
+  `shashidhar22/quest`; the laptop is no longer the only copy. GitHub offered a PR link; opening one
+  is a separate decision and nothing here depends on it.
