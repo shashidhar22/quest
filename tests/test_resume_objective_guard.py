@@ -14,12 +14,15 @@ under the same name.
 
 These tests import a module with no torch or peft dependency, so they run anywhere.
 """
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
 
 from quest.training.resume_compat import (  # noqa: E402
     LOSS_WEIGHTING_SEMANTICS,
@@ -159,3 +162,82 @@ def test_legacy_path_still_pins_batch_shape():
             cfg(batch_size=16, gradient_accumulation_steps=32, world_size=4),
             token_mode=False,
         )
+
+
+# --------------------------------------------------- the import contract is part of the point
+def test_the_rule_imports_with_no_ml_stack_present():
+    """Extracting the rule only helps if it can be read without torch installed.
+
+    The first version of this extraction did not achieve that: the module itself is
+    light, but `quest/training/__init__.py` eagerly re-exported collators, which import
+    torch, so `import quest.training.resume_compat` pulled the whole ML stack in. It
+    passed here only because this machine's default interpreter happens to have torch;
+    on a torch-less one it raised ModuleNotFoundError at collection.
+
+    A fresh subprocess with torch blocked is the falsifiable form: if any import in the
+    chain reaches torch, this fails.
+    """
+    code = textwrap.dedent(
+        r"""
+        import importlib.abc
+        import sys
+
+        class Block(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "torch" or fullname.startswith("torch."):
+                    raise ImportError("torch is blocked for this test")
+                return None
+
+        sys.meta_path.insert(0, Block())
+
+        from quest.training.resume_compat import check_resume_config, objective_fingerprint
+
+        assert objective_fingerprint(
+            {"loss_weighting": "token", "loss_weighting_semantics": "input-length-share/v1"}
+        ) == "token:input-length-share/v1"
+
+        try:
+            check_resume_config(
+                {"loss_weighting": "row", "loss_weighting_semantics": "row-share/v1"},
+                {"loss_weighting": "token", "loss_weighting_semantics": "input-length-share/v1"},
+                token_mode=True,
+            )
+        except ValueError as e:
+            assert "objective" in str(e), e
+        else:
+            raise AssertionError("row-share resumed into token-share without a refusal")
+        print("OK")
+        """
+    )
+    r = subprocess.run([sys.executable, "-c", code], cwd=REPO,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, (
+        "importing the resume rule reached torch:\n" + r.stdout + r.stderr
+    )
+
+
+def test_the_training_package_still_exposes_its_documented_names():
+    """Laziness must not break `from quest.training import EarlyStopping`.
+
+    Those re-exports are documented in CLAUDE.md, so making the package light has to
+    preserve them rather than delete them.
+    """
+    pytest.importorskip("torch", reason="the eager re-exports legitimately need torch")
+    import importlib
+
+    mod = importlib.import_module("quest.training")
+    for name in ("EarlyStopping", "StreamingMetricsTracker", "DataCollatorForMLMDynamic",
+                 "LengthBucketSampler", "BaseTCRTrainer", "get_backend"):
+        assert hasattr(mod, name), f"quest.training no longer exposes {name}"
+    assert name in dir(mod), "dir() must still list the re-exports"
+
+
+def test_the_lazy_export_table_and_all_agree():
+    """A literal __all__ drifts from the lazy table unless something checks."""
+    import importlib
+
+    mod = importlib.import_module("quest.training")
+    assert sorted(mod.__all__) == sorted(mod._EXPORTS), (
+        "quest.training.__all__ and _EXPORTS disagree: "
+        f"{sorted(set(mod.__all__) ^ set(mod._EXPORTS))}"
+    )

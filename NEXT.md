@@ -50,8 +50,13 @@ the GPU-0 port collision · per-cell task selection, so both `*_trb` cells stop 
 provenance waivers are printed, never silent · a comparison cell with no trained checkpoint refuses
 instead of scoring an untrained head · **resume refuses an objective change**, versioned so
 redefining `token` cannot pass under the same word, failing closed on a checkpoint that records no
-semantics with one verified override (`--resume_assume_objective`). The rule moved to
-`quest/training/resume_compat.py`, which imports no torch, so it is testable on a laptop.
+semantics with one verified override (`--resume_assume_objective`). The rule lives in
+`quest/training/resume_compat.py` and is importable with no ML stack present — which took a second
+fix: the module was always stdlib-only, but `quest/training/__init__.py` eagerly re-exported
+collators, so importing the light module executed the package and pulled in torch anyway. Those
+re-exports are now lazy (PEP 562). **A light module under a heavy package is still heavy**, and the
+proof is a subprocess test with torch blocked rather than a passing run on an interpreter that
+happens to have it.
 
 Group cleanup of a real torchrun's worker processes is **not** proven: the tests use stubs. Check it
 on Linux during the preflight.
