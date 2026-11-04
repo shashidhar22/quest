@@ -26,8 +26,11 @@ trap 'rm -rf "$TMP"' EXIT
 STDLIB_TESTS=(
   tests/test_s42_gate.py
   tests/test_s42_readability.py
-  tests/test_token_budget_sampler.py
 )
+# NOT here, and why: tests/test_token_budget_sampler.py looks dependency-free and is not --
+# test_micro_batch_loss_scale_reproduces_fixed_batch_weighting imports cpt_training_lib, which
+# imports peft at module scope. This target caught that on its first run, which is the point.
+# Moving the sampler's weighting assertions behind a lazy import would bring 36 more tests in.
 
 echo "[smoke] cloning $BRANCH at HEAD into a fresh tree (committed content only)"
 git clone --quiet --no-hardlinks --depth 1 --branch "$BRANCH" "file://$REPO" "$TMP/quest"
