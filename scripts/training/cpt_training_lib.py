@@ -57,6 +57,14 @@ from quest.training.resume_compat import (
     RESUME_MATCH_KEYS,
     RESUME_MATCH_KEYS_LEGACY,
 )
+from quest.training.loss_normalization import (
+    exact_microbatch_scale,
+    global_target_count,
+    masked_target_count,
+    sum_from_mean,
+    summed_masked_loss,
+)
+from quest.training.loss_normalization import micro_batch_loss_scale as _micro_batch_loss_scale
 from quest.training.resume_compat import check_resume_config as _check_resume_config
 from quest.training.collators import DataCollatorForMLMDynamic
 from contextlib import nullcontext
@@ -1318,47 +1326,9 @@ _RESUME_MATCH_KEYS = RESUME_MATCH_KEYS
 _RESUME_MATCH_KEYS_LEGACY = RESUME_MATCH_KEYS_LEGACY
 
 
-def micro_batch_loss_scale(n_rows: int, rows_per_rank: int, n_acc: int, token_mode: bool,
-                           weighting: str = "row", mb_tokens: int = 0,
-                           step_tokens: int = 0) -> float:
-    """Weight of one micro-batch's mean loss within the optimizer step.
-
-    ``raw_loss`` is already a mean over the micro-batch's MASKED TOKENS, so this scale decides how
-    much each token ends up contributing to the step's gradient.
-
-    Fixed-batch path (Stage 4.1): ``1 / n_acc``, the mean of ``n_acc`` equal micro-batch means.
-    Its micro-batches hold 16 randomly chosen rows, so each one's token mix is close to the global
-    mix and per-token weight comes out near uniform.
-
-    Token-budget paths, selected by ``weighting``:
-
-    ``"row"`` — ``n_rows / rows_per_rank``, the micro-batch's ROW share of the rank's step. Weights
-      every row alike. **This is not equivalent to the fixed-batch path**, because the v2 cuts are
-      length-homogeneous: full-MHC rows land in their own small, token-rich micro-batch and their
-      tokens are divided down. Measured against the real sampler at the Stage 4.1 length mix
-      (99.5 % of rows ~17 tokens), MHC-bearing tokens receive **0.43x** the per-token gradient
-      weight they had under the fixed-batch path, while short rows keep theirs. That is the
-      mechanism behind Stage 4.3's better-overall-worse-pocket split (quest-cpt/findings.md 9.5).
-      Kept as the default only so existing runs stay reproducible.
-
-    ``"token"`` — ``mb_tokens / step_tokens`` from ``TokenBudgetStepSampler.step_token_plan()``,
-      the micro-batch's TOKEN share of the rank's step. Per-token weight is then uniform across
-      the step however the rows were partitioned, which is what the fixed-batch path approximated.
-      Use this to keep the token-budget speedup without moving the objective.
-
-    Both token-budget paths coincide with ``1 / n_acc`` when micro-batches are equal in rows and
-    tokens (``n_rows * n_acc == rows_per_rank``).
-    """
-    if not token_mode:
-        return 1.0 / n_acc
-    if weighting == "token":
-        if step_tokens <= 0:
-            raise ValueError("token-share weighting needs step_tokens > 0 "
-                             "(from TokenBudgetStepSampler.step_token_plan())")
-        return mb_tokens / float(step_tokens)
-    if weighting != "row":
-        raise ValueError(f"unknown weighting {weighting!r}; expected 'row' or 'token'")
-    return n_rows / float(rows_per_rank)
+# micro_batch_loss_scale moved to quest/training/loss_normalization.py on 2026-11-04 so its
+# contract is testable without peft or esm installed; re-exported here for existing callers.
+micro_batch_loss_scale = _micro_batch_loss_scale
 
 
 class _SkipSampler(Sampler):

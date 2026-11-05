@@ -54,15 +54,26 @@ changes objective, and every repair below except step 5.
    algorithm and seed, endpoint, and keep CPT lineage distinct from SFT and eval settings, so a
    legacy adapter is never labelled with the newly adopted objective. Allow intended treatment
    differences explicitly and reject the rest before a verdict.
-5. **The objective itself, after the decision.** The resume guard is **done**: the objective is
-   matched on resume, versioned so redefining `token` cannot pass under the same word, failing
-   closed on a checkpoint recording no semantics with one verified override. Rule in
-   `quest/training/resume_compat.py`, 13 tests, no torch needed. What waits on the decision is
-   implementing the chosen contract: if it is an exact global masked-target mean, move to summed
-   target loss with a globally reduced denominator, handle zero-target microbatches and rank
-   imbalance, fix clipping order, and verify gradient equivalence across microbatch partitions and
-   world sizes with fixed labels. Add the new semantics as a new version; never relabel historical
-   `token` runs. The existing 15 %-tolerance test is replaced, not loosened.
+5. **The objective. Decision made 2026-11-04; contract proved, loop integration pending.**
+   The approved objective is the **exact global masked-target mean**: the summed loss over every
+   supervised target in the optimizer step, divided by their count across all ranks.
+   Done: the contract lives in `quest/training/loss_normalization.py` with CPU gradient tests that
+   prove the accumulated gradient is invariant to the micro-batch partition and to the world size,
+   that an empty micro-batch contributes nothing and stays finite, and that the old input-length
+   scale fails that same invariance (a control, so the check cannot pass vacuously). The resume
+   guard is in, and the objective is named `token_exact` = `global-masked-target-mean/v2` rather
+   than a new version of `token`, so a name never describes behaviour the loop lacks. Asking for
+   it today raises, by design.
+   **What remains, and it is a loop change:** the scale is `world_size / N_global`, and `N_global`
+   must be known before the step's FIRST backward. The loop pulls one micro-batch at a time, so it
+   cannot know it yet. Landing this means: buffer the step's micro-batches, count supervised
+   targets per micro-batch, one all-reduce of the sum (`global_target_count`), then forward and
+   backward over the buffer with the summed loss (`summed_masked_loss`, or `sum_from_mean` on the
+   HuggingFace path). Clipping stays where it is, once per step after accumulation. Then switch
+   `token_exact` from raising to returning, and point new baseline launchers at it.
+   Historical `token` runs keep `input-length-share/v1` and stay reproducible under that name;
+   never relabel them.
+
 6. **Run spec and plans.** Enforce the step budget and LR schedule or stop recording a step count
    as fact; immutable run IDs or validated resume so a restart cannot overwrite a completed run;
    record that `--gradient_checkpointing` is inert (a config field at `cpt_training_lib.py:1494`
@@ -89,10 +100,25 @@ logic is lifted out of the torch import chain. `resume_compat.py` is the worked 
 model loading, trainer integration and CUDA/DDP numerics need the ML environment, and a stub run
 is never numerical validation.
 
-## Open decisions
+## Decisions, made 2026-11-04
 
-Blocking, in order: the loss-normalization contract · the comparison-cell GPU budget · how the
-locked primary endpoint relates to the declared Recall@10 utility criterion. The reviewer's
-recommendations on all three, including a cheaper judge-first option that answers the first
-missing comparison without buying six CPT baselines, are in `claude-handoff.md`. They are
-recommendations; the spending and recipe calls are Yuexin's.
+All three were approved. They constrain recipe and spend; they did not block the software work.
+
+1. **Objective:** the exact global masked-target mean, versioned, with historical input-length
+   share preserved and never relabelled. Step 5 above.
+2. **Comparison budget:** judge-first. Re-score the existing base SFT checkpoint, then train and
+   evaluate ONE paired legacy arm-D cell, and produce the correct comparison. Beta-chain cells,
+   the six CPT baselines and 100M scaling are separately priced follow-ons. Launcher:
+   `scripts/training/v04_box/judge_first.sh`; itemized specification awaiting approval to spend:
+   `~/Documents/ACS/quest-cpt/box-jobs/visits/v04a-judge-first.md`.
+3. **Endpoint:** `test_novel_pep / peptide / norm_rank` stays the primary inferential endpoint,
+   with Recall@10 and the other conditions reported as secondary and peptide-cluster sensitivity
+   required. The +0.05 Recall@10 practical-utility target remains a SEPARATE claim on its own
+   condition: a normalized-rank effect does not establish it, and the comparator says so in its
+   own output. Whether a clear effect licenses 4.4-4.7 is a spending rule to state prospectively.
+
+## Still open
+
+Not a decision, a measurement: whether the judge-first comparison is worth acting on, and the
+g6.2xlarge hourly rate, which is recorded nowhere in this repo and must come from Cost Explorer
+before launch.

@@ -24,7 +24,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts" / "training"))
 from quest.training.samplers import TokenBudgetStepSampler  # noqa: E402
-from cpt_training_lib import micro_batch_loss_scale as scale  # noqa: E402
+# Imported from the light module, not cpt_training_lib: the helper moved there on
+# 2026-11-04 so this contract is testable without peft or esm installed.
+from quest.training.loss_normalization import micro_batch_loss_scale as scale  # noqa: E402
 
 ROWS_PER_STEP = 1024
 SHORT, LONG = 17, 600          # the Stage 4.1 mix: 99.5 % of rows ~17 tokens, the rest full-MHC
@@ -92,7 +94,19 @@ def test_row_share_leaves_short_rows_alone(w):
 
 
 def test_token_share_is_token_uniform(w):
-    """--loss_weighting token makes per-token weight uniform, which is the MLM objective."""
+    """`token` makes per-INPUT-token weight uniform. That is not per-TARGET uniform.
+
+    Scope corrected 2026-11-04. This test pins the HISTORICAL `token` contract, which Stage 4.1
+    and 4.3 ran: weight each micro-batch by its share of the step's summed input length. The
+    15 % tolerance and the mask counts here (round(0.15 x length) at lengths 17 and 600, so
+    proportional to length by construction) are why it cannot see the gap the audit found: the
+    trainer's loss is a mean over REALIZED masked targets, so per-target weight is uniform only
+    where mask count tracks length.
+
+    The exact objective approved on 2026-11-04 is tested by gradient equivalence instead, in
+    tests/test_loss_normalization.py. This test is not loosened and not deleted, because
+    reproducing the historical runs requires the historical contract to stay pinned.
+    """
     acc, uniform = w
     got = acc["v2_token"][0] / acc["v2_token"][1]
     assert got == pytest.approx(uniform, rel=0.15), \
@@ -133,7 +147,16 @@ def test_token_share_requires_the_step_total():
 # Stage 4.3's V2_FINAL compared an early-stopped run (step 4000 of 7800) with one that ran its
 # full budget. plan.md already forbade early stopping in single-configuration runs; these pin the
 # switch that enforces it.
-from cpt_training_lib import CdrPplPlateauCallback  # noqa: E402
+def _plateau_callback(**kw):
+    """Imported on demand, not at module level.
+
+    CdrPplPlateauCallback lives in cpt_training_lib, which imports peft, and a module-level
+    import of it made this whole file uncollectable wherever peft is absent -- including the
+    weighting tests above, which need nothing heavier than numpy.
+    """
+    pytest.importorskip("peft", reason="CdrPplPlateauCallback lives in the trainer module")
+    from cpt_training_lib import CdrPplPlateauCallback  # noqa: E402
+    return CdrPplPlateauCallback(**kw)
 
 
 def _feed(cb, seq):
@@ -144,25 +167,25 @@ RISE_THEN_STALL = [3.0, 2.0, 1.9, 1.85, 1.86, 1.87, 1.88, 1.89]
 
 
 def test_patience_zero_never_stops():
-    cb = CdrPplPlateauCallback(n_patience=0, metric_path=("m",))
+    cb = _plateau_callback(n_patience=0, metric_path=("m",))
     assert not any(_feed(cb, RISE_THEN_STALL))
     assert all(h.get("disabled") for h in cb.history)
 
 
 def test_negative_patience_also_means_off():
-    cb = CdrPplPlateauCallback(n_patience=-1, metric_path=("m",))
+    cb = _plateau_callback(n_patience=-1, metric_path=("m",))
     assert not any(_feed(cb, RISE_THEN_STALL))
 
 
 def test_patience_three_still_stops_on_a_plateau():
     """The guard must not disable early stopping for runs that do want it."""
-    cb = CdrPplPlateauCallback(n_patience=3, min_rel_improvement=0.01, metric_path=("m",))
+    cb = _plateau_callback(n_patience=3, min_rel_improvement=0.01, metric_path=("m",))
     out = _feed(cb, RISE_THEN_STALL)
     assert any(out), "a genuine plateau must still stop"
 
 
 def test_disabled_callback_still_records_the_curve():
     """Turning the stop off must not cost the eval history that the verdict is read from."""
-    cb = CdrPplPlateauCallback(n_patience=0, metric_path=("m",))
+    cb = _plateau_callback(n_patience=0, metric_path=("m",))
     _feed(cb, [3.0, 2.0, 1.9])
     assert [h["metric"] for h in cb.history] == [3.0, 2.0, 1.9]

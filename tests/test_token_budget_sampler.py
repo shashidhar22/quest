@@ -184,7 +184,7 @@ def test_micro_batch_loss_scale_matches_fixed_batch_only_on_equal_micro_batches(
     weight does not scale with its rows under the token-budget path."""
     import os, sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "training"))
-    from cpt_training_lib import micro_batch_loss_scale as w
+    from quest.training.loss_normalization import micro_batch_loss_scale as w
     assert w(16, 256, 16, token_mode=True) == pytest.approx(w(16, 256, 16, token_mode=False)) == pytest.approx(1 / 16)
     assert w(256, 256, 1, True) == pytest.approx(1.0)
     assert w(27, 256, 2, True) + w(229, 256, 2, True) == pytest.approx(1.0)   # a step's weights sum to 1

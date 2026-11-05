@@ -44,8 +44,15 @@ LOSS_WEIGHTING_SEMANTICS = {
     "row": "row-share/v1",
     # Micro-batch weight is its share of the step's summed INPUT LENGTH, applied to a loss that
     # is already a mean over that micro-batch's realized masked targets. Per supervised target
-    # this is uniform only where mask count is proportional to length.
+    # this is uniform only where mask count is proportional to length. This is what Stage 4.1 and
+    # 4.3 ran, so the label stays v1 and the behaviour stays reachable under this name.
     "token": "input-length-share/v1",
+    # The objective approved on 2026-11-04: summed loss over every supervised target in the
+    # optimizer step, divided by their count across all ranks. A DIFFERENT name rather than a
+    # new version of `token`, so that a name never describes behaviour the loop does not have.
+    # Implemented and gradient-tested in quest/training/loss_normalization.py; the training loop
+    # must buffer a step before it can be selected, so micro_batch_loss_scale refuses it for now.
+    "token_exact": "global-masked-target-mean/v2",
 }
 UNVERSIONED = "UNVERSIONED"
 
