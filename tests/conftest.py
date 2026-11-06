@@ -130,8 +130,13 @@ class _Box:
         # provenance.py reads artifact digests and lineage through track_a.shared.artifacts, and
         # the eval stand-in writes them, so the sandbox carries that stdlib-only module.
         (root / "track_a" / "shared").mkdir(parents=True)
+        (root / "track_a" / "esm_sft").mkdir(parents=True)
         for rel in ("track_a/__init__.py", "track_a/shared/__init__.py",
-                    "track_a/shared/artifacts.py"):
+                    "track_a/shared/artifacts.py", "track_a/esm_sft/__init__.py",
+                    # scoring.py holds SFT_OBJECTIVE, sft_recipe and cotenants: the eval
+                    # stand-in records provenance through the same code the real evaluator uses,
+                    # so the stub cannot drift into being more complete than the real thing.
+                    "track_a/esm_sft/scoring.py"):
             shutil.copy2(REPO / rel, root / rel)
         (root / "tests").mkdir(parents=True, exist_ok=True)
         shutil.copytree(REPO / "tests" / "fixtures", root / "tests" / "fixtures")
