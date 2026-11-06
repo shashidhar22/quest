@@ -1,4 +1,4 @@
-# NEXT — quest (updated 2026-11-06) · history: `docs/LOG.md` · stages: `plans/README.md` · knowledge: `~/Documents/ACS/quest-cpt/`
+# NEXT — quest (updated 2026-11-06, round two) · history: `docs/LOG.md` · stages: `plans/README.md` · knowledge: `~/Documents/ACS/quest-cpt/`
 
 **V04 as specified is cancelled; the next run is JUDGE-FIRST and awaits approval to spend.**
 Decisions 1-3 were approved 2026-11-04. A second external audit on 2026-11-06 found five
@@ -19,17 +19,24 @@ non-estimated: USD 32.050349 / 29.981945 h). So ≈4.9 h ≈ **USD 5.24**, a gat
    Yuexin runs it.
 2. **Approve or amend the judge-first spend**, then launch it with ONE command:
    ```sh
-   PUBLISH_CMD="aws s3 sync /home/ubuntu/jf_out s3://fh-pi-warren-h-eco/quest/tcrbench2/jf_out/" \
+   PUBLISH_DEST=s3://fh-pi-warren-h-eco/quest/tcrbench2/jf_out \
      bash scripts/training/v04_box/launch_judge_first.sh
    ```
-   It starts the run, arms `autostop_when_done.sh` on the pid the run recorded, verifies from the
-   watchdog's own log that it armed on that pid, and only then releases the run past preflight.
-   If arming cannot be verified it terminates the run, so nothing is spent unwatched. Spec:
+   Each launch gets its own directory, `/home/ubuntu/jf_out/runs/<run_id>/` (`jf_out/latest`
+   points at it), and publishes only that directory, to `$PUBLISH_DEST/<run_id>/`. The wrapper
+   takes a lock on the output root, starts the run under a waitable supervisor, reads the pid
+   from an identity file carrying a token it generated, arms the watchdog on that pid, verifies
+   arming from the watchdog's own log, and only then releases the run. On any failure before
+   release it terminates and reaps the driver it started and signals nothing else. Its exit
+   status is the run's. Outcomes: `runs/<id>/status.json` (complete / refused / failed) and
+   `launch_status.json`. Spec:
    `~/Documents/ACS/quest-cpt/box-jobs/visits/v04a-judge-first.md`. Pre-launch, in order:
    `aws sso login --profile DataUserAccess-953915750371`; a read-only hashed copy of
    `/home/ubuntu/v2_full.sh` and any surviving uncommitted `track_a/` off the volume, the only
    record of what computed the two failed V03 verdicts; then the command above.
-3. **Verify on the box what the laptop cannot:** that terminating the launcher kills a *real*
+3. **Verify on the box what the laptop cannot:** that `setsid --wait` exists there and the
+   wrapper's exit status equals the run's (the laptop has no setsid; only a source-equivalent
+   shim has exercised that path); that terminating the launcher kills a *real*
    torchrun's descendant workers, not only a stub; that the real base checkpoint loads and the
    probe passes on it (`judge probe --ckpt`); GPU memory and throughput; and what commit is
    actually deployed — the preflight records it, but only a run on the box can say which.
@@ -39,7 +46,19 @@ non-estimated: USD 32.050349 / 29.981945 h). So ≈4.9 h ≈ **USD 5.24**, a gat
    raises — now on every path, including the fixed-batch one that used to return 1/n_acc without
    looking at the name.
 
-**Done 2026-11-06.** The second audit's five findings, each reproduced before being read:
+**Done 2026-11-06, round two.** A second review of my repair found five more defects, four in
+code I had written that day; all reproduced before I read my own code, all repaired
+(`~/Documents/ACS/quest-cpt/audits/2026-11-06/round-two/`: `review.md`, `triage.md`,
+`repair-verification.txt`). The launch wrapper armed the watchdog on a stale pid file and could
+SIGTERM an unrelated process; under `set -m`, util-linux `setsid` forks and returns 0 at once,
+so on the box the wrapper's status was not the job's; the comparator used a weaker provenance
+rule than the launcher and accepted evals with no model hashes; the SFT seed was a structural
+null and max_len was compared nowhere; a refused rerun could sit beside an old comparison.
+Fixed by run identity (fresh directory, token, lock, waitable supervisor, status manifests),
+one validator for both entry points, and an SFT recipe read from the checkpoint's own args.
+414 → 443 passing, failure set still byte-identical to `59cafcd`.
+
+**Done 2026-11-06, round one.** The first audit's five findings, each reproduced before being read:
 
 - **A cached result could be certified under invented provenance.** The launcher wrote the cell
   manifest *before* testing whether to reuse an existing evaluation, and `provenance.check`

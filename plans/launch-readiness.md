@@ -96,9 +96,25 @@ steps and stay in the visit record.
   equal; it applies the provenance rule itself; the result carries both arms' provenance and
   the treatment differences.
 
+## Round two, 2026-11-06
+
+A review of the repair above found five more defects
+(`~/Documents/ACS/quest-cpt/audits/2026-11-06/round-two/`). Done:
+
+6. **Run identity.** Fresh `runs/<run_id>/` per launch, a token the driver echoes into
+   `run.identity`, a lock per output root, a waitable supervisor (`setsid --wait` or none), reaping
+   only the driver this launch started, `launch_status.json` and `status.json` on every path.
+7. **One provenance validator.** The comparator derives manifests from each eval and runs the
+   launcher's own validation, plus a split digest for every condition it reads.
+8. **SFT recipe from the checkpoint.** Seed, trained max_len and recipe from the checkpoint's own
+   args; `unrecorded` refused; `eval_max_len` compared; train/val digests hashed into new
+   checkpoints; sft_seed no longer waived for cells.
+9. **Two tests of mine that could not fail**, and a preflight that crashed on a raising finder.
+
 ## Still open, and it needs the box
 
-1. Linux process-group cleanup against a real torchrun, not a stub.
+1. Linux process-group cleanup against a real torchrun, not a stub; and `setsid --wait` on the
+   box, with the wrapper's exit status equal to the run's.
 2. That a real checkpoint loads and the probe passes on it.
 3. GPU memory, throughput, and the deployed revision (the preflight records the commit; only a
    run on the box can say what that commit is there).
