@@ -247,3 +247,71 @@ def test_a_checkpoint_that_recorded_nothing_is_not_treated_as_agreeing():
     assert all("records nothing" in b for b in bad)
     bad = f(None, {"task": "as_paired_i"})
     assert len(bad) == 5, "a checkpoint with no args block at all is not compatible by default"
+
+
+# ----------------------------------------------------------------- round two, finding 4
+def test_the_sft_recipe_comes_from_the_checkpoints_own_args():
+    from track_a.esm_sft.scoring import UNRECORDED, sft_recipe
+
+    full = {"lr": 1e-4, "batch_size": 16, "epochs": 2, "patience": 1,
+            "max_train_pos": 50_000, "max_val_pos": 5_000, "num_workers": 4, "seed": 42}
+    got = sft_recipe(full)
+    assert got != UNRECORDED
+    assert "lr=0.0001" in got and "batch_size=16" in got and "max_train_pos=50000" in got
+    assert sft_recipe(dict(full)) == got, "the recipe string must be deterministic"
+    assert sft_recipe(dict(full, lr=1e-3)) != got
+
+
+def test_a_partially_recorded_recipe_is_unrecorded_not_partial():
+    """A half-known recipe cannot be shown equal to another, and provenance refuses the
+    sentinel -- so reporting the known half would be worse than reporting nothing."""
+    from track_a.esm_sft.scoring import UNRECORDED, sft_recipe
+
+    full = {"lr": 1e-4, "batch_size": 16, "epochs": 2, "patience": 1,
+            "max_train_pos": 50_000, "max_val_pos": 5_000, "num_workers": 4}
+    for drop in full:
+        partial = {k: v for k, v in full.items() if k != drop}
+        assert sft_recipe(partial) == UNRECORDED, drop
+    assert sft_recipe(None) == UNRECORDED
+    assert sft_recipe({}) == UNRECORDED
+
+
+def test_the_evaluator_keeps_the_checkpoint_it_loaded():
+    """The defect: `load_checkpoint(...)`'s return value was discarded, and the SFT seed was
+    read from the eval's own namespace -- where --seed does not exist, so it was always None."""
+    assert "ck = load_checkpoint(model, a.ckpt, dev, want=vars(a))" in JUDGE_SRC
+    # the defect was the assignment, not the mention: the comment explaining it stays
+    code = "\n".join(l for l in JUDGE_SRC.splitlines() if not l.lstrip().startswith("#"))
+    assert 'getattr(a, "seed"' not in code
+    assert '"sft_seed": ck_args.get("seed")' in JUDGE_SRC
+    assert '"sft_recipe": sft_recipe(ck_args)' in JUDGE_SRC
+
+
+def test_the_eval_parser_still_has_no_seed_of_its_own():
+    """Which is why reading one off it was always going to be null. If a --seed is ever added to
+    eval, this test fails and whoever adds it has to decide what it means for lineage."""
+    block = JUDGE_SRC[JUDGE_SRC.index('e = sp.choices["eval"]'):
+                      JUDGE_SRC.index('c = sp.add_parser("compare")')]
+    assert "--seed" not in block
+
+
+def test_training_hashes_the_data_it_trained_on():
+    assert 'A.split_digests(a.task, ("train", "val"))' in JUDGE_SRC
+    assert '"data_digests"' in JUDGE_SRC
+
+
+def test_the_cotenancy_record_is_read_not_declared():
+    from track_a.esm_sft.scoring import cotenants
+    import os
+
+    old = os.environ.get("CUDA_VISIBLE_DEVICES")
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+        assert cotenants() == "cuda_visible_devices=3"
+        del os.environ["CUDA_VISIBLE_DEVICES"]
+        assert cotenants() == "cuda_visible_devices=unset"
+    finally:
+        if old is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = old
+        else:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)

@@ -63,7 +63,10 @@ UTILITY_DELTA = 0.05
 UTILITY_METRIC = "recall_at_10"
 UTILITY_CONDITION = "test_level4"
 # Metadata that must agree for two evals to be comparable at all.
-META_KEYS = ("pool_size", "distractor_draw", "task", "tcr_variant", "mhc_variant")
+# `max_len` is here because of round two of the 2026-11-06 review: two evaluations serializing
+# to 1024 and 128 tokens passed every check, and they are not scoring the same inputs. Each
+# checkpoint can match its own evaluation while the two arms remain incomparable.
+META_KEYS = ("pool_size", "distractor_draw", "task", "tcr_variant", "mhc_variant", "max_len")
 
 
 class ComparisonError(Exception):
@@ -99,7 +102,7 @@ def meta_of(doc):
     """The comparison-relevant metadata, from wherever the evaluator recorded it."""
     args = doc.get("args") or {}
     out = {"pool_size": doc.get("pool_size")}
-    for k in ("distractor_draw", "task", "tcr_variant", "mhc_variant"):
+    for k in ("distractor_draw", "task", "tcr_variant", "mhc_variant", "max_len"):
         out[k] = args.get(k)
     return out
 
@@ -241,7 +244,11 @@ def compare(a_path, b_path, units_path, primary=PRIMARY, n_boot=N_BOOT, seed=SEE
     # The comparator applies the provenance rule ITSELF rather than trusting a launcher to have
     # done it: `judge compare` can be run by hand on any two files, and the 2026-11-06 audit
     # found exactly that gap. Same function the launcher calls, so there is one rule.
-    prov_bad, prov_tolerated = PROV.check_eval_provenance(a, b)
+    # The conditions this comparison will actually read, so provenance can require a split
+    # digest for each of them rather than for whichever ones happened to be recorded.
+    read_conditions = sorted({primary[0]} | (set(a.get("conditions") or {})
+                                             & set(b.get("conditions") or {})))
+    prov_bad, prov_tolerated = PROV.check_eval_provenance(a, b, conditions=read_conditions)
     bad = check_metadata(a, b) + prov_bad
     if bad:
         print("[cmp] REFUSED: these evaluations are not comparable")

@@ -34,6 +34,8 @@ def sft(**over):
         "pool_size": 100, "pool_digest": "aaaaaaaaaaaaaaaa",
         "split_digests": {"test_novel_pep": "bbbbbbbbbbbbbbbb"},
         "sft_ckpt_digest": "cccccccccccccccc", "sft_seed": 42, "sft_objective": "bce_pairs/v1",
+        "sft_max_len": 1024, "sft_recipe": "lr=0.0001;bs=16;epochs=2;train_cap=50000",
+        "eval_max_len": 1024,
         "cpt_adapter": "none", "cpt_adapter_digest": "none", "cpt_objective": "none",
         "cpt_run_id": "none", "cpt_steps": None, "cpt_seed": None, "cpt_token_budget": None,
         "device": "cuda", "code_commit": "abcdef123456", "cotenants": "none",
@@ -43,10 +45,13 @@ def sft(**over):
 
 
 def armd(**over):
-    return sft(cpt_adapter="checkpoints/cpt_stage41_pointD_run05/final",
-               cpt_adapter_digest="3afeaf40bc860fef", cpt_objective="fixed-batch-mean/v0",
-               cpt_run_id="cpt_stage41_pointD_run05", cpt_steps=7800, cpt_seed=42,
-               cpt_token_budget=0, sft_ckpt_digest="dddddddddddddddd", **over)
+    """Arm D: the SAME SFT recipe and seed, a different CPT init. That is the treatment."""
+    base = dict(cpt_adapter="checkpoints/cpt_stage41_pointD_run05/final",
+                cpt_adapter_digest="3afeaf40bc860fef", cpt_objective="fixed-batch-mean/v0",
+                cpt_run_id="cpt_stage41_pointD_run05", cpt_steps=7800, cpt_seed=42,
+                cpt_token_budget=0, sft_ckpt_digest="dddddddddddddddd")
+    base.update(over)          # `over` wins, so a test can damage one field on purpose
+    return sft(**base)
 
 
 # ------------------------------------------------------------------ absence is not agreement
@@ -155,7 +160,7 @@ def test_write_from_eval_takes_the_artifact_fields_from_the_eval_itself(tmp_path
     ev = tmp_path / "eval.json"
     ev.write_text(json.dumps({
         "args": {"task": "as_paired_i", "distractor_draw": "length_matched",
-                 "adapter": "none", "seed": 42},
+                 "adapter": "none", "seed": 42, "max_len": 1024},
         "pool_size": 100,
         "conditions": {"test_novel_pep": {"ranks": {"r1": 1}}},
         "provenance": {
@@ -165,11 +170,14 @@ def test_write_from_eval_takes_the_artifact_fields_from_the_eval_itself(tmp_path
             "code_commit": "abcdef123456", "cpt_adapter": "none",
             "cpt_adapter_digest": "none", "cpt_objective": "none", "cpt_run_id": "none",
             "cpt_steps": None, "cpt_seed": None, "cpt_token_budget": None,
+            "sft_objective": "bce_pairs/v1", "cotenants": "none", "sft_seed": 42,
+            "sft_max_len": 1024, "sft_recipe": "lr=0.0001;bs=16;epochs=2",
         }}))
     out = tmp_path / "manifest.json"
+    # No --sft-objective or --cotenants on the command line any more: a field the launcher
+    # declares is a field the launcher can get wrong, so both come from the evaluation.
     r = subprocess.run([sys.executable, str(PROV), "write", "--out", str(out),
-                        "--from-eval", str(ev), "--cotenants", "none",
-                        "--sft-objective", "bce_pairs/v1"],
+                        "--from-eval", str(ev)],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     m = json.loads(out.read_text())
@@ -236,3 +244,83 @@ def test_the_pool_fingerprint_follows_the_loader(monkeypatch, tmp_path):
                        env={**dict(__import__("os").environ), "QUEST_SPLITS_DIR": str(tmp_path)})
     assert r.returncode == 0, r.stdout + r.stderr
     assert r.stdout.strip() != "MISSING"
+
+
+# ------------------------------------------------------------------ round two, finding 3
+def test_an_empty_split_digest_map_is_refused():
+    """`{}` is not None, not "", and contains no "MISSING", so it passed every earlier guard.
+
+    An evaluation that recorded no split hashes cannot be shown to have read the same data as
+    the arm it is compared with, which is the whole purpose of the field.
+    """
+    bad, _ = P.check(sft(split_digests={}), armd(split_digests={}), "cells")
+    assert any("split_digests" in x for x in bad), bad
+    bad, _ = P.check(sft(split_digests={"test_novel_pep": "MISSING"}),
+                     armd(split_digests={"test_novel_pep": "MISSING"}), "cells")
+    assert any("split_digests" in x for x in bad), bad
+
+
+def test_a_label_difference_alone_is_not_two_models():
+    """The review's probe: two evals with no model hashes and different run LABELS were taken
+    as evidence of different models. Identity is a hash, not a name."""
+    a = sft(cpt_run_id="one", cpt_adapter_digest="none", sft_ckpt_digest="same")
+    b = sft(cpt_run_id="two", cpt_adapter_digest="none", sft_ckpt_digest="same")
+    bad, _ = P.check(a, b, "cells")
+    assert any("same" in x.lower() for x in bad), bad
+
+
+def test_model_identities_are_required_not_merely_compared():
+    for over in ({"sft_ckpt_digest": None}, {"cpt_adapter_digest": None},
+                 {"sft_ckpt_digest": "MISSING"}):
+        bad, _ = P.check(sft(**over), armd(), "cells")
+        assert bad, over
+
+
+def test_from_eval_takes_the_sft_objective_and_cotenants_from_the_eval(tmp_path):
+    """Not from the launcher's command line. A field the launcher declares is a field the
+    launcher can get wrong, which is the whole of finding 1 of the first round."""
+    ev = tmp_path / "eval.json"
+    ev.write_text(json.dumps({
+        "args": {"task": "as_paired_i", "distractor_draw": "length_matched", "max_len": 1024},
+        "pool_size": 100, "conditions": {},
+        "provenance": {
+            "pool_digest": "1" * 16, "split_digests": {"test_novel_pep": "2" * 16},
+            "ckpt_digest": "3" * 16, "device": "cuda", "code_commit": "abcdef123456",
+            "sft_objective": "bce-pair-logits/v1", "cotenants": "cuda_visible_devices=0",
+            "sft_seed": 42, "sft_max_len": 1024, "sft_recipe": "lr=0.0001;bs=16;epochs=2",
+            "cpt_adapter": "none", "cpt_adapter_digest": "none", "cpt_objective": "none",
+            "cpt_run_id": "none", "cpt_steps": None, "cpt_seed": None,
+            "cpt_token_budget": None}}))
+    kv = P.from_eval(ev)
+    assert kv["sft_objective"] == "bce-pair-logits/v1"
+    assert kv["cotenants"] == "cuda_visible_devices=0"
+    assert kv["sft_seed"] == 42
+    m = P.write(tmp_path / "m.json", **kv)
+    assert P.check(m, dict(m), "strict") == ([], [])
+
+
+def test_from_eval_refuses_an_eval_that_records_no_sft_objective(tmp_path):
+    ev = tmp_path / "eval.json"
+    ev.write_text(json.dumps({
+        "args": {"task": "as_paired_i", "distractor_draw": "length_matched", "max_len": 1024},
+        "pool_size": 100, "conditions": {},
+        "provenance": {"pool_digest": "1" * 16, "split_digests": {"c": "2" * 16},
+                       "ckpt_digest": "3" * 16, "device": "cuda", "code_commit": "c" * 12}}))
+    with pytest.raises(ValueError, match="sft_objective|cotenants"):
+        P.write(tmp_path / "m.json", **P.from_eval(ev))
+
+
+def test_an_unrecorded_sft_recipe_does_not_match_another_unrecorded_one():
+    """The absence trap one level in: `None` is caught by required-presence, but the STRING
+    "unrecorded" is a value, so two arms that both failed to record their recipe would agree.
+
+    The CPT objective is different and deliberately so: "unrecorded" there is an honest
+    statement about a legacy adapter's own files, and it does not stop a comparison. The SFT
+    recipe is the thing a paired comparison needs held equal, so not knowing it is fatal.
+    """
+    for field in ("sft_recipe", "sft_max_len", "sft_seed"):
+        bad, _ = P.check(sft(**{field: "unrecorded"}), armd(**{field: "unrecorded"}), "cells")
+        assert any(field in x for x in bad), f"{field}: two unrecorded values matched"
+    # the control: an adapter that records nothing about its CPT history is still comparable
+    bad, _ = P.check(sft(), armd(cpt_objective="unrecorded"), "cells")
+    assert bad == [], bad

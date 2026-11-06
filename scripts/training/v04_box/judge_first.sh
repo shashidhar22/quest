@@ -49,10 +49,10 @@ ALLOW_CPU=${ALLOW_CPU:-}
 S42=$Q/scripts/training/stage42_box/s42_check.py
 CMP=$Q/scripts/training/stage42_box/paired_compare.py
 POOL=${POOL_FILE:-$Q/benchmark_v2/splits/as_class_i_candidate_pool.tsv}
-# What the JUDGE optimises. It is not a CPT objective, and the two must never share a field:
-# both manifests used to say `objective=legacy_row_share_cpt`, which the base arm never had and
-# arm D never trained under either (its trainer_state.json records the fixed-batch path).
-SFT_OBJECTIVE=${SFT_OBJECTIVE:-bce-pair-logits/v1}
+# What the JUDGE optimises is recorded by the EVALUATOR (track_a/esm_sft/scoring.SFT_OBJECTIVE),
+# not declared here. It is not a CPT objective, and the two must never share a field: both
+# manifests used to say `objective=legacy_row_share_cpt`, which the base arm never had and arm D
+# never trained under either (its trainer_state.json records the fixed-batch path).
 CONDITIONS=${CONDITIONS:-"test_level4 test_novel_pep test_iid"}
 ADAPTER_D=${ADAPTER_D:-$Q/checkpoints/cpt_stage41_pointD_run05/final}
 BASE_SRC=${BASE_CKPT:-/home/ubuntu/s42_out/base_paired/best.pt}
@@ -66,6 +66,11 @@ export PYTHONPATH=$Q PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TOKENIZERS
 mkdir -p $O; cd $Q
 say(){ echo "[$(date -u '+%F %T')] $*" | tee -a $O/run.log; }
 echo $$ > $O/judge_first.pid     # the watchdog waits on THIS pid, never a name pattern
+# Positive identity for the launch wrapper: it must be able to tell this run's pid from one left
+# in a file by an earlier visit. Round two of the 2026-11-06 review: the wrapper read whatever
+# pid file it found and armed the watchdog on a stale pid. RUN_TOKEN is generated per invocation
+# by launch_judge_first.sh; a direct run leaves no identity file and the wrapper refuses.
+[ -n "${RUN_TOKEN:-}" ] && echo "$RUN_TOKEN $$" > $O/run.identity
 START=$(date +%s)
 # In SECONDS, via awk, so a fractional MAX_HOURS works and the deadline is testable in one run.
 # Integer shell arithmetic on hours could only ever express a ceiling no test could reach.
@@ -75,6 +80,27 @@ START=$(date +%s)
 awk "BEGIN{exit !($MAX_HOURS >= 0 && $MAX_HOURS < 240)}" 2>/dev/null || {
   echo "ABORT: MAX_HOURS=$MAX_HOURS is not a usable ceiling (want 0 <= hours < 240)" >&2; exit 2; }
 MAX_S=$(awk "BEGIN{printf \"%d\", $MAX_HOURS*3600}")
+
+# The run's own outcome, written at every exit path. A reader -- or a publish command -- must be
+# able to tell a complete run from a refused one from a failed one WITHOUT inferring it from
+# which files exist, which is how a previous comparison.json came to sit beside a later refused
+# run as if it belonged to it (finding 5, round two).
+# Whether THIS run produced a comparison. A flag, not a file test: `[ -f $O/comparison.json ]`
+# found a comparison left by an earlier visit, so a refused run's own status pointed at a result
+# it had not produced -- the round-two finding surviving inside its own repair.
+COMPARISON_PRODUCED=0
+write_status(){
+  local outcome=$1 detail=${2:-}
+  printf '{\n  "run_id": "%s",\n  "outcome": "%s",\n  "detail": "%s",\n' \
+    "${RUN_TOKEN:-unnamed}" "$outcome" "$(echo "$detail" | tr -d '"' | tr '\n' ' ')" \
+    > $O/status.json
+  printf '  "draw": "%s",\n  "adapter": "%s",\n  "comparison": %s,\n' \
+    "$DRAW" "$ADAPTER_D" \
+    "$([ "$COMPARISON_PRODUCED" = 1 ] && echo "\"$O/comparison.json\"" || echo null)" \
+    >> $O/status.json
+  printf '  "elapsed_min": %s,\n  "finished_utc": "%s"\n}\n' \
+    "$(( $(used_s) / 60 ))" "$(date -u '+%F %T')" >> $O/status.json
+}
 
 JOBS=""
 FAILED=0
@@ -97,11 +123,12 @@ cleanup(){
   say "cleanup: children gone after ${waited}s"
   JOBS=""
 }
-trap 'say "signal received: cleaning up before exit"; cleanup; say "JUDGE-FIRST TERMINATED"; exit 130' INT TERM
+trap 'say "signal received: cleaning up before exit"; cleanup; write_status terminated "signal received"; say "JUDGE-FIRST TERMINATED"; exit 130' INT TERM
 die(){
   say "ABORT: $*"
   FAILED=1
   cleanup
+  write_status failed "$*"
   say "JUDGE-FIRST FAILED"
   exit 1
 }
@@ -154,8 +181,7 @@ run_gpu(){
 
 # write_manifest <cell dir> <adapter> <label> -- derived from the cell's own evaluation.
 write_manifest(){
-  $PY $PROV write --out "$1/manifest.json" --from-eval "$1/eval.json" \
-    --sft-objective "$SFT_OBJECTIVE" --cotenants none 2>&1 | tee -a $O/run.log
+  $PY $PROV write --out "$1/manifest.json" --from-eval "$1/eval.json" 2>&1 | tee -a $O/run.log
   [ "${PIPESTATUS[0]}" -eq 0 ] || die "$3: its evaluation cannot be certified, so no manifest
   was written. A result whose inputs cannot be established is not a result."
 }
@@ -176,8 +202,7 @@ reuse_or_die(){
   [ "${PIPESTATUS[0]}" -eq 0 ] || die "$lbl: the artifacts behind the existing evaluation have
   changed, so reusing it would compare numbers produced from different inputs."
   $PY $PROV write --out "$cell/.manifest.derived.json" --from-eval "$cell/eval.json" \
-    --sft-objective "$SFT_OBJECTIVE" --cotenants none >/dev/null \
-    || die "$lbl: the existing evaluation cannot be certified."
+    >/dev/null || die "$lbl: the existing evaluation cannot be certified."
   $PY $PROV check --a "$cell/manifest.json" --b "$cell/.manifest.derived.json" --kind strict \
     2>&1 | tee -a $O/run.log
   [ "${PIPESTATUS[0]}" -eq 0 ] || die "$lbl: the stored manifest does not describe the
@@ -185,6 +210,11 @@ reuse_or_die(){
   say "P3: reuse validated — checkpoint present, provenance unaltered, inputs unchanged"
 }
 
+if [ -f $O/comparison.json ]; then
+  say "NOTE: $O/comparison.json already exists and was NOT produced by this run. Nothing here"
+  say "  will overwrite or delete it, and this run's status.json will not point at it. Launch"
+  say "  through launch_judge_first.sh to get a directory of this run's own."
+fi
 say "JUDGE-FIRST start pid=$$ draw=$DRAW rho_floor=$RHO_FLOOR max_hours=$MAX_HOURS adapter=$ADAPTER_D"
 
 # ---------- P0: preflight ----------
@@ -202,7 +232,8 @@ for p in "$UNITS" "$PROV" "$S42" "$CMP" "$PRE"; do
 done
 [ -f "$O/base_paired/best.pt" ] || [ -f "$BASE_SRC" ] || {
   say "  preflight: no base SFT checkpoint to re-score (looked for $BASE_SRC)"; bad=1; }
-[ "$bad" -eq 0 ] || { say "ABORT: preflight failed; nothing was started"; exit 2; }
+[ "$bad" -eq 0 ] || { say "ABORT: preflight failed; nothing was started"
+  write_status preflight_failed "missing paths or checkpoints"; exit 2; }
 
 # The real preflight: imports, CUDA, the pool, EVERY split file including train and val, the
 # adapter's contents and the base checkpoint's loadability. Until 2026-11-06 this phase tested
@@ -216,7 +247,8 @@ $PY $PRE --task as_paired_i --conditions train val $CONDITIONS \
   --adapter "$ADAPTER_D" --ckpt "$([ -f $O/base_paired/best.pt ] && echo $O/base_paired/best.pt || echo $BASE_SRC)" \
   --require "$PREFLIGHT_REQUIRE" $CUDA_FLAG --out $O/preflight.json 2>&1 | tail -40 | tee -a $O/run.log
 [ "${PIPESTATUS[0]}" -eq 0 ] || { say "ABORT: the environment preflight failed; nothing was
-  started. Its report is in $O/preflight.json."; exit 2; }
+  started. Its report is in $O/preflight.json."
+  write_status preflight_failed "environment preflight"; exit 2; }
 say "P0 environment preflight ok; report in $O/preflight.json"
 # The watchdog handshake. REQUIRE_WATCHDOG=1 (set by launch_judge_first.sh) holds the run here
 # until that script has verified, from the watchdog's own log, that it armed on THIS pid. The
@@ -228,7 +260,8 @@ if [ "${REQUIRE_WATCHDOG:-0}" = 1 ]; then
   waited=0
   while [ ! -f "$ARMED" ] && [ "$waited" -lt "${ARM_WAIT:-120}" ]; do sleep 1; waited=$((waited+1)); done
   [ -f "$ARMED" ] || { say "ABORT: no watchdog handshake at $ARMED after ${waited}s; refusing to
-  start GPU work unwatched. Launch through scripts/training/v04_box/launch_judge_first.sh."; exit 2; }
+  start GPU work unwatched. Launch through scripts/training/v04_box/launch_judge_first.sh."
+  write_status no_watchdog "handshake absent"; exit 2; }
   say "P0 watchdog handshake present after ${waited}s: $ARMED"
 fi
 say "P0 ok  pool_id=$POOL_ID"
@@ -284,7 +317,9 @@ if [ "$G1" -ne 0 ]; then
   say "  the $DRAW draw, so no base-versus-CPT number from this task would be interpretable."
   say "  The arm-D cell is NOT being trained. This is the pre-agreed refusal, and it is the"
   say "  cheap half of the run declining to buy the expensive half."
+  write_status refused "the locked primary read cannot resolve the pre-registered effect"
   say "JUDGE-FIRST complete: refused before the paid step. Base re-score is in $BASE/eval.json."
+  say "  This run produced NO comparison, by design. Its status is in $O/status.json."
   exit 0
 fi
 
@@ -326,7 +361,9 @@ CMP_RC=${PIPESTATUS[0]}
 say "C1 exit=$CMP_RC"
 [ "$CMP_RC" -eq 0 ] && [ -f $O/comparison.json ] \
   || die "the comparison could not be produced; this run has no usable result"
+COMPARISON_PRODUCED=1
 
+write_status complete "paired comparison on the locked primary read"
 say "JUDGE-FIRST complete in $(( ($(date +%s) - START) / 60 )) min. Result: $O/comparison.json"
 say "  Scope: this compares the base SFT checkpoint against the LEGACY Stage-4.1 arm-D adapter."
 say "  It says nothing about the newly adopted CPT objective, which has no judge-scored arm yet."

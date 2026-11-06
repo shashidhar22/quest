@@ -43,17 +43,21 @@ def prov(ckpt="cccccccccccccccc", adapter="none", pool_digest="aaaaaaaaaaaaaaaa"
     d = {"pool_digest": pool_digest, "pool_path": "/x/pool.tsv",
          "split_digests": {"test_novel_pep": "bbbbbbbbbbbbbbbb"},
          "ckpt_digest": ckpt, "ckpt_path": f"/x/{ckpt}.pt", "device": "cuda",
-         "code_commit": "abcdef123456", "pool_size": POOL, **lineage}
+         "code_commit": "abcdef123456", "pool_size": POOL,
+         "sft_objective": "bce-pair-logits/v1", "cotenants": "cuda_visible_devices=0",
+         "sft_seed": 42, "sft_max_len": 1024,
+         "sft_recipe": "lr=0.0001;bs=16;epochs=2;train_cap=50000;val_cap=5000", **lineage}
     d.update(over)
     return d
 
 
 def ev(conditions, pool=POOL, draw="length_matched", task="as_paired_i",
-       tcr_variant="cdr3", mhc_variant="full", provenance=None, omit_provenance=False):
+       tcr_variant="cdr3", mhc_variant="full", provenance=None, omit_provenance=False,
+       max_len=1024):
     """An eval document in the judge's shape."""
     d = {
         "pool_size": pool,
-        "args": {"distractor_draw": draw, "task": task,
+        "args": {"distractor_draw": draw, "task": task, "max_len": max_len,
                  "tcr_variant": tcr_variant, "mhc_variant": mhc_variant},
         "conditions": {c: {"ranks": r} for c, r in conditions.items()},
     }
@@ -350,6 +354,83 @@ def test_a_real_pair_reports_the_treatment_difference(tmp_path, capsys):
     assert "cpt_objective" in out and "fixed-batch-mean/v0" in out, (
         "the one difference the comparison is about must travel with the result")
     assert res["provenance"]["arm_b"]["cpt_run_id"] == "cpt_stage41_pointD_run05"
+
+
+# ----------------------------------------------------------------- round two, finding 3
+def _pair(tmp_path, a_doc, b_doc, u):
+    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
+    pa.write_text(json.dumps(a_doc))
+    pb.write_text(json.dumps(b_doc))
+    return pa, pb, write_units(tmp_path, "test_novel_pep", u)
+
+
+def test_the_comparator_applies_the_same_validator_as_the_launcher(tmp_path):
+    """The review's third finding. `check_eval_provenance` required five fields and treated ANY
+    difference among the treatment fields -- including a run LABEL -- as evidence of two models,
+    so two evals with no checkpoint or adapter hashes and empty split hashes were compared and a
+    result was written. The launcher's manifest validator would have refused all three. One rule
+    for both entry points, or the weaker one is the real contract.
+    """
+    a, b, u = many_peptides_all_improving(n_pep=12)
+    weak = {"pool_digest": "pool", "split_digests": {}, "device": "cuda",
+            "code_commit": "commit", "pool_size": POOL, "cpt_run_id": "one"}
+    pa, pb, up = _pair(tmp_path,
+                       ev({"test_novel_pep": a}, provenance=dict(weak)),
+                       ev({"test_novel_pep": b}, provenance=dict(weak, cpt_run_id="two")), u)
+    rc, res = PC.compare(str(pa), str(pb), str(up), n_boot=20)
+    assert rc == PC.EXIT_ERROR, "the weak provenance path is still reachable"
+    assert res is None
+
+
+def test_the_comparator_requires_a_digest_for_every_condition_it_compares(tmp_path):
+    """A split hash that covers a condition nobody compared proves nothing about the one that
+    was compared."""
+    a, b, u = many_peptides_all_improving(n_pep=12)
+    other = {"test_iid": "cccccccccccccccc"}            # not the compared condition
+    pa, pb, up = _pair(tmp_path,
+                       ev({"test_novel_pep": a}, provenance=prov(split_digests=other)),
+                       ev({"test_novel_pep": b},
+                          provenance=prov(ckpt="dddddddddddddddd", split_digests=other)), u)
+    rc, res = PC.compare(str(pa), str(pb), str(up), n_boot=20)
+    assert rc == PC.EXIT_ERROR
+    assert res is None
+
+
+def test_a_different_eval_time_max_len_is_refused(tmp_path):
+    """Finding 4's probe: max_len 1024 against 128 passed both checks. Two arms serialized to
+    different lengths are not scoring the same inputs."""
+    a, b, u = many_peptides_all_improving(n_pep=12)
+    pa, pb, up = _pair(tmp_path,
+                       ev({"test_novel_pep": a}, max_len=1024),
+                       ev({"test_novel_pep": b}, max_len=128,
+                          provenance=prov(ckpt="dddddddddddddddd")), u)
+    rc, res = PC.compare(str(pa), str(pb), str(up), n_boot=20)
+    assert rc == PC.EXIT_ERROR
+    assert res is None
+    assert "max_len" in PC.check_metadata(ev({}, max_len=1024), ev({}, max_len=128))[0]
+
+
+def test_a_different_sft_recipe_is_refused(tmp_path):
+    """The SFT recipe is fixed across arms by construction: only the CPT init differs."""
+    a, b, u = many_peptides_all_improving(n_pep=12)
+    pa, pb, up = _pair(tmp_path,
+                       ev({"test_novel_pep": a}),
+                       ev({"test_novel_pep": b},
+                          provenance=prov(ckpt="dddddddddddddddd",
+                                          sft_recipe="lr=0.001;bs=4;epochs=9")), u)
+    rc, res = PC.compare(str(pa), str(pb), str(up), n_boot=20)
+    assert rc == PC.EXIT_ERROR
+    assert res is None
+
+
+def test_an_unrecorded_sft_recipe_is_refused_rather_than_assumed(tmp_path):
+    a, b, u = many_peptides_all_improving(n_pep=12)
+    pa, pb, up = _pair(tmp_path,
+                       ev({"test_novel_pep": a}, provenance=prov(sft_recipe=None)),
+                       ev({"test_novel_pep": b},
+                          provenance=prov(ckpt="dddddddddddddddd", sft_recipe=None)), u)
+    rc, res = PC.compare(str(pa), str(pb), str(up), n_boot=20)
+    assert rc == PC.EXIT_ERROR
 
 
 # ----------------------------------------------------------------- the CLI contract

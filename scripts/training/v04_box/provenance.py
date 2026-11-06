@@ -56,6 +56,13 @@ Keys, and why each is here:
     sft_ckpt_digest    which trained checkpoint produced these scores
     sft_seed           the SFT run's seed
     sft_objective      what the JUDGE optimised; it is not a CPT objective
+    sft_max_len        the length the CHECKPOINT was trained at, from its own recorded args
+    sft_recipe         lr, batch, epochs, patience, caps and workers, from the same place; any
+                       missing field makes the whole recipe `unrecorded`, which is refused,
+                       because a half-known recipe cannot be shown equal to another
+    eval_max_len       the length the EVALUATION serialized to, which is a different thing: two
+                       arms at 1024 and 128 each matched their own checkpoint while scoring
+                       different inputs
     cpt_*              read from the adapter: its digest, its own recorded objective, its run id,
                        completed steps, seed and token budget. "none" for a base arm, which has
                        no CPT history, and "unrecorded" when the artifact itself is silent
@@ -82,7 +89,8 @@ CPT_RUN_KEYS = ("objective", "token_budget", "bucket_boundaries", "steps", "earl
                 "draw", "pool_size", "pool_id", "dataset", "seed", "cotenants")
 
 SFT_CELL_KEYS = ("task", "dataset", "draw", "pool_size", "pool_digest", "split_digests",
-                 "sft_ckpt_digest", "sft_seed", "sft_objective",
+                 "sft_ckpt_digest", "sft_seed", "sft_objective", "sft_max_len", "sft_recipe",
+                 "eval_max_len",
                  "cpt_adapter", "cpt_adapter_digest", "cpt_objective", "cpt_run_id",
                  "cpt_steps", "cpt_seed", "cpt_token_budget",
                  "device", "code_commit", "cotenants")
@@ -95,12 +103,21 @@ SCHEMAS = {"cpt_run": CPT_RUN_KEYS, "sft_cell": SFT_CELL_KEYS}
 REQUIRED = {
     "cpt_run": CPT_RUN_KEYS,
     "sft_cell": ("task", "dataset", "draw", "pool_size", "pool_digest", "split_digests",
-                 "sft_ckpt_digest", "sft_objective", "cpt_adapter", "cpt_adapter_digest",
-                 "cpt_objective", "cpt_run_id", "device", "code_commit", "cotenants"),
+                 "sft_ckpt_digest", "sft_seed", "sft_objective", "sft_max_len", "sft_recipe",
+                 "eval_max_len",
+                 "cpt_adapter", "cpt_adapter_digest", "cpt_objective", "cpt_run_id",
+                 "device", "code_commit", "cotenants"),
 }
 # A digest of "MISSING" is a faithful record of a file that was not there, and an invalid basis
 # for a verdict, so these may not be MISSING even though they are present.
 NO_MISSING = ("pool_digest", "split_digests", "sft_ckpt_digest")
+# The absence trap one level in: `None` is caught by required-presence, but the STRING
+# "unrecorded" is a value, so two arms that both failed to record their SFT recipe would agree
+# with each other. The SFT recipe is exactly what a paired comparison needs held equal, so not
+# knowing it is fatal. `cpt_objective` is deliberately NOT here: "unrecorded" there is an honest
+# statement about a legacy adapter's own files and does not stop a comparison.
+NO_SENTINEL = ("sft_recipe", "sft_max_len", "sft_seed", "eval_max_len")
+SENTINELS = ("unrecorded", "unknown", "n/a", "none")
 
 # Keys a comparison is ALLOWED to differ on, per schema and comparison kind. A waiver is never
 # silent: check() reports which waived keys actually differed, so a tolerated difference appears
@@ -118,8 +135,13 @@ WAIVED = {
     "sft_cell": {
         # The treatment IS the CPT adapter, so those differ by construction -- and so does the
         # SFT checkpoint trained on top of it. Everything else must match.
-        "cells": ("cotenants", "sft_ckpt_digest", "sft_seed") + CPT_LINEAGE,
-        "arms": ("cotenants", "dataset", "sft_ckpt_digest", "sft_seed") + CPT_LINEAGE,
+        # Only the CPT init and the checkpoint trained on top of it differ. The SFT recipe --
+        # seed, length, lr, batch, epochs, caps -- is fixed across arms by construction, and
+        # waiving the seed (as this did until round two of the 2026-11-06 review) let two arms
+        # differ in the one setting a paired comparison most needs held.
+        "cells": ("cotenants", "sft_ckpt_digest") + CPT_LINEAGE,
+        "arms": ("cotenants", "dataset", "sft_ckpt_digest") + CPT_LINEAGE,
+        # A seed BAND is the one comparison built from differing seeds, so it says so.
         "band": ("cotenants", "sft_seed", "sft_ckpt_digest"),
         "strict": (),
     },
@@ -159,6 +181,10 @@ def validate(m, label="manifest"):
         elif k in NO_MISSING and "MISSING" in json.dumps(m[k]):
             out.append(f"{label}: {k} records MISSING, so the artifact it describes was not "
                        f"there; that is a faithful record and an invalid basis for a verdict")
+        elif k in NO_SENTINEL and str(m[k]).strip().lower() in SENTINELS:
+            out.append(f"{label}: {k} is {m[k]!r}, which is a statement that nobody knows it. "
+                       f"Two arms that both fail to record it would otherwise agree, and the "
+                       f"SFT recipe is what a paired comparison needs held equal")
     return out
 
 
@@ -183,6 +209,46 @@ def load(path):
     return json.loads(pathlib.Path(path).read_text())
 
 
+def from_eval_doc(d, **extra):
+    """The artifact fields for an SFT-cell manifest, from an already-loaded eval document."""
+    prov = d.get("provenance")
+    if not isinstance(prov, dict) or not prov:
+        raise ValueError(
+            "this evaluation has no 'provenance' block, so what it read cannot be established. "
+            "Re-run it with the current evaluator, which records the pool, split, checkpoint "
+            "and adapter digests it actually used.")
+    args = d.get("args") or {}
+    m = {
+        "manifest_kind": "sft_cell",
+        "task": args.get("task"),
+        "dataset": args.get("task"),
+        "draw": args.get("distractor_draw"),
+        "pool_size": d.get("pool_size"),
+        # The length the EVALUATION serialized to, which is not the length the checkpoint was
+        # trained at. The review's probe used 1024 against 128: each checkpoint matched its own
+        # evaluation while the two arms scored different inputs.
+        "eval_max_len": args.get("max_len"),
+        "pool_digest": prov.get("pool_digest"),
+        "split_digests": prov.get("split_digests"),
+        "sft_ckpt_digest": prov.get("ckpt_digest"),
+        # From the CHECKPOINT's recorded training args, by way of the evaluator -- not from the
+        # eval's own CLI. `getattr(a, "seed", None)` in cmd_eval was structurally always None,
+        # because --seed exists only on the train parser; the stub recorded 42 and so was more
+        # complete than the real thing (round two, finding 4).
+        "sft_seed": prov.get("sft_seed"),
+        "sft_max_len": prov.get("sft_max_len"),
+        "sft_recipe": prov.get("sft_recipe"),
+        "sft_objective": prov.get("sft_objective"),
+        "cotenants": prov.get("cotenants"),
+        "device": prov.get("device"),
+        "code_commit": prov.get("code_commit"),
+    }
+    for k in CPT_LINEAGE:
+        m[k] = prov.get(k)
+    m.update({k: v for k, v in extra.items() if v is not None})
+    return m
+
+
 def from_eval(eval_path, **extra):
     """The artifact fields for an SFT-cell manifest, taken from the evaluation's own record.
 
@@ -191,32 +257,10 @@ def from_eval(eval_path, **extra):
     certified -- which is the correct answer for every file produced before the evaluator
     recorded one, including the 2026-10-08 ranks.
     """
-    d = load(eval_path)
-    prov = d.get("provenance")
-    if not isinstance(prov, dict) or not prov:
-        raise ValueError(
-            f"{eval_path} has no 'provenance' block, so what it read cannot be established. "
-            f"It cannot be certified or compared. Re-run the evaluation with the current "
-            f"evaluator, which records the pool, split, checkpoint and adapter digests it "
-            f"actually used.")
-    args = d.get("args") or {}
-    m = {
-        "manifest_kind": "sft_cell",
-        "task": args.get("task"),
-        "dataset": args.get("task"),
-        "draw": args.get("distractor_draw"),
-        "pool_size": d.get("pool_size"),
-        "pool_digest": prov.get("pool_digest"),
-        "split_digests": prov.get("split_digests"),
-        "sft_ckpt_digest": prov.get("ckpt_digest"),
-        "sft_seed": args.get("seed", prov.get("sft_seed")),
-        "device": prov.get("device"),
-        "code_commit": prov.get("code_commit"),
-    }
-    for k in CPT_LINEAGE:
-        m[k] = prov.get(k)
-    m.update({k: v for k, v in extra.items() if v is not None})
-    return m
+    try:
+        return from_eval_doc(load(eval_path), **extra)
+    except ValueError as e:
+        raise ValueError(f"{eval_path}: {e}") from None
 
 
 def check(a, b, kind="strict"):
@@ -245,45 +289,53 @@ def check(a, b, kind="strict"):
     return bad, tolerated
 
 
-# The artifact-derived fields two evaluations must agree on to be a paired comparison, and the
-# ones that differ BECAUSE they are the treatment. Both the launcher and the standalone
-# comparator apply this, so a comparison cannot be certified by whichever of them was skipped.
-EVAL_MUST_MATCH = ("pool_digest", "split_digests", "device", "code_commit", "pool_size")
-EVAL_TREATMENT = ("ckpt_digest", "cpt_adapter", "cpt_adapter_digest", "cpt_objective",
-                  "cpt_run_id", "cpt_steps", "cpt_seed", "cpt_token_budget")
+def check_eval_provenance(a, b, kind="cells", conditions=()):
+    """(offending, tolerated) for two eval documents, through the MANIFEST validator.
 
+    Round two of the 2026-11-06 review, finding 3: this used to apply its own weaker rule --
+    five required fields, and ANY difference among the treatment fields taken as evidence of two
+    different models, including a difference in a run LABEL. Two evaluations with no checkpoint
+    or adapter hashes at all, empty split hashes and different `cpt_run_id` strings were
+    therefore compared and a result written, while the launcher's manifest validator would have
+    refused all three. A contract that two entry points enforce differently is really the weaker
+    of the two.
 
-def check_eval_provenance(a, b):
-    """(offending, tolerated) for two eval documents' own provenance blocks.
-
-    Required-present, so absence cannot read as agreement; MISSING digests refused, so a run
-    that could not find its inputs cannot certify a verdict about them; and a comparison whose
-    treatment keys are all identical refused, because that is one model compared with itself.
+    So there is now one rule: derive an `sft_cell` manifest from each evaluation's own record and
+    run exactly the validation the launcher runs. `conditions` additionally requires a split
+    digest for each condition actually compared -- a hash covering a condition nobody compared
+    proves nothing about the one that was.
     """
-    pa, pb = a.get("provenance"), b.get("provenance")
     bad = []
-    for lbl, pv in (("arm A", pa), ("arm B", pb)):
+    for lbl, doc in (("arm A", a), ("arm B", b)):
+        pv = doc.get("provenance")
         if not isinstance(pv, dict) or not pv:
             bad.append(f"{lbl} records no provenance block, so what it read cannot be "
                        f"established. Re-run it with the current evaluator.")
     if bad:
         return bad, []
-    for k in EVAL_MUST_MATCH:
-        va, vb = pa.get(k), pb.get(k)
-        for lbl, v in (("arm A", va), ("arm B", vb)):
-            if v is None or v == "":
-                bad.append(f"{k}: {lbl} did not record it; absence is not agreement")
-            elif "MISSING" in json.dumps(v):
-                bad.append(f"{k}: {lbl} records MISSING, so the artifact was not there")
-        if va != vb:
-            bad.append(f"{k}: {va!r} vs {vb!r}")
-    tolerated = [f"{k}: {pa.get(k)!r} vs {pb.get(k)!r}"
-                 for k in EVAL_TREATMENT if pa.get(k) != pb.get(k)]
-    if not tolerated:
-        bad.append("these two evaluations came from the SAME model: neither the checkpoint nor "
-                   "the adapter differs, so any effect between them is noise. A reused or stale "
-                   "evaluation looks exactly like this.")
-    return bad, tolerated
+    manifests = []
+    for lbl, doc in (("arm A", a), ("arm B", b)):
+        try:
+            m = from_eval_doc(doc)
+        except ValueError as e:
+            bad.append(f"{lbl}: {e}")
+            continue
+        m["manifest_version"] = MANIFEST_VERSION
+        problems = validate(m, label=lbl)
+        if problems:
+            bad.extend(problems)
+        manifests.append(m)
+        for cond in conditions:
+            got = (m.get("split_digests") or {}).get(cond)
+            if not got:
+                bad.append(f"{lbl}: no split digest for {cond}, which this comparison reads, so "
+                           f"the two arms cannot be shown to have scored the same data")
+            elif got == "MISSING":
+                bad.append(f"{lbl}: the split file for {cond} was not there when it ran")
+    if bad or len(manifests) != 2:
+        return bad, []
+    more, tolerated = check(manifests[0], manifests[1], kind)
+    return bad + more, tolerated
 
 
 def verify_eval(eval_path, ckpt=None, adapter=None):

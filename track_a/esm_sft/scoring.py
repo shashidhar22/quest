@@ -133,3 +133,40 @@ def select_device(cuda_available: bool, allow_cpu: bool = False) -> str:
         "silent fallback to a result nobody chose to pay for, at a fraction of the throughput. "
         "Check the driver (`nvidia-smi`) and the torch build, or pass --allow_cpu if a CPU run "
         "is genuinely what is wanted.")
+
+
+# What the JUDGE optimises. A constant, not a CLI choice: it is a property of the code, and a
+# field the launcher declares is a field the launcher can get wrong.
+SFT_OBJECTIVE = "bce-pair-logits/v1"
+# The training settings two arms of a paired comparison must share. Only the CPT init and the
+# checkpoint trained on top of it may differ (round two of the 2026-11-06 review, finding 4).
+SFT_RECIPE_KEYS = ("lr", "batch_size", "epochs", "patience", "max_train_pos", "max_val_pos",
+                   "num_workers")
+UNRECORDED = "unrecorded"
+
+
+def sft_recipe(saved_args) -> str:
+    """A deterministic string naming the SFT recipe a checkpoint was trained under.
+
+    Taken from the checkpoint's OWN recorded args, so it describes the training that happened
+    rather than the defaults in force when it is read. Any missing key makes the whole recipe
+    `unrecorded`, because a partially known recipe cannot be shown equal to another: provenance
+    refuses that sentinel rather than letting two unrecorded recipes match each other.
+    """
+    a = saved_args if isinstance(saved_args, dict) else {}
+    missing = [k for k in SFT_RECIPE_KEYS if a.get(k) is None]
+    if missing:
+        return UNRECORDED
+    return ";".join(f"{k}={a[k]}" for k in SFT_RECIPE_KEYS)
+
+
+def cotenants() -> str:
+    """Which GPUs this process could see, read from the environment rather than declared.
+
+    Not a claim about what else is running -- nothing visible from inside a process can be --
+    but a record of the visibility the run had, which is what differs between a cell that ran
+    alone and one that shared a box.
+    """
+    import os
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    return f"cuda_visible_devices={vis if vis is not None else 'unset'}"

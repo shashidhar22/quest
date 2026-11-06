@@ -50,13 +50,16 @@ from cpt_training_lib import (  # noqa: E402  (the CPT trainer's own serializer 
 )
 from track_a.esm_sft.model import ESMScorer  # noqa: E402
 from track_a.esm_sft.scoring import (  # noqa: E402  (NumPy only; see its docstring)
+    SFT_OBJECTIVE,
     DeviceError,
     ScoreError,
+    cotenants,
     incompatible_checkpoint_args,
     missing_trainable_keys,
     rank_of,
     score_diagnostics,
     select_device,
+    sft_recipe,
 )
 from track_a.shared import artifacts as A  # noqa: E402  (stdlib only; digests and lineage)
 from track_a.esm_sft_cubes.cpt_loader import load_esmc_from_local_lora  # noqa: E402
@@ -220,10 +223,15 @@ def cmd_train(a):
         sd = {k: v for k, v in model.state_dict().items() if any(t in k for t in TRAINABLE_KEYS)}
         # Keep the latest epoch too: on 2026-10-07 a below-chance val AUC made selection keep the
         # untrained epoch 1, and the epoch-2 weights were lost with nothing to re-evaluate.
-        torch.save({"args": vars(a), "epoch": ep, "val_auc": auc, "trainable_state_dict": sd}, out / "last.pt")
+        # The training inputs are hashed into the checkpoint, so a later evaluation can say
+        # which data produced the weights it is reading rather than which data is there now.
+        meta = {"args": vars(a), "data_digests": A.split_digests(a.task, ("train", "val")),
+                "sft_objective": SFT_OBJECTIVE, "cotenants": cotenants(),
+                "code_commit": A.code_commit()}
+        torch.save({**meta, "epoch": ep, "val_auc": auc, "trainable_state_dict": sd}, out / "last.pt")
         if auc > best + 1e-4:
             best, bad = auc, 0
-            torch.save({"args": vars(a), "trainable_state_dict": sd}, out / "best.pt")
+            torch.save({**meta, "val_auc": auc, "trainable_state_dict": sd}, out / "best.pt")
         else:
             bad += 1
             if bad >= a.patience:
@@ -318,7 +326,12 @@ def cmd_eval(a):
     dev = torch.device(select_device(torch.cuda.is_available(),
                                     allow_cpu=getattr(a, "allow_cpu", False)))
     model, tok = build_model(a.adapter, dev)
-    load_checkpoint(model, a.ckpt, dev, want=vars(a))
+    # The checkpoint is KEPT: its recorded training args are the only honest source for this
+    # evaluation's SFT lineage. Discarding it and reading `getattr(a, "seed", None)` off the
+    # eval's own namespace recorded a structural null, because --seed exists only on the train
+    # parser (round two of the 2026-11-06 review, finding 4).
+    ck = load_checkpoint(model, a.ckpt, dev, want=vars(a))
+    ck_args = ck.get("args") or {}
     pid = int(tok.pad_token_id)
     pool_df = load_candidate_pool()
     pool = pool_df["peptide"].astype(str).tolist() if "peptide" in pool_df else pool_df.iloc[:, 0].astype(str).tolist()
@@ -339,7 +352,13 @@ def cmd_eval(a):
                   "torch_version": torch.__version__,
                   "code_commit": A.code_commit(),
                   "pool_size": POOL_SIZE,
-                  "sft_seed": getattr(a, "seed", None),
+                  # The SFT side, from the checkpoint's own record of its training
+                  "sft_objective": SFT_OBJECTIVE,
+                  "sft_seed": ck_args.get("seed"),
+                  "sft_max_len": ck_args.get("max_len"),
+                  "sft_recipe": sft_recipe(ck_args),
+                  "sft_train_digests": ck.get("data_digests"),
+                  "cotenants": cotenants(),
                   **A.cpt_lineage(a.adapter),
               }}
     for cond in a.conditions:
