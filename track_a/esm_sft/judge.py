@@ -49,6 +49,16 @@ from cpt_training_lib import (  # noqa: E402  (the CPT trainer's own serializer 
     project_canonical_row_to_run_input,
 )
 from track_a.esm_sft.model import ESMScorer  # noqa: E402
+from track_a.esm_sft.scoring import (  # noqa: E402  (NumPy only; see its docstring)
+    DeviceError,
+    ScoreError,
+    incompatible_checkpoint_args,
+    missing_trainable_keys,
+    rank_of,
+    score_diagnostics,
+    select_device,
+)
+from track_a.shared import artifacts as A  # noqa: E402  (stdlib only; digests and lineage)
 from track_a.esm_sft_cubes.cpt_loader import load_esmc_from_local_lora  # noqa: E402
 from track_a.shared.load_splits import load_as_class_i, load_candidate_pool  # noqa: E402
 from track_a.shared.negative_sampling import attach_labels, sample_negatives  # noqa: E402
@@ -112,6 +122,38 @@ def build_model(adapter: str, device) -> tuple[ESMScorer, object]:
     return model, get_tokenizer("esmc_300m")
 
 
+def load_checkpoint(model, path, device, want=None):
+    """Load a trained checkpoint into `model`, refusing an incomplete one.
+
+    Audit finding 2, 2026-11-06: this used to be `sd.update(saved); load_state_dict(sd)` over a
+    fresh `model.state_dict()`, so a trainable tensor absent from the file kept its random
+    initialisation and the load still reported success. An arm evaluated that way is not the arm
+    it claims to be, and nothing downstream could tell. The expected set comes from the live
+    model, so it cannot drift from the model's own structure.
+    """
+    ck = torch.load(path, map_location=device, weights_only=False)
+    if "trainable_state_dict" not in ck:
+        raise ScoreError(f"{path} has no 'trainable_state_dict'; this is not a judge checkpoint")
+    saved = ck["trainable_state_dict"]
+    live = model.state_dict()
+    missing, unexpected = missing_trainable_keys(saved.keys(), live.keys(), TRAINABLE_KEYS)
+    if missing or unexpected:
+        raise ScoreError(
+            f"{path} does not match this model's trainable parameters, so evaluating it would "
+            f"score partly untrained weights as if trained.\n"
+            f"  missing from the checkpoint ({len(missing)}): {missing[:8]}\n"
+            f"  not present in the model ({len(unexpected)}): {unexpected[:8]}")
+    if want is not None:
+        clash = incompatible_checkpoint_args(ck.get("args"), want)
+        if clash:
+            raise ScoreError(
+                f"{path} was not trained for this evaluation:\n  " + "\n  ".join(clash))
+    live.update(saved)
+    model.load_state_dict(live)
+    model.eval()
+    return ck
+
+
 def n_trainable(model) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -138,7 +180,8 @@ def with_negatives(pos: pd.DataFrame, seed: int) -> pd.DataFrame:
 # ---------------------------------------------------------------- train
 def cmd_train(a):
     random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device(select_device(torch.cuda.is_available(),
+                                    allow_cpu=getattr(a, "allow_cpu", False)))
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
     max_pos, max_val = (200, 50) if a.smoke else (a.max_train_pos, a.max_val_pos)
     tr = load_split(a.task, "train"); va = load_split(a.task, "val")
@@ -272,16 +315,33 @@ def _draw_distractors(pool, by_len, true, rng, n, mode):
 
 
 def cmd_eval(a):
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device(select_device(torch.cuda.is_available(),
+                                    allow_cpu=getattr(a, "allow_cpu", False)))
     model, tok = build_model(a.adapter, dev)
-    ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
-    sd = model.state_dict(); sd.update(ck["trainable_state_dict"]); model.load_state_dict(sd); model.eval()
+    load_checkpoint(model, a.ckpt, dev, want=vars(a))
     pid = int(tok.pad_token_id)
     pool_df = load_candidate_pool()
     pool = pool_df["peptide"].astype(str).tolist() if "peptide" in pool_df else pool_df.iloc[:, 0].astype(str).tolist()
     pool_set = set(pool)
     by_len = _pool_by_length(pool)
-    result = {"args": vars(a), "pool_size": POOL_SIZE, "conditions": {}}
+    # Artifact-derived provenance (audit finding 1, 2026-11-06). The launcher used to DECLARE
+    # which pool a run used while this function resolved its own; a manifest is now derived from
+    # this block, so it describes the files that produced the numbers beside it.
+    result = {"args": vars(a), "pool_size": POOL_SIZE, "conditions": {},
+              "provenance": {
+                  "splits_dir": str(A.splits_dir()),
+                  "pool_path": str(A.pool_path()),
+                  "pool_digest": A.file_digest(A.pool_path()),
+                  "split_digests": A.split_digests(a.task, a.conditions),
+                  "ckpt_path": str(a.ckpt),
+                  "ckpt_digest": A.file_digest(a.ckpt),
+                  "device": str(dev),
+                  "torch_version": torch.__version__,
+                  "code_commit": A.code_commit(),
+                  "pool_size": POOL_SIZE,
+                  "sft_seed": getattr(a, "seed", None),
+                  **A.cpt_lineage(a.adapter),
+              }}
     for cond in a.conditions:
         t0 = time.time()
         df = load_split(a.task, cond)
@@ -291,6 +351,7 @@ def cmd_eval(a):
         if len(df) > cap:
             df = df.sample(n=cap, random_state=42).reset_index(drop=True)
         ranks, rids, true_peps, same_len, trunc = [], [], [], [], 0
+        diag = {"spread_min": None, "n_all_tied": 0, "n_distinct_min": None}
         for _, r in df.iterrows():
             row = _clean(r.to_dict()); true = str(row["peptide"])
             true_peps.append(true)
@@ -307,8 +368,22 @@ def cmd_eval(a):
             ids, am = pad(seqs, pid)
             with torch.no_grad():
                 sc = model(ids.to(dev), am.to(dev)).float().cpu().numpy()
-            ranks.append(int(1 + (sc[1:] >= sc[0]).sum()))  # ties count against the true peptide
+            # rank_of refuses a non-finite score instead of turning it into rank 1. The raise
+            # propagates: an eval that cannot score every query writes NO output file, so a
+            # numerical failure can never reach the gate or the comparator as a result.
+            d = score_diagnostics(sc)
+            try:
+                ranks.append(rank_of(sc))
+            except ScoreError as e:
+                raise ScoreError(
+                    f"{cond} row_id={row['row_id']}: {e}\n"
+                    f"  diagnostics: {d}\n"
+                    f"  No eval.json is written. Re-run the probe against this checkpoint "
+                    f"(`judge probe --ckpt ...`) before spending anything further.") from None
             rids.append(str(row["row_id"]))
+            diag["n_all_tied"] += int(d["all_tied"])
+            for key, val in (("spread_min", d["spread"]), ("n_distinct_min", d["n_distinct"])):
+                diag[key] = val if diag[key] is None else min(diag[key], val)
         peps = np.asarray(true_peps)
         rk = np.asarray(ranks)
         # Cluster-bootstrap over PEPTIDES, not queries. Queries sharing a true peptide are not
@@ -334,6 +409,11 @@ def cmd_eval(a):
                  float(np.mean(same_len) / (POOL_SIZE - 1)) if same_len else None),
              "n_queries_fully_length_matched": int(
                  sum(1 for v in same_len if v == POOL_SIZE - 1)),
+             # a rank alone cannot tell a dead scorer from an unlucky one: an all-tie query
+             # and a genuinely last-placed one both score rank N (wave 1, 18 GPU-hours).
+             "score_spread_min": diag["spread_min"],
+             "score_n_distinct_min": diag["n_distinct_min"],
+             "n_queries_all_candidates_tied": diag["n_all_tied"],
              "secs": round(time.time() - t0, 1), "ranks": dict(zip(rids, ranks)),
              "true_peptides": dict(zip(rids, true_peps))}
         result["conditions"][cond] = m
@@ -341,6 +421,9 @@ def cmd_eval(a):
               f"recall@10={m['recall_at_10']} CI={m['recall_at_10_ci95']} (peptide-clustered) "
               f"mrr={m['mrr']} truncated={trunc} ({m['secs']}s)"
               f"{' UNDERPOWERED' if m['underpowered'] else ''}", flush=True)
+        print(f"[judge] {cond}: min score spread={m['score_spread_min']} "
+              f"min distinct candidates={m['score_n_distinct_min']} "
+              f"fully tied queries={m['n_queries_all_candidates_tied']}", flush=True)
         print(f"[judge] {cond}: draw={m['distractor_draw']} "
               f"same-length distractors={m['frac_distractors_same_length']:.3f} "
               f"fully matched queries={m['n_queries_fully_length_matched']}/{m['n_queries']}",
@@ -355,10 +438,29 @@ def cmd_probe(a):
     its true peptide and 5 distractors, at full precision. Exit 1 if any logit is non-finite or
     if any query's 6 candidates come out identical — that is exactly the failure wave 1 spent
     18 GPU-hours discovering (every candidate tied, Recall@10 = 0). Also prints the spread of
-    the pooled vectors, so an input-independent ENCODER shows up as its own line."""
+    the pooled vectors, so an input-independent ENCODER shows up as its own line.
+
+    With --ckpt it probes THAT checkpoint. Without it, it probes a freshly initialised head on
+    the adapter, which is the right check before training but vouches for nothing afterwards:
+    the 2026-11-06 audit noted that a probe of a fresh model says nothing about the base or
+    trained checkpoint the paid evaluation then reads. An incomplete checkpoint refuses here,
+    before any evaluation is bought."""
     from track_a.esm_sft.encoders import encoder_forward
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device(select_device(torch.cuda.is_available(),
+                                    allow_cpu=getattr(a, "allow_cpu", False)))
     model, tok = build_model(a.adapter, dev); model.eval()
+    if getattr(a, "ckpt", None):
+        try:
+            # want=vars(a): the probe is the cheap step, so an incompatible checkpoint should
+            # refuse HERE rather than after a paid evaluation has loaded it.
+            load_checkpoint(model, a.ckpt, dev, want=vars(a))
+        except ScoreError as e:
+            print(f"[probe] FAIL: {e}", flush=True)
+            sys.exit(1)
+        print(f"[probe] checkpoint loaded with every expected trainable key: {a.ckpt}", flush=True)
+    else:
+        print("[probe] no --ckpt: probing a FRESH head, which vouches for no checkpoint",
+              flush=True)
     pid = int(tok.pad_token_id)
     pool = load_candidate_pool(); pool = (pool["peptide"] if "peptide" in pool else pool.iloc[:, 0]).astype(str).tolist()
     df = load_split(a.task, "test_iid").head(3)
@@ -381,8 +483,10 @@ def cmd_probe(a):
         lens = [int(x.sum()) for x in am]
         print(f"[probe] row_id={row['row_id']} lens={lens} pooled_spread={pooled_spread:.3e} "
               f"logits={np.array2string(sc, precision=6)} distinct={n_distinct}/{len(sc)}", flush=True)
-        if not np.all(np.isfinite(sc)):
-            print("[probe] FAIL: non-finite logit", flush=True); ok = False
+        try:
+            rank_of(sc)
+        except ScoreError as e:
+            print(f"[probe] FAIL: {e}", flush=True); ok = False
         if n_distinct < 2:
             print("[probe] FAIL: every candidate scored identically — the scorer ignores its input", flush=True); ok = False
     print(f"[probe] {'PASS' if ok else 'FAIL'}: scores {'vary' if ok else 'do not vary'} with the peptide", flush=True)
@@ -423,6 +527,10 @@ def main():
         p.add_argument("--mhc_variant", required=True)
         p.add_argument("--max_len", type=int, default=1024)
         p.add_argument("--smoke", action="store_true")
+        # No silent CPU fallback: a GPU visit that fell back produced a result nobody chose to
+        # buy (audit finding 5, 2026-11-06). Opting in stays available for off-box checks.
+        p.add_argument("--allow_cpu", action="store_true",
+                       help="run on the CPU when CUDA is absent, instead of refusing")
     t = sp.choices["train"]
     t.add_argument("--out_dir", required=True)
     t.add_argument("--max_train_pos", type=int, default=50_000)
@@ -433,6 +541,10 @@ def main():
     t.add_argument("--lr", type=float, default=1e-4)
     t.add_argument("--seed", type=int, default=42)
     t.add_argument("--num_workers", type=int, default=4)
+    sp.choices["probe"].add_argument(
+        "--ckpt", default=None,
+        help="probe THIS checkpoint rather than a fresh head. Required to vouch for a "
+             "checkpoint an evaluation will read: a fresh-model probe says nothing about it.")
     e = sp.choices["eval"]
     e.add_argument("--ckpt", required=True)
     e.add_argument("--out", required=True)
