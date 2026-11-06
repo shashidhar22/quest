@@ -288,3 +288,49 @@ Laptop-only session. No GPU spend. Branch pushed for the first time since it was
 - **Approach extracted:** `~/Documents/ACS/learnings/2026-11-04-can-this-measurement-answer-the-question.md`.
 - **Cost:** idle spend measured at **USD 298/mo**, confirming the filed 295 rather than contradicting
   it; October's higher figure was a transition month. Both boxes stopped all session.
+
+## 2026-11-06 — two audit rounds, a pre-launch review, and judge-first launched
+
+- **Audit round one** (`quest-cpt/audits/2026-11-06/`). Five readiness defects, all reproduced
+  before the code was read, all repaired. A stale eval with no checkpoint was certified, and its
+  manifest overwritten. A NaN score ranked 1. The hour ceiling was checked only between phases,
+  and the watchdog's publish had no time limit. `token_exact` could be reached through the
+  fixed-batch path. The preflight checked that files existed, not that they worked. Provenance is
+  now read from artifacts.
+- **Found while fixing them:** arm D (Stage 4.1) trained **fixed-batch-mean/v0**, not row share
+  (findings §9.10).
+- **Audit round two** (`round-two/`). Four of the five defects were in that day's own repairs.
+  - The launch wrapper armed the watchdog on a stale pid file, and could SIGTERM an unrelated
+    process.
+  - Under `set -m`, util-linux `setsid` forks, so the wrapper's status was not the job's.
+  - The comparator used a weaker validator than the launcher.
+  - The SFT seed was always null, because the eval parser has no `--seed`; the stub recorded
+    42, which hid it.
+  - A refused rerun could sit beside a stale comparison.
+
+  Fixed by run identity, one validator, and the SFT recipe read from the checkpoint.
+- **Pre-launch code review:** ten findings, all verified and fixed.
+  - The watchdog pattern did not match the judge, so it would have stopped the box mid-run.
+  - Resume was unreachable.
+  - The lock tracked only the launcher.
+  - The preflight never compared the base recipe with arm D's.
+  - The `dirty:` commit identity was too weak.
+  - A missing `token_budget` was read as fixed-batch without saying so.
+  - `sft_train_digests` were never compared.
+  - `POOL_FILE` was silently ignored.
+  - `MAX_HOURS=abc` became a zero ceiling.
+  - A box with no `nvidia-smi` was not refused.
+- **Numbers:** tests 321 → 469 passing. The failure set is identical to 59cafcd: 33 failures plus
+  4 collection errors, all from dependencies missing on the laptop.
+- **Incidents and lessons:**
+  - Three of my own tests passed for false reasons. One matched pytest's tmp path, which carries
+    the test's name. One read a zombie as alive, because `kill -0` succeeds on an unreaped
+    child. One indexed a key before an `or`.
+  - The sandbox git repo exposed that hashing untracked files made the code identity drift
+    mid-run.
+- **Launch:** the box was started 22:33 UTC. Its checkout is a colleague's branch with 600 lines
+  of uncommitted edits; that state was preserved to S3 (`jf_ops/preserve-20261106/`), and the
+  reviewed code was deployed as a bundle into a worktree. The real preflight passed. Judge-first
+  run `20261106T225852Z-9828` started 22:58 UTC; both probes pass, and the watchdog is armed on
+  the verified pid.
+- **Backup:** second remote `mine` → private `YuexinXu/quest`.
