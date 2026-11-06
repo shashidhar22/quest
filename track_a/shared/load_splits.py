@@ -25,26 +25,17 @@ from typing import Optional
 
 import pandas as pd
 
+from track_a.shared import artifacts
+
 def _resolve_splits_dir() -> Path:
     """Where benchmark_v2's AS splits live.
 
-    Resolved inside this checkout first, so the judge is runnable and testable off the
-    training box; the box layout stays as a fallback. Override with QUEST_SPLITS_DIR.
-    This was hardcoded to the box path until 2026-11-03, the same defect already fixed
-    in track_a/shared/negative_sampling.py.
+    Delegated to `track_a.shared.artifacts.splits_dir` on 2026-11-06 so there is exactly ONE
+    rule. Provenance has to hash the file this loader opens, and while the rule existed in two
+    places the launcher could hash a pool the evaluator never read (audit finding 1). Behaviour
+    is unchanged: QUEST_SPLITS_DIR, then this checkout, then the box path.
     """
-    env = os.environ.get("QUEST_SPLITS_DIR")
-    candidates = (
-        *((Path(env),) if env else ()),
-        Path(__file__).resolve().parents[2] / "benchmark_v2" / "splits",
-        Path("/home/ubuntu/quest/benchmark_v2/splits"),
-    )
-    for c in candidates:
-        if c.is_dir():
-            return c
-    # None present: return the first candidate so the loaders' FileNotFoundError names a
-    # path the caller can act on, rather than a path that was never going to exist.
-    return candidates[0]
+    return Path(artifacts.splits_dir())
 
 
 SPLITS_DIR = _resolve_splits_dir()

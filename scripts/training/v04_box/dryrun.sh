@@ -33,11 +33,20 @@ BEFORE_PATHS=$(ckpt_paths)
 touch "$TMP/.t0"
 sleep 1              # so any later write is strictly newer than the marker
 
-# A candidate pool, because an absent pool is no longer a runnable visit: it used to become the
-# string POOL_FILE_MISSING in every manifest and so matched itself.
-POOL=$TMP/pool.tsv
+# A splits directory of its own, exported so the SPLIT LOADER resolves it: provenance now hashes
+# the files an evaluation actually reads, and the resolution rule lives in one place
+# (track_a/shared/artifacts.py). Without this the digests would be MISSING, which provenance
+# rightly refuses as a basis for a verdict.
+SPLITS=$TMP/splits
+mkdir -p $SPLITS
+export QUEST_SPLITS_DIR=$SPLITS
+POOL=$SPLITS/as_class_i_candidate_pool.tsv
 printf 'peptide\n' > $POOL
 for i in $(seq 1 120); do printf 'PEPTIDE%03d\n' "$i" >> $POOL; done
+for c in train val test_iid test_novel_pep test_level4; do
+  printf 'stand-in split %s\n' "$c" > $SPLITS/as_paired_i_$c.parquet
+  printf 'stand-in split %s\n' "$c" > $SPLITS/as_trb_i_$c.parquet
+done
 
 # A stand-in base SFT checkpoint. This used to be /dev/null, which preflight rightly rejects:
 # a character device is not a checkpoint, and the launcher should not have to accept one.
@@ -52,16 +61,27 @@ mkdir -p "$out"; echo "stub trainer: 7800 steps" > "$out/training.log"; exit 0
 EOF
 # Stub python: fakes ONLY the judge; everything else is the real interpreter, so the gate,
 # the predicate and provenance are exercised rather than mocked.
+# A real evaluation records the pool, splits, checkpoint and adapter it read, and the comparator
+# refuses an evaluation that does not, so the stub records them too -- computed from this dry
+# run's own files by the production code in track_a/shared/artifacts.py.
 cat > $TMP/stub_python <<EOF
 #!/bin/bash
 if [ "\$1" = "-m" ] && [ "\$2" = "track_a.esm_sft.judge" ]; then
-  out=""; args=("\$@")
-  for ((i=0;i<\${#args[@]};i++)); do [ "\${args[i]}" = --out ] && out=\${args[i+1]}; done
+  out=""; ckpt=""; adapter=none; draw=length_matched; task=as_paired_i; args=("\$@")
+  for ((i=0;i<\${#args[@]};i++)); do
+    [ "\${args[i]}" = --out ] && out=\${args[i+1]}
+    [ "\${args[i]}" = --ckpt ] && ckpt=\${args[i+1]}
+    [ "\${args[i]}" = --adapter ] && adapter=\${args[i+1]}
+    [ "\${args[i]}" = --distractor_draw ] && draw=\${args[i+1]}
+    [ "\${args[i]}" = --task ] && task=\${args[i+1]}
+  done
   mkdir -p "\$(dirname "\$out")"
   src=\${BASE_EVAL_FIXTURE:-$REPO/tests/fixtures/s42_eval_base_paired_ranks_20261008.json}
-  case "\$out" in *base_paired*) cp "\$src" "\$out" ;;
-                   *) cp "$REPO/tests/fixtures/s42_eval_base_paired_ranks_20261008.json" "\$out" ;;
+  case "\$out" in *base_paired*) : ;;
+                   *) src=$REPO/tests/fixtures/s42_eval_base_paired_ranks_20261008.json ;;
   esac
+  $PYREAL $REPO/tests/fixtures/make_eval.py --ranks "\$src" --out "\$out" \
+    --ckpt "\$ckpt" --adapter "\$adapter" --draw "\$draw" --task "\$task" || exit 9
   exit 0
 fi
 exec $PYREAL "\$@"

@@ -1,59 +1,78 @@
-# NEXT — quest (updated 2026-11-04) · history: `docs/LOG.md` · stages: `plans/README.md` · knowledge: `~/Documents/ACS/quest-cpt/`
+# NEXT — quest (updated 2026-11-06) · history: `docs/LOG.md` · stages: `plans/README.md` · knowledge: `~/Documents/ACS/quest-cpt/`
 
 **V04 as specified is cancelled; the next run is JUDGE-FIRST and awaits approval to spend.**
-Decisions 1-3 were approved 2026-11-04. Audit verdicts and evidence:
-`~/Documents/ACS/quest-cpt/audits/2026-11-04/` (`stage4-audit.md`, `triage.md`, `claude-handoff.md`,
-`decision-recommendations.md`). Remaining work in order: `plans/v04-audit-repair.md`.
+Decisions 1-3 were approved 2026-11-04. A second external audit on 2026-11-06 found five
+readiness defects in the first repair; all five are now repaired off-box. Audits, triage and the
+before/after check: `~/Documents/ACS/quest-cpt/audits/2026-11-06/` (`launch-audit.md`,
+`aws-checks.md`, `triage.md`, `repair-verification.txt`). Repair order:
+`plans/launch-readiness.md`, then `plans/v04-audit-repair.md`.
 
-**No box is running.** `i-0030c1a9c845b3714` is stopped and sized **g6.2xlarge · 1× L4**. The
-judge-first run needs **one GPU, so no resize**. Volume `vol-08f5626ccf18fdd4c`.
+**No box is running.** `i-0030c1a9c845b3714` is stopped, **g6.2xlarge · 1× L4**, us-west-2a,
+instance-initiated shutdown behaviour `stop`, root volume `vol-08f5626ccf18fdd4c` (gp3, 1,000 GiB,
+encrypted, DeleteOnTermination true — stopping preserves it, terminating would not). The
+judge-first run needs **one GPU, so no resize**. The effective rate is now measured, not guessed:
+**USD 1.068988 per GPU-hour** (Cost Explorer, October, usage type `USW2-BoxUsage:g6.2xlarge`,
+non-estimated: USD 32.050349 / 29.981945 h). So ≈4.9 h ≈ **USD 5.24**, a gate refusal ≈1.3 h ≈
+**USD 1.39**, the 8-hour ceiling ≈ **USD 8.55**, excluding storage, snapshots and transfer.
 
 1. **`git push`** the local commits. Claude's sandbox refuses push as a public-surface action, so
    Yuexin runs it.
-2. **Approve or amend the judge-first spend**, then launch it:
-   `~/Documents/ACS/quest-cpt/box-jobs/visits/v04a-judge-first.md` — ≈4.9 GPU-hours, ≈1.3 if the
-   gate refuses, ≈USD 4-6 at the repo's recorded 0.80-1.15 per GPU-hour band. **Confirm the actual
-   g6.2xlarge rate in Cost Explorer first: it is recorded nowhere in this repo.** Pre-launch, in
-   order: `aws sso login --profile DataUserAccess-953915750371`; a read-only hashed copy of
+2. **Approve or amend the judge-first spend**, then launch it with ONE command:
+   ```sh
+   PUBLISH_CMD="aws s3 sync /home/ubuntu/jf_out s3://fh-pi-warren-h-eco/quest/tcrbench2/jf_out/" \
+     bash scripts/training/v04_box/launch_judge_first.sh
+   ```
+   It starts the run, arms `autostop_when_done.sh` on the pid the run recorded, verifies from the
+   watchdog's own log that it armed on that pid, and only then releases the run past preflight.
+   If arming cannot be verified it terminates the run, so nothing is spent unwatched. Spec:
+   `~/Documents/ACS/quest-cpt/box-jobs/visits/v04a-judge-first.md`. Pre-launch, in order:
+   `aws sso login --profile DataUserAccess-953915750371`; a read-only hashed copy of
    `/home/ubuntu/v2_full.sh` and any surviving uncommitted `track_a/` off the volume, the only
-   record of what computed the two failed V03 verdicts; then
-   `scripts/training/v04_box/judge_first.sh` with `autostop_when_done.sh` armed on the pid in
-   `$O/judge_first.pid` and `MAX_HOURS` 8.
+   record of what computed the two failed V03 verdicts; then the command above.
 3. **Verify on the box what the laptop cannot:** that terminating the launcher kills a *real*
-   torchrun's descendant workers, not only a stub. Process groups under `set -m` are right on
-   Linux by construction, but only stubs have exercised it.
-4. **Then, before any CPT baseline:** land the exact-normalization loop change (step 5 of the
-   repair plan). The objective is decided and its contract is gradient-tested, but the training
-   loop still cannot supply the step's global target count before its first backward, so
-   `token_exact` raises on purpose. Buying baselines under `token` would buy the old objective.
+   torchrun's descendant workers, not only a stub; that the real base checkpoint loads and the
+   probe passes on it (`judge probe --ckpt`); GPU memory and throughput; and what commit is
+   actually deployed — the preflight records it, but only a run on the box can say which.
+4. **Then, before any CPT baseline:** land the exact-normalization loop change (step 5 of
+   `plans/v04-audit-repair.md`). The objective is decided and gradient-tested, but the loop still
+   cannot supply the step's global target count before its first backward, so `token_exact`
+   raises — now on every path, including the fixed-batch one that used to return 1/n_acc without
+   looking at the name.
 
-**Done 2026-11-04.** Five commits, 125 new tests, no regressions: the collectible suite went
-211 → 321 passing and its failure set from 34 to 33, all remaining failures being missing
-dependencies on this laptop.
+**Done 2026-11-06.** The second audit's five findings, each reproduced before being read:
 
-- **Lifecycle.** The driver could not `wait` on its own trainers (command substitution), and
-  signalling it left them running (the tracked PID was a function shell). Either way the PID
-  watchdog would have stopped the box on live training. Now: jobs lead their own process groups
-  under `set -m`, are `exec`ed, evaluations are tracked rather than foreground, and cleanup is
-  bounded TERM → wait → KILL → reap with the driver alive throughout.
-- **Dry run.** No longer deletes `checkpoints/v04_arm*_seed*` or writes into the real tree, and its
-  own check compares a before/after inventory instead of reading pre-existing checkpoints as proof
-  it wrote them.
-- **Preflight.** Every path, checkpoint and config is checked before a GPU job starts.
-- **Gate.** Three outcomes (`s42_check.EXIT_OK/REFUSED/ERROR`): a requested readability read with
-  no ranks is now a technical error rather than exit 0, unit-map coverage and rank validity are
-  required, the eval's own pool size is authoritative, and a CI at or below chance is reported as
-  science (`BELOW-CHANCE`) rather than broken software. Only MRR exactly 1/pool is called a fault.
-- **The comparison exists.** `paired_compare.py` measures the locked endpoint, resamples peptides,
-  keeps the molecule-weighted estimator, measures rho instead of assuming it, reports cluster
-  sensitivity and secondary metrics, and states that a normalized-rank effect does not establish
-  the +0.05 Recall@10 target. `judge compare` is a thin consumer; the launcher requires the result.
-- **Resume** refuses an objective change, versioned, failing closed on a checkpoint with no
-  recorded semantics (one verified override, `--resume_assume_objective`).
-- **Off-box by construction.** `resume_compat.py`, `loss_normalization.py` and `paired_compare.py`
-  hold the contracts; a subprocess test with torch blocked proves the import boundary. The lesson
-  that cost a round: **a light module under a heavy package is still heavy** — `quest.training`
-  re-exports are now lazy.
+- **A cached result could be certified under invented provenance.** The launcher wrote the cell
+  manifest *before* testing whether to reuse an existing evaluation, and `provenance.check`
+  treated absence as agreement, so a planted stale eval with no checkpoint produced a
+  `comparison.json`. Now: two schemas with required fields; the evaluator records the pool,
+  split, checkpoint and adapter digests it actually resolved and read; manifests are DERIVED
+  from that record after the evaluation succeeds; reuse requires the checkpoint, an unaltered
+  manifest, and every recorded artifact still hashing the same; a manifest is never overwritten
+  on a reused output; and two arms that differ in neither checkpoint nor adapter are refused as
+  one model compared with itself. The comparator applies the same rule itself.
+- **Lineage is read from artifacts, not declared.** Both manifests said
+  `objective=legacy_row_share_cpt`. The base arm has no CPT at all, and arm D's own
+  `trainer_state.json` records batch 16 × accumulation 16 with no token budget, i.e.
+  **`fixed-batch-mean/v0`** — not row share, which is the v2 token-budget default. CPT, SFT and
+  eval lineage are now separate fields.
+- **A non-finite score became a perfect rank.** `1 + (sc[1:] >= sc[0]).sum()` is 1 for an
+  all-NaN query, and 1 is a legal rank, so no downstream check could see it. `rank_of` refuses
+  and names the rank it would have produced; score spread and tie counts are recorded beside
+  every condition; the probe can now load the actual checkpoint, and an incomplete or
+  wrong-task checkpoint refuses instead of evaluating partly fresh weights.
+- **The ceiling binds during a phase.** `check_ceiling` ran between steps and `run_gpu` then
+  blocked in `wait`, so a phase starting at hour 7:59 could run for days. The watchdog's publish
+  command was unbounded immediately before the shutdown, so a wedged upload defeated the cost
+  ceiling outright. Both are bounded now, and the watchdog is armed and verified by the launch
+  command rather than by remembering a line of prose.
+- **The preflight proves usability.** Imports, CUDA, the pool, every split *including train and
+  val*, the adapter's actual contents and a checkpoint that must load and carry trainable
+  weights — all on the CPU, before anything is bought. A missing train split used to surface
+  after the base evaluation was paid for. The evaluator no longer falls back to the CPU silently.
+
+93 new tests, no regressions: 321 → 414 passing, with the failure set byte-identical to the
+baseline at `59cafcd` (33 failures + 4 collection errors, every one a dependency missing on this
+laptop: peft, esm, neuronx_distributed, openpyxl).
 
 **Open:** cells 2-4 still have no trained checkpoints of their own, so V04's comparison would read
 the legacy arm-D adapter · `STEPS` is recorded in manifests and enforced nowhere, and the trainer
@@ -61,9 +80,11 @@ takes `--resume_from`, which no launcher passes · ρ is assumed 0.8 against a m
 **0.765**, and only a real comparison can replace that · every readability number is power under
 the **uniform** draw until the gate recomputes it · **the 1.31 % is unapportioned**: training
 masking uses the global and DataLoader-worker torch RNG rather than evaluation's dedicated
-Generator, so that stream is seeded but not dedicated and resume does not restore it; hash the
-first batches, labels and masks at one seed before attributing it to anything · arm A has never
-been judge-scored · §9.6's length finding still needs restating per peptide in the findings text.
+Generator, so that stream is seeded but not dedicated and resume does not restore it · arm A has
+never been judge-scored · §9.6's length finding still needs restating per peptide in the findings
+text · `run_v04.sh`'s base cell still carries the CPT-objective mislabel, which cannot be fixed in
+isolation (see the note at its manifest write) and goes away when its cells move to the `sft_cell`
+shape.
 
 `--gradient_checkpointing` is **inert**: the trainer accepts it and never reads it
 (`cpt_training_lib.py:1494`). A preflight of the real command is still needed for memory and

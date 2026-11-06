@@ -273,6 +273,14 @@ G3=3
 BASE=$O/base_paired; mkdir -p $BASE
 [ -f $BASE/best.pt ] || cp "$BASE_SRC" $BASE/best.pt 2>/dev/null
 [ -f $BASE/best.pt ] || die "the base SFT checkpoint vanished between preflight and use"
+# NOTE, 2026-11-06: `--objective $LW` here describes the CPT ARM this cell is compared against,
+# not this cell. The base SFT checkpoint has no CPT history at all, so labelling it with a CPT
+# objective is the mislabel the audit found (finding 1). It cannot be fixed in isolation: the
+# `cpt_run` manifest has no field for an adapter, and the cells comparison requires `objective`
+# to match, so changing only this line would make every V04 comparison refuse. judge_first.sh
+# writes the correct `sft_cell` shape, which separates CPT, SFT and eval lineage and derives the
+# artifact fields from the evaluation itself. V04 as specified is cancelled; when its comparison
+# cells are rewired (plans/v04-audit-repair.md step 7) they move to that shape too.
 $PY $PROV write --out $BASE/manifest.json --objective $LW --token-budget 16384 \
   --bucket-boundaries "64,128,256,512,1024" --steps n/a --early-stop n/a --draw $DRAW \
   --pool-size 100 --pool-id $POOL_ID --dataset as_paired_i --seed 42 --cotenants "armA" >/dev/null \

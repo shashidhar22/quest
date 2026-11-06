@@ -214,11 +214,10 @@ def test_the_visit_produces_a_paired_comparison(box):
 def test_a_refused_comparison_fails_the_visit(box):
     """An uncertified comparison is not a result, so it cannot leave a successful visit."""
     box.seed_cells()
-    src = json.loads((box.root / "tests/fixtures" / RANKS_FIXTURE.name).read_text())
-    src.setdefault("args", {})["distractor_draw"] = "uniform"   # the base cell is length_matched
-    bad = box.root / "tests" / "fixtures" / "cell_uniform_draw.json"
-    bad.write_text(json.dumps(src))
-    r = box.run(STUB_CELL_EVAL_FIXTURE=str(bad))
+    # The arm-D cell carries a UNIFORM-draw evaluation while the base cell is length_matched:
+    # a stale result from another run. Declared through the stub rather than smuggled into a
+    # fixture's args, because a real evaluation records the draw it was actually given.
+    r = box.run(STUB_CELL_EVAL_DRAW="uniform")
     assert r.returncode != 0, "a comparison across a draw mismatch left a successful visit"
     assert not (box.out / "comparison.json").exists(), "a refused comparison wrote a result"
     log = box.run_log()
@@ -340,13 +339,25 @@ def test_dryrun_passes_with_pre_existing_checkpoints(box):
 
 
 def test_dryrun_writes_no_artifacts_into_the_checkpoint_tree(box):
-    """Stub training logs and manifests in a real checkpoint path are a provenance trap."""
+    """Stub training logs and manifests in a real checkpoint path are a provenance trap.
+
+    Snapshot-and-compare rather than "the tree is empty": the arm-D adapter's own files live
+    there and are read by the preflight, so emptiness was only ever a proxy. What matters is
+    that the dry run adds nothing and CHANGES nothing -- a stub manifest written over a real
+    adapter's is the trap, and an emptiness check would not have seen it.
+    """
+    tree = box.root / "checkpoints"
+    before = {str(p.relative_to(box.root)): p.read_bytes()
+              for p in tree.rglob("*") if p.is_file()}
     box.run_dryrun()
-    leftovers = sorted(
-        str(p.relative_to(box.root)) for p in (box.root / "checkpoints").rglob("*")
-        if p.is_file()
-    )
-    assert not leftovers, f"the dry run left artifacts in the checkpoint tree: {leftovers}"
+    after = {str(p.relative_to(box.root)): p.read_bytes()
+             for p in tree.rglob("*") if p.is_file()}
+    assert sorted(after) == sorted(before), (
+        f"the dry run changed the checkpoint tree's contents: "
+        f"added {sorted(set(after) - set(before))}, "
+        f"removed {sorted(set(before) - set(after))}")
+    changed = [k for k in before if after[k] != before[k]]
+    assert not changed, f"the dry run overwrote existing checkpoint artifacts: {changed}"
 
 
 def test_dryrun_passes(box):

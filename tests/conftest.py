@@ -9,6 +9,7 @@ the very destruction it was found to cause. Nothing here touches the real checko
 These are control-flow stubs. Nothing in them says anything about GPU behaviour, throughput or
 numerics, and a passing run is never evidence of any of those.
 """
+import json
 import os
 import shutil
 import signal
@@ -65,14 +66,34 @@ if [ "$1" = "-m" ] && [ "$2" = "track_a.esm_sft.judge" ]; then
     *)
       mkdir -p "$(dirname "$out")"
       src=$RANKS_FIXTURE
+      echo "EVAL_START $(basename "$(dirname "$out")") $$" >> "$EVENTS"
+      ckpt=""; adapter="none"; draw="length_matched"; task="as_paired_i"
+      for ((i=0;i<${#args[@]};i++)); do
+        [ "${args[i]}" = --ckpt ] && ckpt=${args[i+1]}
+        [ "${args[i]}" = --adapter ] && adapter=${args[i+1]}
+        [ "${args[i]}" = --distractor_draw ] && draw=${args[i+1]}
+        [ "${args[i]}" = --task ] && task=${args[i+1]}
+      done
       case "$out" in
         *base_paired*)
           rc=${STUB_BASE_EVAL_RC:-0}
           src=${STUB_BASE_EVAL_FIXTURE:-$RANKS_FIXTURE}
           sleep "${STUB_BASE_EVAL_SLEEP:-0}" ;;
-        *) rc=${STUB_CELL_EVAL_RC:-0}; src=${STUB_CELL_EVAL_FIXTURE:-$RANKS_FIXTURE} ;;
+        *) rc=${STUB_CELL_EVAL_RC:-0}; src=${STUB_CELL_EVAL_FIXTURE:-$RANKS_FIXTURE}
+           # A cell evaluated under a DIFFERENT draw, i.e. a stale result from another run.
+           # Explicit, because a real evaluation records the draw it was given and both arms
+           # of one visit are given the same one.
+           draw=${STUB_CELL_EVAL_DRAW:-$draw} ;;
       esac
-      if [ "$rc" -eq 0 ]; then cp "$src" "$out"; fi
+      # A real evaluation records what it read; the launcher derives its manifest from that. So
+      # the stub records it too, computed from the sandbox's own files. STUB_EVAL_RAW=1 writes
+      # the bare recorded ranks instead, which is what a pre-repair evaluator produced.
+      if [ "$rc" -eq 0 ]; then
+        if [ "${STUB_EVAL_RAW:-0}" = 1 ]; then cp "$src" "$out"
+        else "$PYREAL" "$QROOT/tests/fixtures/make_eval.py" --ranks "$src" --out "$out" \
+               --ckpt "$ckpt" --adapter "$adapter" --draw "$draw" --task "$task" || exit 9
+        fi
+      fi
       echo "judge $out rc=$rc" >> "$EVENTS"
       exit "$rc" ;;
   esac
@@ -103,17 +124,42 @@ class _Box:
 
         for rel in ("scripts/training/v04_box", "scripts/training/stage42_box"):
             shutil.copytree(REPO / rel, root / rel)
+        # launch_judge_first.sh arms the real watchdog, so the sandbox needs it too.
+        shutil.copy2(REPO / "scripts/training/autostop_when_done.sh",
+                     root / "scripts/training/autostop_when_done.sh")
+        # provenance.py reads artifact digests and lineage through track_a.shared.artifacts, and
+        # the eval stand-in writes them, so the sandbox carries that stdlib-only module.
+        (root / "track_a" / "shared").mkdir(parents=True)
+        for rel in ("track_a/__init__.py", "track_a/shared/__init__.py",
+                    "track_a/shared/artifacts.py"):
+            shutil.copy2(REPO / rel, root / rel)
         (root / "tests").mkdir(parents=True, exist_ok=True)
         shutil.copytree(REPO / "tests" / "fixtures", root / "tests" / "fixtures")
         (root / "checkpoints").mkdir()
-        # The legacy arm-D adapter the judge cells and judge_first.sh read.
+        # The legacy arm-D adapter the judge cells and judge_first.sh read. The preflight now
+        # requires an adapter DIRECTORY to contain an adapter, so the stand-in carries the two
+        # files that decide what a LoRA is, plus the lineage a real one records.
         (root / ARM_D_ADAPTER).mkdir(parents=True)
+        (root / ARM_D_ADAPTER / "adapter_config.json").write_text(
+            '{"r": 32, "lora_alpha": 64, "lora_dropout": 0.05}')
+        (root / ARM_D_ADAPTER / "adapter_model.safetensors").write_bytes(b"stand-in weights")
+        (root / ARM_D_ADAPTER / "trainer_state.json").write_text(json.dumps({
+            "global_step": 7800,
+            "config": {"batch_size": 16, "gradient_accumulation_steps": 16, "seed": 42}}))
 
         # The candidate pool at the launchers' default path. An absent pool must abort, so the
         # happy-path tests need a real one.
         pool = root / "benchmark_v2" / "splits" / "as_class_i_candidate_pool.tsv"
         pool.parent.mkdir(parents=True)
         pool.write_text("peptide\n" + "".join(f"PEPTIDE{i:03d}\n" for i in range(1, 121)))
+        # Real files at the real split paths. Not parquet -- nothing in the stubbed path parses
+        # them -- but provenance hashes them, the preflight requires them, and a test can change
+        # one to prove that a reused evaluation is refused.
+        self.splits = {}
+        for cond in ("train", "val", "test_iid", "test_novel_pep", "test_level4"):
+            f = pool.parent / f"as_paired_i_{cond}.parquet"
+            f.write_text(f"stand-in split {cond}\n")
+            self.splits[cond] = f
 
         # Preflight requires these to exist before a GPU job starts. The trainer is stubbed, so
         # empty marker directories are the honest stand-in.
@@ -122,10 +168,21 @@ class _Box:
                   "data/cpt_canonical_eval_v2"):
             (root / d).mkdir(parents=True, exist_ok=True)
 
-        # A stand-in base SFT checkpoint. /dev/null will not do: preflight requires a regular
-        # file, and a character device is not a checkpoint.
+        # A stand-in base SFT checkpoint. /dev/null will not do, and neither will an empty
+        # file: the preflight now loads it and requires a trainable state dict, because a
+        # checkpoint that restores nothing would otherwise be evaluated as freshly initialised
+        # weights. So this is a REAL torch file wherever torch is installed.
         self.base_stub = tmp_path / "base_best.pt"
-        self.base_stub.touch()
+        try:
+            import torch
+            torch.save({"args": {"task": "as_paired_i", "tcr_variant": "cdr3",
+                                 "mhc_variant": "full", "adapter": "none", "seed": 42},
+                        "trainable_state_dict": {"pool.q.weight": torch.zeros(2, 2),
+                                                 "head.0.bias": torch.zeros(2)}},
+                       self.base_stub)
+        except ImportError:
+            # No torch here: the preflight reports the load as unchecked, which is honest.
+            self.base_stub.write_bytes(b"stand-in checkpoint")
 
         self.events = tmp_path / "events.log"
         self.events.touch()
@@ -143,7 +200,9 @@ class _Box:
             Q=str(self.root), O=str(self.out), PY=str(self.bin / "python"),
             TORCHRUN=str(self.bin / "torchrun"), NGPU="4", SEEDS="1 2 3",
             RHO_FLOOR="0.8", BASE_CKPT=str(self.base_stub), EVENTS=str(self.events),
-            PYREAL="python3",
+            PYREAL="python3", QROOT=str(self.root),
+            # The sandbox has no GPU and no peft; everything else the preflight checks is real.
+            ALLOW_CPU="1", PREFLIGHT_REQUIRE="",
             RANKS_FIXTURE=str(self.root / "tests/fixtures" / RANKS_FIXTURE.name),
             PATH=f"{self.bin}:{os.environ['PATH']}",
         )
@@ -198,6 +257,15 @@ class _Box:
             d = self.out / c
             d.mkdir(parents=True, exist_ok=True)
             (d / "best.pt").touch()
+
+    def eval_pids(self):
+        """Pids of the stubbed evaluations, so a test can prove one was really terminated.
+
+        A distinct prefix on purpose: `unfinished()` and `popen_until_started` key on "START",
+        and an eval line counting as a START would let the SIGTERM test return before the phase
+        it means to interrupt had begun.
+        """
+        return [int(l.split()[2]) for l in self.event_lines() if l.startswith("EVAL_START")]
 
     def event_lines(self):
         return [l for l in self.events.read_text().splitlines() if l.strip()]

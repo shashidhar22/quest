@@ -32,15 +32,34 @@ import paired_compare as PC  # noqa: E402
 POOL = 100
 
 
+def prov(ckpt="cccccccccccccccc", adapter="none", pool_digest="aaaaaaaaaaaaaaaa", **over):
+    """The block a real evaluation records about what it read (audit finding 1, 2026-11-06)."""
+    lineage = ({"cpt_adapter": "none", "cpt_adapter_digest": "none", "cpt_objective": "none",
+                "cpt_run_id": "none", "cpt_steps": None, "cpt_seed": None,
+                "cpt_token_budget": None} if adapter == "none" else
+               {"cpt_adapter": adapter, "cpt_adapter_digest": "3afeaf40bc860fef",
+                "cpt_objective": "fixed-batch-mean/v0", "cpt_run_id": "cpt_stage41_pointD_run05",
+                "cpt_steps": 7800, "cpt_seed": 42, "cpt_token_budget": 0})
+    d = {"pool_digest": pool_digest, "pool_path": "/x/pool.tsv",
+         "split_digests": {"test_novel_pep": "bbbbbbbbbbbbbbbb"},
+         "ckpt_digest": ckpt, "ckpt_path": f"/x/{ckpt}.pt", "device": "cuda",
+         "code_commit": "abcdef123456", "pool_size": POOL, **lineage}
+    d.update(over)
+    return d
+
+
 def ev(conditions, pool=POOL, draw="length_matched", task="as_paired_i",
-       tcr_variant="cdr3", mhc_variant="full"):
+       tcr_variant="cdr3", mhc_variant="full", provenance=None, omit_provenance=False):
     """An eval document in the judge's shape."""
-    return {
+    d = {
         "pool_size": pool,
         "args": {"distractor_draw": draw, "task": task,
                  "tcr_variant": tcr_variant, "mhc_variant": mhc_variant},
         "conditions": {c: {"ranks": r} for c, r in conditions.items()},
     }
+    if not omit_provenance:
+        d["provenance"] = provenance if provenance is not None else prov()
+    return d
 
 
 def units_for(cond, mapping):
@@ -263,11 +282,89 @@ def test_incompatible_metadata_is_named(field, value):
     assert any(field.replace("pool", "pool_size") in b for b in bad), bad
 
 
+def test_metadata_absent_on_both_sides_is_refused():
+    """The auditor's second probe line: `check_metadata({pool_size}, {pool_size}) == []`.
+
+    Draw, task and serialization missing from both evals used to read as agreement, so an eval
+    that never recorded its draw was comparable with any other. A uniform-draw number and a
+    length-matched one are not comparable, and absence does not make them so.
+    """
+    bare = {"pool_size": POOL, "args": {}, "conditions": {}, "provenance": prov()}
+    bad = PC.check_metadata(bare, dict(bare))
+    assert bad, "two evals that recorded no metadata were accepted as comparable"
+    for field in ("distractor_draw", "task", "tcr_variant", "mhc_variant"):
+        assert any(field in b for b in bad), field
+
+
+def test_an_eval_with_no_provenance_block_is_refused(tmp_path):
+    """The comparator must apply the same validation as the launcher, not trust it to have."""
+    a, b, u = many_peptides_all_improving(n_pep=12)
+    pa = tmp_path / "a.json"
+    pb = tmp_path / "b.json"
+    pa.write_text(json.dumps(ev({"test_novel_pep": a}, omit_provenance=True)))
+    pb.write_text(json.dumps(ev({"test_novel_pep": b}, provenance=prov(ckpt="dddddddddddddddd"))))
+    up = write_units(tmp_path, "test_novel_pep", u)
+    rc, res = PC.compare(str(pa), str(pb), str(up))
+    assert rc == PC.EXIT_ERROR
+    assert res is None
+
+
+def test_a_changed_pool_between_arms_is_refused_by_the_comparator(tmp_path):
+    a, b, u = many_peptides_all_improving(n_pep=12)
+    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
+    pa.write_text(json.dumps(ev({"test_novel_pep": a})))
+    pb.write_text(json.dumps(ev({"test_novel_pep": b},
+                                provenance=prov(ckpt="dddddddddddddddd",
+                                                pool_digest="ffffffffffffffff"))))
+    up = write_units(tmp_path, "test_novel_pep", u)
+    rc, res = PC.compare(str(pa), str(pb), str(up))
+    assert rc == PC.EXIT_ERROR, "two arms scored against different pools were compared"
+    assert res is None
+
+
+def test_an_arm_compared_with_itself_is_refused_by_the_comparator(tmp_path):
+    """Identical checkpoint and identical adapter: one model, so any effect is noise. This is
+    the shape a reused stale evaluation takes."""
+    a, b, u = many_peptides_all_improving(n_pep=12)
+    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
+    pa.write_text(json.dumps(ev({"test_novel_pep": a})))
+    pb.write_text(json.dumps(ev({"test_novel_pep": b})))      # same provenance = same model
+    up = write_units(tmp_path, "test_novel_pep", u)
+    rc, res = PC.compare(str(pa), str(pb), str(up))
+    assert rc == PC.EXIT_ERROR
+    assert res is None
+
+
+def test_a_real_pair_reports_the_treatment_difference(tmp_path, capsys):
+    a, b, u = many_peptides_all_improving(n_pep=12)
+    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
+    pa.write_text(json.dumps(ev({"test_novel_pep": a})))
+    pb.write_text(json.dumps(ev(
+        {"test_novel_pep": b},
+        provenance=prov(ckpt="dddddddddddddddd",
+                        adapter="checkpoints/cpt_stage41_pointD_run05/final"))))
+    up = write_units(tmp_path, "test_novel_pep", u)
+    rc, res = PC.compare(str(pa), str(pb), str(up))
+    assert rc == PC.EXIT_OK, capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "cpt_objective" in out and "fixed-batch-mean/v0" in out, (
+        "the one difference the comparison is about must travel with the result")
+    assert res["provenance"]["arm_b"]["cpt_run_id"] == "cpt_stage41_pointD_run05"
+
+
 # ----------------------------------------------------------------- the CLI contract
 def write_pair(tmp_path, a, b, **kw):
+    """Two arms, and TWO MODELS: arm B carries the arm-D adapter and its own checkpoint.
+
+    Giving both sides the same provenance would now (rightly) be refused as one model compared
+    with itself, so a CLI fixture has to describe a real pair.
+    """
     pa, pb = tmp_path / "a.json", tmp_path / "b.json"
     pa.write_text(json.dumps(ev({"test_novel_pep": a}, **kw)))
-    pb.write_text(json.dumps(ev({"test_novel_pep": b}, **kw)))
+    kw_b = dict(kw)
+    kw_b.setdefault("provenance", prov(
+        ckpt="dddddddddddddddd", adapter="checkpoints/cpt_stage41_pointD_run05/final"))
+    pb.write_text(json.dumps(ev({"test_novel_pep": b}, **kw_b)))
     return pa, pb
 
 

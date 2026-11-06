@@ -45,6 +45,9 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "v04_box"))
+
+import provenance as PROV  # noqa: E402  (stdlib only; the same rule the launcher applies)
 import readability as R  # noqa: E402  (metrics, by_peptide, weighted_mean; stdlib only)
 
 EXIT_OK = 0        # a valid comparison was produced; its content may be inconclusive
@@ -102,10 +105,20 @@ def meta_of(doc):
 
 
 def check_metadata(a, b):
-    """Offending keys, as printable strings. Empty means comparable."""
+    """Offending keys, as printable strings. Empty means comparable.
+
+    REQUIRED, not merely equal (audit finding 1, 2026-11-06). Until the repair this compared
+    `ma.get(k) != mb.get(k)`, so a field missing from both evals read as agreement: an eval that
+    never recorded its distractor draw was comparable with any other, although a uniform-draw
+    number and a length-matched one are not comparable at all. Absence is the one thing that
+    must never pass a compatibility check, because it is indistinguishable from a mismatch.
+    """
     ma, mb = meta_of(a), meta_of(b)
     bad = []
     for k in META_KEYS:
+        for lbl, m in (("arm A", ma), ("arm B", mb)):
+            if m.get(k) in (None, ""):
+                bad.append(f"{k}: {lbl} did not record it, so agreement cannot be established")
         if ma.get(k) != mb.get(k):
             bad.append(f"{k}: {ma.get(k)!r} vs {mb.get(k)!r}")
     if ma.get("pool_size") in (None, 0):
@@ -225,7 +238,11 @@ def compare(a_path, b_path, units_path, primary=PRIMARY, n_boot=N_BOOT, seed=SEE
             allow_partial_pairing=False, out=None):
     """The whole report. Returns (exit_code, result dict)."""
     a, b = load_eval(a_path), load_eval(b_path)
-    bad = check_metadata(a, b)
+    # The comparator applies the provenance rule ITSELF rather than trusting a launcher to have
+    # done it: `judge compare` can be run by hand on any two files, and the 2026-11-06 audit
+    # found exactly that gap. Same function the launcher calls, so there is one rule.
+    prov_bad, prov_tolerated = PROV.check_eval_provenance(a, b)
+    bad = check_metadata(a, b) + prov_bad
     if bad:
         print("[cmp] REFUSED: these evaluations are not comparable")
         for line in bad:
@@ -268,6 +285,8 @@ def compare(a_path, b_path, units_path, primary=PRIMARY, n_boot=N_BOOT, seed=SEE
 
     print(f"[cmp] pool={pool} draw={meta_of(a)['distractor_draw']} task={meta_of(a)['task']} "
           f"serialization={meta_of(a)['tcr_variant']}x{meta_of(a)['mhc_variant']}")
+    for line in prov_tolerated:
+        print(f"[cmp]   TREATMENT DIFFERENCE (expected, and what the result is about): {line}")
     print(f"[cmp] PRIMARY (locked before any CPT cell existed): {_fmt(prim)}")
     if prim["n_only_in_a"] or prim["n_only_in_b"]:
         print(f"[cmp]   pairing: {prim['n_only_in_a']} excluded from A, "
@@ -294,7 +313,11 @@ def compare(a_path, b_path, units_path, primary=PRIMARY, n_boot=N_BOOT, seed=SEE
     result = {"pool_size": pool, "metadata": meta_of(a), "primary": prim,
               "cluster_sensitivity": cluster, "secondary": secondary,
               "utility_target": {"delta": UTILITY_DELTA, "metric": UTILITY_METRIC,
-                                 "condition": UTILITY_CONDITION, "established": False}}
+                                 "condition": UTILITY_CONDITION, "established": False},
+              # What produced each side, carried INTO the result: a comparison read later
+              # without its provenance is the failure family this programme started with.
+              "provenance": {"arm_a": a.get("provenance"), "arm_b": b.get("provenance"),
+                             "treatment_differences": prov_tolerated}}
     if out:
         pathlib.Path(out).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(out).write_text(json.dumps(result, indent=2, sort_keys=True))
