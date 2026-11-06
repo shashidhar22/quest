@@ -45,4 +45,42 @@ sleep 1
 if pgrep -f '^([^ ]*/)?python[0-9.]* .*(train_cpt|torchrun|run_stage|ray_train|esm_native)' >/dev/null; then echo "FAIL: T6 wrapper matched the training pattern"; fail=$((fail+1)); else echo "PASS: T6 wrapper argv does not match the anchored pattern"; pass=$((pass+1)); fi
 kill "$wpid" 2>/dev/null
 
+# ---- audit finding 3, 2026-11-06: the publish step must not be able to postpone the stop -----
+# These run the REAL publish path (DRY_RUN=0) with the stop command injected, because DRY_RUN=1
+# only logs what it would publish and therefore cannot exercise the bound at all.
+echo "== T7 a hung publisher cannot postpone the stop (failure: the stop never happens, or waits out the publisher)"
+sleep 2 & pid=$!
+t0=$(date +%s)
+LOG="$T/t7.log" NVSMI="$MOCK" DRY_RUN=0 POLL=1 MAX_HOURS=1 IDLE_MIN=60 PUBLISH_TIMEOUT=3 \
+  SHUTDOWN_CMD="echo WOULD-SHUTDOWN" bash "$W" "$pid" "sleep 300" >/dev/null 2>&1
+el=$(( $(date +%s) - t0 ))
+check "$T/t7.log" "publish exceeded" "T7 the publisher is bounded and says so"
+check "$T/t7.log" "WOULD-SHUTDOWN" "T7 the stop still happens"
+if [ "$el" -lt 30 ]; then echo "PASS: T7 stopped in ${el}s, not after the 300s publisher"; pass=$((pass+1));
+else echo "FAIL: T7 took ${el}s — the publisher postponed the stop"; fail=$((fail+1)); fi
+if pgrep -f "^sleep 300$" >/dev/null 2>&1; then echo "FAIL: T7 left the hung publisher running"; fail=$((fail+1));
+else echo "PASS: T7 the hung publisher was terminated"; pass=$((pass+1)); fi
+
+echo "== T8 a publisher that finishes normally is NOT killed (failure: the bound kills everything, so T7 proves nothing)"
+sleep 2 & pid=$!
+LOG="$T/t8.log" NVSMI="$MOCK" DRY_RUN=0 POLL=1 MAX_HOURS=1 IDLE_MIN=60 PUBLISH_TIMEOUT=30 \
+  SHUTDOWN_CMD="echo WOULD-SHUTDOWN" bash "$W" "$pid" "echo published-fine" >/dev/null 2>&1
+check "$T/t8.log" "published-fine" "T8 a normal publish runs to completion"
+check "$T/t8.log" "publish rc=0" "T8 its exit status is recorded"
+if grep -q "publish exceeded" "$T/t8.log"; then echo "FAIL: T8 a normal publish was reported as hung"; fail=$((fail+1));
+else echo "PASS: T8 a normal publish is not bounded out"; pass=$((pass+1)); fi
+
+echo "== T9 the log copy to S3 is bounded too (failure: a stuck aws cp holds the box open)"
+printf '#!/bin/sh\nsleep 300\n' > "$T/aws"; chmod +x "$T/aws"
+sleep 2 & pid=$!
+t0=$(date +%s)
+PATH="$T:$PATH" LOG="$T/t9.log" NVSMI="$MOCK" DRY_RUN=0 POLL=1 MAX_HOURS=1 IDLE_MIN=60 \
+  PUBLISH_TIMEOUT=3 LOG_COPY_TIMEOUT=3 S3_LOG="s3://example/nope.log" \
+  SHUTDOWN_CMD="echo WOULD-SHUTDOWN" \
+  bash "$W" "$pid" >/dev/null 2>&1
+el=$(( $(date +%s) - t0 ))
+check "$T/t9.log" "WOULD-SHUTDOWN" "T9 the stop happens despite a stuck log copy"
+if [ "$el" -lt 30 ]; then echo "PASS: T9 stopped in ${el}s"; pass=$((pass+1));
+else echo "FAIL: T9 took ${el}s — the log copy postponed the stop"; fail=$((fail+1)); fi
+
 echo; echo "passed=$pass failed=$fail"; [ "$fail" = 0 ]

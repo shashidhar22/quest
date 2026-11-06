@@ -21,9 +21,13 @@
 #               resume, no ceiling costs an unbounded bill.
 #
 # Before stopping it runs the publish command (if given) so results reach S3 even when the driver
-# crashed. Arm-time self-test refuses to arm on a dead PID, a missing nvidia-smi, or an absurd
-# MAX_HOURS. Every decision is logged with the guard that made it. DRY_RUN=1 logs instead of
-# publishing/stopping (used by tests/test_autostop_when_done.sh).
+# crashed. That publish is BOUNDED at PUBLISH_TIMEOUT seconds (default 600) and so is the optional
+# log copy, because an unbounded publish immediately before a shutdown is an unbounded bill: a
+# wedged upload held the box open and defeated the whole watchdog (audit finding 3, 2026-11-06).
+# Arm-time self-test refuses to arm on a dead PID, a missing nvidia-smi, or an absurd MAX_HOURS.
+# Every decision is logged with the guard that made it. DRY_RUN=1 logs instead of
+# publishing/stopping, and SHUTDOWN_CMD is overridable so the real publish-then-stop path is
+# itself testable (both used by tests/test_autostop_when_done.sh).
 set -u
 PID="${1:?usage: autostop_when_done.sh <driver_pid> [publish_cmd]}"
 PUBLISH_CMD="${2:-}"
@@ -34,8 +38,42 @@ LOG="${LOG:-$HOME/autostop.log}"
 NVSMI="${NVSMI:-nvidia-smi}"
 DRY_RUN="${DRY_RUN:-0}"
 S3_LOG="${S3_LOG:-}"          # optional s3:// key to copy the log to before stopping
+PUBLISH_TIMEOUT="${PUBLISH_TIMEOUT:-600}"   # seconds; nothing may postpone the stop past this
+LOG_COPY_TIMEOUT="${LOG_COPY_TIMEOUT:-120}" # the log copy is bounded separately and shorter
+SHUTDOWN_CMD="${SHUTDOWN_CMD:-sudo shutdown -h +1}"   # overridable so the stop path is testable
 
 say(){ echo "[$(date -u '+%F %T')] $*" | tee -a "$LOG"; }
+
+# run_bounded <seconds> <label> <command string> -- runs it, kills it if it overruns, returns.
+#
+# Audit finding 3, 2026-11-04 -> 2026-11-06: the publish step ran `bash -c "$PUBLISH_CMD"` with
+# no bound, immediately before the shutdown. A stuck upload -- an `aws s3 sync` against a dead
+# endpoint, a credential prompt, a retry loop -- therefore held the instance open indefinitely,
+# which defeats the entire purpose of a cost watchdog. Publishing is worth waiting a bounded
+# while for; it is never worth an unbounded bill. The job leads its own process group so a
+# wedged grandchild (aws spawns its own) dies with it.
+run_bounded(){
+  local limit=$1 lbl=$2 cmd=$3 waited=0 pp rc=0
+  set -m
+  bash -c "$cmd" >>"$LOG" 2>&1 &
+  pp=$!
+  set +m
+  while [ "$waited" -lt "$limit" ] && kill -0 "$pp" 2>/dev/null; do
+    sleep 2; waited=$((waited+2))
+  done
+  if kill -0 "$pp" 2>/dev/null; then
+    say "$lbl exceeded ${limit}s: terminating it and stopping anyway"
+    kill -TERM -"$pp" 2>/dev/null || kill -TERM "$pp" 2>/dev/null || true
+    sleep 2
+    kill -KILL -"$pp" 2>/dev/null || kill -KILL "$pp" 2>/dev/null || true
+    wait "$pp" 2>/dev/null || true
+    say "$lbl rc=timeout"
+    return 124
+  fi
+  wait "$pp" || rc=$?
+  say "$lbl rc=$rc"
+  return $rc
+}
 
 # ---- arm-time self-test: refuse rather than arm something that cannot work ----------------------
 kill -0 "$PID" 2>/dev/null            || { say "REFUSE: pid $PID is not alive"; exit 2; }
@@ -65,10 +103,14 @@ say "guard fired: $fired  (elapsed $(( ($(date +%s) - t0) / 60 )) min)"
 
 # ---- publish, then stop ---------------------------------------------------------------------------
 if [ -n "$PUBLISH_CMD" ]; then
-  if [ "$DRY_RUN" = 1 ]; then say "dry-run: would publish with: $PUBLISH_CMD"
-  else say "publishing"; bash -c "$PUBLISH_CMD" >>"$LOG" 2>&1; say "publish rc=$?"; fi
+  if [ "$DRY_RUN" = 1 ]; then say "dry-run: would publish with: $PUBLISH_CMD (bounded at ${PUBLISH_TIMEOUT}s)"
+  else say "publishing (bounded at ${PUBLISH_TIMEOUT}s)"; run_bounded "$PUBLISH_TIMEOUT" publish "$PUBLISH_CMD" || true; fi
 fi
-if [ -n "$S3_LOG" ] && [ "$DRY_RUN" != 1 ]; then aws s3 cp "$LOG" "$S3_LOG" --only-show-errors; fi
-if [ "$DRY_RUN" = 1 ]; then say "dry-run: would run: sudo shutdown -h +1"; exit 0; fi
-say "stopping instance in 1 min (shutdown -h; shutdown behavior=stop, volume survives)"
-sudo shutdown -h +1
+if [ -n "$S3_LOG" ] && [ "$DRY_RUN" != 1 ]; then
+  # Bounded for the same reason, and it is the LAST thing attempted, so losing it costs only
+  # this log -- which is already on the volume the stop preserves.
+  run_bounded "$LOG_COPY_TIMEOUT" "log copy" "aws s3 cp '$LOG' '$S3_LOG' --only-show-errors" || true
+fi
+if [ "$DRY_RUN" = 1 ]; then say "dry-run: would run: $SHUTDOWN_CMD"; exit 0; fi
+say "stopping instance (shutdown behavior=stop, volume survives): $SHUTDOWN_CMD"
+$SHUTDOWN_CMD
