@@ -179,15 +179,30 @@ class _Box:
         # weights. So this is a REAL torch file wherever torch is installed.
         self.base_stub = tmp_path / "base_best.pt"
         try:
+            import sys as _sys
             import torch
+            _sys.path.insert(0, str(REPO))
+            # The full default recipe, from the one place it is defined: the preflight now
+            # refuses a base checkpoint whose recipe differs from the one arm D trains under.
+            from track_a.esm_sft.scoring import SFT_TRAIN_DEFAULTS
             torch.save({"args": {"task": "as_paired_i", "tcr_variant": "cdr3",
-                                 "mhc_variant": "full", "adapter": "none", "seed": 42},
+                                 "mhc_variant": "full", "adapter": "none",
+                                 **SFT_TRAIN_DEFAULTS},
                         "trainable_state_dict": {"pool.q.weight": torch.zeros(2, 2),
                                                  "head.0.bias": torch.zeros(2)}},
                        self.base_stub)
         except ImportError:
             # No torch here: the preflight reports the load as unchecked, which is honest.
             self.base_stub.write_bytes(b"stand-in checkpoint")
+
+        # A git repository, because the preflight now refuses an unknown code commit: the
+        # comparison would refuse 'unknown' after every GPU step had been paid for. Committed
+        # clean, so the recorded identity is a plain sha, as on a correctly deployed box.
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        for cmd in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "sandbox"]):
+            subprocess.run(["git", "-C", str(root), *cmd], check=True, capture_output=True,
+                           env=env)
 
         self.events = tmp_path / "events.log"
         self.events.touch()

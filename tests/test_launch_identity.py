@@ -111,6 +111,11 @@ class Harness:
             f.chmod(0o755)
         self.bin = tmp_path / "bin"
         self.bin.mkdir(exist_ok=True)
+        # The launcher refuses a box with no nvidia-smi before anything starts, so the harness
+        # supplies a mock one; the mock watchdog itself never calls it.
+        nv = self.bin / "nvidia-smi"
+        nv.write_text("#!/bin/sh\necho 0\n")
+        nv.chmod(0o755)
         if setsid is not None:
             _shim(self.bin / "setsid", supports_wait=setsid)
         self.proc = None
@@ -335,3 +340,96 @@ def test_a_refused_launch_records_why(harness):
     st = json.loads((h.run_dirs()[0] / "launch_status.json").read_text())
     assert st["outcome"] == "watchdog_not_armed", st
     assert st["driver_rc"] is None or isinstance(st["driver_rc"], int)
+
+
+# --------------------------------------------------------------- pre-launch code review
+def test_a_resumed_run_reuses_its_directory_with_a_fresh_identity(harness):
+    """Every launch made a fresh directory, so judge_first's validated reuse was unreachable
+    through the only supported launch command and an interrupted visit paid again in full."""
+    h = harness(watchdog_arms=False, driver_sleep=30)
+    assert h.run().returncode == 2
+    d = h.run_dirs()[0]
+    old_token = (d / "run.identity").read_text().split()[0]
+    h2 = harness(driver_sleep=1, driver_rc=0)
+    r = h2.run(RESUME=d.name)
+    assert r.returncode == 0, r.stdout[-1500:]
+    assert h2.run_dirs() == [d], "a resume must not create a second directory"
+    new_token, new_pid = (d / "run.identity").read_text().split()
+    assert new_token != old_token, "a resumed launch reused the old identity token"
+    assert h2.armed_pids() == [new_pid]
+
+
+def test_a_stale_handshake_in_a_resumed_directory_cannot_release_the_driver(harness):
+    """An old watchdog.armed in a reused directory would let the new driver start GPU work
+    before this launch had armed anything."""
+    h = harness(watchdog_arms=False, driver_sleep=30)
+    h.run()
+    d = h.run_dirs()[0]
+    (d / "watchdog.armed").touch()                  # left by an earlier launch
+    (d / "driver-finished").unlink(missing_ok=True)
+    r = h.run(RESUME=d.name)
+    assert r.returncode == 2, r.stdout[-1500:]
+    time.sleep(1)
+    assert not (d / "driver-finished").exists(), (
+        "the driver ran on a stale handshake while the watchdog had not armed")
+
+
+def test_reusing_a_run_id_for_a_new_run_is_refused(harness):
+    h = harness(driver_sleep=1, driver_rc=0)
+    assert h.run(RUN_ID="fixed").returncode == 0
+    r = h.run(RUN_ID="fixed")
+    assert r.returncode == 2
+    assert "already exists" in r.stdout
+
+
+def test_resuming_a_run_that_does_not_exist_is_refused(harness):
+    h = harness(driver_sleep=1, driver_rc=0)
+    r = h.run(RESUME="no-such-run")
+    assert r.returncode == 2
+    assert h.run_dirs() == []
+
+
+def test_a_lock_held_by_a_live_driver_is_respected_after_its_launcher_died(harness):
+    """An SSM session drop kills the launcher but not the driver or its watchdog. A lock that
+    tracked only the launcher would then be cleared as stale and a second driver started on
+    the same single GPU."""
+    driver = _live_sleeper()
+    try:
+        h = harness(driver_sleep=1, driver_rc=0)
+        (h.out / "launch.lock").write_text(f"999999999 {driver.pid}\n")
+        r = h.run()
+        assert r.returncode == 2, r.stdout[-1500:]
+        assert "already active" in r.stdout
+        assert h.run_dirs() == []
+    finally:
+        driver.kill()
+        driver.wait()
+
+
+def test_a_lock_whose_every_holder_is_dead_is_cleared(harness):
+    h = harness(driver_sleep=1, driver_rc=0)
+    (h.out / "launch.lock").write_text("999999998 999999999\n")
+    r = h.run()
+    assert r.returncode == 0, r.stdout[-1500:]
+    assert "stale lock" in r.stdout
+
+
+@pytest.mark.parametrize("var", ["MAX_HOURS", "WATCHDOG_HOURS"])
+def test_a_non_numeric_ceiling_is_refused_by_the_launcher(harness, var):
+    """`abc` evaluated to 0 inside awk, so it became a silent zero ceiling, not a refusal."""
+    h = harness(driver_sleep=1, driver_rc=0)
+    r = h.run(**{var: "abc"})
+    assert r.returncode == 2, r.stdout[-1000:]
+    assert "not a number" in r.stdout
+    assert h.run_dirs() == []
+
+
+def test_a_box_without_nvidia_smi_is_refused_before_anything_starts(harness):
+    """The watchdog cannot arm without nvidia-smi. Finding that out after a driver has been
+    started means a driver to reap; finding it first means nothing to undo."""
+    h = harness(driver_sleep=1, driver_rc=0)
+    (h.bin / "nvidia-smi").unlink()
+    r = h.run(NVSMI="definitely-not-nvidia-smi")
+    assert r.returncode == 2
+    assert "not found" in r.stdout
+    assert h.run_dirs() == []

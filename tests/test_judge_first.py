@@ -322,14 +322,19 @@ def test_the_handshake_releases_the_run(jfbox):
 def test_the_launcher_refuses_to_leave_a_run_unwatched(jfbox):
     """launch_judge_first.sh must terminate the run when the watchdog cannot arm.
 
-    Here it cannot: `nvidia-smi` is absent on this laptop, so the real watchdog refuses at its
-    own self-test. A pass requires the wrapper to notice, say so, kill the run, and exit
-    nonzero -- not to proceed with an unwatched GPU visit.
+    Here it cannot: WATCHDOG_HOURS=300 is above the real watchdog's own 240-hour sanity cap, so
+    it refuses at its self-test (nvidia-smi is mocked, so the wrapper's early check passes and
+    the arming path itself is what is exercised). A pass requires the wrapper to notice, say so,
+    kill the run, and exit nonzero -- not to proceed with an unwatched GPU visit.
     """
+    nvsmi = jfbox.bin / "nvidia-smi"
+    nvsmi.write_text("#!/bin/sh\nprintf '0\\n'\n")
+    nvsmi.chmod(0o755)
     r = subprocess.run(
         ["bash", str(jfbox.root / "scripts/training/v04_box/launch_judge_first.sh")],
         capture_output=True, text=True, timeout=180,
-        env=jfbox._env(ARM_TIMEOUT="5", WLOG=str(jfbox.out.parent / "autostop.log")),
+        env=jfbox._env(ARM_TIMEOUT="5", WATCHDOG_HOURS="300",
+                       WLOG=str(jfbox.out.parent / "autostop.log")),
     )
     assert r.returncode == 2, r.stdout[-2000:] + r.stderr[-1000:]
     assert "did not arm" in r.stdout, r.stdout[-2000:]
@@ -440,3 +445,52 @@ def test_the_preflight_report_is_kept_beside_the_result(jfbox):
         assert ck["digest"] not in ("MISSING", None), ck
     else:
         assert ck["n_trainable_keys"] >= 1, ck
+
+
+# --------------------------------------------------------------- pre-launch code review
+def test_a_non_numeric_ceiling_is_refused_not_zeroed(jfbox):
+    r = jfbox.run(MAX_HOURS="abc")
+    assert r.returncode == 2
+    assert "not a usable ceiling" in (r.stdout + r.stderr + jfbox.run_log())
+    assert not jfbox.event_lines()
+
+
+def test_pool_file_is_refused_because_nothing_reads_it(jfbox):
+    """The pool is resolved by the split loader. An ignored setting that looks effective is
+    worse than an error."""
+    r = jfbox.run(POOL_FILE="/x/pool.tsv")
+    assert r.returncode == 2
+    assert "QUEST_SPLITS_DIR" in jfbox.run_log()
+    assert not jfbox.event_lines()
+
+
+def test_a_validated_base_evaluation_is_not_paid_for_twice(jfbox):
+    _complete_cell(jfbox)
+    r = jfbox.run()
+    assert r.returncode == 0, jfbox.run_log()[-2000:]
+    assert not [l for l in jfbox.event_lines() if l.startswith("EVAL_START base_paired")], (
+        "the base re-score was bought again although a validated one existed")
+
+
+def test_a_cell_interrupted_during_its_evaluation_is_not_retrained(jfbox):
+    """The likeliest interruption: training finished, evaluation did not."""
+    cell = _complete_cell(jfbox)
+    (cell / "eval.json").unlink()
+    (cell / "manifest.json").unlink()
+    r = jfbox.run()
+    assert r.returncode == 0, jfbox.run_log()[-2000:]
+    assert not [l for l in jfbox.event_lines() if "sft_armD_paired" in l], "it was retrained"
+    assert [l for l in jfbox.event_lines() if l.startswith("EVAL_START armD_paired")]
+    assert (jfbox.out / "comparison.json").exists()
+
+
+def test_a_checkpoint_from_an_unfinished_training_is_not_trusted(jfbox):
+    """`judge train` writes best.pt after any improving epoch, so a best.pt alone does not mean
+    training finished. Only the launcher's completion marker does."""
+    cell = _complete_cell(jfbox)
+    for f in ("eval.json", "manifest.json", "train.complete"):
+        (cell / f).unlink()
+    r = jfbox.run()
+    assert r.returncode == 0, jfbox.run_log()[-2000:]
+    assert [l for l in jfbox.event_lines() if "sft_armD_paired" in l], (
+        "a possibly partial checkpoint was evaluated as if training had finished")

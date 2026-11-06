@@ -293,7 +293,11 @@ def compare(a_path, b_path, units_path, primary=PRIMARY, n_boot=N_BOOT, seed=SEE
     print(f"[cmp] pool={pool} draw={meta_of(a)['distractor_draw']} task={meta_of(a)['task']} "
           f"serialization={meta_of(a)['tcr_variant']}x{meta_of(a)['mhc_variant']}")
     for line in prov_tolerated:
-        print(f"[cmp]   TREATMENT DIFFERENCE (expected, and what the result is about): {line}")
+        if line.startswith("UNVERIFIED"):
+            # Not a treatment difference: a gap in what can be shown, carried with the result.
+            print(f"[cmp]   {line}")
+        else:
+            print(f"[cmp]   TREATMENT DIFFERENCE (expected, and what the result is about): {line}")
     print(f"[cmp] PRIMARY (locked before any CPT cell existed): {_fmt(prim)}")
     if prim["n_only_in_a"] or prim["n_only_in_b"]:
         print(f"[cmp]   pairing: {prim['n_only_in_a']} excluded from A, "
@@ -324,7 +328,10 @@ def compare(a_path, b_path, units_path, primary=PRIMARY, n_boot=N_BOOT, seed=SEE
               # What produced each side, carried INTO the result: a comparison read later
               # without its provenance is the failure family this programme started with.
               "provenance": {"arm_a": a.get("provenance"), "arm_b": b.get("provenance"),
-                             "treatment_differences": prov_tolerated}}
+                             "treatment_differences": [x for x in prov_tolerated
+                                                       if not x.startswith("UNVERIFIED")],
+                             "unverified": [x for x in prov_tolerated
+                                            if x.startswith("UNVERIFIED")]}}
     if out:
         pathlib.Path(out).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(out).write_text(json.dumps(result, indent=2, sort_keys=True))

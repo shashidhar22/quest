@@ -556,3 +556,24 @@ def test_the_comparator_imports_with_no_ml_stack_present():
     assert r.returncode == 0, (
         "the comparator pulled in a heavy dependency:\n" + r.stdout + r.stderr
     )
+
+
+def test_an_unverified_training_data_gap_is_carried_into_the_result(tmp_path, capsys):
+    """The legacy base checkpoint records no training-data digests. The comparison proceeds,
+    and the gap travels with the result instead of being labelled a treatment difference."""
+    a, b, u = many_peptides_all_improving(n_pep=12)
+    pa, pb = tmp_path / "a.json", tmp_path / "b.json"
+    pa.write_text(json.dumps(ev({"test_novel_pep": a})))            # no sft_train_digests
+    pb.write_text(json.dumps(ev(
+        {"test_novel_pep": b},
+        provenance=prov(ckpt="dddddddddddddddd",
+                        adapter="checkpoints/cpt_stage41_pointD_run05/final",
+                        sft_train_digests={"train": "1" * 16, "val": "2" * 16}))))
+    up = write_units(tmp_path, "test_novel_pep", u)
+    rc, res = PC.compare(str(pa), str(pb), str(up), n_boot=20)
+    assert rc == PC.EXIT_OK, capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "UNVERIFIED sft_train_digests" in out
+    assert "TREATMENT DIFFERENCE (expected, and what the result is about): UNVERIFIED" not in out
+    assert res["provenance"]["unverified"], "the gap must be in the written result too"
+    assert not any("sft_train_digests" in x for x in res["provenance"]["treatment_differences"])

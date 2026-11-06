@@ -51,6 +51,7 @@ from cpt_training_lib import (  # noqa: E402  (the CPT trainer's own serializer 
 from track_a.esm_sft.model import ESMScorer  # noqa: E402
 from track_a.esm_sft.scoring import (  # noqa: E402  (NumPy only; see its docstring)
     SFT_OBJECTIVE,
+    SFT_TRAIN_DEFAULTS as D,
     DeviceError,
     ScoreError,
     cotenants,
@@ -544,7 +545,7 @@ def main():
         p.add_argument("--adapter", required=True, help="'none' = fresh LoRA (fair base), else adapter dir")
         p.add_argument("--tcr_variant", required=True)
         p.add_argument("--mhc_variant", required=True)
-        p.add_argument("--max_len", type=int, default=1024)
+        p.add_argument("--max_len", type=int, default=D["max_len"])
         p.add_argument("--smoke", action="store_true")
         # No silent CPU fallback: a GPU visit that fell back produced a result nobody chose to
         # buy (audit finding 5, 2026-11-06). Opting in stays available for off-box checks.
@@ -552,14 +553,14 @@ def main():
                        help="run on the CPU when CUDA is absent, instead of refusing")
     t = sp.choices["train"]
     t.add_argument("--out_dir", required=True)
-    t.add_argument("--max_train_pos", type=int, default=50_000)
-    t.add_argument("--max_val_pos", type=int, default=5_000)
-    t.add_argument("--epochs", type=int, default=2)
-    t.add_argument("--patience", type=int, default=1)
-    t.add_argument("--batch_size", type=int, default=16)
-    t.add_argument("--lr", type=float, default=1e-4)
-    t.add_argument("--seed", type=int, default=42)
-    t.add_argument("--num_workers", type=int, default=4)
+    t.add_argument("--max_train_pos", type=int, default=D["max_train_pos"])
+    t.add_argument("--max_val_pos", type=int, default=D["max_val_pos"])
+    t.add_argument("--epochs", type=int, default=D["epochs"])
+    t.add_argument("--patience", type=int, default=D["patience"])
+    t.add_argument("--batch_size", type=int, default=D["batch_size"])
+    t.add_argument("--lr", type=float, default=D["lr"])
+    t.add_argument("--seed", type=int, default=D["seed"])
+    t.add_argument("--num_workers", type=int, default=D["num_workers"])
     sp.choices["probe"].add_argument(
         "--ckpt", default=None,
         help="probe THIS checkpoint rather than a fresh head. Required to vouch for a "

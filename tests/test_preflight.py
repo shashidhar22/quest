@@ -171,8 +171,9 @@ def test_a_checkpoint_with_no_trained_weights_fails(tmp_path, splits):
 def test_a_real_checkpoint_reports_what_it_was_trained_with(tmp_path, splits):
     torch = pytest.importorskip("torch")
     ck = tmp_path / "best.pt"
+    from track_a.esm_sft.scoring import SFT_TRAIN_DEFAULTS
     torch.save({"args": {"task": "as_paired_i", "tcr_variant": "cdr3", "mhc_variant": "full",
-                         "adapter": "none", "seed": 42},
+                         "adapter": "none", **SFT_TRAIN_DEFAULTS},
                 "trainable_state_dict": {"pool.q.weight": torch.zeros(2, 2),
                                          "head.0.bias": torch.zeros(2)}}, ck)
     r = run("--require", "", "--ckpt", str(ck), env={"QUEST_SPLITS_DIR": str(splits)})
@@ -193,3 +194,66 @@ def test_the_report_is_written_and_carries_the_commit(tmp_path, splits):
     assert rep["ok"] is True
     assert rep["commit"], "a result must carry the revision that produced it"
     assert rep["problems"] == []
+
+
+# ----------------------------------------------------------------- pre-launch code review
+def _ckpt(path, **args):
+    torch = pytest.importorskip("torch")
+    from track_a.esm_sft.scoring import SFT_TRAIN_DEFAULTS
+    a = {"task": "as_paired_i", "tcr_variant": "cdr3", "mhc_variant": "full",
+         "adapter": "none", **SFT_TRAIN_DEFAULTS}
+    a.update(args)
+    a = {k: v for k, v in a.items() if v is not None}
+    torch.save({"args": a, "trainable_state_dict": {"head.0.bias": torch.zeros(2)}}, path)
+
+
+def test_a_base_checkpoint_with_a_different_recipe_fails_before_spending(tmp_path, splits):
+    """The arm-D cell trains under the judge's defaults. A base checkpoint trained otherwise
+    would pass preflight, buy the base re-score and the arm-D cell, and only then be refused
+    at the comparison. Checked here, where it is free."""
+    ck = tmp_path / "best.pt"
+    _ckpt(ck, epochs=9)
+    r = run("--require", "", "--ckpt", str(ck), env={"QUEST_SPLITS_DIR": str(splits)})
+    assert r.returncode == P.ERROR, r.stderr
+    assert "recipe" in r.stderr
+
+
+def test_a_base_checkpoint_with_an_incomplete_recipe_fails(tmp_path, splits):
+    ck = tmp_path / "best.pt"
+    _ckpt(ck, patience=None)
+    r = run("--require", "", "--ckpt", str(ck), env={"QUEST_SPLITS_DIR": str(splits)})
+    assert r.returncode == P.ERROR
+    assert "unrecorded" in r.stderr
+
+
+def test_a_base_checkpoint_with_the_default_recipe_passes(tmp_path, splits):
+    ck = tmp_path / "best.pt"
+    _ckpt(ck)
+    r = run("--require", "", "--ckpt", str(ck), env={"QUEST_SPLITS_DIR": str(splits)})
+    assert r.returncode == P.OK, r.stderr
+
+
+def test_a_gpu_visit_requires_the_checkpoint_to_have_actually_loaded(tmp_path, splits):
+    """'not checked: torch is unavailable' must not pass on the box, where it would mean the
+    one artifact nothing else validates went unvalidated."""
+    ck = tmp_path / "best.pt"
+    ck.write_bytes(b"x")
+    blocker = tmp_path / "sitecustomize.py"
+    blocker.write_text(
+        "import importlib.abc, sys\n"
+        "class B(importlib.abc.MetaPathFinder):\n"
+        "    def find_spec(self, n, p=None, t=None):\n"
+        "        if n.split('.')[0] == 'torch': raise ImportError(n)\n"
+        "sys.meta_path.insert(0, B())\n")
+    r = run("--require", "", "--require-cuda", "--ckpt", str(ck),
+            env={"QUEST_SPLITS_DIR": str(splits), "PYTHONPATH": str(tmp_path)})
+    assert r.returncode == P.ERROR
+    assert "was not loaded" in r.stderr, r.stderr
+
+
+def test_an_unknown_commit_fails_before_spending(splits):
+    """'unknown' is refused at the comparison, so finding it there costs the whole visit."""
+    r = run("--require", "", env={"QUEST_SPLITS_DIR": str(splits),
+                                  "GIT_DIR": "/nonexistent/.git"})
+    assert r.returncode == P.ERROR
+    assert "commit" in r.stderr

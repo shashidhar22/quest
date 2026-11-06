@@ -48,7 +48,16 @@ PREFLIGHT_REQUIRE=${PREFLIGHT_REQUIRE-torch,peft,transformers}
 ALLOW_CPU=${ALLOW_CPU:-}
 S42=$Q/scripts/training/stage42_box/s42_check.py
 CMP=$Q/scripts/training/stage42_box/paired_compare.py
-POOL=${POOL_FILE:-$Q/benchmark_v2/splits/as_class_i_candidate_pool.tsv}
+# There is no POOL_FILE any more. The pool is whatever the SPLIT LOADER resolves (QUEST_SPLITS_DIR,
+# then this checkout, then the box path), because hashing a launcher-named file the evaluator
+# never read was round one's finding 1. A setting that looks effective and is ignored is worse
+# than an error, so it is refused.
+if [ -n "${POOL_FILE:-}" ]; then
+  echo "ABORT: POOL_FILE=$POOL_FILE has no effect: the evaluator resolves the pool through the" >&2
+  echo "       split loader. Set QUEST_SPLITS_DIR to the directory holding it instead." >&2
+  mkdir -p "$O" && echo "[$(date -u '+%F %T')] ABORT: POOL_FILE is ignored by the evaluator; set QUEST_SPLITS_DIR" >> "$O/run.log"
+  exit 2
+fi
 # What the JUDGE optimises is recorded by the EVALUATOR (track_a/esm_sft/scoring.SFT_OBJECTIVE),
 # not declared here. It is not a CPT objective, and the two must never share a field: both
 # manifests used to say `objective=legacy_row_share_cpt`, which the base arm never had and arm D
@@ -77,6 +86,10 @@ START=$(date +%s)
 # An unparseable or absurd ceiling is REFUSED rather than defaulted: a cost ceiling that quietly
 # becomes "no ceiling" on a typo is the failure this whole guard exists to prevent. MAX_HOURS=0
 # stays legal and means a ceiling already exceeded, so nothing is spent.
+# Numeric BEFORE awk sees it: inside an awk expression `abc` evaluates to 0 and passed this
+# check, becoming a silent zero ceiling; anything else spliced there is awk program text.
+case "$MAX_HOURS" in (''|*[!0-9.]*|*.*.*)
+  echo "ABORT: MAX_HOURS=$MAX_HOURS is not a usable ceiling (not a number)" >&2; exit 2;; esac
 awk "BEGIN{exit !($MAX_HOURS >= 0 && $MAX_HOURS < 240)}" 2>/dev/null || {
   echo "ABORT: MAX_HOURS=$MAX_HOURS is not a usable ceiling (want 0 <= hours < 240)" >&2; exit 2; }
 MAX_S=$(awk "BEGIN{printf \"%d\", $MAX_HOURS*3600}")
@@ -224,8 +237,8 @@ bad=0
 # $POOL while the evaluator read load_candidate_pool(), so a manifest could record the digest of
 # a file nothing opened (audit finding 1, 2026-11-06).
 POOL_ID=$($PY $PROV fingerprint --pool 2>/dev/null || echo MISSING)
-[ "$POOL_ID" = MISSING ] && POOL_ID=POOL_FILE_MISSING
-[ "$POOL_ID" = POOL_FILE_MISSING ] && { say "  preflight: candidate pool not found at $POOL"; bad=1; }
+[ "$POOL_ID" = MISSING ] && { say "  preflight: no candidate pool where the split loader looks
+  (QUEST_SPLITS_DIR, then $Q/benchmark_v2/splits, then the box path)"; bad=1; }
 [ -d "$ADAPTER_D" ] || { say "  preflight: arm D adapter not found at $ADAPTER_D"; bad=1; }
 for p in "$UNITS" "$PROV" "$S42" "$CMP" "$PRE"; do
   [ -f "$p" ] || { say "  preflight: missing file $p"; bad=1; }
@@ -290,16 +303,22 @@ done
 # Eval only, no retraining. The 10-08 number was scored against the uniform draw and is not
 # comparable to anything produced under the length-matched one.
 check_ceiling "the base re-score"
-run_gpu "P2 base re-score" "$BASE/eval.log" \
-  $PY -m track_a.esm_sft.judge eval --task as_paired_i --adapter none \
-    --tcr_variant cdr3 --mhc_variant full --ckpt $BASE/best.pt --out $BASE/eval.json \
-    --conditions $CONDITIONS --max_queries $MAXQ --min_peptides $MINP \
-    --distractor_draw $DRAW $SMOKE $CPU_JUDGE \
-  || die "the base re-score failed; the gate has nothing to read"
-# The manifest is written AFTER the evaluation and DERIVED FROM IT. Writing it first, as this
-# did until 2026-11-06, meant the manifest described an intention; derived from the eval it
-# describes the pool, splits, checkpoint and adapter the evaluation actually read.
-write_manifest $BASE none "the base re-score"
+# A resumed visit (launch_judge_first.sh RESUME=<run_id>) reuses a base evaluation only after the
+# same four checks the arm-D cell gets; otherwise it re-scores.
+if [ -f $BASE/eval.json ]; then
+  reuse_or_die $BASE none "the base re-score"
+else
+  run_gpu "P2 base re-score" "$BASE/eval.log" \
+    $PY -m track_a.esm_sft.judge eval --task as_paired_i --adapter none \
+      --tcr_variant cdr3 --mhc_variant full --ckpt $BASE/best.pt --out $BASE/eval.json \
+      --conditions $CONDITIONS --max_queries $MAXQ --min_peptides $MINP \
+      --distractor_draw $DRAW $SMOKE $CPU_JUDGE \
+    || die "the base re-score failed; the gate has nothing to read"
+  # The manifest is written AFTER the evaluation and DERIVED FROM IT. Writing it first, as this
+  # did until 2026-11-06, meant the manifest described an intention; derived from the eval it
+  # describes the pool, splits, checkpoint and adapter the evaluation actually read.
+  write_manifest $BASE none "the base re-score"
+fi
 
 # ---------- G1: the gate ----------
 say "G1: locked-read readability gate on the NEW-draw ranks"
@@ -332,11 +351,20 @@ CELL=$O/armD_paired; mkdir -p $CELL
 if [ -f $CELL/eval.json ]; then
   reuse_or_die $CELL "$ADAPTER_D" "the arm D cell"
 else
+  # `judge train` writes best.pt after ANY improving epoch, so best.pt alone does not mean
+  # training finished. train.complete is written here, only after a zero exit and a checkpoint,
+  # and it is the only thing that lets an interrupted-during-evaluation cell skip retraining.
+  if [ -f $CELL/best.pt ] && [ -f $CELL/train.complete ]; then
+    say "P3: arm D training completed in an earlier launch (train.complete); evaluating only"
+  else
+  rm -f $CELL/train.complete
   run_gpu "P3 armD train" "$CELL/train.log" \
     $PY -m track_a.esm_sft.judge train --task as_paired_i --adapter "$ADAPTER_D" \
       --tcr_variant cdr3 --mhc_variant full --out_dir $CELL $SMOKE $CPU_JUDGE \
     || die "the arm D SFT cell failed to train"
   [ -f $CELL/best.pt ] || die "training reported success but produced no $CELL/best.pt"
+  date -u '+%F %T' > $CELL/train.complete
+  fi
   check_ceiling "the arm D eval"
   run_gpu "P3 armD eval" "$CELL/eval.log" \
     $PY -m track_a.esm_sft.judge eval --task as_paired_i --adapter "$ADAPTER_D" \

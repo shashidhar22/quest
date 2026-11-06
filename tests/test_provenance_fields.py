@@ -36,6 +36,8 @@ def sft(**over):
         "sft_ckpt_digest": "cccccccccccccccc", "sft_seed": 42, "sft_objective": "bce_pairs/v1",
         "sft_max_len": 1024, "sft_recipe": "lr=0.0001;bs=16;epochs=2;train_cap=50000",
         "eval_max_len": 1024,
+        "sft_train_digests": {"train": "t" * 16, "val": "v" * 16},
+        "cpt_objective_basis": "no adapter",
         "cpt_adapter": "none", "cpt_adapter_digest": "none", "cpt_objective": "none",
         "cpt_run_id": "none", "cpt_steps": None, "cpt_seed": None, "cpt_token_budget": None,
         "device": "cuda", "code_commit": "abcdef123456", "cotenants": "none",
@@ -49,7 +51,8 @@ def armd(**over):
     base = dict(cpt_adapter="checkpoints/cpt_stage41_pointD_run05/final",
                 cpt_adapter_digest="3afeaf40bc860fef", cpt_objective="fixed-batch-mean/v0",
                 cpt_run_id="cpt_stage41_pointD_run05", cpt_steps=7800, cpt_seed=42,
-                cpt_token_budget=0, sft_ckpt_digest="dddddddddddddddd")
+                cpt_token_budget=0, sft_ckpt_digest="dddddddddddddddd",
+                cpt_objective_basis="inferred: the recorded config predates token_budget")
     base.update(over)          # `over` wins, so a test can damage one field on purpose
     return sft(**base)
 
@@ -108,7 +111,11 @@ def test_the_legacy_cpt_run_schema_still_validates():
     """run_v04.sh writes this shape; the repair must not break the CPT comparison path."""
     m = {k: "x" for k in P.SCHEMAS["cpt_run"]}
     m.update(manifest_kind="cpt_run", manifest_version=P.MANIFEST_VERSION)
-    assert P.check(m, dict(m), "strict") == ([], [])
+    # no offending keys; a fixture without training-data digests is DISCLOSED as
+    # unverified rather than silently accepted, so the tolerated list may name it
+    bad, tol = P.check(m, dict(m), "strict")
+    assert bad == [], bad
+    assert all(t.startswith("UNVERIFIED sft_train_digests") for t in tol), tol
     gone = dict(m)
     del gone["steps"]
     bad, _ = P.check(gone, dict(m), "strict")
@@ -186,7 +193,11 @@ def test_write_from_eval_takes_the_artifact_fields_from_the_eval_itself(tmp_path
     assert m["split_digests"] == {"test_novel_pep": "2222222222222222"}
     assert m["cpt_objective"] == "none", "a base arm must not be labelled with a CPT objective"
     assert m["manifest_kind"] == "sft_cell"
-    assert P.check(m, dict(m), "strict") == ([], [])
+    # no offending keys; a fixture without training-data digests is DISCLOSED as
+    # unverified rather than silently accepted, so the tolerated list may name it
+    bad, tol = P.check(m, dict(m), "strict")
+    assert bad == [], bad
+    assert all(t.startswith("UNVERIFIED sft_train_digests") for t in tol), tol
 
 
 def test_write_from_an_eval_with_no_provenance_block_refuses(tmp_path):
@@ -296,7 +307,11 @@ def test_from_eval_takes_the_sft_objective_and_cotenants_from_the_eval(tmp_path)
     assert kv["cotenants"] == "cuda_visible_devices=0"
     assert kv["sft_seed"] == 42
     m = P.write(tmp_path / "m.json", **kv)
-    assert P.check(m, dict(m), "strict") == ([], [])
+    # no offending keys; a fixture without training-data digests is DISCLOSED as
+    # unverified rather than silently accepted, so the tolerated list may name it
+    bad, tol = P.check(m, dict(m), "strict")
+    assert bad == [], bad
+    assert all(t.startswith("UNVERIFIED sft_train_digests") for t in tol), tol
 
 
 def test_from_eval_refuses_an_eval_that_records_no_sft_objective(tmp_path):
@@ -324,3 +339,29 @@ def test_an_unrecorded_sft_recipe_does_not_match_another_unrecorded_one():
     # the control: an adapter that records nothing about its CPT history is still comparable
     bad, _ = P.check(sft(), armd(cpt_objective="unrecorded"), "cells")
     assert bad == [], bad
+
+
+# ------------------------------------------------------------------ pre-launch code review
+def test_an_unknown_code_commit_is_refused():
+    """'unknown' matched 'unknown', so two evaluations whose git call failed were certified as
+    scored by the same code."""
+    bad, _ = P.check(sft(code_commit="unknown"), armd(code_commit="unknown"), "cells")
+    assert any("code_commit" in x for x in bad), bad
+
+
+def test_different_sft_training_data_is_refused():
+    a = sft(sft_train_digests={"train": "1" * 16, "val": "2" * 16})
+    b = armd(sft_train_digests={"train": "9" * 16, "val": "2" * 16})
+    bad, _ = P.check(a, b, "cells")
+    assert any("sft_train_digests" in x for x in bad), bad
+
+
+def test_a_legacy_checkpoint_without_training_digests_is_disclosed_not_hidden():
+    """The 10-08 base checkpoint predates training-data hashing. Refusing would make the
+    approved run impossible; accepting silently would hide a real gap. So it is accepted and
+    named as UNVERIFIED beside the result."""
+    a = sft(sft_train_digests=None)
+    b = armd(sft_train_digests={"train": "1" * 16, "val": "2" * 16})
+    bad, tolerated = P.check(a, b, "cells")
+    assert bad == [], bad
+    assert any(t.startswith("UNVERIFIED") and "sft_train_digests" in t for t in tolerated)

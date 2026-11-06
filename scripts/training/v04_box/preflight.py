@@ -21,6 +21,8 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 from track_a.shared import artifacts as A  # noqa: E402
+from track_a.esm_sft.scoring import (  # noqa: E402  (NumPy only)
+    SFT_TRAIN_DEFAULTS, UNRECORDED, sft_recipe)
 
 OK, ERROR = 0, 2
 # What an adapter directory must actually contain to be an adapter. A directory that merely
@@ -105,6 +107,27 @@ def check_checkpoint(path, require_trainable=True):
     out["recorded_args"] = {k: v for k, v in (ck.get("args") or {}).items()
                             if k in ("task", "tcr_variant", "mhc_variant", "adapter", "seed",
                                      "epochs", "lr", "batch_size", "max_len")}
+    # The recipe the comparison will require. The arm-D cell trains under the judge's
+    # defaults, so a base checkpoint trained otherwise, or one whose recipe is incomplete, would
+    # otherwise be discovered only at C1 -- after the base re-score and the whole arm-D cell had
+    # been paid for (pre-launch review, 2026-11-06).
+    saved = ck.get("args") or {}
+    out["sft_recipe"] = sft_recipe(saved)
+    out["sft_recipe_expected"] = sft_recipe(SFT_TRAIN_DEFAULTS)
+    out["recipe_problems"] = []
+    if out["sft_recipe"] == UNRECORDED:
+        out["recipe_problems"].append(
+            "its SFT recipe is unrecorded (a training setting is missing from its args), so it "
+            "cannot be shown to match the arm-D cell, and the comparison would refuse")
+    elif out["sft_recipe"] != out["sft_recipe_expected"]:
+        out["recipe_problems"].append(
+            f"its SFT recipe {out['sft_recipe']} differs from the one the arm-D cell trains "
+            f"under, {out['sft_recipe_expected']}, and the comparison would refuse")
+    for k in ("seed", "max_len"):
+        if saved.get(k) != SFT_TRAIN_DEFAULTS[k]:
+            out["recipe_problems"].append(
+                f"it was trained with {k}={saved.get(k)!r}; the arm-D cell uses "
+                f"{SFT_TRAIN_DEFAULTS[k]!r}")
     keys = list((ck.get("trainable_state_dict") or {}).keys())
     out["n_trainable_keys"] = len(keys)
     out["trainable_key_prefixes"] = sorted({k.split(".")[0] for k in keys})
@@ -159,6 +182,17 @@ def run(args):
                         f"{report['adapter'].get('missing')}")
     if "checkpoint" in report and not report["checkpoint"]["ok"]:
         problems.append(f"checkpoint {args.ckpt}: {report['checkpoint'].get('why')}")
+    for why in (report.get("checkpoint") or {}).get("recipe_problems") or []:
+        problems.append(f"checkpoint {args.ckpt}: {why}")
+    if args.require_cuda and "checkpoint" in report and \
+            report["checkpoint"].get("loaded") is not True:
+        problems.append(
+            f"checkpoint {args.ckpt} was not loaded ({report['checkpoint'].get('loaded')}). On "
+            f"a GPU visit that would leave the one artifact nothing else validates unvalidated")
+    if report["commit"] == "unknown":
+        problems.append(
+            "the code commit is unknown (the git call failed). The comparison refuses 'unknown', "
+            "so finding it there would cost the whole visit")
 
     report["problems"] = problems
     report["ok"] = not problems

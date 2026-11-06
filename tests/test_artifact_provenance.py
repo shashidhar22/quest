@@ -178,3 +178,60 @@ def test_the_artifact_rules_import_without_pandas_or_torch():
     r = subprocess.run([sys.executable, "-c", code], cwd=REPO,
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, "the artifact rules reached the ML stack:\n" + r.stdout + r.stderr
+
+
+# --------------------------------------------------------------- pre-launch code review
+def _git(repo, *args):
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                   env={**dict(__import__("os").environ), "GIT_AUTHOR_NAME": "t",
+                        "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                        "GIT_COMMITTER_EMAIL": "t@t"})
+
+
+def test_two_different_dirty_trees_on_one_head_have_different_identities(tmp_path):
+    """`dirty:<sha>` alone made any two dirty trees on the same HEAD compare equal, so code
+    edited on the box between the base eval and the arm-D eval was certified as the same code."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "a.py").write_text("x = 1\n")
+    _git(repo, "add", "a.py")
+    _git(repo, "commit", "-qm", "c")
+    clean = A.code_commit(repo)
+    assert not clean.startswith("dirty:")
+    (repo / "a.py").write_text("x = 2\n")
+    one = A.code_commit(repo)
+    (repo / "a.py").write_text("x = 3\n")
+    two = A.code_commit(repo)
+    assert one.startswith("dirty:") and two.startswith("dirty:")
+    assert one != two, "two different edits on one HEAD were given the same identity"
+    (repo / "a.py").write_text("x = 2\n")
+    assert A.code_commit(repo) == one, "the identity must be deterministic"
+
+
+def test_the_fixed_batch_name_says_it_was_inferred_when_it_was(tmp_path):
+    """Review finding: a missing token_budget key was read as 0. For arm D that inference is
+    sound -- its config is a full dump from a trainer that had no such field -- but it IS an
+    inference, so the record says so rather than presenting it as read."""
+    d = tmp_path / "a"
+    d.mkdir()
+    (d / "trainer_state.json").write_text(json.dumps(
+        {"global_step": 1, "config": {"batch_size": 16, "gradient_accumulation_steps": 16}}))
+    got = A.cpt_lineage(d)
+    assert got["cpt_objective"] == "fixed-batch-mean/v0"
+    assert got["cpt_objective_basis"].startswith("inferred")
+    (d / "trainer_state.json").write_text(json.dumps(
+        {"global_step": 1, "config": {"token_budget": 0, "batch_size": 16,
+                                      "gradient_accumulation_steps": 16}}))
+    assert A.cpt_lineage(d)["cpt_objective_basis"] == "recorded"
+
+
+def test_a_config_with_no_batching_record_at_all_is_unrecorded(tmp_path):
+    """Absence of token_budget AND of the fixed-batch shape is not evidence of anything."""
+    d = tmp_path / "a"
+    d.mkdir()
+    (d / "args.json").write_text(json.dumps({"seed": 3, "lr": 2e-4}))
+    got = A.cpt_lineage(d)
+    assert got["cpt_objective"] == "unrecorded", got
+    assert got["cpt_objective_basis"] == "unrecorded"
+    assert A.cpt_lineage("none")["cpt_objective_basis"] == "no adapter"

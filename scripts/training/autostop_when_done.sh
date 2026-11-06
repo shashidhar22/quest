@@ -76,6 +76,9 @@ run_bounded(){
 }
 
 # ---- arm-time self-test: refuse rather than arm something that cannot work ----------------------
+# Numeric BEFORE it reaches awk: `abc` inside an awk expression evaluates to 0, and anything
+# else spliced there is awk program text (pre-launch review, 2026-11-06).
+case "$MAX_HOURS" in (''|*[!0-9.]*|*.*.*) say "REFUSE: MAX_HOURS=$MAX_HOURS is not a number"; exit 2;; esac
 kill -0 "$PID" 2>/dev/null            || { say "REFUSE: pid $PID is not alive"; exit 2; }
 command -v "$NVSMI" >/dev/null 2>&1   || { say "REFUSE: $NVSMI not found"; exit 2; }
 awk "BEGIN{exit !($MAX_HOURS > 0 && $MAX_HOURS < 240)}" \
@@ -83,7 +86,11 @@ awk "BEGIN{exit !($MAX_HOURS > 0 && $MAX_HOURS < 240)}" \
 max_s=$(awk "BEGIN{printf \"%d\", $MAX_HOURS*3600}")
 idle_s=$((IDLE_MIN*60))
 
-training_alive(){ pgrep -f '^([^ ]*/)?python[0-9.]* .*(train_cpt|torchrun|run_stage|ray_train|esm_native)' >/dev/null 2>&1; }
+# `track_a.esm_sft` is the judge. Without it the watchdog could not see judge-first's work at all
+# and fell back on GPU utilisation alone, so 20 minutes of split loading, negative sampling or a
+# slow model load on a lazily restored volume would have fired IDLE and stopped the box mid-run
+# (pre-launch review, 2026-11-06).
+training_alive(){ pgrep -f '^([^ ]*/)?python[0-9.]* .*(train_cpt|torchrun|run_stage|ray_train|esm_native|track_a[.]esm_sft)' >/dev/null 2>&1; }
 gpu_busy(){ "$NVSMI" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null \
             | awk '{ if ($1+0 > 0) b=1 } END { exit !b }'; }
 

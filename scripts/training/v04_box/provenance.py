@@ -90,9 +90,9 @@ CPT_RUN_KEYS = ("objective", "token_budget", "bucket_boundaries", "steps", "earl
 
 SFT_CELL_KEYS = ("task", "dataset", "draw", "pool_size", "pool_digest", "split_digests",
                  "sft_ckpt_digest", "sft_seed", "sft_objective", "sft_max_len", "sft_recipe",
-                 "eval_max_len",
+                 "eval_max_len", "sft_train_digests",
                  "cpt_adapter", "cpt_adapter_digest", "cpt_objective", "cpt_run_id",
-                 "cpt_steps", "cpt_seed", "cpt_token_budget",
+                 "cpt_steps", "cpt_seed", "cpt_token_budget", "cpt_objective_basis",
                  "device", "code_commit", "cotenants")
 
 SCHEMAS = {"cpt_run": CPT_RUN_KEYS, "sft_cell": SFT_CELL_KEYS}
@@ -123,7 +123,7 @@ SENTINELS = ("unrecorded", "unknown", "n/a", "none")
 # silent: check() reports which waived keys actually differed, so a tolerated difference appears
 # in the run log next to the result it licensed.
 CPT_LINEAGE = ("cpt_adapter", "cpt_adapter_digest", "cpt_objective", "cpt_run_id",
-               "cpt_steps", "cpt_seed", "cpt_token_budget")
+               "cpt_steps", "cpt_seed", "cpt_token_budget", "cpt_objective_basis")
 WAIVED = {
     "cpt_run": {
         "band": ("seed", "cotenants"),              # a band is built FROM differing seeds
@@ -181,6 +181,9 @@ def validate(m, label="manifest"):
         elif k in NO_MISSING and "MISSING" in json.dumps(m[k]):
             out.append(f"{label}: {k} records MISSING, so the artifact it describes was not "
                        f"there; that is a faithful record and an invalid basis for a verdict")
+        elif k == "code_commit" and str(m[k]).strip().lower() in SENTINELS:
+            out.append(f"{label}: code_commit is {m[k]!r}: the git call failed, so which code "
+                       f"produced this is unknown, and 'unknown' would otherwise match 'unknown'")
         elif k in NO_SENTINEL and str(m[k]).strip().lower() in SENTINELS:
             out.append(f"{label}: {k} is {m[k]!r}, which is a statement that nobody knows it. "
                        f"Two arms that both fail to record it would otherwise agree, and the "
@@ -238,6 +241,7 @@ def from_eval_doc(d, **extra):
         "sft_seed": prov.get("sft_seed"),
         "sft_max_len": prov.get("sft_max_len"),
         "sft_recipe": prov.get("sft_recipe"),
+        "sft_train_digests": prov.get("sft_train_digests"),
         "sft_objective": prov.get("sft_objective"),
         "cotenants": prov.get("cotenants"),
         "device": prov.get("device"),
@@ -275,6 +279,22 @@ def check(a, b, kind="strict"):
     waived = set(WAIVED[sa].get(kind, ()))
     tolerated = []
     for k in SCHEMAS[sa]:
+        if k == "sft_train_digests":
+            # The data each SFT head was trained on. Both recorded and different: refused, the
+            # delta would mix the CPT treatment with a change of training data. One side
+            # unrecorded: a checkpoint from before training data was hashed (the 10-08 base is
+            # one). Refusing would make that comparison impossible and accepting silently would
+            # hide the gap, so it is accepted and NAMED as unverified beside the result.
+            va, vb = a.get(k), b.get(k)
+            if va and vb:
+                if va != vb:
+                    bad.append(f"{k}: {va!r} vs {vb!r}; the two heads were trained on "
+                               f"different data")
+            else:
+                tolerated.append(f"UNVERIFIED {k}: {va!r} vs {vb!r}; at least one checkpoint "
+                                 f"predates training-data hashing, so the two arms cannot be "
+                                 f"shown to have trained on the same train/val splits")
+            continue
         if a.get(k) == b.get(k):
             continue
         line = f"{k}: {a.get(k)!r} vs {b.get(k)!r}"

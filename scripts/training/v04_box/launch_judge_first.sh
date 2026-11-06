@@ -56,36 +56,78 @@ AUTOSTOP=${AUTOSTOP:-$Q/scripts/training/autostop_when_done.sh}
 JF=${JF:-$Q/scripts/training/v04_box/judge_first.sh}
 PUBLISH_DEST=${PUBLISH_DEST:-}
 PUBLISH_CMD=${PUBLISH_CMD:-}
-RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
-RUNDIR=$OUT_ROOT/runs/$RUN_ID
-WLOG=${WLOG:-$RUNDIR/autostop.log}
+RESUME=${RESUME:-}
 LOCK=$OUT_ROOT/launch.lock
 say(){ echo "[$(date -u '+%F %T')] [launch] $*"; }
 
+# ---- refusals that need nothing created -------------------------------------------------------
+# Numeric before awk ever sees them: `abc` evaluates to 0 inside an awk expression, so a typo
+# became a silent zero ceiling rather than a refusal (pre-launch review, 2026-11-06).
+for v in MAX_HOURS WATCHDOG_HOURS; do
+  val=${!v}
+  [ -z "$val" ] && [ "$v" = WATCHDOG_HOURS ] && continue
+  case "$val" in (''|*[!0-9.]*|*.*.*) say "ABORT: $v=$val is not a number"; exit 2;; esac
+done
+# The watchdog refuses to arm without nvidia-smi, so say so before anything is created rather
+# than after a driver has been started and has to be reaped.
+command -v "${NVSMI:-nvidia-smi}" >/dev/null 2>&1 || { say "ABORT: ${NVSMI:-nvidia-smi} not found."
+  say "       The watchdog cannot arm without it, and this launcher does not start unwatched"
+  say "       work. Off-box checks run judge_first.sh directly with ALLOW_CPU=1."; exit 2; }
 [ -f "$JF" ] || { say "ABORT: no launcher at $JF"; exit 2; }
 [ -f "$AUTOSTOP" ] || { say "ABORT: no watchdog at $AUTOSTOP"; exit 2; }
-mkdir -p "$OUT_ROOT" || { say "ABORT: cannot create $OUT_ROOT"; exit 2; }
+mkdir -p "$OUT_ROOT/runs" || { say "ABORT: cannot create $OUT_ROOT"; exit 2; }
 
-# ---- one active launch per output root ----------------------------------------------------
-if [ -f "$LOCK" ]; then
-  holder=$(cat "$LOCK" 2>/dev/null || true)
-  case "$holder" in (''|*[!0-9]*) holder="" ;; esac
-  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-    say "ABORT: launch pid $holder is already active in $OUT_ROOT. Two drivers in one output"
-    say "       root would interleave their artifacts and their watchdogs. Use a different O,"
-    say "       or wait for that run to finish."
+# ---- the run directory: new by default, or an existing one resumed -----------------------------
+# A fresh directory per launch made a stale pid file unreachable, but it also made judge_first's
+# validated reuse unreachable: an interrupted visit paid again in full. RESUME=<run_id> reuses a
+# directory; identity stays per LAUNCH, through a token that is always new.
+if [ -n "$RESUME" ]; then
+  RUN_ID=$RESUME
+  [ -d "$OUT_ROOT/runs/$RUN_ID" ] || { say "ABORT: RESUME=$RUN_ID, but $OUT_ROOT/runs/$RUN_ID does
+  not exist. Nothing to resume."; exit 2; }
+else
+  RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
+  [ ! -e "$OUT_ROOT/runs/$RUN_ID" ] || { say "ABORT: $OUT_ROOT/runs/$RUN_ID already exists. A new
+  run must not inherit another run's identity or handshake; use RESUME=$RUN_ID to continue it."
+  exit 2; }
+fi
+RUNDIR=$OUT_ROOT/runs/$RUN_ID
+LAUNCH_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
+TOKEN=$RUN_ID/$LAUNCH_ID
+WLOG=${WLOG:-$RUNDIR/autostop-$LAUNCH_ID.log}
+
+# ---- one active launch per output root ---------------------------------------------------------
+# The lock names the launcher AND, once verified, the driver. An SSM session drop kills the
+# launcher but not the driver or its watchdog, so a lock that tracked the launcher alone was
+# cleared as stale and a second driver started beside the first on one GPU. It is taken with
+# noclobber, so two launches cannot both pass a check-then-write.
+lock_live(){ local p; for p in $(cat "$LOCK" 2>/dev/null); do
+  case "$p" in (*[!0-9]*) continue;; esac; kill -0 "$p" 2>/dev/null && return 0; done; return 1; }
+take_lock(){ ( set -C; echo "$$" > "$LOCK" ) 2>/dev/null; }
+if ! take_lock; then
+  if lock_live; then
+    say "ABORT: a launch or its driver is already active in $OUT_ROOT (lock: $(cat "$LOCK"))."
+    say "       Two drivers in one output root would interleave their artifacts and watchdogs."
     exit 2
   fi
-  say "clearing a stale lock left by pid ${holder:-unknown}"
+  say "clearing a stale lock whose every holder is dead: $(cat "$LOCK" 2>/dev/null)"
+  rm -f "$LOCK"
+  take_lock || { say "ABORT: another launch took the lock first"; exit 2; }
 fi
-echo $$ > "$LOCK"
-release_lock(){ [ "$(cat "$LOCK" 2>/dev/null || true)" = "$$" ] && rm -f "$LOCK"; return 0; }
+release_lock(){ [ "$(awk '{print $1}' "$LOCK" 2>/dev/null)" = "$$" ] && rm -f "$LOCK"; return 0; }
 trap 'release_lock' EXIT
 
 mkdir -p "$RUNDIR"
 ARMED=$RUNDIR/watchdog.armed
 IDENT=$RUNDIR/run.identity
 STATUS=$RUNDIR/launch_status.json
+# A resumed directory may hold a previous launch's handshake and identity. Either would let this
+# launch's driver start GPU work, or be identified, before anything here was verified.
+if [ -n "$RESUME" ]; then
+  say "resuming $RUN_ID; retiring its previous handshake, identity and launch status"
+  rm -f "$ARMED" "$IDENT"
+  [ -f "$STATUS" ] && mv "$STATUS" "$RUNDIR/launch_status.before-$LAUNCH_ID.json"
+fi
 : > "$WLOG"
 [ -n "$WATCHDOG_HOURS" ] || WATCHDOG_HOURS=$(awk "BEGIN{printf \"%.4f\", $MAX_HOURS*1.5}")
 PID=""
@@ -98,8 +140,10 @@ ARMED_PID=""
 # been published beside it as if it belonged to it.
 status(){
   local outcome=$1 rc=${2:-null}
-  printf '{\n  "run_id": "%s",\n  "run_dir": "%s",\n  "outcome": "%s",\n  "driver_rc": %s,\n' \
-    "$RUN_ID" "$RUNDIR" "$outcome" "$rc" > "$STATUS"
+  printf '{\n  "run_id": "%s",\n  "launch_id": "%s",\n  "resumed": %s,\n' \
+    "$RUN_ID" "$LAUNCH_ID" "$([ -n "$RESUME" ] && echo true || echo false)" > "$STATUS"
+  printf '  "run_dir": "%s",\n  "outcome": "%s",\n  "driver_rc": %s,\n' \
+    "$RUNDIR" "$outcome" "$rc" >> "$STATUS"
   printf '  "driver_pid": %s,\n  "watchdog_armed_pid": %s,\n  "supervisor": "%s",\n' \
     "${PID:-null}" "$([ -n "$ARMED_PID" ] && echo "\"$ARMED_PID\"" || echo null)" \
     "${DRIVER_SUP:-none}" >> "$STATUS"
@@ -139,7 +183,7 @@ say "driver supervisor: ${DRIVER_SUP:-none; plain background job in its own proc
   say "WARNING: no PUBLISH_DEST; results will be on the volume only"
 
 say "starting the run (ceiling ${MAX_HOURS}h), held at preflight until the watchdog is verified"
-REQUIRE_WATCHDOG=1 RUN_TOKEN=$RUN_ID Q=$Q O=$RUNDIR MAX_HOURS=$MAX_HOURS \
+REQUIRE_WATCHDOG=1 RUN_TOKEN=$TOKEN Q=$Q O=$RUNDIR MAX_HOURS=$MAX_HOURS \
   $DRIVER_SUP bash "$JF" >>"$RUNDIR/launch.log" 2>&1 &
 SUP=$!
 
@@ -160,8 +204,8 @@ if [ ! -s "$IDENT" ]; then
 fi
 got=$(awk 'NR==1{print $1}' "$IDENT")
 PID=$(awk 'NR==1{print $2}' "$IDENT")
-[ "$got" = "$RUN_ID" ] || { PID=""; DIE_OUTCOME=identity_mismatch \
-  die "identity token mismatch in $IDENT: found '$got', this launch is '$RUN_ID'"; }
+[ "$got" = "$TOKEN" ] || { PID=""; DIE_OUTCOME=identity_mismatch \
+  die "identity token mismatch in $IDENT: found '$got', this launch is '$TOKEN'"; }
 case "$PID" in (''|*[!0-9]*) PID=""; DIE_OUTCOME=identity_mismatch \
   die "identity file records no usable pid: '$(cat "$IDENT")'" ;; esac
 if ! kill -0 "$PID" 2>/dev/null; then
@@ -170,6 +214,7 @@ if ! kill -0 "$PID" 2>/dev/null; then
   PID=""; DIE_OUTCOME=driver_exited_early die "nothing to watch"
 fi
 say "driver pid=$PID verified against this launch's token (supervisor pid $SUP)"
+echo "$$ $PID" > "$LOCK"      # the lock now outlives this launcher for as long as the driver does
 
 # ---- arm, and verify from the watchdog's own log --------------------------------------------
 say "arming the watchdog on pid $PID (ceiling ${WATCHDOG_HOURS}h, log $WLOG)"

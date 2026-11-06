@@ -22,6 +22,9 @@ non-estimated: USD 32.050349 / 29.981945 h). So ≈4.9 h ≈ **USD 5.24**, a gat
    PUBLISH_DEST=s3://fh-pi-warren-h-eco/quest/tcrbench2/jf_out \
      bash scripts/training/v04_box/launch_judge_first.sh
    ```
+   **If a visit is interrupted, resume it** rather than starting over: add `RESUME=<run_id>`
+   (the directory name under `jf_out/runs/`). The base evaluation and a trained arm-D cell are
+   then reused after validation, so a stop during the arm-D evaluation repays only that step.
    Each launch gets its own directory, `/home/ubuntu/jf_out/runs/<run_id>/` (`jf_out/latest`
    points at it), and publishes only that directory, to `$PUBLISH_DEST/<run_id>/`. The wrapper
    takes a lock on the output root, starts the run under a waitable supervisor, reads the pid

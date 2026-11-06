@@ -15,14 +15,13 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
-from track_a.esm_sft.scoring import SFT_OBJECTIVE, cotenants, sft_recipe  # noqa: E402
+from track_a.esm_sft.scoring import (  # noqa: E402
+    SFT_OBJECTIVE, SFT_TRAIN_DEFAULTS, cotenants, sft_recipe)
 from track_a.shared import artifacts as A  # noqa: E402
 
 # The recipe a judge-first SFT cell trains under: the CLI defaults of `judge train`. The stub
 # does not train, so it states the recipe it is standing in for rather than inventing one.
-STUB_SFT_ARGS = {"lr": 1e-4, "batch_size": 16, "epochs": 2, "patience": 1,
-                 "max_train_pos": 50_000, "max_val_pos": 5_000, "num_workers": 4,
-                 "seed": 42, "max_len": 1024}
+STUB_SFT_ARGS = dict(SFT_TRAIN_DEFAULTS)
 
 
 def main():

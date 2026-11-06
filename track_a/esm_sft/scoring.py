@@ -142,6 +142,13 @@ SFT_OBJECTIVE = "bce-pair-logits/v1"
 # checkpoint trained on top of it may differ (round two of the 2026-11-06 review, finding 4).
 SFT_RECIPE_KEYS = ("lr", "batch_size", "epochs", "patience", "max_train_pos", "max_val_pos",
                    "num_workers")
+# The recipe `judge train` uses when given no overrides, which is how judge_first.sh trains the
+# arm-D cell. ONE source: judge.py's argparse reads its defaults from here, and the preflight
+# checks the base checkpoint against it, so a base trained under another recipe is refused
+# before anything is bought rather than at the comparison after everything has been.
+SFT_TRAIN_DEFAULTS = {"max_train_pos": 50_000, "max_val_pos": 5_000, "epochs": 2,
+                      "patience": 1, "batch_size": 16, "lr": 1e-4, "seed": 42,
+                      "num_workers": 4, "max_len": 1024}
 UNRECORDED = "unrecorded"
 
 

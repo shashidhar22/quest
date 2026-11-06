@@ -119,9 +119,26 @@ def code_commit(repo_root=None) -> str:
         if sha.returncode != 0:
             return "unknown"
         head = sha.stdout.strip()[:12]
-        st = subprocess.run(["git", "-C", str(root), "status", "--porcelain"],
-                            capture_output=True, text=True, timeout=20)
-        return f"dirty:{head}" if st.stdout.strip() else head
+        # TRACKED files only. Hashing the untracked listing made the identity change as a run
+        # wrote its own outputs inside the checkout, so the base and arm-D evaluations of ONE run
+        # recorded different code and the comparison refused. Untracked files are not code git
+        # can vouch for either way; the box's untracked tree is data, logs and preserved V03
+        # scripts that nothing here executes.
+        st = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
+                             "--untracked-files=no"],
+                            capture_output=True, text=True, timeout=120)
+        if st.returncode != 0:
+            return "unknown"
+        if not st.stdout.strip():
+            return head
+        # `dirty:<sha>` alone made any two dirty trees on one HEAD compare equal, so code edited
+        # on the box between two evaluations was certified as the same code (pre-launch review,
+        # 2026-11-06). The tracked diff is hashed into the identity.
+        diff = subprocess.run(["git", "-C", str(root), "diff", "HEAD", "--binary"],
+                              capture_output=True, timeout=120)
+        if diff.returncode != 0:
+            return "unknown"
+        return f"dirty:{head}:{hashlib.sha256(diff.stdout).hexdigest()[:12]}"
     except (OSError, subprocess.SubprocessError):
         return "unknown"
 
@@ -148,6 +165,24 @@ def _recorded_config(adapter_dir):
     return None, None, None
 
 
+INFERRED_FIXED_BATCH = ("inferred: the recorded config has a fixed batch_size and "
+                        "gradient_accumulation_steps and no token_budget field, i.e. it predates "
+                        "token-budget batching, whose only path was the fixed-batch one")
+
+
+def objective_basis(cfg) -> str:
+    """How `objective_from_config` knows what it says: `recorded`, `inferred: ...`, or
+    `unrecorded`. Stated beside the name, because arm D's objective is an inference from a
+    complete config dump that has no token_budget field -- sound, but not a reading."""
+    if not isinstance(cfg, dict):
+        return "unrecorded"
+    if "token_budget" in cfg:
+        return "recorded"
+    if cfg.get("batch_size") and cfg.get("gradient_accumulation_steps"):
+        return INFERRED_FIXED_BATCH
+    return "unrecorded"
+
+
 def objective_from_config(cfg) -> str:
     """The objective a recorded CPT config implies, by the rule the trainer actually follows.
 
@@ -156,7 +191,8 @@ def objective_from_config(cfg) -> str:
     trained the fixed-batch objective, not row share. Deriving the name from the weighting alone
     is how arm D came to be labelled with an objective it never used.
     """
-    if not isinstance(cfg, dict):
+    if not isinstance(cfg, dict) or objective_basis(cfg) == "unrecorded":
+        # Neither a token_budget field nor the fixed-batch shape: absence is evidence of nothing.
         return "unrecorded"
     budget = cfg.get("token_budget") or 0
     try:
@@ -182,7 +218,8 @@ def cpt_lineage(adapter) -> dict:
     if adapter in (None, "", "none", "base"):
         return {"cpt_adapter": "none", "cpt_adapter_digest": "none", "cpt_objective": "none",
                 "cpt_run_id": "none", "cpt_steps": None, "cpt_seed": None,
-                "cpt_token_budget": None, "cpt_lineage_source": "no adapter"}
+                "cpt_token_budget": None, "cpt_lineage_source": "no adapter",
+                "cpt_objective_basis": "no adapter"}
     p = pathlib.Path(adapter)
     cfg, step, src = _recorded_config(p)
     budget = (cfg or {}).get("token_budget")
@@ -192,6 +229,7 @@ def cpt_lineage(adapter) -> dict:
         # the run id is the directory a human can look up; `final/` is a leaf, not an id
         "cpt_run_id": p.parent.name if p.name in ("final", "best", "last") else p.name,
         "cpt_objective": objective_from_config(cfg) if cfg is not None else "unrecorded",
+        "cpt_objective_basis": objective_basis(cfg),
         "cpt_steps": step,
         "cpt_seed": (cfg or {}).get("seed"),
         "cpt_token_budget": 0 if cfg is not None and not budget else budget,

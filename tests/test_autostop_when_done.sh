@@ -102,6 +102,29 @@ check "$T/t9.log" "WOULD-SHUTDOWN" "T9 the stop happens despite a stuck log copy
 if [ "$el" -lt 30 ]; then echo "PASS: T9 stopped in ${el}s"; pass=$((pass+1));
 else echo "FAIL: T9 took ${el}s — the log copy postponed the stop"; fail=$((fail+1)); fi
 
+# ---- pre-launch code review, 2026-11-06 --------------------------------------------------------
+echo "== T10 a running judge holds IDLE off (failure: IDLE fires during a CPU-bound judge phase)"
+# The pattern matched train_cpt|torchrun|run_stage|ray_train|esm_native and NOT the judge, so
+# during judge-first the only evidence of life was GPU utilisation: 20 minutes of data loading or
+# a slow model load at 0 % GPU would have stopped the box mid-run.
+if [ "${inconclusive:-0}" != 0 ]; then
+  echo "INCONCLUSIVE: T10 needs a pgrep that can see processes (see T6)"; inconclusive=$((inconclusive+1))
+else
+  bash -c 'exec -a "python -m track_a.esm_sft.judge train --task as_paired_i" sleep 90' & jpid=$!
+  sleep 75 & pid=$!
+  GPU_UTIL=0 LOG="$T/t10.log" NVSMI="$MOCK" DRY_RUN=1 POLL=5 MAX_HOURS=1 IDLE_MIN=1 bash "$W" "$pid" >/dev/null 2>&1
+  kill "$jpid" 2>/dev/null
+  if grep -q "guard fired: IDLE" "$T/t10.log"; then echo "FAIL: T10 IDLE fired while a judge was running"; fail=$((fail+1));
+  else check "$T/t10.log" "guard fired: DONE" "T10 a running judge holds IDLE off until the driver exits"; fi
+fi
+
+echo "== T11 a non-numeric MAX_HOURS is refused (failure: 'abc' evaluates to 0 inside awk)"
+sleep 5 & pid=$!
+LOG="$T/t11.log" NVSMI="$MOCK" DRY_RUN=1 MAX_HOURS=abc bash "$W" "$pid" >/dev/null 2>&1; rc=$?
+if [ "$rc" = 2 ] && grep -q "REFUSE: MAX_HOURS" "$T/t11.log"; then echo "PASS: T11 refuses MAX_HOURS=abc"; pass=$((pass+1));
+else echo "FAIL: T11 rc=$rc"; sed 's/^/    /' "$T/t11.log"; fail=$((fail+1)); fi
+kill "$pid" 2>/dev/null
+
 echo; echo "passed=$pass failed=$fail inconclusive=${inconclusive:-0}"
 [ "${inconclusive:-0}" = 0 ] || echo "NOTE: an inconclusive case is not a pass. See the T6 note."
 [ "$fail" = 0 ]
