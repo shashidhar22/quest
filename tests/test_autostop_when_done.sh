@@ -40,10 +40,29 @@ if [ "$rc" = 2 ] && grep -q "REFUSE: pid" "$T/t5.log"; then echo "PASS: T5 refus
 
 echo "== T6 pattern: a tmux/bash wrapper whose argv CONTAINS the script name must not count as training"
 # Simulate the 2026-10-03 shape: a bash process whose cmdline contains 'python … run_stage41_pipeline.py'
+#
+# A negative pgrep match only means something if pgrep can see the process list at all. The
+# round-two review ran this where pgrep printed "Cannot get process list", and the case counted
+# that as a pass: a check that cannot fail proves nothing. So the positive control comes first,
+# and an unusable pgrep is reported INCONCLUSIVE rather than green.
 bash -c 'exec -a "tmux new-session -d -s stage41 cd /x && python scripts/training/run_stage41_pipeline.py" sleep 15' & wpid=$!
+# the positive control: a cmdline that SHOULD match the pattern, so a silent pgrep is detectable
+bash -c 'exec -a "python scripts/training/train_cpt_stage2_single.py --fake" sleep 15' & cpid=$!
 sleep 1
-if pgrep -f '^([^ ]*/)?python[0-9.]* .*(train_cpt|torchrun|run_stage|ray_train|esm_native)' >/dev/null; then echo "FAIL: T6 wrapper matched the training pattern"; fail=$((fail+1)); else echo "PASS: T6 wrapper argv does not match the anchored pattern"; pass=$((pass+1)); fi
-kill "$wpid" 2>/dev/null
+PAT='^([^ ]*/)?python[0-9.]* .*(train_cpt|torchrun|run_stage|ray_train|esm_native)'
+ctl_err=$(pgrep -f "$PAT" 2>&1 >/dev/null)
+if ! pgrep -f "$PAT" >/dev/null 2>&1; then
+  echo "INCONCLUSIVE: T6 pgrep cannot see the positive control (${ctl_err:-no match}); the"
+  echo "              negative case below would pass for the wrong reason, so it is not counted."
+  inconclusive=$((${inconclusive:-0}+1))
+else
+  # pgrep works here, so a non-match for the wrapper is real evidence
+  kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
+  sleep 1
+  if pgrep -f "$PAT" >/dev/null 2>&1; then echo "FAIL: T6 wrapper matched the training pattern"; fail=$((fail+1));
+  else echo "PASS: T6 wrapper argv does not match the anchored pattern"; pass=$((pass+1)); fi
+fi
+kill "$wpid" "$cpid" 2>/dev/null
 
 # ---- audit finding 3, 2026-11-06: the publish step must not be able to postpone the stop -----
 # These run the REAL publish path (DRY_RUN=0) with the stop command injected, because DRY_RUN=1
@@ -83,4 +102,6 @@ check "$T/t9.log" "WOULD-SHUTDOWN" "T9 the stop happens despite a stuck log copy
 if [ "$el" -lt 30 ]; then echo "PASS: T9 stopped in ${el}s"; pass=$((pass+1));
 else echo "FAIL: T9 took ${el}s — the log copy postponed the stop"; fail=$((fail+1)); fi
 
-echo; echo "passed=$pass failed=$fail"; [ "$fail" = 0 ]
+echo; echo "passed=$pass failed=$fail inconclusive=${inconclusive:-0}"
+[ "${inconclusive:-0}" = 0 ] || echo "NOTE: an inconclusive case is not a pass. See the T6 note."
+[ "$fail" = 0 ]

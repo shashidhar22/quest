@@ -333,13 +333,17 @@ def test_the_launcher_refuses_to_leave_a_run_unwatched(jfbox):
     )
     assert r.returncode == 2, r.stdout[-2000:] + r.stderr[-1000:]
     assert "did not arm" in r.stdout, r.stdout[-2000:]
-    assert not (jfbox.out / "comparison.json").exists(), (
-        "the run produced a result although it was never watched")
-    assert not (jfbox.out / "watchdog.armed").exists()
+    runs = sorted((jfbox.out / "runs").iterdir()) if (jfbox.out / "runs").is_dir() else []
+    for d in runs:
+        assert not (d / "comparison.json").exists(), (
+            "the run produced a result although it was never watched")
+        assert not (d / "watchdog.armed").exists()
     time.sleep(1)
-    pid_file = jfbox.out / "judge_first.pid"
-    if pid_file.exists() and pid_file.read_text().strip().isdigit():
-        assert not _alive(int(pid_file.read_text().strip())), "the unwatched run was left running"
+    for d in runs:
+        pid_file = d / "judge_first.pid"
+        if pid_file.exists() and pid_file.read_text().strip().isdigit():
+            assert not _alive(int(pid_file.read_text().strip())), (
+                "the unwatched run was left running")
 
 
 def test_the_launcher_arms_the_watchdog_on_the_pid_the_run_recorded(jfbox):
@@ -359,12 +363,22 @@ def test_the_launcher_arms_the_watchdog_on_the_pid_the_run_recorded(jfbox):
         capture_output=True, text=True, timeout=300,
         env=jfbox._env(ARM_TIMEOUT="30", WLOG=str(wlog), DRY_RUN="1", POLL="1", IDLE_MIN="60"),
     )
-    assert r.returncode == 0, r.stdout[-3000:] + jfbox.run_log()[-2000:]
+    assert r.returncode == 0, r.stdout[-3000:]
     assert "watchdog armed and verified" in r.stdout
-    recorded = (jfbox.out / "judge_first.pid").read_text().strip()
+    # Each launch now owns a directory, so this run's artifacts are in THIS run's directory and
+    # a previous visit's cannot be mistaken for them (round two, findings 1 and 5).
+    runs = sorted((jfbox.out / "runs").iterdir())
+    assert len(runs) == 1, f"expected one run directory, got {runs}"
+    d = runs[0]
+    recorded = (d / "judge_first.pid").read_text().strip()
     assert f"armed: pid={recorded} " in wlog.read_text(), (
         "the watchdog armed on a different pid than the run recorded")
-    assert (jfbox.out / "comparison.json").exists()
+    assert (d / "run.identity").read_text().split()[1] == recorded
+    assert (jfbox.out / "judge_first.pid").read_text().strip() == recorded, (
+        "the stable operator path must be rewritten with this run's pid")
+    assert (d / "comparison.json").exists()
+    assert json.loads((d / "status.json").read_text())["outcome"] == "complete"
+    assert json.loads((d / "launch_status.json").read_text())["outcome"] == "driver_exited_0"
 
 
 # --------------------------------------------------------------- audit 2026-11-06, finding 5
@@ -417,5 +431,12 @@ def test_the_preflight_report_is_kept_beside_the_result(jfbox):
     assert rep["ok"] is True
     assert rep["commit"]
     assert rep["adapter"]["cpt_run_id"] == "cpt_stage41_pointD_run05"
-    assert rep["checkpoint"]["n_trainable_keys"] >= 1 or \
-        "not checked" in str(rep["checkpoint"].get("loaded")), rep["checkpoint"]
+    # `or` does not protect an index: the left operand is evaluated first, so this raised
+    # KeyError wherever torch is absent and the no-torch branch records no key count. Found by
+    # the round-two review, whose interpreter has no torch -- it was the one red line in their
+    # run, and it was a defect in my test rather than in the preflight.
+    ck = rep["checkpoint"]
+    if "not checked" in str(ck.get("loaded")):
+        assert ck["digest"] not in ("MISSING", None), ck
+    else:
+        assert ck["n_trainable_keys"] >= 1, ck

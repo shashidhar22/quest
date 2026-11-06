@@ -29,6 +29,19 @@ OK, ERROR = 0, 2
 ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 
 
+def _torch():
+    """torch, or None. `importlib.util.find_spec` is not safe here: it propagates whatever a
+    meta-path finder raises, so one broken or deliberately blocking finder crashed the whole
+    preflight instead of reporting that torch is unavailable. A preflight must survive the
+    environment it is inspecting.
+    """
+    try:
+        import torch
+        return torch
+    except Exception:                                 # noqa: BLE001 - any failure means "no"
+        return None
+
+
 def check_imports(names):
     """{name: version or None}. Imported, not merely found: a broken install resolves a spec."""
     out = {}
@@ -43,12 +56,9 @@ def check_imports(names):
 
 def check_cuda():
     """What torch says about the GPUs, or why it cannot say."""
-    if importlib.util.find_spec("torch") is None:
-        return {"available": False, "why": "torch is not installed"}
-    try:
-        import torch
-    except Exception as e:                            # noqa: BLE001
-        return {"available": False, "why": f"importing torch failed: {e}"}
+    torch = _torch()
+    if torch is None:
+        return {"available": False, "why": "torch is unavailable in this interpreter"}
     info = {"torch": torch.__version__, "available": bool(torch.cuda.is_available())}
     if info["available"]:
         info["devices"] = [torch.cuda.get_device_name(i)
@@ -82,11 +92,11 @@ def check_checkpoint(path, require_trainable=True):
     if not out["ok"]:
         out["why"] = "missing or empty" if not out["exists"] else "zero bytes"
         return out
-    if importlib.util.find_spec("torch") is None:
-        out["loaded"] = "not checked: torch is not installed here"
+    torch = _torch()
+    if torch is None:
+        out["loaded"] = "not checked: torch is unavailable in this interpreter"
         return out
     try:
-        import torch
         ck = torch.load(p, map_location="cpu", weights_only=False)
     except Exception as e:                            # noqa: BLE001
         out["ok"], out["why"] = False, f"torch could not load it: {type(e).__name__}: {e}"
