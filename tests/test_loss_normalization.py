@@ -271,3 +271,48 @@ def test_the_historical_weightings_still_compute_what_they_did():
         f(4, 16, 4, token_mode=True, weighting="token", mb_tokens=10, step_tokens=0)
     with pytest.raises(ValueError, match="unknown weighting"):
         f(4, 16, 4, token_mode=True, weighting="nonsense")
+
+
+# --------------------------------------------------------- audit 2026-11-06, finding 4
+def test_the_fixed_batch_path_cannot_smuggle_in_an_unimplemented_objective():
+    """The bypass the 2026-11-06 audit found: validation must precede every return.
+
+    `token_mode=False` returned `1/n_acc` before the weighting was ever looked at, so asking
+    for `token_exact` with fixed batches got a silent 0.0625 instead of a refusal. The CLI
+    offers only row and token, but `CPTConfig.loss_weighting` is a plain string, so any
+    programmatic caller inside this repo could reach it. Fail closed means closed on every
+    path, not on the path the CLI happens to take.
+    """
+    from quest.training.loss_normalization import micro_batch_loss_scale as f
+
+    with pytest.raises(ValueError, match="not implemented in the training loop"):
+        f(16, 256, 16, token_mode=False, weighting="token_exact")
+    with pytest.raises(ValueError, match="unknown weighting"):
+        f(16, 256, 16, token_mode=False, weighting="nonsense")
+    # and the historical fixed-batch number is unchanged
+    assert f(16, 256, 16, token_mode=False) == pytest.approx(1 / 16)
+    assert f(16, 256, 16, token_mode=False, weighting="row") == pytest.approx(1 / 16)
+
+
+def test_a_zero_target_micro_batch_cannot_poison_the_step_through_sum_from_mean():
+    """`mean_loss * 0` is NaN when the mean is NaN, and HuggingFace returns NaN for no targets.
+
+    The summed path is already safe (cross entropy with reduction='sum' over an all-ignore
+    batch is a finite 0). The mean path was not: a micro-batch that masking left with no
+    supervised target produced NaN * 0 = NaN, which then propagated through the whole step's
+    accumulated gradient. DDP forbids skipping the backward, so the zero has to be finite.
+    """
+    from quest.training.loss_normalization import sum_from_mean
+
+    nan_mean = torch.tensor(float("nan"), requires_grad=True)
+    out = sum_from_mean(nan_mean, 0)
+    assert torch.isfinite(out), "a zero-target micro-batch must contribute a finite zero"
+    assert float(out) == 0.0
+    # a real mean is still scaled back exactly, and still carries its gradient
+    real = torch.tensor(2.5, requires_grad=True)
+    got = sum_from_mean(real, 4)
+    assert float(got) == pytest.approx(10.0)
+    got.backward()
+    assert float(real.grad) == pytest.approx(4.0)
+    with pytest.raises(ValueError, match="negative"):
+        sum_from_mean(real, -1)

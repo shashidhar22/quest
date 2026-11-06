@@ -73,7 +73,23 @@ def sum_from_mean(mean_loss, n_targets_microbatch: int):
 
     The HuggingFace path reports ``out.loss``, a mean over the micro-batch's supervised targets,
     so the trainer multiplies it back by that count rather than recomputing from logits.
+
+    ZERO TARGETS. ``out.loss`` is a mean over no elements, i.e. NaN, and ``NaN * 0`` is NaN, so
+    the naive multiply let one unmasked micro-batch poison a whole step's accumulated gradient
+    (audit finding 4, 2026-11-06). Such a micro-batch contributes nothing, so the honest return
+    is a finite zero. It is DETACHED from the graph, which is the one thing a caller must know:
+    DDP with ``find_unused_parameters=False`` wants every rank's backward to touch the same
+    parameters, and a detached zero touches none. A loop that must keep that invariant should
+    take the summed path instead -- ``summed_masked_loss`` returns a graph-connected 0.0 for an
+    all-ignore batch, because cross entropy with ``reduction="sum"`` sums zero terms rather than
+    dividing by zero. That is the main reason the summed path is the one this objective specifies.
     """
+    if n_targets_microbatch < 0:
+        raise ValueError(
+            f"a micro-batch cannot have a negative supervised-target count, got "
+            f"{n_targets_microbatch}")
+    if n_targets_microbatch == 0:
+        return torch.zeros_like(mean_loss) if torch.is_tensor(mean_loss) else 0.0
     return mean_loss * n_targets_microbatch
 
 
@@ -149,20 +165,15 @@ def micro_batch_loss_scale(n_rows: int, rows_per_rank: int, n_acc: int, token_mo
     Both token-budget paths coincide with ``1 / n_acc`` when micro-batches are equal in rows and
     tokens (``n_rows * n_acc == rows_per_rank``).
     """
-    if not token_mode:
-        return 1.0 / n_acc
-    if weighting == "token":
-        if step_tokens <= 0:
-            raise ValueError("token-share weighting needs step_tokens > 0 "
-                             "(from TokenBudgetStepSampler.step_token_plan())")
-        return mb_tokens / float(step_tokens)
+    # Validation comes FIRST, before any return. Until 2026-11-06 the fixed-batch branch
+    # returned 1/n_acc without ever looking at `weighting`, so `token_exact` with fixed batches
+    # silently produced a number instead of refusing (audit finding 4). A guard that only covers
+    # the branch the CLI happens to take is not a guard.
     if weighting == "token_exact":
         # The objective approved 2026-11-04: summed target loss over the step's GLOBAL target
-        # count. It cannot be expressed as a per-micro-batch factor computed here, because the
-        # denominator is not known until the whole step's micro-batches have been counted and
-        # all-reduced. quest/training/loss_normalization.py holds the contract and its gradient
-        # tests; the loop must buffer a step to use it. Refusing is the fail-closed behaviour:
-        # a run must never start under a name the loop does not implement.
+        # count. It cannot be expressed as a per-micro-batch factor, because the denominator is
+        # not known until the step's micro-batches have been counted and all-reduced. Kept inline
+        # and self-contained so this function refuses correctly even when extracted on its own.
         raise ValueError(
             "loss_weighting 'token_exact' (global-masked-target-mean/v2) is not implemented in "
             "the training loop yet. Its contract and gradient tests live in "
@@ -170,7 +181,14 @@ def micro_batch_loss_scale(n_rows: int, rows_per_rank: int, n_acc: int, token_mo
             "all-reduce its supervised-target count first. See plans/v04-audit-repair.md step 5. "
             "Use 'token' only to reproduce the historical input-length-share objective."
         )
-    if weighting != "row":
+    if weighting not in ("row", "token"):
         raise ValueError(
             f"unknown weighting {weighting!r}; expected 'row', 'token' or 'token_exact'")
+    if not token_mode:
+        return 1.0 / n_acc
+    if weighting == "token":
+        if step_tokens <= 0:
+            raise ValueError("token-share weighting needs step_tokens > 0 "
+                             "(from TokenBudgetStepSampler.step_token_plan())")
+        return mb_tokens / float(step_tokens)
     return n_rows / float(rows_per_rank)
