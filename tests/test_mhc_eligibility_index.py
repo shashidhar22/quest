@@ -1,0 +1,210 @@
+"""Step 3: distinct-sequence MHC eligibility decisions (`quest.data.mhc_eligibility`).
+
+One explicit decision per distinct chain sequence, from a pinned reference. The rules these
+tests pin, and why each exists:
+
+  * A reference-supported chain is eligible at any length. Length belongs to tokenization,
+    not to biological eligibility (that conflation is the run05 defect).
+  * A sequence may match several alleles. The index must report ALL compatible loci, never a
+    single arbitrarily chosen two-field allele. `standardization.resolve_allele_to_sequence`
+    does the opposite - it falls back through a prefix cache, so `A*02` silently returns the
+    sequence of `A*02:01` - and this module must not inherit that behaviour.
+  * An allele NAME is evidence, not proof. A name that disagrees with the sequence is a
+    conflict and quarantines; it is never silently trusted over the sequence.
+  * Non-classical HLA-E/F/G is kept separate from classical A/B/C coverage, so a corpus cannot
+    report class-I exposure that is actually E/F/G.
+  * Unknown, malformed and out-of-scope chains get distinct reason codes and quarantine. They
+    must never be counted as validated class-I exposure.
+
+Fixture sequences are SYNTHETIC but use realistic lengths (class-I heavy 362-366 aa, class-II
+alpha/beta ~250 aa). They assert the decision logic, nothing biological.
+"""
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from quest.data.mhc_eligibility import (  # noqa: E402
+    EligibilityIndex,
+    build_index_from_fasta,
+)
+
+REAL_REFERENCE = ROOT / "data/raw_data/imgthla/hla_prot.fasta"
+
+
+VALID = "ACDEFGHIKLMNPQRSTVWYXU"
+
+
+def chain(length: int, salt: str = "A") -> str:
+    """Deterministic synthetic residues of an exact length; distinct per `salt`.
+
+    `salt` must itself be a valid residue, or the fixture lands in `invalid_residues` and the
+    test measures the wrong branch. That mistake happened once; the assert keeps it caught.
+    """
+    assert salt in VALID, f"fixture salt {salt!r} is not a valid residue"
+    motif = (salt + "GAVLIPFMWSTCYNQDEKRH")[:20]
+    seq = (motif * (length // len(motif) + 1))[:length]
+    assert not set(seq) - set(VALID)
+    return seq
+
+
+SEQ_A = chain(365, "A")      # class-I heavy, full length
+SEQ_B = chain(362, "N")      # class-I heavy, full length
+SEQ_C = chain(366, "C")      # class-I heavy, full length
+SEQ_E = chain(358, "E")      # non-classical class I
+SEQ_DRA = chain(254, "D")    # class-II alpha
+SEQ_DRB = chain(266, "R")    # class-II beta
+SEQ_SHARED = chain(364, "S")  # deliberately shared by two A alleles
+SEQ_CROSS = chain(363, "X")   # deliberately shared across A and DRB1 -> conflict
+
+
+@pytest.fixture
+def index(tmp_path) -> EligibilityIndex:
+    """A mini reference exercising every branch, written as IMGT-style FASTA."""
+    records = [
+        ("HLA:0001 A*02:01:01:01 365 bp", SEQ_A),
+        ("HLA:0002 B*07:02:01:01 362 bp", SEQ_B),
+        ("HLA:0003 C*07:01:01:01 366 bp", SEQ_C),
+        ("HLA:0004 E*01:01:01:01 358 bp", SEQ_E),
+        ("HLA:0005 DRA*01:01:01:01 254 bp", SEQ_DRA),
+        ("HLA:0006 DRB1*15:01:01:01 266 bp", SEQ_DRB),
+        ("HLA:0007 A*02:09:01:01 364 bp", SEQ_SHARED),
+        ("HLA:0008 A*68:01:01:01 364 bp", SEQ_SHARED),
+        ("HLA:0009 A*11:01:01:01 363 bp", SEQ_CROSS),
+        ("HLA:0010 DRB1*04:01:01:01 363 bp", SEQ_CROSS),
+    ]
+    fasta = tmp_path / "mini_prot.fasta"
+    fasta.write_text("".join(f">{h}\n{s}\n" for h, s in records))
+    return build_index_from_fasta(fasta, reference_version="MINI-TEST-1")
+
+
+# ---------- the core repair: length is not an eligibility criterion ----------
+
+@pytest.mark.parametrize("seq,locus", [(SEQ_A, "A"), (SEQ_B, "B"), (SEQ_C, "C")])
+def test_full_length_classical_heavy_chain_is_accepted(index, seq, locus):
+    """Full-length class-I heavy chains are eligible. Failure = the run05 defect persists."""
+    d = index.decide(seq)
+    assert d.decision == "accept"
+    assert d.mhc_class == "I" and d.chain_role == "heavy"
+    assert d.classical is True
+    assert locus in d.loci
+    assert d.reason == "reference_exact_match"
+
+
+def test_class_ii_alpha_and_beta_roles_are_distinguished(index):
+    """Alpha and beta must not collapse into one 'class II' bucket; slots depend on the role."""
+    assert (index.decide(SEQ_DRA).mhc_class, index.decide(SEQ_DRA).chain_role) == ("II", "alpha")
+    assert (index.decide(SEQ_DRB).mhc_class, index.decide(SEQ_DRB).chain_role) == ("II", "beta")
+
+
+def test_non_classical_class_i_is_accepted_but_flagged_non_classical(index):
+    """HLA-E is class I yet not classical A/B/C; a corpus must be able to exclude it from coverage."""
+    d = index.decide(SEQ_E)
+    assert d.decision == "accept" and d.mhc_class == "I"
+    assert d.classical is False, "E/F/G counted as classical would inflate class-I coverage"
+
+
+# ---------- all compatible alleles, never one arbitrary pick ----------
+
+def test_shared_sequence_reports_every_compatible_allele(index):
+    """Two alleles share a sequence: report both, mark ambiguous, still accept."""
+    d = index.decide(SEQ_SHARED)
+    assert d.decision == "accept"
+    assert d.allele_ambiguous is True
+    assert set(d.alleles) == {"A*02:09", "A*68:01"}, "must not collapse to one arbitrary allele"
+    assert d.loci == ("A",)
+
+
+def test_sequence_matching_conflicting_classes_is_quarantined(index):
+    """One sequence mapping to both class I and class II cannot be assigned a role."""
+    d = index.decide(SEQ_CROSS)
+    assert d.decision == "quarantine"
+    assert d.reason == "class_role_conflict"
+    assert d.mhc_class is None and d.chain_role is None
+
+
+# ---------- names are evidence, not proof ----------
+
+def test_absent_allele_name_is_resolved_from_sequence(index):
+    """A missing name is not a failure when the sequence itself resolves class and role."""
+    d = index.decide(SEQ_A, allele=None)
+    assert d.decision == "accept" and d.mhc_class == "I" and d.chain_role == "heavy"
+
+
+def test_name_disagreeing_with_sequence_is_quarantined(index):
+    """A class-II name on a class-I sequence is a conflict; the name is never trusted silently."""
+    d = index.decide(SEQ_A, allele="HLA-DRB1*15:01")
+    assert d.decision == "quarantine"
+    assert d.reason == "name_sequence_conflict"
+
+
+def test_name_only_match_without_reference_support_is_quarantined(index):
+    """An A*-looking name with an unsupported sequence is NOT validated class-I exposure."""
+    d = index.decide(chain(340, "Q"), allele="HLA-A*02:01")
+    assert d.decision == "quarantine"
+    assert d.reason == "reference_absent"
+    assert d.mhc_class is None, "name-only evidence must not assert class"
+
+
+def test_two_field_name_is_not_prefix_substituted(index):
+    """`A*02` must not silently resolve to A*02:01's sequence (the standardization fallback bug)."""
+    d = index.decide(chain(341, "Y"), allele="HLA-A*02")
+    assert d.decision == "quarantine" and d.reason == "reference_absent"
+
+
+# ---------- malformed and out-of-scope ----------
+
+@pytest.mark.parametrize("bad,reason", [
+    ("", "empty_sequence"),
+    ("   ", "empty_sequence"),
+    ("ACDEFG123", "invalid_residues"),
+    ("ACDEFG*", "invalid_residues"),
+])
+def test_malformed_sequences_get_distinct_reasons(index, bad, reason):
+    d = index.decide(bad)
+    assert d.decision == "quarantine" and d.reason == reason
+
+
+def test_nonhuman_allele_is_out_of_scope_not_invalid(index):
+    """Mouse H-2 is neither human-eligible nor malformed; it needs its own pinned reference."""
+    d = index.decide(chain(362, "M"), allele="H-2Kb")
+    assert d.decision == "quarantine"
+    assert d.reason == "nonhuman_out_of_scope"
+
+
+# ---------- provenance ----------
+
+def test_decision_carries_hashes_and_reference_version(index):
+    """Every decision is traceable to the exact bytes judged and the reference that judged them."""
+    d = index.decide(f"  {SEQ_A.lower()}  ")
+    assert d.decision == "accept", "documented whitespace/case normalization must still match"
+    assert d.normalized_sha256 == index.decide(SEQ_A).normalized_sha256
+    assert d.original_sha256 != d.normalized_sha256
+    assert d.reference_version == "MINI-TEST-1"
+    assert len(d.normalized_sha256) == 64
+
+
+def test_every_distinct_chain_gets_exactly_one_decision(index):
+    """Step 3 acceptance: no chain is left undecided and no chain gets two decisions."""
+    chains = [SEQ_A, SEQ_B, SEQ_C, SEQ_E, SEQ_DRA, SEQ_DRB, SEQ_SHARED, SEQ_CROSS,
+              "", "ACDEFG123", chain(340, "Q")]
+    out = index.decide_many(chains)
+    assert len(out) == len(chains)
+    assert all(d.decision in ("accept", "quarantine") for d in out)
+    assert all(d.reason for d in out)
+
+
+# ---------- real reference, when it is present ----------
+
+@pytest.mark.skipif(not REAL_REFERENCE.exists(), reason="pinned IMGT/HLA FASTA not downloaded")
+def test_real_reference_accepts_full_length_heavy_chains_the_old_rule_rejected():
+    """On the pinned 3.58.0 reference, real >320-aa A/B/C chains must be eligible."""
+    idx = build_index_from_fasta(REAL_REFERENCE, reference_version="IPD-IMGT/HLA 3.58.0")
+    long_heavy = [s for s, d in idx.sample_by(mhc_class="I", classical=True, min_len=321, limit=25)]
+    assert len(long_heavy) == 25, "reference must contain classical class-I chains over 320 aa"
+    for seq in long_heavy:
+        d = idx.decide(seq)
+        assert d.decision == "accept" and d.chain_role == "heavy"
