@@ -330,7 +330,8 @@ def main():
                     help='must be the policy the build used; no default, as in the builder')
     ap.add_argument('--hla-reference', type=Path, default=None,
                     help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
-    ap.add_argument('--split-routing', choices=['cluster-v0', 'receptor-hash-v1'], required=True,
+    ap.add_argument('--split-routing', choices=['cluster-v0', 'receptor-hash-v1', 'receptor-hash-v2'],
+                    required=True,
                     help='must be the routing policy the build used; no default')
     ap.add_argument('--benchmark-exclusion', choices=['none', 'heldout-peptides-v2'], required=True,
                     help='must be the isolation policy the build used; no default')
@@ -677,10 +678,11 @@ def main():
             con_v5.close()
         v5_violations = []
         v5_checked = 0
-        hash_routing = args.split_routing == 'receptor-hash-v1'
+        hash_routing = args.split_routing in ('receptor-hash-v1', 'receptor-hash-v2')
+        v2_routing = args.split_routing == 'receptor-hash-v2'
         if hash_routing:
             sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-            from quest.data.split_routing import receptor_split
+            from quest.data.split_routing import peptide_split, receptor_split
             _m = json.loads((art_dir / 'build_manifest.json').read_text())
             assert _m.get('split_routing') == args.split_routing, (
                 f"build used routing {_m.get('split_routing')!r}, verifier was asked for "
@@ -707,6 +709,14 @@ def main():
                     if sp is not None:
                         splits.append(sp)
                     continue
+                if v2_routing and axis == 'peptide':
+                    # By cluster id, else by the peptide's own string: it always votes.
+                    sp = peptide_split(cid, src.get('peptide'), build_seed)
+                    if sp is not None:
+                        splits.append(sp)
+                    continue
+                if v2_routing and axis in ('mhc_one_pocket', 'mhc_two_pocket'):
+                    continue  # the pocket axes cast no vote under receptor-hash-v2
                 if cid is None or cid == -1:
                     continue
                 sp = cid_split_lookup.get((axis, cid))

@@ -320,7 +320,8 @@ def main():
     ap.add_argument('--benchmark-exclusion', required=True, choices=['none', 'heldout-peptides-v2'],
                     help='Benchmark isolation passed through to builder and verifier. No default: '
                          'none reproduces past, non-isolated builds.')
-    ap.add_argument('--split-routing', required=True, choices=['cluster-v0', 'receptor-hash-v1'],
+    ap.add_argument('--split-routing', required=True,
+                    choices=['cluster-v0', 'receptor-hash-v1', 'receptor-hash-v2'],
                     help='Split routing passed through to builder and verifier. No default: '
                          'cluster-v0 reproduces past builds and their length-skewed splits.')
     ap.add_argument('--exclusion-list', default=None,

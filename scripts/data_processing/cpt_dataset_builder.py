@@ -47,11 +47,8 @@ from quest.data.benchmark_exclusion import (  # noqa: E402
     normalize_peptide_sql,
 )
 from quest.data.split_routing import (  # noqa: E402
-    CLUSTER_ROUTING,
-    RECEPTOR_AXES,
-    RECEPTOR_HASH_ROUTING,
     ROUTING_POLICIES,
-    receptor_split_sql,
+    axis_vote_sql,
 )
 from quest.data.mhc_eligibility import (  # noqa: E402
     MHC_ONE_ROLES,
@@ -525,7 +522,8 @@ def main():
     ap.add_argument('--split-routing', choices=list(ROUTING_POLICIES), required=True,
                     help='cluster-v0 reproduces past builds, whose splits differ by receptor CDR3 '
                          'length because Hamming-1 clusters percolate; receptor-hash-v1 routes '
-                         'each receptor by a seeded hash of its own sequence')
+                         'each receptor by a seeded hash of its own sequence; receptor-hash-v2 also '
+                         'drops the MHC pocket vote and hashes peptide clusters 80/10/10')
     ap.add_argument('--benchmark-exclusion', choices=list(EXCLUSION_POLICIES), required=True,
                     help='none reproduces past builds, which were NOT isolated from the benchmark; '
                          'heldout-peptides-v2 drops every row carrying a held-out peptide')
@@ -987,22 +985,18 @@ def main():
 
         # ---------- Step 5: JOIN clusters + project + route ----------
         log(f'STEP 5: cluster JOINs + projection + routing ({args.split_routing})', run_id=run_id)
-        if args.split_routing == CLUSTER_ROUTING:
-            s_trb_sql, s_tra_sql = 'jtrb.split', 'jtra.split'
-        else:
-            # The receptor's own sequence decides, so the split cannot follow cluster size or
-            # length. The cluster id is still joined and reported.
-            s_trb_sql = receptor_split_sql('k.trb_cdr3', RECEPTOR_AXES[0], args.seed)
-            s_tra_sql = receptor_split_sql('k.tra_cdr3', RECEPTOR_AXES[1], args.seed)
+        # Which axes vote, and how, is the routing policy (`quest.data.split_routing`). Cluster
+        # ids are joined and reported under every policy, whether or not they decide the split.
+        vote = axis_vote_sql(args.split_routing, args.seed)
         build_sql = f"""
         CREATE OR REPLACE TABLE staging AS
         WITH joined AS (
           SELECT k.*,
-            jtrb.cluster_id AS trb_cluster_raw, {s_trb_sql} AS s_trb,
-            jtra.cluster_id AS tra_cluster_raw, {s_tra_sql} AS s_tra,
-            jpep.cluster_id AS peptide_cluster_raw, jpep.split AS s_pep,
-            jm1.cluster_id  AS mhc_one_cluster_raw, jm1.split AS s_m1,
-            jm2.cluster_id  AS mhc_two_cluster_raw, jm2.split AS s_m2
+            jtrb.cluster_id AS trb_cluster_raw, {vote['s_trb']} AS s_trb,
+            jtra.cluster_id AS tra_cluster_raw, {vote['s_tra']} AS s_tra,
+            jpep.cluster_id AS peptide_cluster_raw, {vote['s_pep']} AS s_pep,
+            jm1.cluster_id  AS mhc_one_cluster_raw, {vote['s_m1']} AS s_m1,
+            jm2.cluster_id  AS mhc_two_cluster_raw, {vote['s_m2']} AS s_m2
           FROM staging_raw k
           LEFT JOIN trb_cdr3_lkp jtrb ON k.trb_cdr3 = jtrb.mol
           LEFT JOIN tra_cdr3_lkp jtra ON k.tra_cdr3 = jtra.mol

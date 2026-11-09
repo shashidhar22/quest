@@ -32,7 +32,7 @@ def receptors(n, seed=0):
 
 
 def test_policies_are_named_and_the_legacy_one_is_kept():
-    assert ROUTING_POLICIES == ("cluster-v0", "receptor-hash-v1")
+    assert ROUTING_POLICIES == ("cluster-v0", "receptor-hash-v1", "receptor-hash-v2")
     assert RECEPTOR_AXES == ("trb_cdr3", "tra_cdr3")
 
 
@@ -102,5 +102,106 @@ def test_sql_and_python_agree_on_every_receptor():
                 f"SELECT i, {receptor_split_sql('r', axis, 42)} FROM t").fetchall())
             for i, r in enumerate(rs):
                 assert got[i] == receptor_split(r, axis, 42), (axis, r)
+    finally:
+        con.close()
+
+
+# ---------- receptor-hash-v2: the pocket axes do not vote, peptide clusters are hashed ----------
+
+from quest.data.split_routing import axis_vote_sql, peptide_split, peptide_split_sql  # noqa: E402
+
+
+def test_a_peptide_cluster_stays_whole():
+    """Every peptide of one cluster gets that cluster's split, whatever its own string is."""
+    for cid in range(300):
+        assert len({peptide_split(cid, p, 42) for p in ("GILGFVFTL", "GILGFVFTM", "NLVPMVATV")}) == 1
+
+
+def test_peptide_cluster_shares_are_80_10_10():
+    c = collections.Counter(peptide_split(cid, "X", 42) for cid in range(20000))
+    assert abs(c["train"] / 20000 - 0.80) < 0.01
+    assert abs(c["val"] / 20000 - 0.10) < 0.01 and abs(c["test"] / 20000 - 0.10) < 0.01
+
+
+@pytest.mark.parametrize("no_cluster", [None, -1, float("nan")])
+def test_a_peptide_without_a_cluster_still_votes_by_its_own_string(no_cluster):
+    """Silence would let its rows follow the receptor axes into different splits."""
+    assert peptide_split(no_cluster, "GILGFVFTL", 42) in ("train", "val", "test")
+    assert peptide_split(no_cluster, "GILGFVFTL", 42) == peptide_split(None, "GILGFVFTL", 42)
+    assert peptide_split(no_cluster, None, 42) is None
+    assert peptide_split(no_cluster, "", 42) is None
+
+
+def test_unknown_policy_is_refused():
+    with pytest.raises(ValueError):
+        axis_vote_sql("no-such-routing", 42)
+
+
+ROWS = [  # (tag, trb_cdr3, tra_cdr3, peptide, pep_cluster, pep_cluster_split, m1_split, m2_split)
+    ("receptor_only", "CASSLGQNTEAFF", None, None, None, None, None, None),
+    ("pep_in_cluster", None, None, "GILGFVFTL", 7, "train", None, None),
+    ("pep_same_cluster", None, None, "GILGFVFTM", 7, "train", None, None),
+    ("pep_no_cluster", None, None, "KLGGALQAK", None, None, None, None),
+    ("pep_empty", "CASSF", None, "", None, None, None, None),
+    ("mhc_says_test", None, None, "GILGFVFTL", 7, "train", "test", None),
+    ("mhc_only", None, None, None, None, None, "test", "val"),
+    ("everything", "CASSF", "CAVR", "NLVPMVATV", 9, "val", "test", "test"),
+]
+
+
+def votes(policy, seed=42):
+    duckdb = pytest.importorskip("duckdb")
+    v = axis_vote_sql(policy, seed)
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE TABLE r (tag VARCHAR, trb_cdr3 VARCHAR, tra_cdr3 VARCHAR, peptide VARCHAR, "
+                    "pc BIGINT, ps VARCHAR, m1 VARCHAR, m2 VARCHAR)")
+        con.executemany("INSERT INTO r VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ROWS)
+        got = con.execute(f"""
+            SELECT k.tag, {v['s_trb']}, {v['s_tra']}, {v['s_pep']}, {v['s_m1']}, {v['s_m2']}
+            FROM r k
+            LEFT JOIN (SELECT tag, 'train' AS split, 1 AS cluster_id FROM r WHERE trb_cdr3 IS NOT NULL) jtrb USING (tag)
+            LEFT JOIN (SELECT tag, 'train' AS split, 1 AS cluster_id FROM r WHERE tra_cdr3 IS NOT NULL) jtra USING (tag)
+            LEFT JOIN (SELECT tag, ps AS split, pc AS cluster_id FROM r WHERE pc IS NOT NULL) jpep USING (tag)
+            LEFT JOIN (SELECT tag, m1 AS split, 2 AS cluster_id FROM r WHERE m1 IS NOT NULL) jm1 USING (tag)
+            LEFT JOIN (SELECT tag, m2 AS split, 3 AS cluster_id FROM r WHERE m2 IS NOT NULL) jm2 USING (tag)
+        """).fetchall()
+    finally:
+        con.close()
+    return {g[0]: g[1:] for g in got}
+
+
+def test_v2_votes_in_sql_match_the_python_rule_on_every_axis():
+    got = votes("receptor-hash-v2")
+    for tag, trb, tra, pep, pc, _ps, _m1, _m2 in ROWS:
+        assert got[tag] == (receptor_split(trb, "trb_cdr3", 42), receptor_split(tra, "tra_cdr3", 42),
+                            peptide_split(pc, pep, 42), None, None), tag
+    assert got["pep_in_cluster"][2] == got["pep_same_cluster"][2] == got["mhc_says_test"][2]
+    assert got["pep_no_cluster"][2] is not None and got["pep_empty"][2] is None
+
+
+def test_under_v2_the_mhc_pocket_cannot_hold_a_row_out():
+    got = votes("receptor-hash-v2")
+    assert combine(got["mhc_only"]) == "train"                      # no vote at all: train by default
+    assert combine(got["mhc_says_test"]) == combine(got["pep_in_cluster"])
+
+
+def test_v1_and_legacy_votes_are_unchanged_by_adding_v2():
+    legacy, v1 = votes("cluster-v0"), votes("receptor-hash-v1")
+    assert legacy["everything"] == ("train", "train", "val", "test", "test")
+    assert legacy["mhc_only"] == (None, None, None, "test", "val")
+    assert v1["everything"][2:] == ("val", "test", "test")          # peptide and MHC still by cluster
+    assert v1["everything"][:2] == (receptor_split("CASSF", "trb_cdr3", 42), receptor_split("CAVR", "tra_cdr3", 42))
+
+
+def test_peptide_split_sql_and_python_agree():
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect()
+    try:
+        cases = [(cid, pep) for cid in (None, -1, 0, 1, 7, 3948632, 16134210, 2 ** 40) for pep in ("GILGFVFTL", "", None)]
+        for cid, pep in cases:
+            got = con.execute(f"SELECT {peptide_split_sql('CAST($1 AS BIGINT)', 'CAST($2 AS VARCHAR)', 42)}",
+                              [cid, pep]).fetchone()[0]
+            assert got == peptide_split(cid, pep, 42), (cid, pep)
     finally:
         con.close()
