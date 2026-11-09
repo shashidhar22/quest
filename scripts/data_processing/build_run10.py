@@ -119,6 +119,7 @@ def main() -> None:
         "--eligibility-policy", "legacy-320-v0",
         # Likewise deliberate: past builds were not isolated from the benchmark.
         "--benchmark-exclusion", "none",
+        "--split-routing", "cluster-v0",
         "--seed", "42",
         # Memory safety on this 181 GB / no-swap g6 instance (see module header).
         "--memory-gb", str(SAFE_MEMORY_GB),

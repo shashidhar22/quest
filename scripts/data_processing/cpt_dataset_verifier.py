@@ -11,7 +11,9 @@ V2. Filter compliance among sampled rows, under the build's eligibility policy:
     the builder's SQL semi-join without DuckDB.
 V3. Column projection (input_text matches independent re-derivation)
 V4. Sampling distribution (per-partition expected vs actual within tolerance)
-V5. Split routing (priority routing applied correctly)
+V5. Split routing (priority routing applied correctly). Under receptor-hash-v1 the receptor
+    axes are re-derived from the source row's own CDR3 strings with
+    `quest.data.split_routing.receptor_split`, so only source-matched rows are checked.
 V6. Separator and assembly (only literal <eos>, AA-only segments)
 V7. mhc_class consistency
 V8. Cluster ID consistency
@@ -328,6 +330,8 @@ def main():
                     help='must be the policy the build used; no default, as in the builder')
     ap.add_argument('--hla-reference', type=Path, default=None,
                     help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
+    ap.add_argument('--split-routing', choices=['cluster-v0', 'receptor-hash-v1'], required=True,
+                    help='must be the routing policy the build used; no default')
     ap.add_argument('--benchmark-exclusion', choices=['none', 'heldout-peptides-v2'], required=True,
                     help='must be the isolation policy the build used; no default')
     ap.add_argument('--exclusion-list', type=Path, default=None,
@@ -673,8 +677,21 @@ def main():
             con_v5.close()
         v5_violations = []
         v5_checked = 0
-        # V5 runs over ALL sampled output rows; doesn't need source lookup.
-        for r in sampled_all:
+        hash_routing = args.split_routing == 'receptor-hash-v1'
+        if hash_routing:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+            from quest.data.split_routing import receptor_split
+            _m = json.loads((art_dir / 'build_manifest.json').read_text())
+            assert _m.get('split_routing') == args.split_routing, (
+                f"build used routing {_m.get('split_routing')!r}, verifier was asked for "
+                f"{args.split_routing!r}")
+            build_seed = _m['config']['seed']
+        # cluster-v0: ALL sampled output rows. receptor-hash-v1: source-matched rows only, since
+        # the receptor strings that decide the split are read from the source row.
+        for r in (source_subsample if hash_routing else sampled_all):
+            src = src_map.get(r['source_row_hash']) if hash_routing else None
+            if hash_routing and src is None:
+                continue
             v5_checked += 1
             cids = {
                 'trb_cdr3': r['trb_cluster'],
@@ -685,6 +702,11 @@ def main():
             }
             splits = []
             for axis, cid in cids.items():
+                if hash_routing and axis in ('trb_cdr3', 'tra_cdr3'):
+                    sp = receptor_split(src.get(axis), axis, build_seed)
+                    if sp is not None:
+                        splits.append(sp)
+                    continue
                 if cid is None or cid == -1:
                     continue
                 sp = cid_split_lookup.get((axis, cid))
@@ -705,9 +727,10 @@ def main():
                     'expected': ds_label, 'actual': r['__split'],
                     'splits_seen': splits,
                 })
-        v5 = {'n_checked': v5_checked, 'violations': v5_violations[:20],
+        v5 = {'policy': args.split_routing, 'n_checked': v5_checked, 'violations': v5_violations[:20],
               'n_violations': len(v5_violations),
-              'status': 'PASS' if not v5_violations else 'FAIL'}
+              # Zero rows checked would make the zero violations meaningless.
+              'status': 'PASS' if (v5_checked > 0 and not v5_violations) else 'FAIL'}
         (art_dir / 'v5_split_routing.json').write_text(json.dumps(v5, indent=2, default=str))
 
         # ---------- V4: Sampling distribution (from artifacts) ----------

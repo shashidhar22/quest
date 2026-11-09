@@ -46,6 +46,13 @@ from quest.data.benchmark_exclusion import (  # noqa: E402
     load_excluded_peptides,
     normalize_peptide_sql,
 )
+from quest.data.split_routing import (  # noqa: E402
+    CLUSTER_ROUTING,
+    RECEPTOR_AXES,
+    RECEPTOR_HASH_ROUTING,
+    ROUTING_POLICIES,
+    receptor_split_sql,
+)
 from quest.data.mhc_eligibility import (  # noqa: E402
     MHC_ONE_ROLES,
     MHC_TWO_ROLES,
@@ -498,6 +505,10 @@ def main():
                          'reference-aware-v1 decides eligibility against a pinned reference')
     ap.add_argument('--hla-reference', type=Path, default=None,
                     help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
+    ap.add_argument('--split-routing', choices=list(ROUTING_POLICIES), required=True,
+                    help='cluster-v0 reproduces past builds, whose splits differ by receptor CDR3 '
+                         'length because Hamming-1 clusters percolate; receptor-hash-v1 routes '
+                         'each receptor by a seeded hash of its own sequence')
     ap.add_argument('--benchmark-exclusion', choices=list(EXCLUSION_POLICIES), required=True,
                     help='none reproduces past builds, which were NOT isolated from the benchmark; '
                          'heldout-peptides-v2 drops every row carrying a held-out peptide')
@@ -958,13 +969,20 @@ def main():
         )
 
         # ---------- Step 5: JOIN clusters + project + route ----------
-        log('STEP 5: cluster JOINs + projection + routing', run_id=run_id)
+        log(f'STEP 5: cluster JOINs + projection + routing ({args.split_routing})', run_id=run_id)
+        if args.split_routing == CLUSTER_ROUTING:
+            s_trb_sql, s_tra_sql = 'jtrb.split', 'jtra.split'
+        else:
+            # The receptor's own sequence decides, so the split cannot follow cluster size or
+            # length. The cluster id is still joined and reported.
+            s_trb_sql = receptor_split_sql('k.trb_cdr3', RECEPTOR_AXES[0], args.seed)
+            s_tra_sql = receptor_split_sql('k.tra_cdr3', RECEPTOR_AXES[1], args.seed)
         build_sql = f"""
         CREATE OR REPLACE TABLE staging AS
         WITH joined AS (
           SELECT k.*,
-            jtrb.cluster_id AS trb_cluster_raw, jtrb.split AS s_trb,
-            jtra.cluster_id AS tra_cluster_raw, jtra.split AS s_tra,
+            jtrb.cluster_id AS trb_cluster_raw, {s_trb_sql} AS s_trb,
+            jtra.cluster_id AS tra_cluster_raw, {s_tra_sql} AS s_tra,
             jpep.cluster_id AS peptide_cluster_raw, jpep.split AS s_pep,
             jm1.cluster_id  AS mhc_one_cluster_raw, jm1.split AS s_m1,
             jm2.cluster_id  AS mhc_two_cluster_raw, jm2.split AS s_m2
@@ -1190,6 +1208,7 @@ def main():
                 'output': str(out_dir),
             },
             'eligibility_policy': policy,
+            'split_routing': args.split_routing,
             # F1-F6 exist only under the legacy policy; reference-aware reports per-pair decisions.
             'filter_counts': {
                 'F1': int(filter_row['F1']),

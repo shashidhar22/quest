@@ -55,7 +55,8 @@ def now_utc_iso() -> str:
 
 
 def run_pair(run_id: str, tcr: str, mhc: str, dist: str, scale: int, suffix: str,
-             eligibility_policy: str, benchmark_exclusion: str, hla_reference=None,
+             eligibility_policy: str, benchmark_exclusion: str, split_routing: str,
+             hla_reference=None,
              exclusion_list=None,
              dry_run: bool = False, only_builder: bool = False) -> bool:
     """Run builder + verifier for one variant; return True on PASS."""
@@ -95,6 +96,7 @@ def run_pair(run_id: str, tcr: str, mhc: str, dist: str, scale: int, suffix: str
         '--run-id', run_id,
         '--eligibility-policy', eligibility_policy,
         '--benchmark-exclusion', benchmark_exclusion,
+        '--split-routing', split_routing,
     ]
     if hla_reference:
         builder_cmd += ['--hla-reference', str(hla_reference)]
@@ -111,6 +113,7 @@ def run_pair(run_id: str, tcr: str, mhc: str, dist: str, scale: int, suffix: str
         '--poll-timeout-sec', '43200' if scale >= 50_000_000 else '21600',
         '--eligibility-policy', eligibility_policy,
         '--benchmark-exclusion', benchmark_exclusion,
+        '--split-routing', split_routing,
     ]
     if hla_reference:
         verifier_cmd += ['--hla-reference', str(hla_reference)]
@@ -317,6 +320,9 @@ def main():
     ap.add_argument('--benchmark-exclusion', required=True, choices=['none', 'heldout-peptides-v2'],
                     help='Benchmark isolation passed through to builder and verifier. No default: '
                          'none reproduces past, non-isolated builds.')
+    ap.add_argument('--split-routing', required=True, choices=['cluster-v0', 'receptor-hash-v1'],
+                    help='Split routing passed through to builder and verifier. No default: '
+                         'cluster-v0 reproduces past builds and their length-skewed splits.')
     ap.add_argument('--exclusion-list', default=None,
                     help='held-out peptide TSV; required for heldout-peptides-v2')
     ap.add_argument('--only', nargs='*', help='Run only these IDs (e.g. run07 run01)')
@@ -346,6 +352,7 @@ def main():
         ok = run_pair(run_id, tcr, mhc, dist, scale, suffix,
                       eligibility_policy=args.eligibility_policy,
                       benchmark_exclusion=args.benchmark_exclusion,
+                      split_routing=args.split_routing,
                       hla_reference=args.hla_reference,
                       exclusion_list=args.exclusion_list,
                       dry_run=args.dry_run, only_builder=args.no_verifier)
