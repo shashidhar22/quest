@@ -39,6 +39,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from quest.data.benchmark_exclusion import (  # noqa: E402
+    EXCLUSION_POLICIES,
+    HELDOUT_PEPTIDES,
+    load_excluded_peptides,
+    normalize_peptide_sql,
+)
 from quest.data.mhc_eligibility import (  # noqa: E402
     MHC_ONE_ROLES,
     MHC_TWO_ROLES,
@@ -327,8 +333,14 @@ def normalize_sequence_sql(expr: str) -> str:
 
 # ---------- filter SQL fragment ----------
 
-def filter_where_sql(policy: str, eligibility_table: str | None = None) -> str:
+def filter_where_sql(policy: str, eligibility_table: str | None = None,
+                     excluded_peptides_table: str | None = None) -> str:
     """SQL WHERE clause yielding rows that PASS eligibility under `policy`.
+
+    `excluded_peptides_table`, when given, is benchmark isolation (`quest.data.benchmark_exclusion`):
+    a table with one normalized `excluded_peptide` column, and every row carrying one of those peptides is
+    dropped, in every projection. It composes with either policy and is absent by default so the
+    legacy text stays byte-identical for reproduction.
 
     `policy` is required; see POLICIES. `eligibility_table` is required for
     REFERENCE_AWARE_POLICY and must hold the accepted pairs produced by
@@ -337,6 +349,17 @@ def filter_where_sql(policy: str, eligibility_table: str | None = None) -> str:
     """
     if policy not in POLICIES:
         raise ValueError(f'unknown eligibility policy {policy!r}; expected one of {POLICIES}')
+
+    isolation = ''
+    if excluded_peptides_table:
+        # NOT EXISTS, not NOT IN: a NULL on either side must never turn the test into NULL.
+        # The list's column is deliberately NOT called `peptide`: inside the subquery an
+        # unqualified `peptide` would then bind to the list itself, the comparison would always
+        # be true, and every peptide-bearing row would be dropped.
+        isolation = f"""    AND (peptide IS NULL OR NOT EXISTS (
+          SELECT 1 FROM {excluded_peptides_table} x
+          WHERE x.excluded_peptide = {normalize_peptide_sql('peptide')}))
+    """
 
     if policy == LEGACY_POLICY:
         h1 = hsql('mhc_one_allele')
@@ -348,7 +371,7 @@ def filter_where_sql(policy: str, eligibility_table: str | None = None) -> str:
         AND NOT (mhc_one_allele IS NOT NULL AND ({h1}) = 'unknown')
         AND NOT (mhc_one IS NOT NULL AND length(mhc_one) > 320)
         AND NOT (mhc_two IS NOT NULL AND length(mhc_two) > 320)
-    """
+    """ + isolation
 
     if not eligibility_table:
         raise ValueError(f'{REFERENCE_AWARE_POLICY} requires eligibility_table')
@@ -379,7 +402,7 @@ def filter_where_sql(policy: str, eligibility_table: str | None = None) -> str:
       WHERE {slot('mhc_one', 'mhc_one_allele', MHC_ONE_ROLES)}
         AND {slot('mhc_two', 'mhc_two_allele', MHC_TWO_ROLES)}
         AND {paired}
-    """
+    """ + isolation
 
 
 # ---------- target computation ----------
@@ -474,6 +497,11 @@ def main():
                          'reference-aware-v1 decides eligibility against a pinned reference')
     ap.add_argument('--hla-reference', type=Path, default=None,
                     help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
+    ap.add_argument('--benchmark-exclusion', choices=list(EXCLUSION_POLICIES), required=True,
+                    help='none reproduces past builds, which were NOT isolated from the benchmark; '
+                         'heldout-peptides-v1 drops every row carrying a held-out peptide')
+    ap.add_argument('--exclusion-list', type=Path, default=None,
+                    help='TSV from build_cpt_benchmark_exclusion.py; required for heldout-peptides-v1')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--run-id', type=str, default='runXX')
     ap.add_argument('--threads', type=int, default=DEFAULT_THREADS)
@@ -510,6 +538,40 @@ def main():
         })
 
         src = f"read_parquet('{ROOT_INPUT}/**/*.parquet', hive_partitioning=1)"
+
+        # ---------- Step 0a: benchmark isolation ----------
+        excl_table = None
+        exclusion_manifest = 'NOT_APPLIED'
+        log(f'benchmark exclusion: {args.benchmark_exclusion}', run_id=run_id)
+        if args.benchmark_exclusion == HELDOUT_PEPTIDES:
+            if not args.exclusion_list or not Path(args.exclusion_list).exists():
+                raise SystemExit(f'--exclusion-list is required for {HELDOUT_PEPTIDES}')
+            excluded, excl_sha = load_excluded_peptides(args.exclusion_list)
+            excl_table = 'excluded_peptides'
+            con.execute(f'CREATE OR REPLACE TABLE {excl_table} (excluded_peptide VARCHAR)')
+            con.executemany(f'INSERT INTO {excl_table} VALUES (?)', [(p,) for p in sorted(excluded)])
+            t0 = time.time()
+            excl_df = con.execute(f"""
+                SELECT subset_key, COUNT(*) AS n FROM {src}
+                WHERE peptide IS NOT NULL AND EXISTS (
+                  SELECT 1 FROM {excl_table} x
+                  WHERE x.excluded_peptide = {normalize_peptide_sql('peptide')})
+                GROUP BY subset_key ORDER BY subset_key
+            """).df()
+            with open(art_dir / 'benchmark_exclusion_counts.csv', 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['policy', 'subset_key', 'source_rows_carrying_a_heldout_peptide'])
+                for row in excl_df.itertuples():
+                    w.writerow([args.benchmark_exclusion, row.subset_key, int(row.n)])
+            n_excl = int(excl_df.n.sum()) if len(excl_df) else 0
+            log(f'  {len(excluded)} held-out peptides ({excl_sha[:12]}); {n_excl:,} source rows '
+                f'carry one, in {time.time()-t0:.1f}s', run_id=run_id)
+            exclusion_manifest = {
+                'policy': args.benchmark_exclusion,
+                'list': str(args.exclusion_list), 'list_sha256': excl_sha,
+                'n_peptides': len(excluded),
+                'source_rows_carrying_a_heldout_peptide': n_excl,
+            }
 
         # ---------- Step 0: eligibility policy ----------
         policy = args.eligibility_policy
@@ -621,7 +683,8 @@ def main():
         # ---------- Step 2: per-partition post-filter counts ----------
         log('STEP 2: per-partition counts', run_id=run_id)
         t0 = time.time()
-        where = filter_where_sql(policy, eligibility_table=elig_table)
+        where = filter_where_sql(policy, eligibility_table=elig_table,
+                                 excluded_peptides_table=excl_table)
         part_df = con.execute(f"""
             SELECT subset_key, order_key, COUNT(*) AS n
             FROM {src}
@@ -693,7 +756,8 @@ def main():
                                  ['subset_key VARCHAR', 'order_key VARCHAR'])
         con.execute(f'CREATE OR REPLACE TABLE staging_raw (\n  {ddl_cols}\n)')
 
-        partition_where = filter_where_sql(policy, eligibility_table=elig_table)
+        partition_where = filter_where_sql(policy, eligibility_table=elig_table,
+                                           excluded_peptides_table=excl_table)
 
         # Partition into large vs. small lists
         large_partitions = []
@@ -1153,7 +1217,8 @@ def main():
                 'p99': int(lq['p99']) if lq['p99'] is not None else 0,
                 'max': int(lq['max_len']) if lq['max_len'] is not None else 0,
             },
-            'antigenic_specificity_exclusion': 'NOT_APPLIED',
+            # 'NOT_APPLIED' (the literal run05 carries) unless --benchmark-exclusion applied one.
+            'antigenic_specificity_exclusion': exclusion_manifest,
             'peak_rss_mb': peak_rss_mb(),
             'host': socket.gethostname(),
             'tool_versions': {
@@ -1169,7 +1234,9 @@ def main():
             pass
         try:
             git_sha = subprocess.check_output(
-                ['git', '-C', '/home/ubuntu/quest', 'rev-parse', 'HEAD'],
+                # The checkout this script runs from, which on the box is a worktree and not
+                # /home/ubuntu/quest (a colleague's branch with other code).
+                ['git', '-C', str(Path(__file__).resolve().parents[2]), 'rev-parse', 'HEAD'],
                 text=True
             ).strip()
             manifest['quest_git_sha'] = git_sha

@@ -55,7 +55,8 @@ def now_utc_iso() -> str:
 
 
 def run_pair(run_id: str, tcr: str, mhc: str, dist: str, scale: int, suffix: str,
-             eligibility_policy: str, hla_reference=None,
+             eligibility_policy: str, benchmark_exclusion: str, hla_reference=None,
+             exclusion_list=None,
              dry_run: bool = False, only_builder: bool = False) -> bool:
     """Run builder + verifier for one variant; return True on PASS."""
     out_dir = DATA_ROOT / suffix
@@ -93,9 +94,12 @@ def run_pair(run_id: str, tcr: str, mhc: str, dist: str, scale: int, suffix: str
         '--seed', '42',
         '--run-id', run_id,
         '--eligibility-policy', eligibility_policy,
+        '--benchmark-exclusion', benchmark_exclusion,
     ]
     if hla_reference:
         builder_cmd += ['--hla-reference', str(hla_reference)]
+    if exclusion_list:
+        builder_cmd += ['--exclusion-list', str(exclusion_list)]
     verifier_cmd = [
         'python3', str(VERIFIER),
         '--output-dir', str(out_dir),
@@ -106,9 +110,12 @@ def run_pair(run_id: str, tcr: str, mhc: str, dist: str, scale: int, suffix: str
         '--run-id', run_id,
         '--poll-timeout-sec', '43200' if scale >= 50_000_000 else '21600',
         '--eligibility-policy', eligibility_policy,
+        '--benchmark-exclusion', benchmark_exclusion,
     ]
     if hla_reference:
         verifier_cmd += ['--hla-reference', str(hla_reference)]
+    if exclusion_list:
+        verifier_cmd += ['--exclusion-list', str(exclusion_list)]
 
     if dry_run:
         log(f'  DRY: {" ".join(builder_cmd)}')
@@ -307,6 +314,11 @@ def main():
                          'reference-aware-v1 requires --hla-reference.')
     ap.add_argument('--hla-reference', default=None,
                     help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
+    ap.add_argument('--benchmark-exclusion', required=True, choices=['none', 'heldout-peptides-v1'],
+                    help='Benchmark isolation passed through to builder and verifier. No default: '
+                         'none reproduces past, non-isolated builds.')
+    ap.add_argument('--exclusion-list', default=None,
+                    help='held-out peptide TSV; required for heldout-peptides-v1')
     ap.add_argument('--only', nargs='*', help='Run only these IDs (e.g. run07 run01)')
     ap.add_argument('--dry-run', action='store_true', help='Print commands without executing')
     ap.add_argument('--continue-on-fail', action='store_true',
@@ -333,7 +345,9 @@ def main():
         run_t0 = time.time()
         ok = run_pair(run_id, tcr, mhc, dist, scale, suffix,
                       eligibility_policy=args.eligibility_policy,
+                      benchmark_exclusion=args.benchmark_exclusion,
                       hla_reference=args.hla_reference,
+                      exclusion_list=args.exclusion_list,
                       dry_run=args.dry_run, only_builder=args.no_verifier)
         run_dt = time.time() - run_t0
         log(f'{run_id}: {"PASS" if ok else "FAIL"} after {run_dt/60:.1f} min')

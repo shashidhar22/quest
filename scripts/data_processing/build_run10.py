@@ -117,6 +117,8 @@ def main() -> None:
         # deliberately -- including its 320-aa rejection, which discards most full-length
         # class-I heavy chains. A NEW corpus must pass reference-aware-v1 instead.
         "--eligibility-policy", "legacy-320-v0",
+        # Likewise deliberate: past builds were not isolated from the benchmark.
+        "--benchmark-exclusion", "none",
         "--seed", "42",
         # Memory safety on this 181 GB / no-swap g6 instance (see module header).
         "--memory-gb", str(SAFE_MEMORY_GB),

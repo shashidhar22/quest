@@ -16,6 +16,9 @@ V6. Separator and assembly (only literal <eos>, AA-only segments)
 V7. mhc_class consistency
 V8. Cluster ID consistency
 V9. Split fractions in expected ranges
+V10. Benchmark isolation: under heldout-peptides-v1, EVERY peptide-bearing output row (not a
+     sample) is parsed and none may carry a held-out peptide; the list's sha256 must match the
+     build manifest. Under 'none' the check is recorded as not applied.
 """
 from __future__ import annotations
 
@@ -325,7 +328,14 @@ def main():
                     help='must be the policy the build used; no default, as in the builder')
     ap.add_argument('--hla-reference', type=Path, default=None,
                     help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
+    ap.add_argument('--benchmark-exclusion', choices=['none', 'heldout-peptides-v1'], required=True,
+                    help='must be the isolation policy the build used; no default')
+    ap.add_argument('--exclusion-list', type=Path, default=None,
+                    help='held-out peptide TSV; required for heldout-peptides-v1')
     args = ap.parse_args()
+    if args.benchmark_exclusion != 'none' and not (
+            args.exclusion_list and args.exclusion_list.exists()):
+        ap.error(f'--exclusion-list is required for {args.benchmark_exclusion}')
     if args.eligibility_policy == REFERENCE_AWARE_POLICY and not (
             args.hla_reference and args.hla_reference.exists()):
         ap.error(f'--hla-reference is required for {REFERENCE_AWARE_POLICY}')
@@ -741,11 +751,49 @@ def main():
               'status': 'PASS' if not v4_violations else 'FAIL'}
         (art_dir / 'v4_distribution_check.json').write_text(json.dumps(v4, indent=2, default=str))
 
+        # ---------- V10: benchmark isolation, every peptide-bearing output row ----------
+        log(f'V10: benchmark isolation ({args.benchmark_exclusion})', run_id=run_id)
+        manifest_path = art_dir / 'build_manifest.json'
+        built = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        built_excl = built.get('antigenic_specificity_exclusion', 'NOT_APPLIED')
+        built_excl_policy = built_excl.get('policy') if isinstance(built_excl, dict) else 'none'
+        assert built_excl_policy == args.benchmark_exclusion, (
+            f'build used exclusion {built_excl_policy!r}, verifier was asked for '
+            f'{args.benchmark_exclusion!r}')
+        if args.benchmark_exclusion == 'none':
+            v10 = {'policy': 'none', 'status': 'PASS', 'note': 'not applied; build is not isolated'}
+        else:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+            from quest.data.benchmark_exclusion import load_excluded_peptides, peptide_of_output_row
+            excluded, excl_sha = load_excluded_peptides(args.exclusion_list)
+            assert built_excl.get('list_sha256') == excl_sha, (
+                f"exclusion list differs from the build: {excl_sha} vs {built_excl.get('list_sha256')}")
+            v10_checked, v10_violations = 0, []
+            for split_name in ('train', 'validation', 'test'):
+                # Every row is parsed by its order_key; no pre-filter on subset_key, whose storage
+                # type (string, dictionary, class label) must not decide what gets checked.
+                tbl = ds[split_name].data.table.select(['input_text', 'order_key'])
+                for batch in tbl.to_batches(max_chunksize=200_000):
+                    for text, order in zip(batch.column(0).to_pylist(), batch.column(1).to_pylist()):
+                        pep = peptide_of_output_row(text, str(order))
+                        if pep is None:
+                            continue
+                        v10_checked += 1
+                        if pep in excluded:
+                            v10_violations.append({'split': split_name, 'order_key': str(order)})
+            v10 = {'policy': args.benchmark_exclusion, 'list_sha256': excl_sha,
+                   'n_peptides': len(excluded), 'n_peptide_rows_checked': v10_checked,
+                   'n_violations': len(v10_violations), 'violations': v10_violations[:50],
+                   # Zero rows checked would make the zero below meaningless.
+                   'status': 'PASS' if (v10_checked > 0 and not v10_violations) else 'FAIL'}
+        (art_dir / 'v10_benchmark_isolation.json').write_text(json.dumps(v10, indent=2, default=str))
+
         # ---------- Overall verdict ----------
         all_status = {
             'V1': v1['status'], 'V2': v2['status'], 'V3': v3['status'],
             'V4': v4['status'], 'V5': v5['status'], 'V6': v6['status'],
             'V7': v7['status'], 'V8': v8['status'], 'V9': v9['status'],
+            'V10': v10['status'],
         }
         log(f'verdicts: {all_status}', run_id=run_id)
         fails = [k for k, v in all_status.items() if v == 'FAIL']
