@@ -58,7 +58,9 @@ SEQ_E = chain(358, "E")      # non-classical class I
 SEQ_DRA = chain(254, "D")    # class-II alpha
 SEQ_DRB = chain(266, "R")    # class-II beta
 SEQ_SHARED = chain(364, "S")  # deliberately shared by two A alleles
-SEQ_CROSS = chain(363, "X")   # deliberately shared across A and DRB1 -> conflict
+# Deliberately shared across A and DRB1 -> conflict. 266 aa so that this artificial entry does
+# not become the longest "DRB1" and turn the real 266-aa beta chain into a fragment.
+SEQ_CROSS = chain(266, "X")
 SEQ_DQA2 = chain(255, "Q")   # in the reference, but a locus outside the class tables
 
 
@@ -74,8 +76,8 @@ def index(tmp_path) -> EligibilityIndex:
         ("HLA:0006 DRB1*15:01:01:01 266 bp", SEQ_DRB),
         ("HLA:0007 A*02:09:01:01 364 bp", SEQ_SHARED),
         ("HLA:0008 A*68:01:01:01 364 bp", SEQ_SHARED),
-        ("HLA:0009 A*11:01:01:01 363 bp", SEQ_CROSS),
-        ("HLA:0010 DRB1*04:01:01:01 363 bp", SEQ_CROSS),
+        ("HLA:0009 A*11:01:01:01 266 bp", SEQ_CROSS),
+        ("HLA:0010 DRB1*04:01:01:01 266 bp", SEQ_CROSS),
         ("HLA:0011 DQA2*01:01:01:01 255 bp", SEQ_DQA2),
     ]
     fasta = tmp_path / "mini_prot.fasta"
@@ -335,3 +337,44 @@ def test_out_of_scope_locus_name_is_reported_as_such(index, name):
     d = index.decide(SEQ_A, allele=name)
     assert d.decision == "quarantine" and d.reason == "locus_out_of_scope"
     assert d.allele_evidence == "out_of_scope"
+
+
+def partial_index(tmp_path):
+    """Locus A: full length 365 (commonest near the longest), one 364 variant, fragments at 181
+    and 349. Locus DRB1: mostly 89-aa exon-2 fragments, full length 266."""
+    recs = [(f"HLA:{i} A*01:{i:02d}:01:01 365 bp", chain(365, "ACDEFGHIKL"[i])) for i in range(5)]
+    recs += [("HLA:20 A*02:01:01:01 364 bp", chain(364, "M")), ("HLA:21 A*03:01:01:01 349 bp", chain(349, "N")),
+             ("HLA:22 A*11:01:01:01 181 bp", chain(181, "P")), ("HLA:23 A*24:02:01:01N 120 bp", chain(120, "Q"))]
+    recs += [(f"HLA:{30+i} DRB1*01:{i:02d}:01:01 89 bp", chain(89, "ACDEFGHIKL"[i])) for i in range(6)]
+    recs += [("HLA:40 DRB1*15:01:01:01 266 bp", chain(266, "R")), ("HLA:41 DRB1*15:02:01:01 266 bp", chain(266, "S"))]
+    fasta = tmp_path / "partial_prot.fasta"
+    fasta.write_text("".join(f">{h}\n{s}\n" for h, s in recs))
+    return build_index_from_fasta(fasta, reference_version="PARTIAL-TEST")
+
+
+def test_full_length_is_the_commonest_length_near_the_longest(tmp_path):
+    """Not the commonest length overall: for DRB1 that is the 89-aa exon-2 fragment."""
+    idx = partial_index(tmp_path)
+    assert idx.full_lengths == {"A": 365, "DRB1": 266}
+
+
+@pytest.mark.parametrize("length,salt,decision,reason", [
+    (365, "A", "accept", "reference_exact_match"),
+    (364, "M", "accept", "reference_exact_match"),         # natural variant, one residue short
+    (349, "N", "quarantine", "reference_partial_sequence"),  # 95.6% of full: a fragment
+    (181, "P", "quarantine", "reference_partial_sequence"),  # exons 2-3 only
+])
+def test_partial_reference_match_is_quarantined(tmp_path, length, salt, decision, reason):
+    d = partial_index(tmp_path).decide(chain(length, salt))
+    assert (d.decision, d.reason) == (decision, reason)
+    assert d.reference_status == ("partial" if decision == "quarantine" else "exact")
+    assert (d.mhc_class, d.chain_role) == ("I", "heavy")   # identity is known either way
+
+
+def test_partial_is_relative_to_the_locus_not_a_fixed_length(tmp_path):
+    """266 aa is full length for DRB1 and would be a fragment for A; 89 aa is a DRB1 fragment."""
+    idx = partial_index(tmp_path)
+    assert idx.decide(chain(266, "R")).decision == "accept"
+    assert idx.decide(chain(89, "A")).reason == "reference_partial_sequence"
+    assert idx.is_partial(266, ["A"]) and not idx.is_partial(266, ["DRB1"])
+    assert not idx.is_partial(100, ["UNSEEN"])     # no full length known: never judged partial

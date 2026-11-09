@@ -51,7 +51,8 @@ def synthetic_chain(length: int) -> str:
 
 SEQ_365 = synthetic_chain(CLASS_I_HEAVY_LEN)
 SEQ_366 = synthetic_chain(CLASS_I_HEAVY_LEN_ALT)
-SEQ_SHORT_I = synthetic_chain(275)
+SEQ_SHORT_I = synthetic_chain(360)       # a natural length variant: shorter, still full length
+SEQ_PARTIAL_I = synthetic_chain(275)     # a fragment: the reference holds this allele only in part
 SEQ_II_A = synthetic_chain(CLASS_II_LEN)
 SEQ_II_B = synthetic_chain(266)
 SEQ_II_DQB = synthetic_chain(261)
@@ -66,7 +67,8 @@ def index():
         ("HLA:1 A*02:01:01:01 365 bp", SEQ_365), ("HLA:2 B*07:02:01:01 365 bp", SEQ_365),
         ("HLA:3 C*07:01:01:01 365 bp", SEQ_365), ("HLA:4 A*02:01:01:02 366 bp", SEQ_366),
         ("HLA:5 B*07:02:01:02 366 bp", SEQ_366), ("HLA:6 C*07:01:01:02 366 bp", SEQ_366),
-        ("HLA:7 A*11:01:01:01 275 bp", SEQ_SHORT_I),
+        ("HLA:7 A*11:01:01:01 360 bp", SEQ_SHORT_I),
+        ("HLA:11 A*24:02:01:01 275 bp", SEQ_PARTIAL_I),
         ("HLA:8 DRA*01:01:01:01 255 bp", SEQ_II_A),
         ("HLA:9 DRB1*15:01:01:01 266 bp", SEQ_II_B),
         ("HLA:10 DQB1*06:02:01:01 261 bp", SEQ_II_DQB),
@@ -214,7 +216,7 @@ def test_allele_field_holding_a_copy_of_the_sequence_still_passes(index):
 
 def test_legacy_policy_dropped_the_copied_allele_row(index):
     """Pins the defect the decision above recovers: F4 rejected it as an unknown allele."""
-    rows = [{"tag": "allele_is_seq", "mhc_one": SEQ_SHORT_I, "mhc_one_allele": SEQ_SHORT_I}]
+    rows = [{"tag": "allele_is_seq", "mhc_one": SEQ_II_A, "mhc_one_allele": SEQ_II_A}]
     assert surviving_rows(rows, index, policy=LEGACY_POLICY) == set()
 
 
@@ -267,3 +269,13 @@ def test_python_row_rule_agrees_with_the_sql_filter(index):
         r.get("mhc_two"), r.get("mhc_two_allele"))[0]}
     assert python == surviving_rows(PAIR_ROWS, index) == {"dr_pair", "dq_beta_alone",
                                                           "starless_name"}
+
+
+def test_exact_match_to_a_partial_reference_entry_is_rejected(index):
+    """The reference holds many alleles only as fragments. Matching one exactly proves the chain
+    is incomplete, so it is quarantined rather than counted as full-MHC exposure. The legacy
+    filter kept such rows precisely because they are short."""
+    rows = [{"tag": "partial", "mhc_one": SEQ_PARTIAL_I, "mhc_one_allele": "HLA-A*24:02"},
+            {"tag": "variant", "mhc_one": SEQ_SHORT_I, "mhc_one_allele": "HLA-A*11:01"}]
+    assert surviving_rows(rows, index) == {"variant"}
+    assert surviving_rows(rows[:1], index, policy=LEGACY_POLICY) == {"partial"}

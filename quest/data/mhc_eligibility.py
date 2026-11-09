@@ -19,6 +19,10 @@ Design rules, each of which a test pins:
     reporting can exclude it.
   * Unknown, malformed and out-of-scope chains quarantine with distinct reason codes and are
     never counted as validated exposure.
+  * A chain that exactly matches a PARTIAL reference entry is incomplete, not eligible. The
+    reference holds many alleles only as fragments (exons 2-3, 181 aa, is the commonest class-I
+    case). "Partial" is relative to the full-length entries of the chain's own locus in the same
+    reference, so it is not a fixed length limit and a 365-aa chain is never affected.
 
 A decision here is about one chain. Slot/role consistency for a row (which chain may occupy
 `mhc_one` vs `mhc_two`) is step 4, in the builder.
@@ -62,6 +66,17 @@ _EXPRESSION_SUFFIXES = "NLSCAQ"
 # pasted into the allele column parses as a 250-character "locus", and the name/sequence conflict
 # check then silently skips the row instead of quarantining it.
 _LOCUS_TOKEN_RE = re.compile(r"^[A-Z]{1,3}[0-9]?$")
+# A chain is partial when it is shorter than this fraction of its locus's full length. Measured on
+# IPD-IMGT/HLA 3.58.0, reference lengths are strongly bimodal: natural variants cluster within a
+# few residues of full length (A 364/365, G 333/338, DQB1 257/261, DPA1 254/260, all >= 97.7%)
+# and fragments at 181, 273, 337 and C 349 aa (<= 95.4%). The cut is a judgement, not a gap: about
+# twenty reference sequences lie between 95.4% and 97.7% (for example A 354 and C 355 fall just
+# under it, A 356 and C 356 just over), and for those the choice of 0.97 decides the outcome.
+PARTIAL_FRACTION = 0.97
+# The full length of a locus is the commonest length among its entries at least this close to the
+# longest one; the commonest length overall can be a fragment (DRB1: 89 aa, exon 2 alone).
+_FULL_LENGTH_BAND = 0.90
+
 # Residue-only text of this length in an allele field is a sequence, not a name.
 _SEQUENCE_IN_NAME_MIN_LEN = 25
 
@@ -78,7 +93,7 @@ class ChainDecision:
     loci: tuple[str, ...]
     alleles: tuple[str, ...]
     allele_ambiguous: bool
-    reference_status: str      # 'exact' | 'absent' | 'not_evaluated'
+    reference_status: str      # 'exact' | 'partial' | 'absent' | 'not_evaluated'
     allele_evidence: str       # 'named' | 'absent' | 'is_sequence' | 'nonhuman' |
     #                            'out_of_scope' | 'malformed'
     original_sha256: str
@@ -249,10 +264,17 @@ class EligibilityIndex:
     """Maps a normalized chain sequence to every allele in the reference carrying that sequence."""
 
     def __init__(self, by_hash: dict[str, set[str]], sequences: dict[str, str],
-                 reference_version: str):
+                 reference_version: str, full_lengths: dict[str, int] | None = None):
         self._by_hash = by_hash
         self._sequences = sequences          # normalized_sha256 -> normalized sequence
         self.reference_version = reference_version
+        # locus -> full length in this reference; a locus missing here is never judged partial.
+        self.full_lengths = dict(full_lengths or {})
+
+    def is_partial(self, length: int, loci) -> bool:
+        """True when `length` falls short of full length for every locus the chain matches."""
+        known = [self.full_lengths[l] for l in loci if l in self.full_lengths]
+        return bool(known) and all(length < PARTIAL_FRACTION * full for full in known)
 
     def __len__(self) -> int:
         return len(self._by_hash)
@@ -307,6 +329,11 @@ class EligibilityIndex:
             return out("quarantine", "locus_out_of_scope", loci=loci, alleles=alleles,
                        ambiguous=len(alleles) > 1, ref_status="exact", evidence=evidence)
         classical = all(class_role_of_locus(l)[2] for l in loci)
+        if self.is_partial(len(norm), loci):
+            # Class and role are known and are reported; the chain is still not eligible.
+            return out("quarantine", "reference_partial_sequence", mhc_class=mhc_class,
+                       chain_role=chain_role, classical=classical, loci=loci, alleles=alleles,
+                       ambiguous=len(alleles) > 1, ref_status="partial", evidence=evidence)
 
         if evidence == "named":
             # A name is checked at every resolution it states: class/role, then locus, then the
@@ -359,6 +386,7 @@ def build_index_from_fasta(path, reference_version: str) -> EligibilityIndex:
     """Build the index from an IMGT-style protein FASTA (`>HLA:ID allele length bp`)."""
     by_hash: dict[str, set[str]] = {}
     sequences: dict[str, str] = {}
+    lengths: dict[str, dict[int, int]] = {}
     allele, buf = None, []
 
     def flush():
@@ -370,6 +398,11 @@ def build_index_from_fasta(path, reference_version: str) -> EligibilityIndex:
         h = _sha(norm)
         by_hash.setdefault(h, set()).add(four_digit(allele))
         sequences.setdefault(h, norm)
+        # Expression-variant alleles ('...N') are often truncated; they do not define full length.
+        locus = locus_of(allele)
+        if locus is not None and allele[-1:] not in tuple(_EXPRESSION_SUFFIXES):
+            per = lengths.setdefault(locus, {})
+            per[len(norm)] = per.get(len(norm), 0) + 1
 
     with Path(path).open() as fh:
         for line in fh:
@@ -380,7 +413,12 @@ def build_index_from_fasta(path, reference_version: str) -> EligibilityIndex:
             else:
                 buf.append(line.strip())
     flush()
-    return EligibilityIndex(by_hash, sequences, reference_version)
+    full_lengths = {}
+    for locus, per in lengths.items():
+        near_longest = {n: c for n, c in per.items() if n >= _FULL_LENGTH_BAND * max(per)}
+        # Commonest length near the longest; ties go to the longer.
+        full_lengths[locus] = max(near_longest, key=lambda n: (near_longest[n], n))
+    return EligibilityIndex(by_hash, sequences, reference_version, full_lengths)
 
 
 def accepted_pairs_table(index: EligibilityIndex, pairs) -> list[dict]:

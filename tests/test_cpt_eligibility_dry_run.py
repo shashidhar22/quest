@@ -20,16 +20,16 @@ def chain(length, salt):
     return (motif * (length // 20 + 1))[:length]
 
 
-LONG_A, SHORT_A, DRA, DRB, UNKNOWN = chain(365, "A"), chain(275, "N"), chain(254, "D"), chain(266, "R"), chain(300, "K")
+LONG_A, PART_A, DRA, DRB, UNKNOWN = chain(365, "A"), chain(275, "N"), chain(254, "D"), chain(266, "R"), chain(300, "K")
 
 # (subset_key, mhc_one, mhc_one_allele, mhc_two, mhc_two_allele, copies)
 ROWS = [
     ("trb_mhc_one", LONG_A, "HLA-A*02:01", None, None, 5),             # legacy fail (F5) -> new pass
-    ("trb_mhc_one", SHORT_A, "HLA-A*11:01", None, None, 3),            # pass -> pass
+    ("trb_mhc_one", PART_A, "HLA-A*11:01", None, None, 3),             # legacy pass -> new fail: fragment
     ("trb_mhc_one", UNKNOWN, "HLA-A*02:01", None, None, 2),            # legacy pass -> new fail
-    ("trb_mhc_one", SHORT_A, "HLA-B*07:02", None, None, 4),            # pass -> fail, on the name only
+    ("trb_mhc_one", DRA, "HLA-DQA1*01:01", None, None, 4),             # pass -> fail, on the name only
     ("trb_mhc_one_mhc_two", DRA, "HLA-DRA*01:01", DRB, "HLA-DRB1*15:01", 6),   # pass -> pass
-    ("trb_mhc_one_mhc_two", SHORT_A, "HLA-A*11:01", DRB, "HLA-DRB1*15:01", 1),  # pass -> fail, pairing
+    ("trb_mhc_one_mhc_two", LONG_A, "HLA-A*02:01", DRB, "HLA-DRB1*15:01", 1),  # fail -> fail, pairing
     ("trb", None, None, None, None, 7),                                 # receptor-only, untouched
 ]
 
@@ -48,7 +48,7 @@ def corpus(tmp_path):
             ("mhc_one", "mhc_one_allele", "mhc_two", "mhc_two_allele"), cols)}), d / "data_0.parquet")
     fasta = tmp_path / "mini_prot.fasta"
     fasta.write_text("".join(f">{h}\n{s}\n" for h, s in [
-        ("HLA:1 A*02:01:01:01 365 bp", LONG_A), ("HLA:2 A*11:01:01:01 275 bp", SHORT_A),
+        ("HLA:1 A*02:01:01:01 365 bp", LONG_A), ("HLA:2 A*11:01:01:01 275 bp", PART_A),
         ("HLA:3 DRA*01:01:01:01 254 bp", DRA), ("HLA:4 DRB1*15:01:01:01 266 bp", DRB)]))
     return src, fasta, tmp_path / "out"
 
@@ -58,11 +58,14 @@ def test_dry_run_counts_every_transition(corpus):
     s = run(src, fasta, out)
     assert s["rows_scanned"] == 28 and s["rows_with_any_mhc_chain"] == 21
     t = {k: v["rows"] for k, v in s["transition_legacy_to_new"].items()}
-    assert t == {"False | True": 5, "True | True": 3 + 6 + 7, "True | False": 2 + 4 + 1}
-    assert s["legacy_length_only_rejections"]["rows"] == 5
+    assert t == {"False | True": 5, "True | True": 6 + 7, "True | False": 3 + 2 + 4, "False | False": 1}
+    assert s["legacy_length_only_rejections"]["rows"] == 5 + 1
     assert s["gained_legacy_fail_new_pass"]["rows"] == 5
     assert {k: v["rows"] for k, v in s["lost_legacy_pass_new_fail"].items()} == {
-        "mhc_one:reference_absent": 2, "mhc_one:name_locus_conflict": 4, "pair_mismatch": 1}
+        "mhc_one:reference_partial_sequence": 3, "mhc_one:reference_absent": 2,
+        "mhc_one:name_locus_conflict": 4}
+    assert s["new_reason"]["pair_mismatch"]["rows"] == 1
+    assert s["reference_full_length_by_locus"] == {"A": 365, "DRA": 254, "DRB1": 266}
     assert {k: v["rows"] for k, v in s["rejected_on_allele_name_only"].items()} == {
         "mhc_one:name_locus_conflict": 4}
     assert s["new_accepted_mhc_one_over_320"] == {"I | A": {"rows": 5, "combinations": 1}}

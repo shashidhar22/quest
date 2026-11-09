@@ -247,6 +247,7 @@ def run(source_root: Path, hla_reference: Path, out_dir: Path) -> dict:
         con.close()
     summary = {'policy_old': 'legacy-320-v0', 'policy_new': 'reference-aware-v1',
                'reference_sha256': ref_sha, 'reference_distinct_sequences': len(index),
+               'reference_full_length_by_locus': dict(sorted(index.full_lengths.items())),
                'source_root': str(source_root), 'slot_roles': {'mhc_one': MHC_ONE_ROLES, 'mhc_two': MHC_TWO_ROLES},
                **summarize(rows, keys)}
     # Sequences are replaced by hashes and lengths: the tables are for reading, not for reuse.
