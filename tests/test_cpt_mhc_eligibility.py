@@ -54,6 +54,7 @@ SEQ_366 = synthetic_chain(CLASS_I_HEAVY_LEN_ALT)
 SEQ_SHORT_I = synthetic_chain(275)
 SEQ_II_A = synthetic_chain(CLASS_II_LEN)
 SEQ_II_B = synthetic_chain(266)
+SEQ_II_DQB = synthetic_chain(261)
 SEQ_UNSUPPORTED = synthetic_chain(301)   # deliberately absent from the mini reference
 
 
@@ -68,6 +69,7 @@ def index():
         ("HLA:7 A*11:01:01:01 275 bp", SEQ_SHORT_I),
         ("HLA:8 DRA*01:01:01:01 255 bp", SEQ_II_A),
         ("HLA:9 DRB1*15:01:01:01 266 bp", SEQ_II_B),
+        ("HLA:10 DQB1*06:02:01:01 261 bp", SEQ_II_DQB),
     ]
     tmp = Path(__file__).resolve().parent / "fixtures" / "_mini_hla_prot.fasta"
     tmp.parent.mkdir(exist_ok=True)
@@ -94,11 +96,12 @@ def surviving_rows(rows, index, policy=REFERENCE_AWARE_POLICY) -> set[str]:
                 pairs.append((r.get("mhc_one"), r.get("mhc_one_allele")))
                 pairs.append((r.get("mhc_two"), r.get("mhc_two_allele")))
             con.execute("CREATE TABLE elig (seq_norm VARCHAR, allele_norm VARCHAR, "
-                        "chain_role VARCHAR)")
+                        "chain_role VARCHAR, pair_group VARCHAR)")
             table = accepted_pairs_table(index, pairs)
             if table:
-                con.executemany("INSERT INTO elig VALUES (?, ?, ?)",
-                                [(r["seq_norm"], r["allele_norm"], r["chain_role"]) for r in table])
+                con.executemany("INSERT INTO elig VALUES (?, ?, ?, ?)",
+                                [(r["seq_norm"], r["allele_norm"], r["chain_role"],
+                                  r["pair_group"]) for r in table])
             kwargs["eligibility_table"] = "elig"
         got = con.execute(f"SELECT tag FROM t {filter_where_sql(policy, **kwargs)}").fetchall()
         return {g[0] for g in got}
@@ -232,3 +235,35 @@ def test_sql_and_python_normalization_agree(raw):
     finally:
         con.close()
     assert got == normalize_sequence(raw), f"SQL {got!r} vs Python {normalize_sequence(raw)!r}"
+
+
+# ---------- review fixes, 2026-11-09 ----------
+
+PAIR_ROWS = [
+    {"tag": "dr_pair", "mhc_one": SEQ_II_A, "mhc_two": SEQ_II_B,
+     "mhc_one_allele": "HLA-DRA*01:01", "mhc_two_allele": "HLA-DRB1*15:01"},
+    {"tag": "class_i_with_class_ii_beta", "mhc_one": SEQ_SHORT_I, "mhc_two": SEQ_II_B,
+     "mhc_one_allele": "HLA-A*11:01", "mhc_two_allele": "HLA-DRB1*15:01"},
+    {"tag": "dr_alpha_with_dq_beta", "mhc_one": SEQ_II_A, "mhc_two": SEQ_II_DQB,
+     "mhc_one_allele": "HLA-DRA*01:01", "mhc_two_allele": "HLA-DQB1*06:02"},
+    {"tag": "dq_beta_alone", "mhc_two": SEQ_II_DQB, "mhc_two_allele": "HLA-DQB1*06:02"},
+    {"tag": "same_class_wrong_locus", "mhc_one": SEQ_SHORT_I, "mhc_one_allele": "HLA-B*07:02"},
+    {"tag": "starless_name", "mhc_one": SEQ_SHORT_I, "mhc_one_allele": "HLA-A11:01"},
+    {"tag": "nbsp_in_chain", "mhc_one": SEQ_SHORT_I[:9] + "\u00a0" + SEQ_SHORT_I[9:]},
+]
+
+
+def test_two_chains_in_one_row_must_belong_together(index):
+    """Each chain passing on its own is not enough: a class-I heavy chain beside a class-II beta,
+    or a DR alpha beside a DQ beta, is not a molecule and used to pass both slot checks."""
+    assert surviving_rows(PAIR_ROWS[:4], index) == {"dr_pair", "dq_beta_alone"}
+
+
+def test_python_row_rule_agrees_with_the_sql_filter(index):
+    """The verifier re-decides rows with `row_decision`; it must never disagree with the SQL."""
+    from quest.data.mhc_eligibility import row_decision
+    python = {r["tag"] for r in PAIR_ROWS if row_decision(
+        index, r.get("mhc_one"), r.get("mhc_one_allele"),
+        r.get("mhc_two"), r.get("mhc_two_allele"))[0]}
+    assert python == surviving_rows(PAIR_ROWS, index) == {"dr_pair", "dq_beta_alone",
+                                                          "starless_name"}

@@ -5,7 +5,10 @@ Polls the builder's _implementer_done marker, then runs V1-V9 independent
 checks using PyArrow + Python only (no DuckDB, no import of builder code).
 
 V1. Output integrity (DatasetDict structure, columns, row counts)
-V2. Filter compliance (no F1-F6 violations among sampled rows)
+V2. Filter compliance among sampled rows, under the build's eligibility policy:
+    legacy-320-v0 re-checks F1-F6 here; reference-aware-v1 re-decides each row in Python with
+    `quest.data.mhc_eligibility.row_decision` against the same pinned reference, which checks
+    the builder's SQL semi-join without DuckDB.
 V3. Column projection (input_text matches independent re-derivation)
 V4. Sampling distribution (per-partition expected vs actual within tolerance)
 V5. Split routing (priority routing applied correctly)
@@ -38,6 +41,10 @@ ROOT_INPUT = Path('/home/ubuntu/quest/data/deduplicated_again/exploded_deduped_e
 CLUSTERS_DIR = Path('/home/ubuntu/quest/data/molecule_clusters/clusters')
 SPLIT_DIR = Path('/home/ubuntu/quest/data/molecule_clusters/split_assignments')
 MASTER_PQ = Path('/home/ubuntu/quest/data/molecule_clusters/master_cluster_assignments.parquet')
+
+# Policy names are repeated, not imported: this script stays independent of builder code.
+LEGACY_POLICY = 'legacy-320-v0'
+REFERENCE_AWARE_POLICY = 'reference-aware-v1'
 
 EOS = '<eos>'
 AA_RE = re.compile(r'^[ACDEFGHIKLMNPQRSTVWY*]+$')
@@ -313,7 +320,15 @@ def main():
     ap.add_argument('--sample-n', type=int, default=1000)
     ap.add_argument('--source-sample-n', type=int, default=120)
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--eligibility-policy', choices=[LEGACY_POLICY, REFERENCE_AWARE_POLICY],
+                    required=True,
+                    help='must be the policy the build used; no default, as in the builder')
+    ap.add_argument('--hla-reference', type=Path, default=None,
+                    help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
     args = ap.parse_args()
+    if args.eligibility_policy == REFERENCE_AWARE_POLICY and not (
+            args.hla_reference and args.hla_reference.exists()):
+        ap.error(f'--hla-reference is required for {REFERENCE_AWARE_POLICY}')
 
     art_dir: Path = args.output_dir / '_build_artifacts'
     art_dir.mkdir(parents=True, exist_ok=True)
@@ -454,7 +469,23 @@ def main():
             f'{time.time()-t0:.1f}s', run_id=run_id)
 
         # ---------- V2: Filter compliance on matched source rows ----------
-        log('V2: filter compliance', run_id=run_id)
+        log(f'V2: filter compliance ({args.eligibility_policy})', run_id=run_id)
+        manifest_path = art_dir / 'build_manifest.json'
+        built = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+        # A manifest written before policies existed has no key; that build was legacy.
+        built_policy = built.get('eligibility_policy', LEGACY_POLICY)
+        assert built_policy == args.eligibility_policy, (
+            f'build used {built_policy!r}, verifier was asked for {args.eligibility_policy!r}')
+        elig_index = None
+        if args.eligibility_policy == REFERENCE_AWARE_POLICY:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+            from quest.data.mhc_eligibility import build_index_from_fasta, row_decision
+            ref_sha = hashlib.sha256(args.hla_reference.read_bytes()).hexdigest()
+            built_sha = built.get('filter_counts', {}).get('reference_sha256')
+            assert built_sha in (None, ref_sha), (
+                f'reference differs from the build: {ref_sha} vs {built_sha}')
+            elig_index = build_index_from_fasta(
+                args.hla_reference, reference_version=f'{args.hla_reference.name}:{ref_sha[:12]}')
         v2_violations = []
         v2_checked = 0
         for r in source_subsample:
@@ -462,15 +493,21 @@ def main():
             if src is None:
                 continue
             v2_checked += 1
-            if not passes_filters(src):
+            if elig_index is None:
+                ok, why = passes_filters(src), 'legacy F1-F6'
+            else:
+                ok, why = row_decision(elig_index, src.get('mhc_one'), src.get('mhc_one_allele'),
+                                       src.get('mhc_two'), src.get('mhc_two_allele'))
+            if not ok:
                 v2_violations.append({
                     'hash': r['source_row_hash'],
+                    'reason': why,
                     'mhc_one_allele': src.get('mhc_one_allele'),
                     'mhc_two_allele': src.get('mhc_two_allele'),
                     'len_mhc_one': len(src.get('mhc_one') or ''),
                     'len_mhc_two': len(src.get('mhc_two') or ''),
                 })
-        v2 = {'n_checked': v2_checked, 'n_unmatched': len(source_subsample) - v2_checked,
+        v2 = {'policy': args.eligibility_policy, 'n_checked': v2_checked, 'n_unmatched': len(source_subsample) - v2_checked,
               'violations': v2_violations, 'status': 'PASS' if not v2_violations else 'FAIL'}
         (art_dir / 'v2_filter_compliance.json').write_text(json.dumps(v2, indent=2, default=str))
 

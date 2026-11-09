@@ -254,3 +254,40 @@ def test_normalization_strips_only_the_whitespace_sql_strips(index, ws):
     assert ws in normalize_sequence(dirty)
     assert index.decide(dirty).reason == "invalid_residues"
 
+
+@pytest.mark.parametrize("name,expected", [
+    ("HLA-A*02:01", ("A", ("02", "01"))), ("A*02:01:01:01", ("A", ("02", "01", "01", "01"))),
+    ("HLA-A02:01", ("A", ("02", "01"))), ("A0201", ("A", ("02", "01"))), ("A2", ("A", ("02",))),
+    ("HLA-A*0201", ("A", ("02", "01"))), ("A*01:04N", ("A", ("01", "04"))),
+    ("DRB11501", ("DRB1", ("15", "01"))), ("HLA-DRB1_15:01", ("DRB1", ("15", "01"))),
+    ("DPB1*104:01", ("DPB1", ("104", "01"))), ("HLA-DRA", ("DRA", ())),
+    ("A*02:01P", ("A", None)), ("A020101", ("A", None)),
+    ("B2M", (None, None)), ("MICA*001", (None, None)), ("", (None, None)),
+])
+def test_allele_names_parse_with_and_without_a_star(name, expected):
+    from quest.data.mhc_eligibility import parse_allele_name
+    assert parse_allele_name(name) == expected
+
+
+@pytest.mark.parametrize("name", ["HLA-A02:01", "A0201", "A2", "A*02", "HLA-A*02:01:01", "A*02:01P"])
+def test_starless_or_coarser_names_do_not_quarantine_an_exact_chain(index, name):
+    """Punctuation or lower resolution is not a contradiction; these used to be 'malformed'."""
+    d = index.decide(SEQ_A, allele=name)
+    assert d.decision == "accept" and d.allele_evidence == "named"
+
+
+@pytest.mark.parametrize("seq,name,reason", [
+    (SEQ_A, "HLA-B*07:02", "name_locus_conflict"),      # same class and role, wrong locus
+    (SEQ_A, "HLA-A*11:01", "name_allele_conflict"),     # right locus, a different protein
+    (SEQ_A, "A1101", "name_allele_conflict"),
+    (SEQ_DRB, "HLA-DRB1*04:01", "name_allele_conflict"),
+])
+def test_same_class_name_contradicting_the_sequence_is_quarantined(index, seq, name, reason):
+    d = index.decide(seq, allele=name)
+    assert d.decision == "quarantine" and d.reason == reason
+
+
+def test_any_allele_sharing_the_sequence_satisfies_the_name(index):
+    for name in ("HLA-A*02:09", "HLA-A*68:01"):
+        assert index.decide(SEQ_SHARED, allele=name).decision == "accept"
+    assert index.decide(SEQ_DRA, allele="HLA-DRA1*01:01").decision == "accept"

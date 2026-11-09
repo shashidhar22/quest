@@ -105,7 +105,10 @@ def run_pair(run_id: str, tcr: str, mhc: str, dist: str, scale: int, suffix: str
         '--scale', str(scale),
         '--run-id', run_id,
         '--poll-timeout-sec', '43200' if scale >= 50_000_000 else '21600',
+        '--eligibility-policy', eligibility_policy,
     ]
+    if hla_reference:
+        verifier_cmd += ['--hla-reference', str(hla_reference)]
 
     if dry_run:
         log(f'  DRY: {" ".join(builder_cmd)}')

@@ -40,6 +40,8 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from quest.data.mhc_eligibility import (  # noqa: E402
+    MHC_ONE_ROLES,
+    MHC_TWO_ROLES,
     accepted_pairs_table,
     build_index_from_fasta,
 )
@@ -310,11 +312,8 @@ LEGACY_POLICY = 'legacy-320-v0'
 REFERENCE_AWARE_POLICY = 'reference-aware-v1'
 POLICIES = (LEGACY_POLICY, REFERENCE_AWARE_POLICY)
 
-# Slots, as measured in the benchmark rather than assumed: every populated mhc_two is class-II beta
-# (23 distinct sequences in the train split), so there is no class-I second chain to accommodate.
-# No beta-2-microglobulin is fabricated and none is required for a heavy-chain-only example.
-MHC_ONE_ROLES = ('heavy', 'alpha')
-MHC_TWO_ROLES = ('beta',)
+# Slot roles (MHC_ONE_ROLES, MHC_TWO_ROLES) live in `quest.data.mhc_eligibility`, beside the
+# Python row rule (`row_decision`) that the verifier uses to re-check this SQL.
 
 
 def normalize_sequence_sql(expr: str) -> str:
@@ -333,7 +332,8 @@ def filter_where_sql(policy: str, eligibility_table: str | None = None) -> str:
 
     `policy` is required; see POLICIES. `eligibility_table` is required for
     REFERENCE_AWARE_POLICY and must hold the accepted pairs produced by
-    `mhc_eligibility.accepted_pairs_table` (columns seq_norm, allele_norm, chain_role).
+    `mhc_eligibility.accepted_pairs_table` (columns seq_norm, allele_norm, chain_role,
+    pair_group).
     """
     if policy not in POLICIES:
         raise ValueError(f'unknown eligibility policy {policy!r}; expected one of {POLICIES}')
@@ -364,9 +364,21 @@ def filter_where_sql(policy: str, eligibility_table: str | None = None) -> str:
           WHERE e.seq_norm = {seq} AND e.allele_norm = coalesce({allele}, '')
             AND e.chain_role IN ({roles_sql})))"""
 
+    # Both slots populated: the two chains must also belong together (same pair_group), so a
+    # class-I heavy chain beside a class-II beta, or DQA1 beside DRB1, is rejected. A NULL
+    # pair_group never matches. Python twin: `mhc_eligibility.row_decision`.
+    seq1, seq2 = normalize_sequence_sql('mhc_one'), normalize_sequence_sql('mhc_two')
+    al1, al2 = normalize_sequence_sql('mhc_one_allele'), normalize_sequence_sql('mhc_two_allele')
+    paired = f"""(mhc_one IS NULL OR {seq1} = '' OR mhc_two IS NULL OR {seq2} = '' OR EXISTS (
+          SELECT 1 FROM {eligibility_table} e1, {eligibility_table} e2
+          WHERE e1.seq_norm = {seq1} AND e1.allele_norm = coalesce({al1}, '')
+            AND e2.seq_norm = {seq2} AND e2.allele_norm = coalesce({al2}, '')
+            AND e1.pair_group = e2.pair_group))"""
+
     return f"""
       WHERE {slot('mhc_one', 'mhc_one_allele', MHC_ONE_ROLES)}
         AND {slot('mhc_two', 'mhc_two_allele', MHC_TWO_ROLES)}
+        AND {paired}
     """
 
 
@@ -562,12 +574,14 @@ def main():
             elig_table = 'mhc_eligibility'
             con.execute(f'CREATE OR REPLACE TABLE {elig_table} ('
                         'seq_norm VARCHAR, allele_norm VARCHAR, chain_role VARCHAR, '
-                        'mhc_class VARCHAR, classical BOOLEAN, allele_evidence VARCHAR)')
+                        'mhc_class VARCHAR, classical BOOLEAN, allele_evidence VARCHAR, '
+                        'pair_group VARCHAR)')
             if elig_rows:
                 con.executemany(
-                    f'INSERT INTO {elig_table} VALUES (?, ?, ?, ?, ?, ?)',
+                    f'INSERT INTO {elig_table} VALUES (?, ?, ?, ?, ?, ?, ?)',
                     [(r['seq_norm'], r['allele_norm'], r['chain_role'], r['mhc_class'],
-                      r['classical'], r['allele_evidence']) for r in elig_rows])
+                      r['classical'], r['allele_evidence'], r['pair_group'])
+                     for r in elig_rows])
             log(f'  {len(elig_rows)} accepted pairs of {len(decisions)} distinct',
                 run_id=run_id)
             if not elig_rows:

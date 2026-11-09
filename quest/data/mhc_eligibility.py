@@ -42,7 +42,16 @@ CLASS_II_BETA = frozenset({"DRB1", "DRB2", "DRB3", "DRB4", "DRB5", "DQB1", "DPB1
 # eligible nor malformed, because silently calling them invalid would hide real records.
 NONHUMAN_PREFIXES = ("H-2", "H2-", "MAMU", "BOLA", "SLA-", "RT1", "GOGO", "PATR", "DLA-")
 
-_ALLELE_RE = re.compile(r"^(?:HLA-)?([A-Z]+[0-9]?)\*?")
+# Slots, as measured in the benchmark rather than assumed: every populated mhc_two is class-II beta
+# (23 distinct sequences in the train split), so there is no class-I second chain to accommodate.
+# No beta-2-microglobulin is fabricated and none is required for a heavy-chain-only example.
+MHC_ONE_ROLES = ("heavy", "alpha")
+MHC_TWO_ROLES = ("beta",)
+
+# Two spellings of one locus; compared as equal when a name is checked against the reference.
+_LOCUS_ALIASES = {"DRA1": "DRA"}
+# Expression-status suffixes ('A*01:04N'). They do not change which protein is named.
+_EXPRESSION_SUFFIXES = "NLSCAQ"
 # A real locus token is short: 'A', 'C', 'DRB1', 'DQA1'. Without this bound, a protein sequence
 # pasted into the allele column parses as a 250-character "locus", and the name/sequence conflict
 # check then silently skips the row instead of quarantining it.
@@ -97,16 +106,78 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def parse_allele_name(allele) -> tuple[str | None, tuple[str, ...] | None]:
+    """Split an allele name into (locus, fields).
+
+    'HLA-DRB1*15:01:01' -> ('DRB1', ('15', '01', '01')). Star-less spellings are read too, because
+    they are common in source data and a reference-exact chain must not be quarantined over
+    punctuation: 'HLA-A02:01', 'A0201' -> ('A', ('02', '01')); 'A2' -> ('A', ('02',));
+    'DRB11501' -> ('DRB1', ('15', '01')).
+
+    `locus` is None when no locus can be read. `fields` is None when the locus is readable but
+    the resolution is not safely comparable: a P/G group name (which covers several proteins) or
+    compact digits of ambiguous width. `fields` is () for a bare locus.
+    """
+    s = as_text(allele).strip().upper().replace("_", "-")
+    if s.startswith("HLA-"):
+        s = s[4:]
+    if "*" in s:
+        token, rest = s.split("*", 1)
+        starred = True
+    else:
+        m = re.match(r"^([A-Z]+)(.*)$", s)
+        if not m:
+            return None, None
+        token, rest = m.groups()
+        # Without a star, a digit after the letters is part of the locus only when that spells a
+        # known locus ('DRB1' in 'DRB11501'); otherwise it begins the allele ('A' in 'A02:01').
+        if rest[:1].isdigit() and class_role_of_locus(token + rest[0])[0] is not None:
+            token, rest = token + rest[0], rest[1:]
+        rest = rest.lstrip("-")
+        # Anything but an allele designation after the locus is not a name ('B2M').
+        if not re.fullmatch(rf"[0-9:]*[{_EXPRESSION_SUFFIXES}PG]?", rest):
+            return None, None
+        starred = False
+    if not _LOCUS_TOKEN_RE.match(token):
+        return None, None
+    rest = rest.strip()
+    if rest[-1:] in ("P", "G"):
+        return token, None
+    if rest[-1:] in tuple(_EXPRESSION_SUFFIXES):
+        rest = rest[:-1]
+    if not rest:
+        return token, ()
+    if ":" in rest:
+        parts = rest.split(":")
+    elif rest.isdigit() and (len(rest) <= 2 or (len(rest) == 3 and starred)):
+        parts = [rest]
+    elif rest.isdigit() and len(rest) == 4:
+        parts = [rest[:2], rest[2:]]
+    else:
+        return token, None
+    if not all(p.isdigit() for p in parts):
+        return token, None
+    return token, tuple(p.zfill(2) for p in parts)
+
+
 def locus_of(allele: str) -> str | None:
     """Leading locus token of an allele name, e.g. 'HLA-DRB1*15:01' -> 'DRB1'."""
-    allele = as_text(allele)
-    if not allele:
-        return None
-    m = _ALLELE_RE.match(allele.strip().upper().replace("_", "-"))
-    if not m:
-        return None
-    token = m.group(1)
-    return token if _LOCUS_TOKEN_RE.match(token) else None
+    return parse_allele_name(allele)[0]
+
+
+def _canonical_locus(locus: str | None) -> str | None:
+    return _LOCUS_ALIASES.get(locus, locus)
+
+
+def pair_group_of(mhc_class: str | None, loci) -> str | None:
+    """Which chains may share one row: 'I', or the class-II isotype 'DR' / 'DQ' / 'DP'.
+
+    None when undetermined, which never pairs with anything.
+    """
+    if mhc_class == "I":
+        return "I"
+    groups = {locus[:2] for locus in loci}
+    return groups.pop() if mhc_class == "II" and len(groups) == 1 else None
 
 
 def class_role_of_locus(locus: str | None) -> tuple[str | None, str | None, bool | None]:
@@ -220,9 +291,24 @@ class EligibilityIndex:
         classical = all(class_role_of_locus(l)[2] for l in loci)
 
         if evidence == "named":
-            name_class, name_role, _ = class_role_of_locus(locus_of(allele))
+            # A name is checked at every resolution it states: class/role, then locus, then the
+            # allele fields. 'HLA-B*07:02' on an A*02:01 sequence agrees on class and role and is
+            # still a contradiction. A coarser name ('A*02') only has to be a prefix of a match.
+            name_locus, name_fields = parse_allele_name(allele)
+            name_class, name_role, _ = class_role_of_locus(name_locus)
+            conflict = None
             if (name_class, name_role) != (mhc_class, chain_role):
-                return out("quarantine", "name_sequence_conflict", loci=loci, alleles=alleles,
+                conflict = "name_sequence_conflict"
+            elif _canonical_locus(name_locus) not in {_canonical_locus(l) for l in loci}:
+                conflict = "name_locus_conflict"
+            elif name_fields:
+                want = name_fields[:2]
+                parsed = (parse_allele_name(a) for a in alleles)
+                if not any(_canonical_locus(rl) == _canonical_locus(name_locus)
+                           and rf is not None and rf[:len(want)] == want for rl, rf in parsed):
+                    conflict = "name_allele_conflict"
+            if conflict:
+                return out("quarantine", conflict, loci=loci, alleles=alleles,
                            ambiguous=len(alleles) > 1, ref_status="exact", evidence=evidence)
 
         return out("accept", "reference_exact_match", mhc_class=mhc_class, chain_role=chain_role,
@@ -304,9 +390,35 @@ def accepted_pairs_table(index: EligibilityIndex, pairs) -> list[dict]:
         rows.append({
             "seq_norm": s_norm, "allele_norm": a_norm, "chain_role": d.chain_role,
             "mhc_class": d.mhc_class, "classical": d.classical,
+            "pair_group": pair_group_of(d.mhc_class, d.loci),
             "allele_evidence": d.allele_evidence, "reason": d.reason,
             "alleles": ";".join(d.alleles), "allele_ambiguous": d.allele_ambiguous,
             "normalized_sha256": d.normalized_sha256,
             "reference_version": d.reference_version,
         })
     return rows
+
+
+def row_decision(index: EligibilityIndex, mhc_one, mhc_one_allele, mhc_two,
+                 mhc_two_allele) -> tuple[bool, str]:
+    """Row-level eligibility in Python: the same rule the builder's SQL applies by semi-join.
+
+    Each populated slot needs an accepted chain in a role that slot allows. When both slots are
+    populated the two chains must also belong together: a class-II alpha with a beta of the same
+    isotype. A class-I heavy chain beside a class-II beta, or DQA1 beside DRB1, is not a molecule.
+    Used by the dataset verifier to re-check the SQL independently of DuckDB.
+    """
+    groups = []
+    for slot, seq, allele, roles in (("mhc_one", mhc_one, mhc_one_allele, MHC_ONE_ROLES),
+                                     ("mhc_two", mhc_two, mhc_two_allele, MHC_TWO_ROLES)):
+        if not normalize_sequence(seq):
+            continue
+        d = index.decide(seq, allele)
+        if d.decision != "accept":
+            return False, f"{slot}:{d.reason}"
+        if d.chain_role not in roles:
+            return False, f"{slot}:role_not_allowed_in_slot"
+        groups.append(pair_group_of(d.mhc_class, d.loci))
+    if len(groups) == 2 and (groups[0] is None or groups[0] != groups[1]):
+        return False, "pair_mismatch"
+    return True, "eligible"
