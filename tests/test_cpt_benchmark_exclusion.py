@@ -2,8 +2,8 @@
 
 Why this file exists. The builder never consulted the benchmark, and run05's train split held the
 exact receptor-peptide association for 103 of 1,589 locked-test molecules. Policy
-`heldout-peptides-v1` drops every row carrying a held-out peptide; these tests pin what that
-means, including what it must NOT remove.
+`heldout-peptides-v2` drops every row carrying a held-out peptide or, at min_edit_distance=2, a
+one-edit neighbour of one; these tests pin what that means, including what it must NOT remove.
 """
 import sys
 from pathlib import Path
@@ -19,7 +19,9 @@ pytest.importorskip("pyarrow")
 from quest.data.benchmark_exclusion import (  # noqa: E402
     HELDOUT_PEPTIDES,
     build_exclusion,
+    exclusion_list_info,
     load_excluded_peptides,
+    one_edit_neighbours,
     peptide_of_output_row,
     write_exclusion,
 )
@@ -49,12 +51,15 @@ def splits(tmp_path):
 
 
 def test_list_counts_molecules_not_order_variants(splits):
-    rows, meta = build_exclusion(splits, TASK, ["val", "test_novel_pep"])
+    rows, meta = build_exclusion(splits, TASK, ["val", "test_novel_pep"], min_edit_distance=1)
     assert rows == [
-        {"peptide": "ELAGIGILTV", "parts": "test_novel_pep,val", "molecules": 3},
-        {"peptide": "KLGGALQAK", "parts": "test_novel_pep", "molecules": 1},
+        {"peptide": "ELAGIGILTV", "distance": 0, "heldout_peptide": "ELAGIGILTV",
+         "parts": "test_novel_pep,val", "molecules": 3},
+        {"peptide": "KLGGALQAK", "distance": 0, "heldout_peptide": "KLGGALQAK",
+         "parts": "test_novel_pep", "molecules": 1},
     ]
     assert meta["policy"] == HELDOUT_PEPTIDES and meta["n_peptides"] == 2
+    assert meta["min_edit_distance"] == 1 and meta["n_heldout_peptides"] == 2
     assert meta["heldout_parts"] == ["val", "test_novel_pep"]
     assert set(meta["input_sha256"]) == {f"{TASK}_{p}.parquet" for p in ("train", "val", "test_novel_pep")}
 
@@ -63,34 +68,43 @@ def test_refuses_a_part_whose_peptides_are_training_peptides(splits):
     """Excluding them would hide from CPT what fine-tuning is allowed to see. Such parts need
     pair-level exclusion; widening this one silently would be the wrong repair."""
     with pytest.raises(ValueError, match="also occur in as_paired_i train"):
-        build_exclusion(splits, TASK, ["val", "test_novel_tcr"])
+        build_exclusion(splits, TASK, ["val", "test_novel_tcr"], min_edit_distance=1)
 
 
 def test_train_is_never_a_heldout_part(splits):
     with pytest.raises(ValueError):
-        build_exclusion(splits, TASK, ["train"])
+        build_exclusion(splits, TASK, ["train"], min_edit_distance=1)
     with pytest.raises(ValueError):
-        build_exclusion(splits, TASK, [])
+        build_exclusion(splits, TASK, [], min_edit_distance=1)
+    with pytest.raises(ValueError):
+        build_exclusion(splits, TASK, ["val"], min_edit_distance=3)   # cannot be enumerated
 
 
 def test_list_round_trips_and_is_hashed(splits, tmp_path):
-    rows, meta = build_exclusion(splits, TASK, ["val", "test_novel_pep"])
+    rows, meta = build_exclusion(splits, TASK, ["val", "test_novel_pep"], min_edit_distance=1)
     out = tmp_path / "heldout.tsv"
     digest = write_exclusion(rows, meta, out)
     peptides, loaded_digest = load_excluded_peptides(out)
     assert peptides == {"ELAGIGILTV", "KLGGALQAK"} and loaded_digest == digest
+    assert exclusion_list_info(out) == {"policy": HELDOUT_PEPTIDES, "min_edit_distance": 1}
     assert f'"list_sha256": "{digest}"' in (tmp_path / "heldout.tsv.meta.json").read_text()
     with pytest.raises(FileExistsError):
         write_exclusion(rows, meta, out)
 
 
+HEAD = "#policy=heldout-peptides-v2;min_edit_distance=2\npeptide\tdistance\theldout_peptide\tparts\tmolecules\n"
+
+
 @pytest.mark.parametrize("content", [
-    "", "wrong\theader\nAAA\tval\t1\n", "peptide\tparts\tmolecules\n",
-    "peptide\tparts\tmolecules\nKLMVAL1\n",               # tabs lost
-    "peptide\tparts\tmolecules\nKL M\tval\t1\n",          # edited peptide
-    "peptide\tparts\tmolecules\nklm\tval\t1\n",           # not as written
-    "peptide\tparts\tmolecules\nKLM\tval\t1\n\n",         # truncated or padded
-    "\ufeffpeptide\tparts\tmolecules\nKLM\tval\t1\n",     # byte-order mark
+    "", HEAD,                                                   # empty, or no peptides
+    "peptide\tdistance\theldout_peptide\tparts\tmolecules\nKLM\t0\tKLM\tval\t1\n",   # no policy line
+    HEAD.replace("=2", "=5") + "KLM\t0\tKLM\tval\t1\n",        # a distance that was never built
+    HEAD + "KLMVAL1\n",                                         # tabs lost
+    HEAD + "KL M\t0\tKLM\tval\t1\n",                            # edited peptide
+    HEAD + "klm\t0\tKLM\tval\t1\n",                             # not as written
+    HEAD + "KLM\t7\tKLM\tval\t1\n",                             # impossible distance
+    HEAD + "KLM\t0\tKLM\tval\t1\n\n",                           # truncated or padded
+    "\ufeff" + HEAD + "KLM\t0\tKLM\tval\t1\n",                  # byte-order mark
 ])
 def test_a_file_that_is_not_an_exclusion_list_is_refused(tmp_path, content):
     """An empty or mis-headed file must not load as 'exclude nothing'."""
@@ -123,8 +137,64 @@ def test_unknown_order_key_raises_rather_than_being_read_loosely(order):
 
 
 def test_one_row_id_with_two_peptides_lists_both(splits):
-    rows, _ = build_exclusion(splits, TASK, ["test_level4"])
+    rows, _ = build_exclusion(splits, TASK, ["test_level4"], min_edit_distance=1)
     assert [(r["peptide"], r["molecules"]) for r in rows] == [("AAAWYYY", 1), ("CCCWYYY", 1)]
+
+
+# ---------- one-edit neighbours (min_edit_distance=2) ----------
+
+def test_one_edit_neighbours_are_exactly_the_strings_at_distance_one():
+    n = one_edit_neighbours("ACD")
+    assert {"AC", "AD", "CD"} <= n                       # deletions
+    assert {"ACE", "WCD", "AWD"} <= n                    # substitutions
+    assert {"WACD", "ACDW", "ACWD"} <= n                 # insertions
+    assert "ACD" not in n and "A" not in n and "ACDWW" not in n and "WWD" not in n
+    assert len(n) == 3 + 3 * 25 + (4 * 26 - 3)           # dels + subs + distinct insertions
+
+
+def test_neighbours_are_listed_with_the_heldout_peptide_they_are_near(splits):
+    rows, meta = build_exclusion(splits, TASK, ["val", "test_novel_pep"], min_edit_distance=2)
+    by = {r["peptide"]: r for r in rows}
+    assert meta["n_heldout_peptides"] == 2 and meta["n_peptides"] == len(rows) > 2
+    assert by["ELAGIGILTV"]["distance"] == 0
+    for near in ("ELAGIGILTA", "ELAGIGILT", "ELAGIGILTVV", "WELAGIGILTV"):   # sub, del, two insertions
+        assert by[near]["distance"] == 1 and by[near]["heldout_peptide"] == "ELAGIGILTV"
+        assert by[near]["molecules"] == 0
+    assert "ELAGIGILAA" not in by                        # two substitutions away: allowed to stay
+    assert "GILGFVFTL" not in by                         # an unrelated training peptide
+
+
+def test_refuses_when_a_training_peptide_is_one_edit_from_a_heldout_one(tmp_path):
+    """The same rule as for exact matches: never hide from CPT what fine-tuning may see."""
+    d = write_splits(tmp_path, {"train": [("t1", "GILGFVFTL")], "val": [("v1", "GILGFVFTV")]})
+    build_exclusion(d, TASK, ["val"], min_edit_distance=1)            # exact-only is fine
+    with pytest.raises(ValueError, match="one edit from a held-out peptide"):
+        build_exclusion(d, TASK, ["val"], min_edit_distance=2)
+
+
+def test_a_min_distance_two_list_removes_neighbours_through_the_sql_filter(splits, tmp_path):
+    """End to end: build the list, load it, filter. A neighbour goes, a two-edit peptide stays."""
+    duckdb_ = pytest.importorskip("duckdb")
+    from scripts.data_processing.cpt_dataset_builder import LEGACY_POLICY as LEG, filter_where_sql as fws
+    rows, meta = build_exclusion(splits, TASK, ["val", "test_novel_pep"], min_edit_distance=2)
+    out = tmp_path / "list.tsv"
+    write_exclusion(rows, meta, out)
+    excluded, _ = load_excluded_peptides(out)
+    con = duckdb_.connect()
+    try:
+        con.execute("CREATE TABLE t (tag VARCHAR, peptide VARCHAR, mhc_one VARCHAR, mhc_two VARCHAR, "
+                    "mhc_one_allele VARCHAR, mhc_two_allele VARCHAR)")
+        con.executemany("INSERT INTO t VALUES (?, ?, NULL, NULL, NULL, NULL)", [
+            ("exact", "ELAGIGILTV"), ("substitution", "ELAGIGILTA"), ("deletion", "LAGIGILTV"),
+            ("insertion", "ELAGIGGILTV"), ("two_edits", "ELAGIGILAA"), ("train", "GILGFVFTL"),
+            ("no_peptide", None)])
+        con.execute("CREATE TABLE x (excluded_peptide VARCHAR)")
+        con.executemany("INSERT INTO x VALUES (?)", [(p,) for p in excluded])
+        kept = {r[0] for r in con.execute(
+            f"SELECT tag FROM t {fws(LEG, excluded_peptides_table='x')}").fetchall()}
+    finally:
+        con.close()
+    assert kept == {"two_edits", "train", "no_peptide"}
 
 
 @pytest.mark.parametrize("raw", ["ELAGIGILTV", " elagigiltv\t", "ELAG\u00a0IGILTV", "ELAGIGILTV\u200b",

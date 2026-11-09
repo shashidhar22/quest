@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from quest.data.benchmark_exclusion import (  # noqa: E402
     EXCLUSION_POLICIES,
     HELDOUT_PEPTIDES,
+    exclusion_list_info,
     load_excluded_peptides,
     normalize_peptide_sql,
 )
@@ -499,9 +500,9 @@ def main():
                     help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
     ap.add_argument('--benchmark-exclusion', choices=list(EXCLUSION_POLICIES), required=True,
                     help='none reproduces past builds, which were NOT isolated from the benchmark; '
-                         'heldout-peptides-v1 drops every row carrying a held-out peptide')
+                         'heldout-peptides-v2 drops every row carrying a held-out peptide')
     ap.add_argument('--exclusion-list', type=Path, default=None,
-                    help='TSV from build_cpt_benchmark_exclusion.py; required for heldout-peptides-v1')
+                    help='TSV from build_cpt_benchmark_exclusion.py; required for heldout-peptides-v2')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--run-id', type=str, default='runXX')
     ap.add_argument('--threads', type=int, default=DEFAULT_THREADS)
@@ -547,6 +548,10 @@ def main():
             if not args.exclusion_list or not Path(args.exclusion_list).exists():
                 raise SystemExit(f'--exclusion-list is required for {HELDOUT_PEPTIDES}')
             excluded, excl_sha = load_excluded_peptides(args.exclusion_list)
+            excl_info = exclusion_list_info(args.exclusion_list)
+            if excl_info['policy'] != args.benchmark_exclusion:
+                raise SystemExit(f"exclusion list was built for {excl_info['policy']!r}, "
+                                 f"not {args.benchmark_exclusion!r}")
             excl_table = 'excluded_peptides'
             con.execute(f'CREATE OR REPLACE TABLE {excl_table} (excluded_peptide VARCHAR)')
             con.executemany(f'INSERT INTO {excl_table} VALUES (?)', [(p,) for p in sorted(excluded)])
@@ -560,17 +565,18 @@ def main():
             """).df()
             with open(art_dir / 'benchmark_exclusion_counts.csv', 'w', newline='') as f:
                 w = csv.writer(f)
-                w.writerow(['policy', 'subset_key', 'source_rows_carrying_a_heldout_peptide'])
+                w.writerow(['policy', 'subset_key', 'source_rows_carrying_an_excluded_peptide'])
                 for row in excl_df.itertuples():
                     w.writerow([args.benchmark_exclusion, row.subset_key, int(row.n)])
             n_excl = int(excl_df.n.sum()) if len(excl_df) else 0
-            log(f'  {len(excluded)} held-out peptides ({excl_sha[:12]}); {n_excl:,} source rows '
+            log(f'  {len(excluded)} excluded peptides ({excl_sha[:12]}); {n_excl:,} source rows '
                 f'carry one, in {time.time()-t0:.1f}s', run_id=run_id)
             exclusion_manifest = {
                 'policy': args.benchmark_exclusion,
                 'list': str(args.exclusion_list), 'list_sha256': excl_sha,
+                'min_edit_distance': excl_info['min_edit_distance'],
                 'n_peptides': len(excluded),
-                'source_rows_carrying_a_heldout_peptide': n_excl,
+                'source_rows_carrying_an_excluded_peptide': n_excl,
             }
 
         # ---------- Step 0: eligibility policy ----------

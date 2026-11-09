@@ -16,7 +16,7 @@ V6. Separator and assembly (only literal <eos>, AA-only segments)
 V7. mhc_class consistency
 V8. Cluster ID consistency
 V9. Split fractions in expected ranges
-V10. Benchmark isolation: under heldout-peptides-v1, EVERY peptide-bearing output row (not a
+V10. Benchmark isolation: under heldout-peptides-v2, EVERY peptide-bearing output row (not a
      sample) is parsed and none may carry a held-out peptide; the list's sha256 must match the
      build manifest. Under 'none' the check is recorded as not applied.
 """
@@ -328,10 +328,10 @@ def main():
                     help='must be the policy the build used; no default, as in the builder')
     ap.add_argument('--hla-reference', type=Path, default=None,
                     help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
-    ap.add_argument('--benchmark-exclusion', choices=['none', 'heldout-peptides-v1'], required=True,
+    ap.add_argument('--benchmark-exclusion', choices=['none', 'heldout-peptides-v2'], required=True,
                     help='must be the isolation policy the build used; no default')
     ap.add_argument('--exclusion-list', type=Path, default=None,
-                    help='held-out peptide TSV; required for heldout-peptides-v1')
+                    help='held-out peptide TSV; required for heldout-peptides-v2')
     args = ap.parse_args()
     if args.benchmark_exclusion != 'none' and not (
             args.exclusion_list and args.exclusion_list.exists()):

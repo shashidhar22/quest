@@ -314,11 +314,11 @@ def main():
                          'reference-aware-v1 requires --hla-reference.')
     ap.add_argument('--hla-reference', default=None,
                     help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
-    ap.add_argument('--benchmark-exclusion', required=True, choices=['none', 'heldout-peptides-v1'],
+    ap.add_argument('--benchmark-exclusion', required=True, choices=['none', 'heldout-peptides-v2'],
                     help='Benchmark isolation passed through to builder and verifier. No default: '
                          'none reproduces past, non-isolated builds.')
     ap.add_argument('--exclusion-list', default=None,
-                    help='held-out peptide TSV; required for heldout-peptides-v1')
+                    help='held-out peptide TSV; required for heldout-peptides-v2')
     ap.add_argument('--only', nargs='*', help='Run only these IDs (e.g. run07 run01)')
     ap.add_argument('--dry-run', action='store_true', help='Print commands without executing')
     ap.add_argument('--continue-on-fail', action='store_true',
