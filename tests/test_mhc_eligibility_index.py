@@ -208,3 +208,24 @@ def test_real_reference_accepts_full_length_heavy_chains_the_old_rule_rejected()
     for seq in long_heavy:
         d = idx.decide(seq)
         assert d.decision == "accept" and d.chain_role == "heavy"
+
+
+# ---------- real-world missing values ----------
+
+@pytest.mark.parametrize("missing", [None, float("nan"), "", "   "])
+def test_missing_sequence_values_are_treated_as_empty(index, missing):
+    """Parquet/pandas represent a missing chain as NaN, which is a float AND truthy.
+
+    `seq or ""` does not catch it, so an unguarded normalizer raises TypeError on real data
+    instead of deciding. A missing chain must decide explicitly as empty_sequence.
+    """
+    d = index.decide(missing)
+    assert d.decision == "quarantine" and d.reason == "empty_sequence"
+
+
+@pytest.mark.parametrize("missing", [None, float("nan"), "", "   "])
+def test_missing_allele_values_count_as_absent_evidence(index, missing):
+    """A missing allele is absent evidence, and the sequence still decides the chain."""
+    d = index.decide(SEQ_A, allele=missing)
+    assert d.decision == "accept"
+    assert d.allele_evidence == "absent"

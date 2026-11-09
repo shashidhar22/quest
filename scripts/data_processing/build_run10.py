@@ -113,6 +113,10 @@ def main() -> None:
         "--scale", "10000000",
         "--output-dir", str(OUT_DIR),
         "--run-id", "run10",
+        # Reproduction of a past build, so the legacy eligibility policy is selected
+        # deliberately -- including its 320-aa rejection, which discards most full-length
+        # class-I heavy chains. A NEW corpus must pass reference-aware-v1 instead.
+        "--eligibility-policy", "legacy-320-v0",
         "--seed", "42",
         # Memory safety on this 181 GB / no-swap g6 instance (see module header).
         "--memory-gb", str(SAFE_MEMORY_GB),

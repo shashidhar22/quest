@@ -55,6 +55,7 @@ def now_utc_iso() -> str:
 
 
 def run_pair(run_id: str, tcr: str, mhc: str, dist: str, scale: int, suffix: str,
+             eligibility_policy: str, hla_reference=None,
              dry_run: bool = False, only_builder: bool = False) -> bool:
     """Run builder + verifier for one variant; return True on PASS."""
     out_dir = DATA_ROOT / suffix
@@ -91,7 +92,10 @@ def run_pair(run_id: str, tcr: str, mhc: str, dist: str, scale: int, suffix: str
         '--output-dir', str(out_dir),
         '--seed', '42',
         '--run-id', run_id,
+        '--eligibility-policy', eligibility_policy,
     ]
+    if hla_reference:
+        builder_cmd += ['--hla-reference', str(hla_reference)]
     verifier_cmd = [
         'python3', str(VERIFIER),
         '--output-dir', str(out_dir),
@@ -293,6 +297,13 @@ def aggregate_sweep_report(passed: list[tuple[str, str]], failed: list[tuple[str
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument('--eligibility-policy', required=True,
+                    choices=['legacy-320-v0', 'reference-aware-v1'],
+                    help='MHC eligibility policy passed through to the builder. No default: '
+                         'legacy-320-v0 reproduces past builds including the 320-aa defect, '
+                         'reference-aware-v1 requires --hla-reference.')
+    ap.add_argument('--hla-reference', default=None,
+                    help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
     ap.add_argument('--only', nargs='*', help='Run only these IDs (e.g. run07 run01)')
     ap.add_argument('--dry-run', action='store_true', help='Print commands without executing')
     ap.add_argument('--continue-on-fail', action='store_true',
@@ -318,6 +329,8 @@ def main():
     for run_id, tcr, mhc, dist, scale, suffix in selected:
         run_t0 = time.time()
         ok = run_pair(run_id, tcr, mhc, dist, scale, suffix,
+                      eligibility_policy=args.eligibility_policy,
+                      hla_reference=args.hla_reference,
                       dry_run=args.dry_run, only_builder=args.no_verifier)
         run_dt = time.time() - run_t0
         log(f'{run_id}: {"PASS" if ok else "FAIL"} after {run_dt/60:.1f} min')

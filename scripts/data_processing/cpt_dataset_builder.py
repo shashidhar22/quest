@@ -38,6 +38,12 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from quest.data.mhc_eligibility import (  # noqa: E402
+    accepted_pairs_table,
+    build_index_from_fasta,
+)
+
 # ---------- constants ----------
 
 ROOT_INPUT = Path('/home/ubuntu/quest/data/deduplicated_again/exploded_deduped_enriched')
@@ -285,22 +291,82 @@ def build_input_text_sql(tcr_variant: str, mhc_variant: str) -> str:
     """
 
 
+# ---------- eligibility policies ----------
+#
+# LEGACY_POLICY reproduces run05 byte for byte, including its defect: it rejects any populated MHC
+# chain over 320 aa, which against pinned IPD-IMGT/HLA 3.58.0 discards 63.7% of A, 63.7% of B and
+# 69.4% of C alleles and 0.0% of class-II chains. It is kept ONLY so past builds can be reproduced.
+#
+# REFERENCE_AWARE_POLICY decides eligibility per distinct (sequence, allele) pair in Python, in
+# `quest.data.mhc_eligibility`, and this SQL only semi-joins against the ACCEPTED pairs. No
+# eligibility rule is written in SQL, so Python and SQL cannot drift on the rules; the single
+# duplicated expression is `normalize_sequence_sql` below, whose agreement with its Python twin is
+# pinned by tests/test_cpt_mhc_eligibility.py.
+#
+# There is deliberately no default. `--loss_weighting` defaulted to 'row' in this codebase and that
+# silent default is why every launcher must now pass it explicitly; an un-migrated call site here
+# must fail loudly rather than silently choose which chains reach the model.
+LEGACY_POLICY = 'legacy-320-v0'
+REFERENCE_AWARE_POLICY = 'reference-aware-v1'
+POLICIES = (LEGACY_POLICY, REFERENCE_AWARE_POLICY)
+
+# Slots, as measured in the benchmark rather than assumed: every populated mhc_two is class-II beta
+# (23 distinct sequences in the train split), so there is no class-I second chain to accommodate.
+# No beta-2-microglobulin is fabricated and none is required for a heavy-chain-only example.
+MHC_ONE_ROLES = ('heavy', 'alpha')
+MHC_TWO_ROLES = ('beta',)
+
+
+def normalize_sequence_sql(expr: str) -> str:
+    """SQL twin of `quest.data.mhc_eligibility.normalize_sequence`.
+
+    Documented normalization only: strip all whitespace, upper-case. NULL in gives NULL out, so
+    callers test IS NULL separately rather than relying on comparison with ''.
+    """
+    return f"upper(regexp_replace({expr}, '\\s', '', 'g'))"
+
+
 # ---------- filter SQL fragment ----------
 
-def filter_where_sql() -> str:
-    """SQL WHERE clause that REJECTS rows matching any of F1-F6.
+def filter_where_sql(policy: str, eligibility_table: str | None = None) -> str:
+    """SQL WHERE clause yielding rows that PASS eligibility under `policy`.
 
-    Returns a fragment beginning with 'WHERE' that yields rows that pass.
+    `policy` is required; see POLICIES. `eligibility_table` is required for
+    REFERENCE_AWARE_POLICY and must hold the accepted pairs produced by
+    `mhc_eligibility.accepted_pairs_table` (columns seq_norm, allele_norm, chain_role).
     """
-    h1 = hsql('mhc_one_allele')
-    h2 = hsql('mhc_two_allele')
-    return f"""
+    if policy not in POLICIES:
+        raise ValueError(f'unknown eligibility policy {policy!r}; expected one of {POLICIES}')
+
+    if policy == LEGACY_POLICY:
+        h1 = hsql('mhc_one_allele')
+        h2 = hsql('mhc_two_allele')
+        return f"""
       WHERE NOT (mhc_one_allele IS NOT NULL AND ({h1}) = 'II_beta')
         AND NOT (mhc_two_allele IS NOT NULL AND ({h2}) = 'I')
         AND NOT (mhc_two_allele IS NOT NULL AND ({h2}) = 'II_alpha')
         AND NOT (mhc_one_allele IS NOT NULL AND ({h1}) = 'unknown')
         AND NOT (mhc_one IS NOT NULL AND length(mhc_one) > 320)
         AND NOT (mhc_two IS NOT NULL AND length(mhc_two) > 320)
+    """
+
+    if not eligibility_table:
+        raise ValueError(f'{REFERENCE_AWARE_POLICY} requires eligibility_table')
+
+    def slot(seq_col, allele_col, roles):
+        seq = normalize_sequence_sql(seq_col)
+        allele = normalize_sequence_sql(allele_col)
+        roles_sql = ', '.join(f"'{r}'" for r in roles)
+        # A row with no chain in this slot is untouched: the corpus is overwhelmingly
+        # receptor-only and eligibility has nothing to say about those rows.
+        return f"""({seq_col} IS NULL OR {seq} = '' OR EXISTS (
+          SELECT 1 FROM {eligibility_table} e
+          WHERE e.seq_norm = {seq} AND e.allele_norm = coalesce({allele}, '')
+            AND e.chain_role IN ({roles_sql})))"""
+
+    return f"""
+      WHERE {slot('mhc_one', 'mhc_one_allele', MHC_ONE_ROLES)}
+        AND {slot('mhc_two', 'mhc_two_allele', MHC_TWO_ROLES)}
     """
 
 
@@ -391,6 +457,11 @@ def main():
     ap.add_argument('--distribution', choices=['proportional', 'balanced'], required=True)
     ap.add_argument('--scale', type=int, required=True)
     ap.add_argument('--output-dir', type=Path, required=True)
+    ap.add_argument('--eligibility-policy', choices=list(POLICIES), required=True,
+                    help='legacy-320-v0 reproduces run05 including its 320-aa defect; '
+                         'reference-aware-v1 decides eligibility against a pinned reference')
+    ap.add_argument('--hla-reference', type=Path, default=None,
+                    help='IPD-IMGT/HLA *_prot.fasta; required for reference-aware-v1')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--run-id', type=str, default='runXX')
     ap.add_argument('--threads', type=int, default=DEFAULT_THREADS)
@@ -428,39 +499,108 @@ def main():
 
         src = f"read_parquet('{ROOT_INPUT}/**/*.parquet', hive_partitioning=1)"
 
+        # ---------- Step 0: eligibility policy ----------
+        policy = args.eligibility_policy
+        elig_table = None
+        log(f'eligibility policy: {policy}', run_id=run_id)
+        if policy == REFERENCE_AWARE_POLICY:
+            if not args.hla_reference or not Path(args.hla_reference).exists():
+                raise SystemExit(f'--hla-reference is required for {REFERENCE_AWARE_POLICY}')
+            ref = Path(args.hla_reference)
+            ref_sha = hashlib.sha256(ref.read_bytes()).hexdigest()
+            ref_version = f'{ref.name}:{ref_sha[:12]}'
+            log(f'  reference {ref_version}', run_id=run_id)
+            index = build_index_from_fasta(ref, reference_version=ref_version)
+
+            # Distinct (chain, allele) pairs only. The decision is per pair, never per row, so this
+            # is a small table however large the corpus is.
+            t0 = time.time()
+            pairs_df = con.execute(f"""
+                SELECT DISTINCT mhc_one AS seq, mhc_one_allele AS allele
+                  FROM {src} WHERE mhc_one IS NOT NULL
+                UNION
+                SELECT DISTINCT mhc_two AS seq, mhc_two_allele AS allele
+                  FROM {src} WHERE mhc_two IS NOT NULL
+            """).df()
+            log(f'  {len(pairs_df)} distinct (chain, allele) pairs in {time.time()-t0:.1f}s',
+                run_id=run_id)
+
+            # Full audit first: every pair gets one explicit decision, accepted or not, so the
+            # rejection counts below reconcile against the total.
+            all_pairs = list(zip(pairs_df.seq, pairs_df.allele))
+            decisions = [(sq, al, index.decide(sq or '', al)) for sq, al in all_pairs]
+            with open(art_dir / 'eligibility_audit.csv', 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['decision', 'reason', 'allele_evidence', 'mhc_class', 'chain_role',
+                            'classical', 'allele_ambiguous', 'alleles', 'length',
+                            'normalized_sha256', 'reference_version'])
+                for _sq, _al, d in decisions:
+                    w.writerow([d.decision, d.reason, d.allele_evidence, d.mhc_class, d.chain_role,
+                                d.classical, d.allele_ambiguous, ';'.join(d.alleles), d.length,
+                                d.normalized_sha256, d.reference_version])
+
+            # Mutually exclusive reason counts, replacing F1-F6 for this policy.
+            reason_counts = {}
+            for _sq, _al, d in decisions:
+                key = (d.decision, d.reason)
+                reason_counts[key] = reason_counts.get(key, 0) + 1
+            with open(art_dir / 'filter_counts.csv', 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['policy', 'decision', 'reason', 'distinct_pairs'])
+                for (dec, reason), n in sorted(reason_counts.items()):
+                    w.writerow([policy, dec, reason, n])
+            assert sum(reason_counts.values()) == len(decisions), 'reason counts must reconcile'
+
+            elig_rows = accepted_pairs_table(index, all_pairs)
+            elig_table = 'mhc_eligibility'
+            con.execute(f'CREATE OR REPLACE TABLE {elig_table} ('
+                        'seq_norm VARCHAR, allele_norm VARCHAR, chain_role VARCHAR, '
+                        'mhc_class VARCHAR, classical BOOLEAN, allele_evidence VARCHAR)')
+            if elig_rows:
+                con.executemany(
+                    f'INSERT INTO {elig_table} VALUES (?, ?, ?, ?, ?, ?)',
+                    [(r['seq_norm'], r['allele_norm'], r['chain_role'], r['mhc_class'],
+                      r['classical'], r['allele_evidence']) for r in elig_rows])
+            log(f'  {len(elig_rows)} accepted pairs of {len(decisions)} distinct',
+                run_id=run_id)
+            if not elig_rows:
+                raise SystemExit('no MHC chain passed eligibility; refusing to build a corpus '
+                                 'with zero validated MHC exposure')
+
         # ---------- Step 1: filter counts (F1-F6) ----------
-        log('STEP 1: filter counts', run_id=run_id)
-        h1 = hsql('mhc_one_allele')
-        h2 = hsql('mhc_two_allele')
-        t0 = time.time()
-        filter_counts_df = con.execute(f"""
-            SELECT
-              SUM(CASE WHEN mhc_one_allele IS NOT NULL AND ({h1}) = 'II_beta' THEN 1 ELSE 0 END) AS F1,
-              SUM(CASE WHEN mhc_two_allele IS NOT NULL AND ({h2}) = 'I'        THEN 1 ELSE 0 END) AS F2,
-              SUM(CASE WHEN mhc_two_allele IS NOT NULL AND ({h2}) = 'II_alpha' THEN 1 ELSE 0 END) AS F3,
-              SUM(CASE WHEN mhc_one_allele IS NOT NULL AND ({h1}) = 'unknown'  THEN 1 ELSE 0 END) AS F4,
-              SUM(CASE WHEN mhc_one IS NOT NULL AND length(mhc_one) > 320      THEN 1 ELSE 0 END) AS F5,
-              SUM(CASE WHEN mhc_two IS NOT NULL AND length(mhc_two) > 320      THEN 1 ELSE 0 END) AS F6,
-              COUNT(*) AS n_raw
-            FROM {src}
-        """).df()
-        log(f'  filter counts in {time.time()-t0:.1f}s', run_id=run_id)
-        filter_row = filter_counts_df.iloc[0].to_dict()
-        with open(art_dir / 'filter_counts.csv', 'w', newline='') as f:
-            w = csv.writer(f)
-            w.writerow(['filter_id', 'condition', 'rows_dropped'])
-            w.writerow(['F1', "hla_class(mhc_one_allele) == 'II_beta'", int(filter_row['F1'])])
-            w.writerow(['F2', "hla_class(mhc_two_allele) == 'I'", int(filter_row['F2'])])
-            w.writerow(['F3', "hla_class(mhc_two_allele) == 'II_alpha'", int(filter_row['F3'])])
-            w.writerow(['F4', "mhc_one_allele NOT NULL AND hla_class(mhc_one_allele) == 'unknown'",
-                        int(filter_row['F4'])])
-            w.writerow(['F5', 'length(mhc_one) > 320', int(filter_row['F5'])])
-            w.writerow(['F6', 'length(mhc_two) > 320', int(filter_row['F6'])])
+        if policy == LEGACY_POLICY:
+            log('STEP 1: filter counts', run_id=run_id)
+            h1 = hsql('mhc_one_allele')
+            h2 = hsql('mhc_two_allele')
+            t0 = time.time()
+            filter_counts_df = con.execute(f"""
+                SELECT
+                  SUM(CASE WHEN mhc_one_allele IS NOT NULL AND ({h1}) = 'II_beta' THEN 1 ELSE 0 END) AS F1,
+                  SUM(CASE WHEN mhc_two_allele IS NOT NULL AND ({h2}) = 'I'        THEN 1 ELSE 0 END) AS F2,
+                  SUM(CASE WHEN mhc_two_allele IS NOT NULL AND ({h2}) = 'II_alpha' THEN 1 ELSE 0 END) AS F3,
+                  SUM(CASE WHEN mhc_one_allele IS NOT NULL AND ({h1}) = 'unknown'  THEN 1 ELSE 0 END) AS F4,
+                  SUM(CASE WHEN mhc_one IS NOT NULL AND length(mhc_one) > 320      THEN 1 ELSE 0 END) AS F5,
+                  SUM(CASE WHEN mhc_two IS NOT NULL AND length(mhc_two) > 320      THEN 1 ELSE 0 END) AS F6,
+                  COUNT(*) AS n_raw
+                FROM {src}
+            """).df()
+            log(f'  filter counts in {time.time()-t0:.1f}s', run_id=run_id)
+            filter_row = filter_counts_df.iloc[0].to_dict()
+            with open(art_dir / 'filter_counts.csv', 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['filter_id', 'condition', 'rows_dropped'])
+                w.writerow(['F1', "hla_class(mhc_one_allele) == 'II_beta'", int(filter_row['F1'])])
+                w.writerow(['F2', "hla_class(mhc_two_allele) == 'I'", int(filter_row['F2'])])
+                w.writerow(['F3', "hla_class(mhc_two_allele) == 'II_alpha'", int(filter_row['F3'])])
+                w.writerow(['F4', "mhc_one_allele NOT NULL AND hla_class(mhc_one_allele) == 'unknown'",
+                            int(filter_row['F4'])])
+                w.writerow(['F5', 'length(mhc_one) > 320', int(filter_row['F5'])])
+                w.writerow(['F6', 'length(mhc_two) > 320', int(filter_row['F6'])])
 
         # ---------- Step 2: per-partition post-filter counts ----------
         log('STEP 2: per-partition counts', run_id=run_id)
         t0 = time.time()
-        where = filter_where_sql()
+        where = filter_where_sql(policy, eligibility_table=elig_table)
         part_df = con.execute(f"""
             SELECT subset_key, order_key, COUNT(*) AS n
             FROM {src}
@@ -532,7 +672,7 @@ def main():
                                  ['subset_key VARCHAR', 'order_key VARCHAR'])
         con.execute(f'CREATE OR REPLACE TABLE staging_raw (\n  {ddl_cols}\n)')
 
-        partition_where = filter_where_sql()
+        partition_where = filter_where_sql(policy, eligibility_table=elig_table)
 
         # Partition into large vs. small lists
         large_partitions = []
