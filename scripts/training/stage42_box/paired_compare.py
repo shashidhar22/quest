@@ -309,9 +309,9 @@ def compare(a_path, b_path, units_path, primary=PRIMARY, n_boot=N_BOOT, seed=SEE
               "is part of the result, not a footnote.")
     rho_txt = ("unmeasurable" if prim["measured_rho"] is None
                else f"{prim['measured_rho']:+.3f}")
-    print(f"[cmp]   measured cross-arm rho = {rho_txt}; the pre-run analysis ASSUMED 0.80 against "
-          f"a breakeven of 0.765. That assumption was a planning parameter and is not evidence "
-          f"about this result.")
+    print(f"[cmp]   measured cross-arm rho = {rho_txt}; consult the run-specific gate for "
+          "planning rho, modeled effect and breakeven. Planning assumptions are not "
+          "evidence about this result.")
     print("[cmp] SECONDARY (reported, not the inferential endpoint):")
     for r in secondary:
         print(f"[cmp]   {_fmt(r)}")

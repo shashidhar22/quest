@@ -350,3 +350,14 @@ Laptop-only session. No GPU spend. Branch pushed for the first time since it was
   - The base checkpoint was trained on 10-08 code and recorded no data hashes.
   - Only the legacy fixed-batch recipe was tested.
 - **Unexplained:** both arms are below chance on test_novel_pep (0.457 and 0.434 against 0.5).
+
+
+## 2026-11-09 — diagnostic preparation after judge-first review
+
+Added opt-in CPU manifest builder and evaluation-only scorer, preserving locked benchmark behavior.
+Fixed comparator's stale gate-threshold prose. 78 targeted tests and fake scoring of 300 queries
+passed; real GPU inference remains untested. Native precision only; fp32 explicitly refuses.
+S3 run05 metadata newly establishes only 168 class-I-labelled rows across all partitions and a
+320-aa full-MHC exclusion inconsistent with 98.4% of SFT training MHC1 sequences. Corpus eligibility
+repair and sequence/overlap checks remain open. No EC2 start or training. See
+`docs/diagnostics/judge-pilot.md` and ACS `quest-cpt/audits/2026-11-09/repair-status.md`.

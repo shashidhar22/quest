@@ -354,6 +354,9 @@ def test_a_real_pair_reports_the_treatment_difference(tmp_path, capsys):
     assert "cpt_objective" in out and "fixed-batch-mean/v0" in out, (
         "the one difference the comparison is about must travel with the result")
     assert res["provenance"]["arm_b"]["cpt_run_id"] == "cpt_stage41_pointD_run05"
+    assert "0.765" not in out, "historical power threshold must not masquerade as this run’s gate"
+    assert "run-specific gate" in out
+
 
 
 # ----------------------------------------------------------------- round two, finding 3
