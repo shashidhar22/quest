@@ -361,3 +361,41 @@ S3 run05 metadata newly establishes only 168 class-I-labelled rows across all pa
 320-aa full-MHC exclusion inconsistent with 98.4% of SFT training MHC1 sequences. Corpus eligibility
 repair and sequence/overlap checks remain open. No EC2 start or training. See
 `docs/diagnostics/judge-pilot.md` and ACS `quest-cpt/audits/2026-11-09/repair-status.md`.
+
+## 2026-11-09 — corpus repair steps 1-8, and a review of the day's own code
+
+Reviewed everything written earlier the same day and found ten defects, all fixed (`b48831a`,
+`155255f`). An independent verifier then falsified two of those fixes (`aa73f25`): the eligibility
+decision read the raw allele text while the SQL joined on normalized text, so the result depended
+on input order, and an unreadable allele designation fell through to a locus-only check and was
+accepted.
+
+Corpus eligibility repair, off-box, all on the laptop:
+
+- **Eligibility** (`reference-aware-v1`, `quest/data/mhc_eligibility.py`). Replaced the blanket
+  320-aa MHC rejection with a decision against pinned IPD-IMGT/HLA 3.58.0. Also quarantines
+  out-of-scope loci, name/sequence conflicts at locus and allele level, incompatible chain pairs,
+  and chains matching only a partial reference entry (shorter than 97% of their locus's full
+  length). Of 16,797,809 MHC-bearing source rows the legacy filter passed 27.8%; this passes
+  99.76%. Accepted classical class-I rows 12,088,017 against run05's 168 labelled rows.
+- **Benchmark isolation** (`heldout-peptides-v2`). The builder never consulted the benchmark:
+  run05's train split held the exact receptor-peptide association for 103 of 1,589
+  `test_novel_pep` molecules and 118 of its 463 peptides. Now every row whose peptide is within
+  one edit of a held-out peptide is dropped (672 peptides, 316,574 enumerated strings, 694,978
+  rows). Overlap with the four judge-scored parts measures zero afterwards.
+- **Split routing** (`receptor-hash-v2`). Receptor clusters are Hamming-1 components, so each is
+  one length and run05's train split had almost no beta CDR3 of 12 letters or fewer. Receptors
+  now route by a hash of their own sequence; the MHC pocket casts no vote and peptide clusters are
+  re-assigned 80/10/10. Class-I rows reaching training rise from 42.4% to 77.8%, and peptides
+  straddling the train boundary fall from 1.72M to 2,181.
+- **Serialization**. The builder's projection SQL did not run on DuckDB 2.0 (single-arrow lambda);
+  fixed. Builder SQL and the trainer's Python projection agree byte for byte on 64,440 real rows
+  across all nine variants. Under cdr3 x full the longest row is 581 tokens against the 1,024
+  limit; under full x full 48,048 class-II rows would be truncated silently.
+- **Census**. A proportional 10M sample is expected to put ~62,414 classical class-I rows in
+  training. Class I is 0.78% of rows but 17.2% of residue tokens. 79% of that exposure carries no
+  receptor, and the paired TCR + peptide + class-I stratum has an effective peptide count of 3.5.
+
+246 tests pass locally (DuckDB installed to a scratch dir; `tests/test_cpt_mhc_eligibility.py`
+skips silently without it). No EC2 start, no build, no training. Step 9 is in progress and its
+candidate sizing is defective — see ACS `quest-cpt/audits/2026-11-09/repair/contract/README.md`.
