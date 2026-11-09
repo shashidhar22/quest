@@ -181,7 +181,9 @@ def build_chain_expr(variant: str, prefix: str) -> str:
             f"CASE WHEN COALESCE({prefix}_cdr1, '') = '' "
             f"AND COALESCE({prefix}_cdr2, '') = '' "
             f"AND COALESCE({prefix}_cdr3, '') = '' THEN NULL "
-            f"ELSE array_to_string(array_filter([{joined}], x -> x IS NOT NULL), '{EOS}') END"
+            # A list comprehension, not `array_filter(..., x -> ...)`: DuckDB 2.0 rejects the
+            # single-arrow lambda, and the replacement `lambda x:` form fails on older releases.
+            f"ELSE array_to_string([x for x in [{joined}] if x IS NOT NULL], '{EOS}') END"
         )
     if variant == 'full':
         return f"NULLIF({prefix}_full, '')"
@@ -254,7 +256,7 @@ def build_input_text_sql(tcr_variant: str, mhc_variant: str) -> str:
     # as alternation patterns; longest first so 'mhc_one' wins over 'one'.
     return f"""
       list_aggregate(
-        list_filter([
+        [x for x in [
           CASE WHEN list_contains(string_split(replace(replace(order_key, 'mhc_one', 'M1'), 'mhc_two', 'M2'), '_'),
             list_extract(string_split(replace(replace(order_key, 'mhc_one', 'M1'), 'mhc_two', 'M2'), '_'), 1)) THEN
             CASE list_extract(string_split(replace(replace(order_key, 'mhc_one', 'M1'), 'mhc_two', 'M2'), '_'), 1)
@@ -301,10 +303,25 @@ def build_input_text_sql(tcr_variant: str, mhc_variant: str) -> str:
               WHEN 'M2' THEN ({m2_e})
               ELSE NULL
             END END
-        ], x -> x IS NOT NULL),
+        ] if x IS NOT NULL],
         'string_agg', '{EOS}'
       )
     """
+
+
+TOKEN_LIMIT = 1024
+
+
+def token_count_sql(expr: str) -> str:
+    """Model tokens of a serialized row under the ESM-C sequence tokenizer.
+
+    That tokenizer is one id per residue and one id for the literal '<eos>', plus <cls> and a
+    final <eos>, so tokens = residues + separators + 2. Checked against the real tokenizer on
+    64,440 real rows in corpus repair step 7 (exact on every row). Reporting only: the trainer
+    tokenizes with truncation=True, so a row over the limit is otherwise cut silently.
+    """
+    n_sep = f"((length({expr}) - length(replace({expr}, '{EOS}', ''))) / {len(EOS)})"
+    return f"(length({expr}) - {len(EOS) - 1} * {n_sep} + 2)"
 
 
 # ---------- eligibility policies ----------
@@ -1186,9 +1203,11 @@ def main():
               quantile_cont(length(input_text), 0.5) AS p50,
               quantile_cont(length(input_text), 0.95) AS p95,
               quantile_cont(length(input_text), 0.99) AS p99,
-              MAX(length(input_text)) AS max_len
+              MAX(length(input_text)) AS max_len,
+              MAX({tok}) AS max_tokens,
+              SUM(CASE WHEN {tok} > {limit} THEN 1 ELSE 0 END) AS over_limit
             FROM staging
-        """).df()
+        """.format(tok=token_count_sql('input_text'), limit=TOKEN_LIMIT)).df()
         lq = lq_df.iloc[0].to_dict()
 
         manifest = {
@@ -1241,6 +1260,12 @@ def main():
                 'p95': int(lq['p95']) if lq['p95'] is not None else 0,
                 'p99': int(lq['p99']) if lq['p99'] is not None else 0,
                 'max': int(lq['max_len']) if lq['max_len'] is not None else 0,
+            },
+            # Residues + separators + 2 (ESM-C). Rows over the limit are truncated by the trainer.
+            'input_text_tokens': {
+                'limit': TOKEN_LIMIT,
+                'max': int(lq['max_tokens']) if lq['max_tokens'] is not None else 0,
+                'rows_over_limit': int(lq['over_limit']) if lq['over_limit'] is not None else 0,
             },
             # 'NOT_APPLIED' (the literal run05 carries) unless --benchmark-exclusion applied one.
             'antigenic_specificity_exclusion': exclusion_manifest,
