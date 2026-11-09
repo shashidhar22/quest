@@ -261,8 +261,12 @@ def test_normalization_strips_only_the_whitespace_sql_strips(index, ws):
     ("HLA-A*0201", ("A", ("02", "01"))), ("A*01:04N", ("A", ("01", "04"))),
     ("DRB11501", ("DRB1", ("15", "01"))), ("HLA-DRB1_15:01", ("DRB1", ("15", "01"))),
     ("DPB1*104:01", ("DPB1", ("104", "01"))), ("HLA-DRA", ("DRA", ())),
-    ("A*02:01P", ("A", None)), ("A020101", ("A", None)),
-    ("B2M", (None, None)), ("MICA*001", (None, None)), ("", (None, None)),
+    ("A*02:01P", ("A", None)), ("A020101", ("A", ("02", "01", "01"))),
+    ("A*02010101", ("A", ("02", "01", "01", "01"))), ("HLA-A * 02:01", ("A", ("02", "01"))),
+    ("hla-a*02:01", ("A", ("02", "01"))), ("A201", (None, None)), ("A*24-02", (None, None)),
+    ("A*24:XX", (None, None)), ("A*24:02/HLA-B*07:02", (None, None)), ("A*24:02,A*02:01", (None, None)),
+    ("B2M", (None, None)), ("MICA*001", ("MICA", ("001",))), ("", (None, None)),
+    ("HLA-TAP1*01:01", ("TAP1", ("01", "01"))), ("HLA-DQA2*01:01", ("DQA2", ("01", "01"))),
 ])
 def test_allele_names_parse_with_and_without_a_star(name, expected):
     from quest.data.mhc_eligibility import parse_allele_name
@@ -291,3 +295,43 @@ def test_any_allele_sharing_the_sequence_satisfies_the_name(index):
     for name in ("HLA-A*02:09", "HLA-A*68:01"):
         assert index.decide(SEQ_SHARED, allele=name).decision == "accept"
     assert index.decide(SEQ_DRA, allele="HLA-DRA1*01:01").decision == "accept"
+
+
+@pytest.mark.parametrize("name", ["A*24-02", "A*24.02", "A*24:02;01", "A*24:XX", "A*24:02 xx",
+                                  "HLA-A*24:02/HLA-B*07:02", "A*24:02,A*02:01"])
+def test_unreadable_allele_designation_is_malformed_not_a_locus_match(index, name):
+    """Each of these states some allele other than A*02:01 in a spelling that cannot be parsed.
+    Falling back to a locus-only check accepted all of them on the A*02:01 sequence."""
+    d = index.decide(SEQ_A, allele=name)
+    assert d.decision == "quarantine" and d.reason == "allele_field_malformed"
+
+
+def test_readable_wrong_allele_with_stray_spaces_is_still_a_conflict(index):
+    assert index.decide(SEQ_A, allele="HLA-A*24: 02").reason == "name_allele_conflict"
+
+
+@pytest.mark.parametrize("spellings", [
+    ["HLA-A*02:01", "HLA-A * 02:01", "hla-a*02:01", " HLA-A*02:01\t"],
+    ["HLA-A*11:01", "HLA-A * 11:01"],
+    ["H-2Kb", "h-2 kb"],
+])
+def test_decision_depends_only_on_the_normalized_allele(index, spellings):
+    """The SQL filter joins on (normalized sequence, normalized allele), and
+    `accepted_pairs_table` decides only the first spelling seen for each key. So every spelling
+    with the same key must decide the same way, or the SQL result depends on input order."""
+    from quest.data.mhc_eligibility import accepted_pairs_table, normalize_sequence
+    assert len({normalize_sequence(a) for a in spellings}) == 1
+    decisions = {(d.decision, d.reason) for d in (index.decide(SEQ_A, allele=a) for a in spellings)}
+    assert len(decisions) == 1
+    forward = accepted_pairs_table(index, [(SEQ_A, a) for a in spellings])
+    backward = accepted_pairs_table(index, [(SEQ_A, a) for a in reversed(spellings)])
+    assert forward == backward
+
+
+@pytest.mark.parametrize("name", ["HLA-MICA*008:01", "HLA-DMA*01:01", "HLA-TAP1*01:01", "HLA-DQA2*01:01"])
+def test_out_of_scope_locus_name_is_reported_as_such(index, name):
+    """Measured in the source corpus: 155 chains named for MICA/MICB/DM/DO/DQA2/DQB2/TAP/HFE.
+    They were quarantined as 'allele_field_malformed', which misdescribes a well-formed name."""
+    d = index.decide(SEQ_A, allele=name)
+    assert d.decision == "quarantine" and d.reason == "locus_out_of_scope"
+    assert d.allele_evidence == "out_of_scope"

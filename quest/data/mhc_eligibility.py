@@ -38,6 +38,12 @@ CLASS_I_NON_CLASSICAL = frozenset({"E", "F", "G"})
 CLASS_II_ALPHA = frozenset({"DRA", "DRA1", "DQA1", "DPA1"})
 CLASS_II_BETA = frozenset({"DRB1", "DRB2", "DRB3", "DRB4", "DRB5", "DQB1", "DPB1"})
 
+# HLA-region genes present in the pinned reference that are not peptide-presenting class I/II
+# chains. Recognized so that a name such as 'HLA-MICA*008:01' is reported as out of scope rather
+# than as a malformed name. Measured in the source corpus: 155 distinct chains across these loci.
+OUT_OF_SCOPE_LOCI = frozenset({"DMA", "DMB", "DOA", "DOB", "DQA2", "DQB2", "HFE",
+                               "MICA", "MICB", "TAP1", "TAP2"})
+
 # Prefixes that denote a non-human MHC. Out of scope for a human reference: explicitly neither
 # eligible nor malformed, because silently calling them invalid would hide real records.
 NONHUMAN_PREFIXES = ("H-2", "H2-", "MAMU", "BOLA", "SLA-", "RT1", "GOGO", "PATR", "DLA-")
@@ -73,7 +79,8 @@ class ChainDecision:
     alleles: tuple[str, ...]
     allele_ambiguous: bool
     reference_status: str      # 'exact' | 'absent' | 'not_evaluated'
-    allele_evidence: str       # 'named' | 'absent' | 'is_sequence' | 'nonhuman' | 'malformed'
+    allele_evidence: str       # 'named' | 'absent' | 'is_sequence' | 'nonhuman' |
+    #                            'out_of_scope' | 'malformed'
     original_sha256: str
     normalized_sha256: str
     reference_version: str
@@ -114,11 +121,16 @@ def parse_allele_name(allele) -> tuple[str | None, tuple[str, ...] | None]:
     punctuation: 'HLA-A02:01', 'A0201' -> ('A', ('02', '01')); 'A2' -> ('A', ('02',));
     'DRB11501' -> ('DRB1', ('15', '01')).
 
-    `locus` is None when no locus can be read. `fields` is None when the locus is readable but
-    the resolution is not safely comparable: a P/G group name (which covers several proteins) or
-    compact digits of ambiguous width. `fields` is () for a bare locus.
+    `fields` is () for a bare locus, and None only for a P/G group name, which covers several
+    proteins and is therefore compared at locus level. Anything else that cannot be read as an
+    allele designation ('A*24-02', 'A*24:XX', 'A*24:02/B*07:02') returns (None, None): an
+    unreadable name is malformed, never a silent locus-only match.
+
+    Whitespace is removed first, exactly as `normalize_sequence` does, so the result depends only
+    on the normalized text. The SQL join is keyed on that text; if two spellings with the same
+    key could parse differently, Python and SQL would disagree.
     """
-    s = as_text(allele).strip().upper().replace("_", "-")
+    s = normalize_sequence(allele).replace("_", "-")
     if s.startswith("HLA-"):
         s = s[4:]
     if "*" in s:
@@ -131,33 +143,36 @@ def parse_allele_name(allele) -> tuple[str | None, tuple[str, ...] | None]:
         token, rest = m.groups()
         # Without a star, a digit after the letters is part of the locus only when that spells a
         # known locus ('DRB1' in 'DRB11501'); otherwise it begins the allele ('A' in 'A02:01').
-        if rest[:1].isdigit() and class_role_of_locus(token + rest[0])[0] is not None:
+        if rest[:1].isdigit() and _known_locus(token + rest[0]):
             token, rest = token + rest[0], rest[1:]
         rest = rest.lstrip("-")
         # Anything but an allele designation after the locus is not a name ('B2M').
         if not re.fullmatch(rf"[0-9:]*[{_EXPRESSION_SUFFIXES}PG]?", rest):
             return None, None
         starred = False
-    if not _LOCUS_TOKEN_RE.match(token):
+    if not (_LOCUS_TOKEN_RE.match(token) or token in OUT_OF_SCOPE_LOCI):
         return None, None
-    rest = rest.strip()
-    if rest[-1:] in ("P", "G"):
-        return token, None
-    if rest[-1:] in tuple(_EXPRESSION_SUFFIXES):
+    group = rest[-1:] in ("P", "G")
+    if group or rest[-1:] in tuple(_EXPRESSION_SUFFIXES):
         rest = rest[:-1]
     if not rest:
-        return token, ()
+        return (token, ()) if not group else (None, None)
     if ":" in rest:
         parts = rest.split(":")
     elif rest.isdigit() and (len(rest) <= 2 or (len(rest) == 3 and starred)):
         parts = [rest]
-    elif rest.isdigit() and len(rest) == 4:
-        parts = [rest[:2], rest[2:]]
+    elif rest.isdigit() and len(rest) in (4, 6, 8):
+        # Pre-2010 compact nomenclature: two digits per field ('A*0201', 'A*02010101').
+        parts = [rest[i:i + 2] for i in range(0, len(rest), 2)]
     else:
-        return token, None
+        return None, None
     if not all(p.isdigit() for p in parts):
-        return token, None
-    return token, tuple(p.zfill(2) for p in parts)
+        return None, None
+    return token, (None if group else tuple(p.zfill(2) for p in parts))
+
+
+def _known_locus(locus: str) -> bool:
+    return class_role_of_locus(locus)[0] is not None or locus in OUT_OF_SCOPE_LOCI
 
 
 def locus_of(allele: str) -> str | None:
@@ -194,7 +209,7 @@ def class_role_of_locus(locus: str | None) -> tuple[str | None, str | None, bool
 
 
 def is_nonhuman(allele) -> bool:
-    a = as_text(allele).strip().upper()
+    a = normalize_sequence(allele)
     return any(a.startswith(p) for p in NONHUMAN_PREFIXES)
 
 
@@ -208,16 +223,17 @@ def allele_field_evidence(allele: str | None, normalized_sequence: str) -> str:
     It stays a distinct value so coverage reports can count it separately and it can never pass
     as validated exposure on name evidence.
     """
-    allele = as_text(allele)
-    if not allele.strip():
-        return "absent"
-    if is_nonhuman(allele):
-        return "nonhuman"
     norm = normalize_sequence(allele)
+    if not norm:
+        return "absent"
+    if is_nonhuman(norm):
+        return "nonhuman"
     if len(norm) >= _SEQUENCE_IN_NAME_MIN_LEN and not (set(norm) - VALID_RESIDUES):
         # Residue-only text: a copy of this chain is absent-equivalent, any other sequence is junk.
         return "is_sequence" if norm == normalized_sequence else "malformed"
     locus = locus_of(allele)
+    if locus in OUT_OF_SCOPE_LOCI:
+        return "out_of_scope"
     if locus is not None and class_role_of_locus(locus)[0] is not None:
         return "named"
     return "malformed"
@@ -265,6 +281,8 @@ class EligibilityIndex:
         if evidence == "nonhuman":
             # Needs its own pinned reference and an explicit scope decision.
             return out("quarantine", "nonhuman_out_of_scope", evidence=evidence)
+        if evidence == "out_of_scope":
+            return out("quarantine", "locus_out_of_scope", evidence=evidence)
         if evidence == "malformed":
             # Previously such a name parsed as a bogus locus and skipped the conflict check.
             return out("quarantine", "allele_field_malformed", evidence=evidence)
