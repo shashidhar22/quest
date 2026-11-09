@@ -334,3 +334,19 @@ Laptop-only session. No GPU spend. Branch pushed for the first time since it was
   run `20261106T225852Z-9828` started 22:58 UTC; both probes pass, and the watchdog is armed on
   the verified pid.
 - **Backup:** second remote `mine` → private `YuexinXu/quest`.
+
+## 2026-11-09 — judge-first result read
+
+- Run `20261106T225852Z-9828` completed 2026-11-07 03:52 UTC: 294 min, about USD 5.7. The
+  watchdog's DONE guard fired, the results published, and the box stopped. `driver_rc` 0 under
+  `setsid --wait`.
+- The gate PASSED: the locked read's breakeven ρ is −0.933.
+- **Primary (`test_novel_pep / peptide / norm_rank`):** arm D − base = **−0.023
+  [−0.044, −0.002]**. At pep_cluster the interval spans zero. Measured ρ 0.735.
+- **Secondary:** test_level4 Recall@10 0.401 → 0.228 (−0.173 [−0.356, −0.082]). test_iid shows
+  no difference.
+- **Caveats:**
+  - One SFT seed per arm, and arm D's SFT validation AUC was lower (0.630 vs 0.702).
+  - The base checkpoint was trained on 10-08 code and recorded no data hashes.
+  - Only the legacy fixed-batch recipe was tested.
+- **Unexplained:** both arms are below chance on test_novel_pep (0.457 and 0.434 against 0.5).
