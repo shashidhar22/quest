@@ -83,8 +83,14 @@ def as_text(value) -> str:
 
 
 def normalize_sequence(seq) -> str:
-    """Documented normalization only: strip surrounding/internal whitespace, upper-case."""
-    return re.sub(r"\s+", "", as_text(seq)).upper()
+    """Documented normalization only: strip surrounding/internal whitespace, upper-case.
+
+    The class is spelled out to equal DuckDB/RE2 `\\s` in `normalize_sequence_sql`. Python's
+    `\\s` also strips Unicode whitespace (NBSP, vertical tab), which the SQL side keeps, so an
+    accepted pair would then fail the semi-join. Any other whitespace now stays in the text and
+    quarantines as `invalid_residues` on both sides.
+    """
+    return re.sub(r"[ \t\n\f\r]+", "", as_text(seq)).upper()
 
 
 def _sha(text: str) -> str:
@@ -206,6 +212,11 @@ class EligibilityIndex:
                        ambiguous=len(alleles) > 1, ref_status="exact", evidence=evidence)
 
         mhc_class, chain_role = next(iter(signatures))
+        if mhc_class is None:
+            # Reference-exact but outside the class tables (DQA2, DMA, DOA, HFE, TAP1, ...).
+            # Without this the chain was "accepted" with no class or role.
+            return out("quarantine", "locus_out_of_scope", loci=loci, alleles=alleles,
+                       ambiguous=len(alleles) > 1, ref_status="exact", evidence=evidence)
         classical = all(class_role_of_locus(l)[2] for l in loci)
 
         if evidence == "named":

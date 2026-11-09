@@ -87,13 +87,14 @@ def build_manifest(splits, pool, max_queries=100):
             if ctx:
                 positives[ctx].add(row['peptide'])
     train_peptides = {r['peptide'] for r in records.get('train', [])}
+    pool_set = set(pool)
     rows_out = []
     counts = {}
     summary = {}
     for condition in CONDITIONS:
         if condition not in records:
             continue
-        eligible = [r for r in records[condition] if r['peptide'] in set(pool) and r.get('tra_cdr3') and r.get('trb_cdr3')]
+        eligible = [r for r in records[condition] if r['peptide'] in pool_set and r.get('tra_cdr3') and r.get('trb_cdr3')]
         # Round-robin clusters with seeded stable ordering, to avoid a dominant cluster.
         groups = defaultdict(list)
         for r in eligible:

@@ -116,6 +116,9 @@ def main(argv=None):
     if (a.task, a.tcr_variant, a.mhc_variant) != ('as_paired_i', 'cdr3', 'full'):
         raise ValueError('diagnostic requires as_paired_i, cdr3, full')
     if Path(a.out).exists(): raise FileExistsError(a.out)
+    directory = Path(a.out).resolve().parent
+    # Checked before scoring: discovering this at write time would discard the whole run.
+    if not directory.is_dir() or not os.access(directory, os.W_OK): raise NotADirectoryError(f'output directory missing or not writable: {directory}')
     with open(a.manifest) as f: manifest = validate_manifest(json.load(f))
     if a.max_len < 1 or a.batch_size < 1 or a.max_seconds <= 0: raise ValueError('invalid limits')
     if a.precision == 'fp32': raise ValueError('fp32 encoder mode is not implemented; native mode uses the judge precision')
@@ -138,7 +141,6 @@ def main(argv=None):
     from track_a.shared import artifacts as A
     output = {'protocol': 'judge-diagnostic-results-v1', 'manifest_sha256': manifest_digest, 'checkpoint_sha256': checkpoint_digest, 'code_revision': A.code_commit(), 'diagnostic_code_sha256': _digest(__file__), 'checkpoint_args': ck.get('args'), 'checkpoint_data_digests': ck.get('data_digests'), 'cpt_lineage': A.cpt_lineage(a.adapter), 'settings': vars(a), 'runtime': {'device': str(dev), 'python': platform.python_version(), 'numpy': np.__version__, 'torch': torch.__version__, 'seconds': time.monotonic()-start}, 'rows': results}
     if time.monotonic() - start >= a.max_seconds: raise TimeoutError('diagnostic time limit exceeded')
-    directory = Path(a.out).resolve().parent
     fd, tmp = tempfile.mkstemp(prefix='.diagnostic-', dir=directory)
     try:
         with os.fdopen(fd, 'w') as f: json.dump(output, f, allow_nan=False); f.write('\n')

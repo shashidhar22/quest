@@ -59,6 +59,7 @@ SEQ_DRA = chain(254, "D")    # class-II alpha
 SEQ_DRB = chain(266, "R")    # class-II beta
 SEQ_SHARED = chain(364, "S")  # deliberately shared by two A alleles
 SEQ_CROSS = chain(363, "X")   # deliberately shared across A and DRB1 -> conflict
+SEQ_DQA2 = chain(255, "Q")   # in the reference, but a locus outside the class tables
 
 
 @pytest.fixture
@@ -75,6 +76,7 @@ def index(tmp_path) -> EligibilityIndex:
         ("HLA:0008 A*68:01:01:01 364 bp", SEQ_SHARED),
         ("HLA:0009 A*11:01:01:01 363 bp", SEQ_CROSS),
         ("HLA:0010 DRB1*04:01:01:01 363 bp", SEQ_CROSS),
+        ("HLA:0011 DQA2*01:01:01:01 255 bp", SEQ_DQA2),
     ]
     fasta = tmp_path / "mini_prot.fasta"
     fasta.write_text("".join(f">{h}\n{s}\n" for h, s in records))
@@ -229,3 +231,26 @@ def test_missing_allele_values_count_as_absent_evidence(index, missing):
     d = index.decide(SEQ_A, allele=missing)
     assert d.decision == "accept"
     assert d.allele_evidence == "absent"
+
+
+# ---------- review fixes, 2026-11-09 ----------
+
+def test_reference_locus_outside_the_class_tables_is_not_accepted(index):
+    """DQA2, DMA, HFE, TAP1 ... are in hla_prot.fasta. An exact match used to come back
+    'accept' with mhc_class=None and chain_role=None, i.e. counted as validated exposure."""
+    d = index.decide(SEQ_DQA2)
+    assert d.decision == "quarantine" and d.reason == "locus_out_of_scope"
+    assert d.reference_status == "exact"
+    assert d.mhc_class is None and d.chain_role is None
+
+
+@pytest.mark.parametrize("ws", ["\u00a0", "\x0b", "\u2003"])
+def test_normalization_strips_only_the_whitespace_sql_strips(index, ws):
+    """DuckDB/RE2 `\\s` is [ \\t\\n\\f\\r]. If Python strips more, a pair is accepted here and then
+    fails the SQL semi-join. Other whitespace must survive and decide as invalid_residues."""
+    from quest.data.mhc_eligibility import normalize_sequence
+    assert normalize_sequence(" a\tb\nc\r\fd ") == "ABCD"
+    dirty = SEQ_A[:10] + ws + SEQ_A[10:]
+    assert ws in normalize_sequence(dirty)
+    assert index.decide(dirty).reason == "invalid_residues"
+

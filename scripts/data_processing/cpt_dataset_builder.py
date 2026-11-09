@@ -550,6 +550,13 @@ def main():
                 for (dec, reason), n in sorted(reason_counts.items()):
                     w.writerow([policy, dec, reason, n])
             assert sum(reason_counts.values()) == len(decisions), 'reason counts must reconcile'
+            eligibility_manifest = {
+                'reference': ref_version,
+                'reference_sha256': ref_sha,
+                'distinct_pairs': len(decisions),
+                'distinct_pair_decisions': {f'{dec}:{reason}': n for (dec, reason), n
+                                            in sorted(reason_counts.items())},
+            }
 
             elig_rows = accepted_pairs_table(index, all_pairs)
             elig_table = 'mhc_eligibility'
@@ -1098,6 +1105,8 @@ def main():
                 'split_dir': str(SPLIT_DIR),
                 'output': str(out_dir),
             },
+            'eligibility_policy': policy,
+            # F1-F6 exist only under the legacy policy; reference-aware reports per-pair decisions.
             'filter_counts': {
                 'F1': int(filter_row['F1']),
                 'F2': int(filter_row['F2']),
@@ -1106,6 +1115,9 @@ def main():
                 'F5': int(filter_row['F5']),
                 'F6': int(filter_row['F6']),
                 'n_raw': int(filter_row['n_raw']),
+                'n_post_filter': total_post_filter,
+            } if policy == LEGACY_POLICY else {
+                **eligibility_manifest,
                 'n_post_filter': total_post_filter,
             },
             'partition_target_summary': {
