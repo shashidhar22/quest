@@ -599,7 +599,8 @@ def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: 
                ELSE 'train' END AS split,
           {stratum_sql(mhc_class='e_class', classical='e_classical', peptide='pep_n',
                        tra='tra_cdr3', trb='trb_cdr3', mhc_two='mhc_two')} AS stratum,
-          {example_hash_sql(peptide='pep_n')} AS ex_hash, input_text
+          {example_hash_sql(peptide='pep_n')} AS ex_hash, input_text,
+          (tra_cdr3 = '' OR trb_cdr3 = '' OR mhc_one = '' OR mhc_two = '') IS TRUE AS has_empty
         FROM (
           SELECT {', '.join('k.' + c for c in src_cols)}, k.subset_key, k.order_key,
             NULLIF(k.peptide, '') AS pep_n, c.mhc_class AS e_class, c.classical AS e_classical,
@@ -617,8 +618,15 @@ def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: 
 
     con.execute(f"""CREATE OR REPLACE TEMP TABLE contract_ex AS
         SELECT stratum, split, pep_n AS peptide, ex_hash, COUNT(*) AS order_variants,
-               arg_min(order_key, {order_variant_key_sql(seed)}) AS chosen_order
+               arg_min(order_key, {order_variant_key_sql(seed)}) AS chosen_order,
+               bool_or(has_empty) AS has_empty
         FROM ({tagged}) GROUP BY stratum, split, pep_n, ex_hash""")
+    n_empty = con.execute('SELECT COUNT(*) FROM contract_ex WHERE has_empty').fetchone()[0]
+    if n_empty:
+        # An empty string is "present" to the stratum rule and the hash but absent from the text,
+        # so such an example would be selected into a stratum its built row cannot show.
+        raise ContractNotMet(f'{n_empty:,} examples hold an empty-string receptor or MHC chain; the '
+                             'strata are defined on NULL for absent, so the source must be normalized')
     n_ex, n_hash = con.execute('SELECT COUNT(*), COUNT(DISTINCT ex_hash) FROM contract_ex').fetchone()
     if n_ex != n_hash:
         raise ContractNotMet(f'example hash is not unique: {n_ex:,} examples, {n_hash:,} hashes '
@@ -682,8 +690,9 @@ def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: 
             WHERE dup = 1 ORDER BY bk LIMIT {t['target_rows']}""")
         got = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0] - before
         if got != t['target_rows']:
-            raise ContractNotMet(f"{t['stratum']}/{t['split']}: the source supplies {got:,} single-receptor "
-                                 f"rows, target {t['target_rows']:,}")
+            raise ContractNotMet(f"{t['stratum']}/{t['split']}: {got:,} distinct single-receptor rows among "
+                                 f"the {margin:,} lowest keys, target {t['target_rows']:,} (too few in the "
+                                 "source, or more rows per receptor than the margin allows)")
         achieved[f"{t['split']}/{t['stratum']}"] = got
         log(f"  contract: {t['stratum']}/{t['split']} {got:,} rows")
     for sk in SINGLE_RECEPTOR_SUBSETS:
@@ -994,6 +1003,9 @@ def main():
                 targets[k] = avail
         if capped_partitions:
             log(f'  capped {len(capped_partitions)} partitions at availability', run_id=run_id)
+        if capped_partitions and contract_version is not None:
+            raise SystemExit(f'refusing to build: {len(capped_partitions)} partition(s) hold fewer rows '
+                             f'than the contract fixes, e.g. {capped_partitions[:3]}')
 
         def write_partition_targets():
             with open(art_dir / 'partition_targets.csv', 'w', newline='') as f:

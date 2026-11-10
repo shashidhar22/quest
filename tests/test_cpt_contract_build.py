@@ -253,3 +253,14 @@ def test_refuses_an_example_that_lands_in_two_strata():
                 "WHERE mhc_one_allele = 'HLA-E*01:01'")
     with pytest.raises(ContractNotMet, match="not unique"):
         run(con, version)
+
+
+@pytest.mark.parametrize("column", ["tra_cdr3", "mhc_two"])
+def test_refuses_an_empty_string_where_a_component_is_absent(column):
+    """'' is present to the stratum rule and the hash, absent from the text: never selected silently."""
+    rows = source_rows()
+    version, _ = expected(rows)
+    rows = rows + [_row("trb_peptide", "trb_peptide", trb_cdr3="CASSWWWEQYF", peptide=PEPTIDES[3], **{column: ""})]
+    with pytest.raises(ContractNotMet, match="empty-string"):
+        run(connect(rows), version)
+

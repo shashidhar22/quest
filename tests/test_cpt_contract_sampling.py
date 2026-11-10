@@ -330,7 +330,10 @@ def _version(**overrides):
 
 def _built(rows=BUILT):
     one = count_built_split(rows, lambda seq: KNOWN.get(seq, (None, None)))
-    return {s: one for s in ("train", "val", "test")}
+    # The same counts in every split; only train keeps its identities, so that reusing one fixture
+    # three times is not itself read as a cross-split leak.
+    counts_only = {k: v for k, v in one.items() if k not in ("examples", "background_receptors")}
+    return {"train": one, "val": counts_only, "test": counts_only}
 
 
 def test_a_dataset_that_meets_the_contract_has_no_violation():
@@ -376,4 +379,24 @@ def test_row_sampled_versions_are_held_to_the_stated_tolerance():
     assert contract_violations(version, built(470, 10390)) == []            # within 4 sqrt(E): 80 and 400
     assert len(contract_violations(version, built(485, 10000))) == 1
     assert len(contract_violations(version, built(400, 9590))) == 1
+
+
+def test_a_repeated_background_receptor_is_a_violation_even_when_counts_and_residues_match():
+    swapped = [r for r in BUILT if r != ("CASSG", "trb")] + [("CASSF", "trb")]      # CASSF twice, same lengths
+    got = contract_violations(_version(), _built(swapped))
+    assert got and all("more than once" in g for g in got), got
+
+
+def test_an_example_or_background_receptor_in_two_splits_is_a_violation():
+    count = lambda rows: count_built_split(rows, lambda seq: KNOWN.get(seq, (None, None)))
+    other = [("CAVQ<eos>CASSW<eos>GILGFVFTL<eos>" + MHC_A, "tra_trb_peptide_mhc_one"),
+             (MHC_A + "<eos>GILGFVFTL<eos>CASSY<eos>CAVN", "mhc_one_peptide_trb_tra"),
+             ("NLVPMVATV<eos>CASSV", "peptide_trb"), ("CASSD<eos>" + MHC_E, "trb_mhc_one"),
+             ("CASSH", "trb"), ("CASSI", "trb"), ("CAVK", "tra")]
+    clean = {"train": count(BUILT), "val": count(other), "test": count([(t.replace("CASS", "CAST").replace("CAV", "CAL"), o) for t, o in other])}
+    assert contract_violations(_version(), clean) == []
+    leaked_example = {**clean, "val": count([BUILT[0]] + other[1:])}
+    assert any("share 1" in g for g in contract_violations(_version(), leaked_example))
+    leaked_receptor = {**clean, "val": count(other[:4] + [("CASSF", "trb")] + other[5:])}
+    assert any("share 1" in g for g in contract_violations(_version(), leaked_receptor))
 

@@ -288,14 +288,18 @@ def count_built_split(rows, class_of_chain) -> dict:
     `class_of_chain(sequence)` returns (mhc_class, classical) of an `mhc_one` chain from the
     reference, so the strata are re-derived from the built text and not from any label the
     builder wrote. Returns per-stratum rows and residues, per-peptide maxima, and the number of
-    examples that occur more than once.
+    examples (and, for background rows, receptors) that occur more than once.
     """
     rows_by, residues_by, per_peptide, seen, repeated = {}, {}, {}, set(), 0
+    receptors = {v: set() for v in BACKGROUND_STRATA.values()}
     for text, order_key in rows:
         c = components_of_output_row(text, order_key)
         residues = len(text) - len(EOS) * (len(c) - 1)
         if order_key in BACKGROUND_STRATA.values():
             name = next(k for k, v in BACKGROUND_STRATA.items() if v == order_key)
+            if text in receptors[order_key]:
+                repeated += 1
+            receptors[order_key].add(text)
         else:
             tup = (c.get("tra"), c.get("trb"), c.get("peptide"), c.get("mhc_one"), c.get("mhc_two"))
             mhc_class, classical = class_of_chain(tup[3]) if tup[3] is not None else (None, None)
@@ -310,7 +314,9 @@ def count_built_split(rows, class_of_chain) -> dict:
     largest = {}
     for (name, _pep), n in per_peptide.items():
         largest[name] = max(largest.get(name, 0), n)
-    return {"rows": rows_by, "residues": residues_by, "largest_peptide": largest, "repeated_examples": repeated}
+    return {"rows": rows_by, "residues": residues_by, "largest_peptide": largest, "repeated_examples": repeated,
+            # Kept for the cross-split check; not for serializing.
+            "examples": seen, "background_receptors": receptors}
 
 
 def contract_violations(version: dict, built: dict) -> list[str]:
@@ -341,6 +347,15 @@ def contract_violations(version: dict, built: dict) -> list[str]:
                 out.append(f"{split}: {got['repeated_examples']:,} examples occur more than once")
             if sum(got["rows"].values()) != want["target_rows_total"]:
                 out.append(f"{split}: {sum(got['rows'].values()):,} rows, target {want['target_rows_total']:,}")
+        # An example, or a background receptor, routes to one split; in two it is a leak.
+        for i, a in enumerate(SPLITS):
+            for b in SPLITS[i + 1:]:
+                shared = len(built[a].get("examples", set()) & built[b].get("examples", set()))
+                shared += sum(len(built[a].get("background_receptors", {}).get(k, set())
+                                  & built[b].get("background_receptors", {}).get(k, set()))
+                              for k in BACKGROUND_STRATA.values())
+                if shared:
+                    out.append(f"{a} and {b} share {shared:,} examples or background receptors")
         return out
     # Row-sampled: split and stratum counts are outcomes of routing, held to the stated tolerance.
     for census_name, by_split in sorted(version["split_and_stratum_counts"]["expected"].items()):
