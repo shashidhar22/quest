@@ -29,7 +29,8 @@ def evidence(row):
     names = ' '.join(str(row.get(k) or '') for k in ('mhc_one_allele', 'mhc_two_allele')).upper()
     if re.search(r'(?:HLA-)?D[PRQ][A-Z0-9]*\*', names):
         return 'named_class_ii'
-    if re.search(r'(?:HLA-)?[ABC]\*', names):
+    # The locus letter must start a token: 'MICA*' and 'DMB*' are not class I.
+    if re.search(r'(?<![A-Z0-9])[ABC]\*', names):
         return 'named_class_i'
     return 'unknown'
 
