@@ -529,6 +529,10 @@ def main():
                          'heldout-peptides-v2 drops every row carrying a held-out peptide')
     ap.add_argument('--exclusion-list', type=Path, default=None,
                     help='TSV from build_cpt_benchmark_exclusion.py; required for heldout-peptides-v2')
+    ap.add_argument('--source-root', type=Path, default=ROOT_INPUT,
+                    help='source rows, laid out subset_key=*/order_key=*/*.parquet')
+    ap.add_argument('--clusters-dir', type=Path, default=CLUSTERS_DIR)
+    ap.add_argument('--split-dir', type=Path, default=SPLIT_DIR)
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--run-id', type=str, default='runXX')
     ap.add_argument('--threads', type=int, default=DEFAULT_THREADS)
@@ -537,6 +541,7 @@ def main():
     args = ap.parse_args()
 
     out_dir: Path = args.output_dir
+    source_root, clusters_dir, split_dir = args.source_root, args.clusters_dir, args.split_dir
     art_dir = out_dir / '_build_artifacts'
     out_dir.mkdir(parents=True, exist_ok=True)
     art_dir.mkdir(parents=True, exist_ok=True)
@@ -564,7 +569,7 @@ def main():
             'temp_directory': str(args.duckdb_tmp),
         })
 
-        src = f"read_parquet('{ROOT_INPUT}/**/*.parquet', hive_partitioning=1)"
+        src = f"read_parquet('{source_root}/**/*.parquet', hive_partitioning=1)"
 
         # ---------- Step 0a: benchmark isolation ----------
         excl_table = None
@@ -814,7 +819,7 @@ def main():
             # DuckDB supports brace-expansion globs:
             #   read_parquet('{p1,p2,p3}/*.parquet', hive_partitioning=1)
             globs = [
-                f'{ROOT_INPUT}/subset_key={sk}/order_key={ok}/*.parquet'
+                f'{source_root}/subset_key={sk}/order_key={ok}/*.parquet'
                 for sk, ok, _ in small_partitions
             ]
             # Build a small in-memory targets PyArrow table keyed by (sk, ok).
@@ -864,7 +869,7 @@ def main():
             f"'{{ok}}' AS order_key",
         ])
         for sk, ok, tgt in large_partitions:
-            glob = f'{ROOT_INPUT}/subset_key={sk}/order_key={ok}/*.parquet'
+            glob = f'{source_root}/subset_key={sk}/order_key={ok}/*.parquet'
             sel = select_cols.format(sk=sk, ok=ok)
             n_pf = partition_counts[(sk, ok)]
             # Hash modulus: pick a UINT64 threshold so that fraction tgt/n_pf
@@ -911,13 +916,13 @@ def main():
         # ---------- Per-axis cluster + split lookup views ----------
         log('  registering cluster + split_assignment lookups', run_id=run_id)
         for axis, cpq, col in [
-            ('trb_cdr3', CLUSTERS_DIR / 'trb_cdr3_clusters.parquet', 'trb_cdr3'),
-            ('tra_cdr3', CLUSTERS_DIR / 'tra_cdr3_clusters.parquet', 'tra_cdr3'),
-            ('peptide', CLUSTERS_DIR / 'peptide_clusters.parquet', 'peptide'),
-            ('mhc_one_pocket', CLUSTERS_DIR / 'mhc_one_pocket_clusters.parquet', 'mhc_one_pocket'),
-            ('mhc_two_pocket', CLUSTERS_DIR / 'mhc_two_pocket_clusters.parquet', 'mhc_two_pocket'),
+            ('trb_cdr3', clusters_dir / 'trb_cdr3_clusters.parquet', 'trb_cdr3'),
+            ('tra_cdr3', clusters_dir / 'tra_cdr3_clusters.parquet', 'tra_cdr3'),
+            ('peptide', clusters_dir / 'peptide_clusters.parquet', 'peptide'),
+            ('mhc_one_pocket', clusters_dir / 'mhc_one_pocket_clusters.parquet', 'mhc_one_pocket'),
+            ('mhc_two_pocket', clusters_dir / 'mhc_two_pocket_clusters.parquet', 'mhc_two_pocket'),
         ]:
-            spq = SPLIT_DIR / f'{axis}_split_assignment.parquet'
+            spq = split_dir / f'{axis}_split_assignment.parquet'
             con.execute(f"""
                 CREATE OR REPLACE TEMP VIEW {axis}_lkp AS
                 SELECT c.{col} AS mol, c.cluster_id, s.split
@@ -1215,9 +1220,9 @@ def main():
                 'seed': args.seed,
             },
             'paths': {
-                'input': str(ROOT_INPUT),
-                'clusters_dir': str(CLUSTERS_DIR),
-                'split_dir': str(SPLIT_DIR),
+                'input': str(source_root),
+                'clusters_dir': str(clusters_dir),
+                'split_dir': str(split_dir),
                 'output': str(out_dir),
             },
             'eligibility_policy': policy,
