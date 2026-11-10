@@ -1,0 +1,157 @@
+"""Example-level sampling for the CPT sampling contract (corpus repair, steps 9-10).
+
+The contract (`cpt-sampling-contract-v1`) names targets per stratum and split, in biological
+examples. This module is the single definition of the four things that turn rows into those
+examples, so the sizing scripts that produced the contract and the builder that has to meet it
+cannot drift:
+
+  * the stratum of a row, from its components and the reference-derived class of its MHC chain;
+  * the example hash, md5 of the five components joined by '|' with a missing component written
+    as the empty string. `concat_ws` on the bare columns skips NULLs, which made an alpha-only
+    and a beta-only example with the same CDR3 collide; every component is therefore coalesced;
+  * the selection within one (stratum, split): the per-peptide cap first (lowest hashes within a
+    peptide), then the N lowest hashes of what the cap leaves. No replacement;
+  * the one order variant kept per selected example: the order_key with the lowest seeded md5.
+
+Each SQL builder has a Python twin and a test pins their agreement. Selection is by md5, not
+DuckDB's hash(), whose values are not promised stable across versions.
+"""
+from __future__ import annotations
+
+import hashlib
+
+STRATA = (
+    "s1_paired_tcr_peptide_classI",
+    "s2_one_chain_tcr_peptide_classI",
+    "s3_peptide_classI_no_tcr",
+    "s4_classI_no_peptide",
+    "s5_nonclassical_classI",
+    "s6_classII",
+    "s7_tcr_peptide_no_mhc",
+    "s8_peptide_only",
+    "s9_paired_receptors_only",
+)
+# Strata whose examples carry a receptor and a peptide; the contract caps these per peptide.
+TCR_PEPTIDE_STRATA = (STRATA[0], STRATA[1], STRATA[6])
+BACKGROUND_STRATA = {"background_single_beta_chain": "trb", "background_single_alpha_chain": "tra"}
+NO_PEPTIDE = "<none>"
+COMPONENTS = ("tra_cdr3", "trb_cdr3", "peptide", "mhc_one", "mhc_two")
+
+
+def _md5(text: str) -> str:
+    return hashlib.md5(text.encode()).hexdigest()
+
+
+def stratum_sql(*, mhc_class: str, classical: str, peptide: str, tra: str, trb: str, mhc_two: str) -> str:
+    """CASE expression for a row's stratum. Arguments are SQL expressions.
+
+    `mhc_class` and `classical` describe the row's `mhc_one` chain and come from the eligibility
+    decision, never from an allele name. `peptide` must already be NULL when the row has none
+    (NULLIF(peptide, '')). The first matching branch wins, so the order is part of the definition.
+    """
+    c1 = f"{mhc_class} = 'I' AND {classical}"
+    any_tcr = f"({tra} IS NOT NULL OR {trb} IS NOT NULL)"
+    return f"""CASE
+        WHEN {c1} AND {peptide} IS NOT NULL AND {tra} IS NOT NULL AND {trb} IS NOT NULL THEN '{STRATA[0]}'
+        WHEN {c1} AND {peptide} IS NOT NULL AND {any_tcr} THEN '{STRATA[1]}'
+        WHEN {c1} AND {peptide} IS NOT NULL THEN '{STRATA[2]}'
+        WHEN {c1} THEN '{STRATA[3]}'
+        WHEN {mhc_class} = 'I' THEN '{STRATA[4]}'
+        WHEN {mhc_class} = 'II' OR {mhc_two} IS NOT NULL THEN '{STRATA[5]}'
+        WHEN {peptide} IS NOT NULL AND {any_tcr} THEN '{STRATA[6]}'
+        WHEN {peptide} IS NOT NULL THEN '{STRATA[7]}'
+        ELSE '{STRATA[8]}' END"""
+
+
+def stratum_of(mhc_class, classical, peptide, tra, trb, mhc_two) -> str:
+    """Python twin of `stratum_sql`. None is absent; `classical` counts only when it is True."""
+    c1 = mhc_class == "I" and classical is True
+    has_pep, any_tcr = peptide is not None, tra is not None or trb is not None
+    if c1 and has_pep and tra is not None and trb is not None:
+        return STRATA[0]
+    if c1 and has_pep and any_tcr:
+        return STRATA[1]
+    if c1 and has_pep:
+        return STRATA[2]
+    if c1:
+        return STRATA[3]
+    if mhc_class == "I":
+        return STRATA[4]
+    if mhc_class == "II" or mhc_two is not None:
+        return STRATA[5]
+    if has_pep and any_tcr:
+        return STRATA[6]
+    if has_pep:
+        return STRATA[7]
+    return STRATA[8]
+
+
+def example_hash_sql(tra: str = "tra_cdr3", trb: str = "trb_cdr3", peptide: str = "peptide",
+                     mhc_one: str = "mhc_one", mhc_two: str = "mhc_two") -> str:
+    """md5 of the example tuple; every component coalesced so that NULLs keep their position."""
+    parts = ", ".join(f"coalesce({c}, '')" for c in (tra, trb, peptide, mhc_one, mhc_two))
+    return f"md5(concat_ws('|', {parts}))"
+
+
+def example_hash(tra, trb, peptide, mhc_one, mhc_two) -> str:
+    """Python twin of `example_hash_sql`."""
+    return _md5("|".join("" if c is None else c for c in (tra, trb, peptide, mhc_one, mhc_two)))
+
+
+def peptide_rank_sql(stratum: str = "stratum", split: str = "split", peptide: str = "peptide",
+                     ex_hash: str = "ex_hash") -> str:
+    """Rank of an example within its peptide, by hash: the column a per-peptide cap filters on."""
+    return (f"row_number() OVER (PARTITION BY {stratum}, {split}, coalesce({peptide}, '{NO_PEPTIDE}') "
+            f"ORDER BY {ex_hash})")
+
+
+def selection_sql(table: str, cap, n, rank_col: str = "rn_pep", ex_hash: str = "ex_hash") -> str:
+    """SELECT of one (stratum, split)'s selection from `table`; two `?` parameters, in that order.
+
+    `table` holds one line per example with `stratum`, `split`, `ex_hash` and `rank_col`
+    (`peptide_rank_sql`). `cap` and `n` are None when the rule has no cap or no count.
+    ORDER BY ... LIMIT, not QUALIFY row_number() <= n: DuckDB 1.5 rewrites the latter to a top-N
+    aggregate that refuses n >= 1,000,000.
+    """
+    cap_sql = "TRUE" if cap is None else f"{rank_col} <= {int(cap)}"
+    limit_sql = "" if n is None else f" ORDER BY {ex_hash} LIMIT {int(n)}"
+    return f"SELECT * FROM {table} WHERE stratum = ? AND split = ? AND {cap_sql}{limit_sql}"
+
+
+def select_examples(examples, cap, n) -> list:
+    """Python twin of the selection. `examples` is an iterable of (ex_hash, peptide, ...) tuples
+    of ONE (stratum, split); returns the chosen tuples in hash order."""
+    pool = sorted(examples, key=lambda e: e[0])
+    if cap is not None:
+        seen: dict = {}
+        kept = []
+        for e in pool:
+            key = NO_PEPTIDE if e[1] is None else e[1]
+            if seen.get(key, 0) < cap:
+                seen[key] = seen.get(key, 0) + 1
+                kept.append(e)
+        pool = kept
+    return pool if n is None else pool[:n]
+
+
+def rule_cap_and_count(rule) -> tuple:
+    """(cap, n) of a contract rule: 'all', {'cap_per_peptide': K}, {'examples': N}, or both."""
+    if rule == "all":
+        return None, None
+    unknown = set(rule) - {"cap_per_peptide", "examples"}
+    if not isinstance(rule, dict) or unknown or not rule:
+        raise ValueError(f"not a sampling rule: {rule!r}")
+    return rule.get("cap_per_peptide"), rule.get("examples")
+
+
+def order_variant_key_sql(seed: int, ex_hash: str = "ex_hash", order_key: str = "order_key") -> str:
+    """Sort key for choosing an example's single order variant: the lowest key is kept."""
+    return f"md5(concat('{int(seed)}|', {ex_hash}, '|', {order_key}))"
+
+
+def choose_order_variant(seed: int, ex_hash: str, order_keys) -> str:
+    """Python twin: the order_key with the lowest seeded md5."""
+    order_keys = list(order_keys)
+    if not order_keys:
+        raise ValueError("an example has no order variant")
+    return min(order_keys, key=lambda ok: _md5(f"{int(seed)}|{ex_hash}|{ok}"))
