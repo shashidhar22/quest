@@ -39,6 +39,9 @@ from quest.data.contract_sampling import (  # noqa: E402
     serialization_name,
     stratum_targets,
     version_kind,
+    components_of_output_row,
+    contract_violations,
+    count_built_split,
 )
 
 
@@ -288,4 +291,89 @@ def test_background_key_sql_and_python_agree_and_differ_from_the_routing_vote():
     assert got == {c: background_key(42, "trb_cdr3", c) for c in cdr3s}
     assert background_key(42, "trb_cdr3", "CASSF") != background_key(42, "tra_cdr3", "CASSF")
     assert background_key(42, "trb_cdr3", "CASSF") != background_key(43, "trb_cdr3", "CASSF")
+
+
+# ---------- checking a built dataset ----------
+
+MHC_A, MHC_E = "GSHSMRYF", "GSHSLKYF"
+KNOWN = {MHC_A: ("I", True), MHC_E: ("I", False)}
+BUILT = [
+    ("CAVR<eos>CASSL<eos>GILGFVFTL<eos>" + MHC_A, "tra_trb_peptide_mhc_one"),
+    (MHC_A + "<eos>GILGFVFTL<eos>CASSQ<eos>CAVS", "mhc_one_peptide_trb_tra"),
+    ("NLVPMVATV<eos>CASSL", "peptide_trb"),
+    ("CASSE<eos>" + MHC_E, "trb_mhc_one"),
+    ("CASSF", "trb"), ("CASSG", "trb"), ("CAVT", "tra"),
+]
+
+
+def test_a_built_row_is_parsed_back_into_its_components():
+    assert components_of_output_row(*BUILT[1]) == {"mhc_one": MHC_A, "peptide": "GILGFVFTL", "trb": "CASSQ", "tra": "CAVS"}
+    assert components_of_output_row("CASSF", "trb") == {"trb": "CASSF"}
+    for text, order in [("CASSF<eos>CAVT", "trb"), ("CASSF", "trb_tra"), ("CASSF", "beta"),
+                        ("CASSF<eos>", "trb_tra"), ("A<eos>B", "trb_trb")]:
+        with pytest.raises(ValueError):
+            components_of_output_row(text, order)
+
+
+def _version(**overrides):
+    def stratum(n, res, rule="all"):
+        return {"target_rows": n, "target_examples": n, "residue_tokens": res, "rule": rule}
+    strata = {"s1_paired_tcr_peptide_classI": stratum(2, 52, {"cap_per_peptide": 2}),
+              "s7_tcr_peptide_no_mhc": stratum(1, 14), "s5_nonclassical_classI": stratum(1, 13),
+              "background_single_beta_chain": {"target_rows": 2, "residue_tokens_estimate": 10, "rule": {}},
+              "background_single_alpha_chain": {"target_rows": 1, "residue_tokens_estimate": 4, "rule": {}}}
+    for k, v in overrides.items():
+        strata[k] = {**strata[k], **v}
+    split = {"by_stratum": strata, "target_rows_total": sum(v["target_rows"] for v in strata.values())}
+    return {"splits": {s: split for s in ("train", "val", "test")}}
+
+
+def _built(rows=BUILT):
+    one = count_built_split(rows, lambda seq: KNOWN.get(seq, (None, None)))
+    return {s: one for s in ("train", "val", "test")}
+
+
+def test_a_dataset_that_meets_the_contract_has_no_violation():
+    built = _built()
+    assert built["train"]["rows"] == {"s1_paired_tcr_peptide_classI": 2, "s7_tcr_peptide_no_mhc": 1,
+                                      "s5_nonclassical_classI": 1, "background_single_beta_chain": 2,
+                                      "background_single_alpha_chain": 1}
+    assert built["train"]["largest_peptide"]["s1_paired_tcr_peptide_classI"] == 2
+    assert contract_violations(_version(), built) == []
+
+
+@pytest.mark.parametrize("override, needle", [
+    ({"s1_paired_tcr_peptide_classI": {"target_rows": 3}}, "target 3"),
+    ({"s1_paired_tcr_peptide_classI": {"residue_tokens": 53}}, "residue tokens"),
+    ({"s1_paired_tcr_peptide_classI": {"rule": {"cap_per_peptide": 1}}}, "cap 1"),
+    ({"background_single_beta_chain": {"target_rows": 3}}, "target 3"),
+    ({"background_single_beta_chain": {"residue_tokens_estimate": 20}}, "tolerance 1%"),
+])
+def test_each_departure_from_the_contract_is_a_violation(override, needle):
+    got = contract_violations(_version(**override), _built())
+    assert got and any(needle in g for g in got), got
+
+
+def test_a_repeated_example_and_an_unnamed_stratum_are_violations():
+    got = contract_violations(_version(), _built(BUILT + [BUILT[0]]))
+    assert any("more than once" in g for g in got)
+    got = contract_violations(_version(), _built(BUILT + [("GILGFVFTL", "peptide")]))
+    assert any("does not name" in g for g in got)
+
+
+def test_a_class_the_reference_does_not_confirm_is_not_counted_as_class_one():
+    built = count_built_split(BUILT[:1], lambda seq: (None, None))
+    assert built["rows"] == {"s7_tcr_peptide_no_mhc": 1}
+
+
+def test_row_sampled_versions_are_held_to_the_stated_tolerance():
+    version = {"target_rows_by_partition": {}, "split_and_stratum_counts": {"expected": {
+        "7 TCR + peptide, no MHC": {"train": {"expected_rows": 400.0}},
+        "background single trb chain": {"train": {"expected_rows": 10000.0}},
+        "5 non-classical class I (E/F/G)": {"train": {"expected_rows": 3.0}}}}}       # below 100: not judged
+    def built(n7, nb):
+        return {"train": {"rows": {"s7_tcr_peptide_no_mhc": n7, "background_single_beta_chain": nb}}}
+    assert contract_violations(version, built(470, 10390)) == []            # within 4 sqrt(E): 80 and 400
+    assert len(contract_violations(version, built(485, 10000))) == 1
+    assert len(contract_violations(version, built(400, 9590))) == 1
 

@@ -23,6 +23,11 @@ V9. Split fractions in expected ranges
 V10. Benchmark isolation: under heldout-peptides-v2, EVERY peptide-bearing output row (not a
      sample) is parsed and none may carry a held-out peptide; the list's sha256 must match the
      build manifest. Under 'none' the check is recorded as not applied.
+V11. Sampling contract: when the build names one, EVERY output row is parsed and recounted by
+     stratum from its own text, with MHC class re-decided against the reference, and compared
+     with the contract: exact counts, residue tokens, per-peptide caps and no repeated example
+     for an example-sampled version; the stated tolerance for a row-sampled one. A build that
+     names no contract records the check as not applied.
 """
 from __future__ import annotations
 
@@ -316,11 +321,13 @@ def build_source_hash_map(sampled_rows: list[dict],
 # ---------- main verifier ----------
 
 def main():
+    # The source-reading helpers above read these module names; main() may repoint them.
+    global ROOT_INPUT, CLUSTERS_DIR, SPLIT_DIR
     ap = argparse.ArgumentParser()
     ap.add_argument('--output-dir', type=Path, required=True)
     ap.add_argument('--tcr-variant', choices=['cdr3', 'cdr123', 'full'], required=True)
     ap.add_argument('--mhc-variant', choices=['pocket', 'pocket_contact', 'full'], required=True)
-    ap.add_argument('--distribution', choices=['proportional', 'balanced'], required=True)
+    ap.add_argument('--distribution', choices=['proportional', 'balanced', 'contract'], required=True)
     ap.add_argument('--scale', type=int, required=True)
     ap.add_argument('--run-id', type=str, default='runXX')
     ap.add_argument('--poll-timeout-sec', type=int, default=21600)  # 6h default
@@ -339,7 +346,14 @@ def main():
                     help='must be the isolation policy the build used; no default')
     ap.add_argument('--exclusion-list', type=Path, default=None,
                     help='held-out peptide TSV; required for heldout-peptides-v2')
+    ap.add_argument('--source-root', type=Path, default=ROOT_INPUT)
+    ap.add_argument('--clusters-dir', type=Path, default=CLUSTERS_DIR)
+    ap.add_argument('--split-dir', type=Path, default=SPLIT_DIR)
+    ap.add_argument('--sampling-contract', type=Path, default=None,
+                    help='the cpt-sampling-contract-v1 file the build named; required when it named one')
+    ap.add_argument('--contract-version', default=None)
     args = ap.parse_args()
+    ROOT_INPUT, CLUSTERS_DIR, SPLIT_DIR = args.source_root, args.clusters_dir, args.split_dir
     if args.benchmark_exclusion != 'none' and not (
             args.exclusion_list and args.exclusion_list.exists()):
         ap.error(f'--exclusion-list is required for {args.benchmark_exclusion}')
@@ -828,12 +842,59 @@ def main():
                    'status': 'PASS' if (v10_checked > 0 and not v10_violations) else 'FAIL'}
         (art_dir / 'v10_benchmark_isolation.json').write_text(json.dumps(v10, indent=2, default=str))
 
+        # ---------- V11: sampling contract, every output row ----------
+        built_contract = built.get('sampling_contract')
+        log(f"V11: sampling contract ({built_contract['version'] if built_contract else 'none'})", run_id=run_id)
+        if not built_contract:
+            assert not args.sampling_contract, 'a contract was passed but the build names none'
+            v11 = {'contract': None, 'status': 'PASS', 'note': 'not applied; build names no contract'}
+        else:
+            assert args.sampling_contract and args.sampling_contract.exists(), (
+                f"the build names contract version {built_contract['version']!r}; pass --sampling-contract")
+            assert args.contract_version == built_contract['version'], (
+                f"build used version {built_contract['version']!r}, verifier was asked for "
+                f"{args.contract_version!r}")
+            assert elig_index is not None, 'the contract check re-decides MHC class against the reference'
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+            from quest.data.contract_sampling import (
+                CHECKABLE_SERIALIZATION, contract_violations, count_built_split, load_contract_version)
+            contract, c_version, c_sha = load_contract_version(args.sampling_contract, args.contract_version)
+            assert c_sha == built_contract['sha256'], (
+                f"contract differs from the build's: {c_sha} vs {built_contract['sha256']}")
+            assert contract['policies']['serialization'] == CHECKABLE_SERIALIZATION == (
+                f'{args.tcr_variant} x {args.mhc_variant}'), 'rows can only be parsed back under cdr3 x full'
+            class_cache = {}
+
+            def class_of_chain(seq):
+                if seq not in class_cache:
+                    d = elig_index.decide(seq)
+                    class_cache[seq] = (d.mhc_class, d.classical) if d.decision == 'accept' else (None, None)
+                return class_cache[seq]
+
+            def rows_of(split_name):
+                tbl = ds[split_name].data.table.select(['input_text', 'order_key'])
+                for batch in tbl.to_batches(max_chunksize=200_000):
+                    yield from zip(batch.column(0).to_pylist(), map(str, batch.column(1).to_pylist()))
+
+            counted = {name: count_built_split(rows_of(ds_name), class_of_chain)
+                       for name, ds_name in (('train', 'train'), ('val', 'validation'), ('test', 'test'))}
+            violations = contract_violations(c_version, counted)
+            n_rows = sum(sum(c['rows'].values()) for c in counted.values())
+            v11 = {'contract': contract['contract'], 'version': args.contract_version, 'sha256': c_sha,
+                   'n_rows_checked': n_rows, 'distinct_mhc_one_chains': len(class_cache),
+                   'rows_by_split_and_stratum': {k: dict(sorted(c['rows'].items())) for k, c in counted.items()},
+                   'repeated_examples': {k: c['repeated_examples'] for k, c in counted.items()},
+                   'n_violations': len(violations), 'violations': violations[:50],
+                   # Zero rows checked would make the zero violations meaningless.
+                   'status': 'PASS' if (n_rows > 0 and not violations) else 'FAIL'}
+        (art_dir / 'v11_sampling_contract.json').write_text(json.dumps(v11, indent=2, default=str))
+
         # ---------- Overall verdict ----------
         all_status = {
             'V1': v1['status'], 'V2': v2['status'], 'V3': v3['status'],
             'V4': v4['status'], 'V5': v5['status'], 'V6': v6['status'],
             'V7': v7['status'], 'V8': v8['status'], 'V9': v9['status'],
-            'V10': v10['status'],
+            'V10': v10['status'], 'V11': v11['status'],
         }
         log(f'verdicts: {all_status}', run_id=run_id)
         fails = [k for k, v in all_status.items() if v == 'FAIL']

@@ -257,3 +257,100 @@ def background_key(seed: int, axis: str, cdr3: str) -> str:
     """Python twin of `background_key_sql`."""
     return _md5(f"{int(seed)}|background|{axis}|{cdr3}")
 
+
+# ---------- checking a built dataset against the contract ----------
+
+EOS = "<eos>"
+_ORDER_TOKENS = ("mhc_one", "mhc_two", "tra", "trb", "peptide")
+CHECKABLE_SERIALIZATION = "cdr3 x full"      # one text segment per component, so a row can be parsed back
+_CENSUS_STRATUM = {s[1]: s for s in STRATA}  # the census names its strata '1 paired TCR + ...'
+
+
+def components_of_output_row(input_text: str, order_key: str) -> dict:
+    """{component: text} of a serialized row under cdr3 x full. Raises when the order_key does
+    not name exactly the segments present, because every count built on the parse would be wrong."""
+    order, rest = [], order_key
+    while rest:
+        token = next((t for t in _ORDER_TOKENS if rest == t or rest.startswith(t + "_")), None)
+        if token is None:
+            raise ValueError(f"order_key {order_key!r} is not a '_'-joined list of known components")
+        order.append(token)
+        rest = rest[len(token) + 1:]
+    parts = input_text.split(EOS)
+    if len(parts) != len(order) or len(set(order)) != len(order) or not all(parts):
+        raise ValueError(f"order_key {order_key!r} names {len(order)} components, input_text has {len(parts)}")
+    return dict(zip(order, parts))
+
+
+def count_built_split(rows, class_of_chain) -> dict:
+    """Recount one built split from its own rows: `rows` yields (input_text, order_key).
+
+    `class_of_chain(sequence)` returns (mhc_class, classical) of an `mhc_one` chain from the
+    reference, so the strata are re-derived from the built text and not from any label the
+    builder wrote. Returns per-stratum rows and residues, per-peptide maxima, and the number of
+    examples that occur more than once.
+    """
+    rows_by, residues_by, per_peptide, seen, repeated = {}, {}, {}, set(), 0
+    for text, order_key in rows:
+        c = components_of_output_row(text, order_key)
+        residues = len(text) - len(EOS) * (len(c) - 1)
+        if order_key in BACKGROUND_STRATA.values():
+            name = next(k for k, v in BACKGROUND_STRATA.items() if v == order_key)
+        else:
+            tup = (c.get("tra"), c.get("trb"), c.get("peptide"), c.get("mhc_one"), c.get("mhc_two"))
+            mhc_class, classical = class_of_chain(tup[3]) if tup[3] is not None else (None, None)
+            name = stratum_of(mhc_class, classical, tup[2], tup[0], tup[1], tup[4])
+            if tup in seen:
+                repeated += 1
+            seen.add(tup)
+            key = (name, NO_PEPTIDE if tup[2] is None else tup[2])
+            per_peptide[key] = per_peptide.get(key, 0) + 1
+        rows_by[name] = rows_by.get(name, 0) + 1
+        residues_by[name] = residues_by.get(name, 0) + residues
+    largest = {}
+    for (name, _pep), n in per_peptide.items():
+        largest[name] = max(largest.get(name, 0), n)
+    return {"rows": rows_by, "residues": residues_by, "largest_peptide": largest, "repeated_examples": repeated}
+
+
+def contract_violations(version: dict, built: dict) -> list[str]:
+    """Every way a built dataset departs from a contract version. `built` maps the contract's
+    split names to `count_built_split` results. An empty list is the only pass."""
+    out = []
+    if version_kind(version) == EXAMPLE_SAMPLED:
+        for split in SPLITS:
+            want, got = version["splits"][split], built[split]
+            for name, v in sorted(want["by_stratum"].items()):
+                n = got["rows"].get(name, 0)
+                if n != v["target_rows"]:
+                    out.append(f"{split}/{name}: {n:,} rows, target {v['target_rows']:,}")
+                if name in BACKGROUND_STRATA:
+                    est, res = v["residue_tokens_estimate"], got["residues"].get(name, 0)
+                    if abs(res - est) > 0.01 * est:
+                        out.append(f"{split}/{name}: {res:,} residue tokens, estimate {est:,} (tolerance 1%)")
+                    continue
+                if got["residues"].get(name, 0) != v["residue_tokens"]:
+                    out.append(f"{split}/{name}: {got['residues'].get(name, 0):,} residue tokens, "
+                               f"target {v['residue_tokens']:,}")
+                cap, _n = rule_cap_and_count(v["rule"])
+                if cap is not None and got["largest_peptide"].get(name, 0) > cap:
+                    out.append(f"{split}/{name}: a peptide has {got['largest_peptide'][name]:,} examples, cap {cap:,}")
+            for name in sorted(set(got["rows"]) - set(want["by_stratum"])):
+                out.append(f"{split}/{name}: {got['rows'][name]:,} rows in a stratum the contract does not name")
+            if got["repeated_examples"]:
+                out.append(f"{split}: {got['repeated_examples']:,} examples occur more than once")
+            if sum(got["rows"].values()) != want["target_rows_total"]:
+                out.append(f"{split}: {sum(got['rows'].values()):,} rows, target {want['target_rows_total']:,}")
+        return out
+    # Row-sampled: split and stratum counts are outcomes of routing, held to the stated tolerance.
+    for census_name, by_split in sorted(version["split_and_stratum_counts"]["expected"].items()):
+        if census_name.startswith("background single "):
+            name = next(k for k, v in BACKGROUND_STRATA.items() if v == census_name.split()[2])
+        else:
+            name = _CENSUS_STRATUM[census_name[0]]
+        for split, v in by_split.items():
+            e, n = v["expected_rows"], built[split]["rows"].get(name, 0)
+            if e >= 100 and abs(n - e) > 4 * e ** 0.5:
+                out.append(f"{split}/{name}: {n:,} rows, expected {e:,} +/- {4 * e ** 0.5:,.0f}")
+    return out
+
