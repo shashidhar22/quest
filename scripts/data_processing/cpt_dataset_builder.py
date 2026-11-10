@@ -48,6 +48,7 @@ from quest.data.benchmark_exclusion import (  # noqa: E402
 )
 from quest.data.split_routing import (  # noqa: E402
     RECEPTOR_AXES,
+    RECEPTOR_HASH_V2_ROUTING,
     ROUTING_POLICIES,
     axis_vote_sql,
     receptor_split_sql,
@@ -581,6 +582,11 @@ def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: 
     per split.
     """
     assert where.strip().startswith('WHERE'), where[:40]
+    if routing != RECEPTOR_HASH_V2_ROUTING:
+        # Selection routes rows without the receptor and MHC cluster joins, which is the whole
+        # vote only under this policy; under any other the later routing would disagree.
+        raise ContractNotMet(f'example-level selection is implemented for {RECEPTOR_HASH_V2_ROUTING} '
+                             f'routing only, not {routing}')
     cols = ', '.join(src_cols)
     vote = axis_vote_sql(routing, seed)
     text = build_input_text_sql(tcr_variant, mhc_variant)
@@ -716,6 +722,9 @@ def main():
                     help='cpt-sampling-contract-v1 file. Required for --distribution contract. With '
                          'proportional it is checked: the computed targets must equal the contract\'s')
     ap.add_argument('--contract-version', default=None, help='which version of --sampling-contract to build')
+    ap.add_argument('--allow-background-subset', action='store_true',
+                    help='test builds only: let --distribution contract draw background from a source '
+                         'that does not hold the single-receptor rows the contract was sized on')
     ap.add_argument('--scale', type=int, required=True)
     ap.add_argument('--output-dir', type=Path, required=True)
     ap.add_argument('--eligibility-policy', choices=list(POLICIES), required=True,
@@ -759,6 +768,9 @@ def main():
             p.write_text('STATUS=PASS\n')
         else:
             p.write_text(f'STATUS=FAIL: {reason}\n')
+
+    # A marker left by an earlier build in this directory must not outlive a new attempt.
+    (art_dir / '_implementer_done').unlink(missing_ok=True)
 
     try:
         log(f'config: tcr={args.tcr_variant} mhc={args.mhc_variant} '
@@ -914,6 +926,11 @@ def main():
             if mismatches:
                 raise SystemExit('refusing to build: this build is not the one the contract was sized '
                                  'for.\n  ' + '\n  '.join(mismatches))
+            if by_example:
+                contract_total = sum(t.get('target_examples', t.get('target_rows'))
+                                     for t in stratum_targets(contract_version))
+                if args.scale != contract_total:
+                    raise SystemExit(f'--scale must be the contract total, {contract_total}')
             contract_manifest = {'file': str(args.sampling_contract), 'sha256': contract_sha,
                                  'contract': contract['contract'], 'version': args.contract_version,
                                  'kind': version_kind(contract_version)}
@@ -980,10 +997,19 @@ def main():
             # Targets are per stratum and split, not per partition. The per-partition table is
             # filled in afterwards with what the selection realized.
             targets = {k: 0 for k in partition_counts}
-            contract_total = sum(t.get('target_examples', t.get('target_rows'))
-                                 for t in stratum_targets(contract_version))
-            if args.scale != contract_total:
-                raise SystemExit(f'--scale must be the contract total, {contract_total}')
+            # 2. The background universe: biological strata are checked against the supply the
+            # contract was sized on; single-receptor rows must be too, or a partial source
+            # silently yields a different background.
+            sized_on = contract['universe']['single_receptor_rows_from_footers']
+            held = {sk: partition_counts.get((sk, sk), 0) for sk in SINGLE_RECEPTOR_SUBSETS}
+            if held != {sk: sized_on[sk] for sk in SINGLE_RECEPTOR_SUBSETS}:
+                if not args.allow_background_subset:
+                    raise SystemExit(f'refusing to build: the source holds {held} single-receptor rows, '
+                                     f'the contract was sized on {sized_on}. Pass --allow-background-subset '
+                                     'only for a test build; it is recorded in the manifest.')
+                log(f'  TEST BUILD: background drawn from a subset {held}, not the contract universe', run_id=run_id)
+            contract_manifest['background_universe'] = (
+                'contract' if held == {sk: sized_on[sk] for sk in SINGLE_RECEPTOR_SUBSETS} else {'subset': held})
         else:
             targets = compute_targets(partition_counts, args.distribution, args.scale)
             if contract_version is not None and targets != partition_targets(contract_version):
@@ -1594,6 +1620,13 @@ def main():
         print(f'IMPLEMENTER_STATUS: {run_id}: PASS', flush=True)
         return 0
 
+    except SystemExit as e:
+        # A refusal. SystemExit is not an Exception, so without this branch a refused build
+        # left no marker at all, or an earlier build's PASS.
+        log(f'BUILD REFUSED: {e}', run_id=run_id)
+        _write_done('FAIL', f'refused: {str(e)[:180]}')
+        print(f'IMPLEMENTER_STATUS: {run_id}: FAIL: refused: {e}', flush=True)
+        return 1
     except Exception as e:
         tb = traceback.format_exc()
         log(f'BUILD FAIL: {e}\n{tb}', run_id=run_id)

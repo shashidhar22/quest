@@ -120,6 +120,8 @@ def expected(rows):
             if fraction is not None:
                 n = int(len(under_cap) * fraction)
             chosen = select_examples(pool, cap, n)
+            rule = "all" if (cap is None and n == len(pool)) else {**({"cap_per_peptide": cap} if cap else {}),
+                                                                   **({"examples": n} if n != len(under_cap) else {})}
             strata[stratum] = {"rule": rule, "target_examples": n, "target_rows": n,
                                "examples_available": len(pool), "examples_available_under_cap": len(under_cap)}
             want |= {(tup, choose_order_variant(SEED, h, oks)) for h, _p, tup, oks in chosen}
@@ -230,8 +232,18 @@ def test_refuses_a_target_the_stratum_cannot_supply():
     version = copy.deepcopy(version)
     s = version["splits"]["train"]["by_stratum"]["s5_nonclassical_classI"]
     s["target_examples"] = s["examples_available"] + 1
-    with pytest.raises(ContractNotMet, match="selected"):
+    with pytest.raises(ValueError, match="implies"):          # the contract contradicts itself
         run(connect(rows), version)
+
+
+def test_refuses_any_routing_but_the_one_selection_implements():
+    rows = source_rows()
+    version, _ = expected(rows)
+    with pytest.raises(ContractNotMet, match="routing only"):
+        fill_staging_from_contract(
+            connect(rows), src="source", where=filter_where_sql(REFERENCE_AWARE_POLICY, eligibility_table="elig"),
+            eligibility_table="elig", peptide_lookup="pep_lkp", version=version, routing="receptor-hash-v1",
+            seed=SEED, tcr_variant="cdr3", mhc_variant="full", src_cols=SRC_COLS)
 
 
 def test_refuses_background_the_source_cannot_supply():

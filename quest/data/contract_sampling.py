@@ -239,7 +239,14 @@ def stratum_targets(version: dict) -> list[dict]:
                 out.append({"split": split, "stratum": name, "background": BACKGROUND_STRATA[name],
                             "target_rows": int(v["target_rows"])})
                 continue
-            cap, _n = rule_cap_and_count(v["rule"])
+            cap, n = rule_cap_and_count(v["rule"])
+            # The rule and the numbers beside it must say the same thing, or the contract
+            # contradicts itself and whichever one the builder follows is a guess.
+            implied = n if n is not None else (v["examples_available"] if cap is None
+                                               else v["examples_available_under_cap"])
+            if implied != v["target_examples"] or v["target_examples"] > v["examples_available_under_cap"]:
+                raise ValueError(f"{split}/{name}: rule {v['rule']!r} implies {implied:,} examples, the target "
+                                 f"is {v['target_examples']:,} of {v['examples_available_under_cap']:,} available")
             out.append({"split": split, "stratum": name, "background": None, "cap": cap,
                         "target_examples": int(v["target_examples"]),
                         "examples_available": int(v["examples_available"]),

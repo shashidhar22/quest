@@ -209,7 +209,7 @@ def test_the_no_peptide_sentinel_cannot_be_a_peptide():
 # ---------- the contract file ----------
 
 def _contract():
-    stratum = {"target_examples": 3, "target_rows": 3, "rule": {"cap_per_peptide": 2},
+    stratum = {"target_examples": 3, "target_rows": 3, "rule": {"cap_per_peptide": 2, "examples": 3},
                "examples_available": 9, "examples_available_under_cap": 4}
     bg = {"target_rows": 5, "expected_supply_rows": 50, "rule": {"fill": "x"}}
     split = {"by_stratum": {"s7_tcr_peptide_no_mhc": stratum, "background_single_beta_chain": bg}}
@@ -399,4 +399,23 @@ def test_an_example_or_background_receptor_in_two_splits_is_a_violation():
     assert any("share 1" in g for g in contract_violations(_version(), leaked_example))
     leaked_receptor = {**clean, "val": count(other[:4] + [("CASSF", "trb")] + other[5:])}
     assert any("share 1" in g for g in contract_violations(_version(), leaked_receptor))
+
+
+@pytest.mark.parametrize("rule, target, ok", [
+    ("all", 9, True), ("all", 3, False),                                  # 'all' means all 9
+    ({"cap_per_peptide": 2}, 4, True), ({"cap_per_peptide": 2}, 3, False),  # a bare cap means all 4 it leaves
+    ({"examples": 3}, 3, True), ({"examples": 60000}, 3, False),          # a count must be the target
+    ({"cap_per_peptide": 2, "examples": 5}, 5, False),                    # more than the cap leaves
+])
+def test_a_rule_that_contradicts_its_target_is_refused(rule, target, ok):
+    version = _contract()["versions"]["examples"]
+    s = dict(version["splits"]["train"]["by_stratum"]["s7_tcr_peptide_no_mhc"], rule=rule, target_examples=target)
+    if rule == "all":
+        s["examples_available_under_cap"] = s["examples_available"]      # no cap: the cap leaves everything
+    version["splits"] = {k: {"by_stratum": {"s7_tcr_peptide_no_mhc": s}} for k in ("train", "val", "test")}
+    if ok:
+        assert len(stratum_targets(version)) == 3
+    else:
+        with pytest.raises(ValueError, match="implies"):
+            stratum_targets(version)
 

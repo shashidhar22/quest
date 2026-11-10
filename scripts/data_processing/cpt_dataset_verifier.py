@@ -352,6 +352,8 @@ def main():
     ap.add_argument('--sampling-contract', type=Path, default=None,
                     help='the cpt-sampling-contract-v1 file the build named; required when it named one')
     ap.add_argument('--contract-version', default=None)
+    ap.add_argument('--allow-background-subset', action='store_true',
+                    help='test builds only: accept a contract build whose background came from a subset')
     args = ap.parse_args()
     ROOT_INPUT, CLUSTERS_DIR, SPLIT_DIR = args.source_root, args.clusters_dir, args.split_dir
     if args.benchmark_exclusion != 'none' and not (
@@ -879,9 +881,14 @@ def main():
             counted = {name: count_built_split(rows_of(ds_name), class_of_chain)
                        for name, ds_name in (('train', 'train'), ('val', 'validation'), ('test', 'test'))}
             violations = contract_violations(c_version, counted)
+            background_universe = built_contract.get('background_universe', 'contract')
+            if background_universe != 'contract' and not args.allow_background_subset:
+                violations.append(f'background drawn from {background_universe}, not the universe the '
+                                  'contract was sized on (a test build)')
             n_rows = sum(sum(c['rows'].values()) for c in counted.values())
             v11 = {'contract': contract['contract'], 'version': args.contract_version, 'sha256': c_sha,
                    'n_rows_checked': n_rows, 'distinct_mhc_one_chains': len(class_cache),
+                   'background_universe': background_universe,
                    'rows_by_split_and_stratum': {k: dict(sorted(c['rows'].items())) for k, c in counted.items()},
                    'repeated_examples': {k: c['repeated_examples'] for k, c in counted.items()},
                    'n_violations': len(violations), 'violations': violations[:50],
