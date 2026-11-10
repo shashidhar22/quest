@@ -53,6 +53,7 @@ from quest.data.split_routing import (  # noqa: E402
 from quest.data.mhc_eligibility import (  # noqa: E402
     MHC_ONE_ROLES,
     MHC_TWO_ROLES,
+    UNRESOLVED_ISOTYPE,
     accepted_pairs_table,
     build_index_from_fasta,
 )
@@ -425,6 +426,34 @@ def filter_where_sql(policy: str, eligibility_table: str | None = None,
         AND {slot('mhc_two', 'mhc_two_allele', MHC_TWO_ROLES)}
         AND {paired}
     """ + isolation
+
+
+def mhc_class_from_eligibility_sql(eligibility_table: str) -> str:
+    """`mhc_class` of a row from its chains' accepted roles; SQL twin of
+    `mhc_eligibility.row_mhc_class`.
+
+    Under `reference-aware-v1` the label must rest on the same evidence as eligibility. The legacy
+    expression reads the allele NAME, so a reference-exact class-I chain with no name was
+    labelled 'none' and a mislabelled chain took its name's class. (seq_norm, allele_norm) is
+    the eligibility table's key, so each lookup returns at most one row.
+    """
+    def lookup(col, seq_col, allele_col):
+        return (f"(SELECT e.{col} FROM {eligibility_table} e "
+                f"WHERE e.seq_norm = {normalize_sequence_sql(seq_col)} "
+                f"AND e.allele_norm = coalesce({normalize_sequence_sql(allele_col)}, ''))")
+
+    role1 = lookup('chain_role', 'mhc_one', 'mhc_one_allele')
+    role2 = lookup('chain_role', 'mhc_two', 'mhc_two_allele')
+    group2 = lookup('pair_group', 'mhc_two', 'mhc_two_allele')
+    return f"""
+          CASE
+            WHEN {role1} = 'heavy' THEN 'I'
+            WHEN {role1} = 'alpha' AND {role2} = 'beta' THEN 'II_complete'
+            WHEN {role1} = 'alpha' THEN 'II_partial_alpha'
+            WHEN {role2} = 'beta' THEN 'II_partial_' || coalesce({group2}, '{UNRESOLVED_ISOTYPE}') || '_beta'
+            ELSE 'none'
+          END
+        """
 
 
 # ---------- target computation ----------
@@ -978,6 +1007,9 @@ def main():
             ELSE 'none'
           END
         """
+        if policy == REFERENCE_AWARE_POLICY:
+            # The label rests on the same reference decision as eligibility, not on the name.
+            mhc_class_sql = mhc_class_from_eligibility_sql(elig_table)
         # DuckDB's sha256() already returns lowercase hex string — do NOT wrap in to_hex
         # (that would double-encode). Take the first 16 hex chars.
         source_row_hash_sql = (

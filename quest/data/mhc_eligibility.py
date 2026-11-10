@@ -478,3 +478,35 @@ def row_decision(index: EligibilityIndex, mhc_one, mhc_one_allele, mhc_two,
     if len(groups) == 2 and (groups[0] is None or groups[0] != groups[1]):
         return False, "pair_mismatch"
     return True, "eligible"
+
+
+# The builder's `mhc_class` row label. The vocabulary is the legacy one, so evaluation strata keep
+# their names; only the evidence changes, from the allele NAME to the chain's reference decision.
+UNRESOLVED_ISOTYPE = "unresolved"
+
+
+def row_mhc_class(index: EligibilityIndex, mhc_one, mhc_one_allele, mhc_two,
+                  mhc_two_allele) -> str:
+    """`mhc_class` label of a row under `reference-aware-v1`, from its chains' accepted roles.
+
+    'I' for a class-I heavy chain (classical or not), 'II_complete' for an alpha with a beta,
+    'II_partial_alpha', 'II_partial_<DR|DQ|DP>_beta', and 'none' when no slot holds an accepted
+    chain. A populated but unaccepted chain also gives 'none': such a row cannot pass the
+    filter, so the label never asserts a class the reference did not confirm. SQL twin:
+    `cpt_dataset_builder.mhc_class_from_eligibility_sql`.
+    """
+    def accepted(seq, allele):
+        if not normalize_sequence(seq):
+            return None
+        d = index.decide(seq, allele)
+        return d if d.decision == "accept" else None
+
+    one, two = accepted(mhc_one, mhc_one_allele), accepted(mhc_two, mhc_two_allele)
+    if one is not None and one.chain_role == "heavy":
+        return "I"
+    if one is not None and one.chain_role == "alpha":
+        return "II_complete" if two is not None and two.chain_role == "beta" else "II_partial_alpha"
+    if two is not None and two.chain_role == "beta":
+        return f"II_partial_{pair_group_of(two.mhc_class, two.loci) or UNRESOLVED_ISOTYPE}_beta"
+    return "none"
+

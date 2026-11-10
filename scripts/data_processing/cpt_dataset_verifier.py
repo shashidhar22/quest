@@ -15,7 +15,9 @@ V5. Split routing (priority routing applied correctly). Under receptor-hash-v1 t
     axes are re-derived from the source row's own CDR3 strings with
     `quest.data.split_routing.receptor_split`, so only source-matched rows are checked.
 V6. Separator and assembly (only literal <eos>, AA-only segments)
-V7. mhc_class consistency
+V7. mhc_class consistency. Under reference-aware-v1 the label is re-derived in Python from the
+    chains' reference decisions (`mhc_eligibility.row_mhc_class`), as the builder derives it;
+    under legacy-320-v0 from the allele names.
 V8. Cluster ID consistency
 V9. Split fractions in expected ranges
 V10. Benchmark isolation: under heldout-peptides-v2, EVERY peptide-bearing output row (not a
@@ -494,7 +496,8 @@ def main():
         elig_index = None
         if args.eligibility_policy == REFERENCE_AWARE_POLICY:
             sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-            from quest.data.mhc_eligibility import build_index_from_fasta, row_decision
+            from quest.data.mhc_eligibility import (
+                build_index_from_fasta, row_decision, row_mhc_class)
             ref_sha = hashlib.sha256(args.hla_reference.read_bytes()).hexdigest()
             built_sha = built.get('filter_counts', {}).get('reference_sha256')
             assert built_sha in (None, ref_sha), (
@@ -558,14 +561,18 @@ def main():
             if src is None:
                 continue
             v7_checked += 1
-            expected = derive_mhc_class(src.get('mhc_one_allele'), src.get('mhc_two_allele'))
+            if elig_index is None:
+                expected = derive_mhc_class(src.get('mhc_one_allele'), src.get('mhc_two_allele'))
+            else:
+                expected = row_mhc_class(elig_index, src.get('mhc_one'), src.get('mhc_one_allele'),
+                                         src.get('mhc_two'), src.get('mhc_two_allele'))
             if expected != r['mhc_class']:
                 v7_violations.append({
                     'hash': r['source_row_hash'],
                     'expected': expected, 'actual': r['mhc_class'],
                     'alleles': (src.get('mhc_one_allele'), src.get('mhc_two_allele')),
                 })
-        v7 = {'n_checked': v7_checked, 'violations': v7_violations[:20],
+        v7 = {'policy': args.eligibility_policy, 'n_checked': v7_checked, 'violations': v7_violations[:20],
               'n_violations': len(v7_violations),
               'status': 'PASS' if not v7_violations else 'FAIL'}
         (art_dir / 'v7_mhc_class.json').write_text(json.dumps(v7, indent=2, default=str))

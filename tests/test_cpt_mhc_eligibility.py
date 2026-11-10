@@ -279,3 +279,55 @@ def test_exact_match_to_a_partial_reference_entry_is_rejected(index):
             {"tag": "variant", "mhc_one": SEQ_SHORT_I, "mhc_one_allele": "HLA-A*11:01"}]
     assert surviving_rows(rows, index) == {"variant"}
     assert surviving_rows(rows[:1], index, policy=LEGACY_POLICY) == {"partial"}
+
+
+# ---------- the row's mhc_class label rests on the reference decision, not on the name ----------
+
+CLASS_ROWS = [
+    ({"tag": "class_i_named", "mhc_one": SEQ_SHORT_I, "mhc_one_allele": "HLA-A*11:01"}, "I"),
+    # The case the name-based label got wrong: reference-exact class I with no allele name.
+    ({"tag": "class_i_no_name", "mhc_one": SEQ_SHORT_I}, "I"),
+    ({"tag": "class_i_365_no_name", "mhc_one": SEQ_365}, "I"),
+    ({"tag": "dr_pair", "mhc_one": SEQ_II_A, "mhc_two": SEQ_II_B,
+      "mhc_one_allele": "HLA-DRA*01:01", "mhc_two_allele": "HLA-DRB1*15:01"}, "II_complete"),
+    ({"tag": "alpha_alone", "mhc_one": SEQ_II_A, "mhc_one_allele": "HLA-DRA*01:01"}, "II_partial_alpha"),
+    ({"tag": "dr_beta_alone", "mhc_two": SEQ_II_B, "mhc_two_allele": "HLA-DRB1*15:01"}, "II_partial_DR_beta"),
+    ({"tag": "dq_beta_alone", "mhc_two": SEQ_II_DQB}, "II_partial_DQ_beta"),
+    ({"tag": "no_mhc"}, "none"),
+]
+
+
+def test_mhc_class_label_comes_from_the_eligibility_decision(index):
+    from quest.data.mhc_eligibility import row_mhc_class
+    from scripts.data_processing.cpt_dataset_builder import hla_class, mhc_class_from_eligibility_sql
+    rows = [r for r, _ in CLASS_ROWS]
+    python = {r["tag"]: row_mhc_class(index, r.get("mhc_one"), r.get("mhc_one_allele"),
+                                      r.get("mhc_two"), r.get("mhc_two_allele")) for r in rows}
+    assert python == {r["tag"]: label for r, label in CLASS_ROWS}
+    assert surviving_rows(rows, index) == set(python)          # every fixture row is eligible
+    # The legacy evidence would have said otherwise for the unnamed chain.
+    assert hla_class(None) == "null"
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (tag VARCHAR, mhc_one VARCHAR, mhc_two VARCHAR, "
+                "mhc_one_allele VARCHAR, mhc_two_allele VARCHAR)")
+    con.executemany("INSERT INTO t VALUES (?, ?, ?, ?, ?)", [
+        (r["tag"], r.get("mhc_one"), r.get("mhc_two"), r.get("mhc_one_allele"), r.get("mhc_two_allele"))
+        for r in rows])
+    con.execute("CREATE TABLE elig (seq_norm VARCHAR, allele_norm VARCHAR, chain_role VARCHAR, "
+                "mhc_class VARCHAR, pair_group VARCHAR)")
+    pairs = [(r.get(s), r.get(s + "_allele")) for r in rows for s in ("mhc_one", "mhc_two")]
+    con.executemany("INSERT INTO elig VALUES (?, ?, ?, ?, ?)", [
+        (e["seq_norm"], e["allele_norm"], e["chain_role"], e["mhc_class"], e["pair_group"])
+        for e in accepted_pairs_table(index, pairs)])
+    sql = dict(con.execute(f"SELECT tag, {mhc_class_from_eligibility_sql('elig')} FROM t").fetchall())
+    assert sql == python
+
+
+def test_a_name_cannot_assign_a_class_the_sequence_does_not_have(index):
+    """A class-I chain carrying a class-II name is quarantined, so it is labelled 'none' and never
+    'II': the label can only repeat what the reference decided."""
+    from quest.data.mhc_eligibility import row_mhc_class
+    assert row_mhc_class(index, SEQ_SHORT_I, "HLA-DRB1*15:01", None, None) == "none"
+    assert row_mhc_class(index, SEQ_UNSUPPORTED, "HLA-A*02:01", None, None) == "none"
+
