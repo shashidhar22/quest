@@ -203,6 +203,17 @@ def test_a_duplicated_source_row_still_yields_one_row():
     assert con.execute("SELECT COUNT(*) FROM staging_raw").fetchone()[0] == len(want)
 
 
+def test_background_takes_each_receptor_once():
+    rows = source_rows()
+    version, want = expected(rows)
+    again = [dict(r, trb_full="MEXTRA" + r["trb_cdr3"]) for r in rows if r["subset_key"] == "trb"]
+    con = connect(rows + again + again[:50])            # every beta receptor two or three times
+    stats = run(con, version)
+    assert staged(con) == want
+    n, d = con.execute("SELECT COUNT(*), COUNT(DISTINCT trb_cdr3) FROM staging_raw WHERE subset_key = 'trb'").fetchone()
+    assert n == d > 0 and stats["background_rows_sharing_a_receptor"] == {"tra": 0, "trb": 0}
+
+
 @pytest.mark.parametrize("field", ["examples_available", "examples_available_under_cap"])
 def test_refuses_a_contract_sized_on_a_different_supply(field):
     rows = source_rows()

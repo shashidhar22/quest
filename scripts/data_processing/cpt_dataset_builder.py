@@ -577,7 +577,8 @@ def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: 
 
     `src` is the source table expression, `where` the builder's filter clause, `peptide_lookup`
     a table expression with (mol, cluster_id, split). One row per selected example, one order
-    variant; background rows are single-receptor rows, the lowest seeded keys per split.
+    variant; background rows are single-receptor rows, one per receptor, the lowest seeded keys
+    per split.
     """
     assert where.strip().startswith('WHERE'), where[:40]
     cols = ', '.join(src_cols)
@@ -664,14 +665,21 @@ def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: 
         sk = t['background']
         axis = next(a for a in RECEPTOR_AXES if a.startswith(sk))
         before = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0]
+        # One row per receptor: under a CDR3 serialization two rows of one receptor are the same
+        # text. Rows sharing a CDR3 are adjacent in (bk, rk) order, so reading a margin past the
+        # target and keeping each receptor's first row gives the N lowest distinct receptors.
+        margin = t['target_rows'] + t['target_rows'] // 10 + 1000
         con.execute(f"""INSERT INTO staging_raw
             SELECT {cols}, subset_key, order_key FROM (
-              SELECT {cols}, subset_key, order_key, {text} AS input_text,
-                {receptor_split_sql('k.' + axis, axis, seed)} AS split,
-                {background_key_sql(seed, axis, 'k.' + axis)} AS bk, {row_key} AS rk
-              FROM (SELECT {typed} FROM {src} {where} AND CAST(subset_key AS VARCHAR) = '{sk}') k)
-            WHERE split = '{t['split']}' AND coalesce(input_text, '') <> ''
-            ORDER BY bk, rk LIMIT {t['target_rows']}""")
+              SELECT *, row_number() OVER (PARTITION BY {axis} ORDER BY rk) AS dup FROM (
+                SELECT {cols}, subset_key, order_key, bk, rk FROM (
+                  SELECT {cols}, subset_key, order_key, {text} AS input_text,
+                    {receptor_split_sql('k.' + axis, axis, seed)} AS split,
+                    {background_key_sql(seed, axis, 'k.' + axis)} AS bk, {row_key} AS rk
+                  FROM (SELECT {typed} FROM {src} {where} AND CAST(subset_key AS VARCHAR) = '{sk}') k)
+                WHERE split = '{t['split']}' AND coalesce(input_text, '') <> ''
+                ORDER BY bk, rk LIMIT {margin}))
+            WHERE dup = 1 ORDER BY bk LIMIT {t['target_rows']}""")
         got = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0] - before
         if got != t['target_rows']:
             raise ContractNotMet(f"{t['stratum']}/{t['split']}: the source supplies {got:,} single-receptor "
