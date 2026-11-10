@@ -399,3 +399,27 @@ Corpus eligibility repair, off-box, all on the laptop:
 246 tests pass locally (DuckDB installed to a scratch dir; `tests/test_cpt_mhc_eligibility.py`
 skips silently without it). No EC2 start, no build, no training. Step 9 is in progress and its
 candidate sizing is defective — see ACS `quest-cpt/audits/2026-11-09/repair/contract/README.md`.
+
+## 2026-11-09 — review of the day's changes; step-9 sizing corrected
+
+Reviewed every script changed today in both repos. No defect found in the committed eligibility,
+isolation, routing, builder or verifier code; the defects were in the unfinished step-9 sizing
+(ACS `quest-cpt/audits/2026-11-09/repair/contract/`).
+
+- Sizing: held-out splits were stamped with a residue budget of 1/8 of training's and exceeded it
+  by 0.02-0.24%, which is why the checker ended in FAIL. The budget now binds training only.
+- Sizing crashed on DuckDB 1.5.2: `QUALIFY row_number() <= n` is rewritten to a top-N aggregate
+  that refuses n >= 1,000,000, exactly the peptide-only target. Now `ORDER BY ... LIMIT`; output
+  is byte-identical on 1.5.2 and 2.0.
+- Checker: its hash check never read the cache's own hashes, and its held-out check skipped
+  missing strata and background rows. Both closed; against the old NULL-skipping cache it fails.
+- `track_a/esm_sft/diagnostic_data.py`: the class-I name pattern matched `MICA*` / `DMB*`. No row
+  in the five benchmark splits is affected.
+- 201 sizing checks pass; 202 tests pass with `~/.venvs/quest-cpt` (it has DuckDB, esm,
+  transformers — no scratch install needed).
+
+Left as found, low impact: `four_digit` drops the expression suffix of long allele names (reported
+identity only); the class lookup join would duplicate rows if two spellings of one chain
+normalized alike (none today: 9,444 raw pairs, 9,444 normalized); verifier V2 accepts a manifest
+with no reference hash.
+
