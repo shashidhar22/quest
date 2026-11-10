@@ -19,6 +19,8 @@ DuckDB's hash(), whose values are not promised stable across versions.
 from __future__ import annotations
 
 import hashlib
+import json
+from pathlib import Path
 
 STRATA = (
     "s1_paired_tcr_peptide_classI",
@@ -155,3 +157,103 @@ def choose_order_variant(seed: int, ex_hash: str, order_keys) -> str:
     if not order_keys:
         raise ValueError("an example has no order variant")
     return min(order_keys, key=lambda ok: _md5(f"{int(seed)}|{ex_hash}|{ok}"))
+
+
+# ---------- the contract file ----------
+
+CONTRACT_NAME = "cpt-sampling-contract-v1"
+SPLITS = ("train", "val", "test")
+ROW_SAMPLED, EXAMPLE_SAMPLED = "rows per partition", "examples per stratum"
+
+
+def load_contract_version(path, version: str) -> tuple[dict, dict, str]:
+    """Read a sampling contract. Returns (contract, the named version, sha256 of the file)."""
+    raw = Path(path).read_bytes()
+    contract = json.loads(raw)
+    if contract.get("contract") != CONTRACT_NAME:
+        raise ValueError(f"{path} is not a {CONTRACT_NAME} file")
+    versions = contract.get("versions", {})
+    if version not in versions:
+        raise ValueError(f"{path} has no version {version!r}; it has {sorted(versions)}")
+    return contract, versions[version], hashlib.sha256(raw).hexdigest()
+
+
+def version_kind(version: dict) -> str:
+    """Whether a contract version fixes rows per partition (run05's sampling) or examples per stratum."""
+    if "target_rows_by_partition" in version:
+        return ROW_SAMPLED
+    if "splits" in version:
+        return EXAMPLE_SAMPLED
+    raise ValueError("contract version has neither partition targets nor per-split strata")
+
+
+def contract_mismatches(contract: dict, **build) -> list[str]:
+    """Every way the build's own settings differ from what the contract was sized under.
+
+    A contract's numbers hold only for the universe it was counted on, so the builder refuses
+    on any entry here instead of sampling a different universe to the same targets. `build`
+    must name every key below; a setting the caller forgot is a mismatch, not a pass.
+    """
+    p = contract["policies"]
+    want = {
+        "eligibility_policy": p["eligibility"]["policy"],
+        "reference_sha256": p["eligibility"]["hla_reference_sha256"],
+        "partial_chain_fraction": p["eligibility"]["partial_chain_fraction"],
+        "exclusion_policy": p["benchmark_exclusion"]["policy"],
+        "exclusion_list_sha256": p["benchmark_exclusion"]["list_sha256"],
+        "min_edit_distance": p["benchmark_exclusion"]["min_edit_distance"],
+        "routing_policy": p["split_routing"]["policy"],
+        "seed": p["split_routing"]["seed"],
+        "serialization": p["serialization"],
+    }
+    extra = set(build) - set(want)
+    if extra:
+        raise TypeError(f"unknown build settings: {sorted(extra)}")
+    return [f"{k}: contract {v!r}, build {build.get(k)!r}" for k, v in want.items() if build.get(k) != v]
+
+
+def serialization_name(tcr_variant: str, mhc_variant: str) -> str:
+    return f"{tcr_variant} x {mhc_variant}"
+
+
+def partition_targets(version: dict) -> dict:
+    """{(subset_key, order_key): rows} of a row-sampled version."""
+    return {tuple(k.split("|")): int(n) for k, n in version["target_rows_by_partition"].items()}
+
+
+def stratum_targets(version: dict) -> list[dict]:
+    """One entry per (split, stratum) of an example-sampled version, in a fixed order.
+
+    Non-background entries carry the rule's cap, the exact example target and the supply the
+    contract was sized on; background entries carry the row target and their subset_key.
+    """
+    out = []
+    for split in SPLITS:
+        strata = version["splits"][split]["by_stratum"]
+        unknown = set(strata) - set(STRATA) - set(BACKGROUND_STRATA)
+        if unknown:
+            raise ValueError(f"contract names unknown strata in {split}: {sorted(unknown)}")
+        for name in sorted(strata):
+            v = strata[name]
+            if name in BACKGROUND_STRATA:
+                out.append({"split": split, "stratum": name, "background": BACKGROUND_STRATA[name],
+                            "target_rows": int(v["target_rows"])})
+                continue
+            cap, _n = rule_cap_and_count(v["rule"])
+            out.append({"split": split, "stratum": name, "background": None, "cap": cap,
+                        "target_examples": int(v["target_examples"]),
+                        "examples_available": int(v["examples_available"]),
+                        "examples_available_under_cap": int(v["examples_available_under_cap"])})
+    return out
+
+
+def background_key_sql(seed: int, axis: str, cdr3: str) -> str:
+    """Sort key for background rows: the N lowest per split are kept. Same hash family as the
+    receptor's routing vote, with its own prefix so that the two are independent."""
+    return f"md5(concat('{int(seed)}|background|{axis}|', {cdr3}))"
+
+
+def background_key(seed: int, axis: str, cdr3: str) -> str:
+    """Python twin of `background_key_sql`."""
+    return _md5(f"{int(seed)}|background|{axis}|{cdr3}")
+

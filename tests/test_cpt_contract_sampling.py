@@ -28,6 +28,17 @@ from quest.data.contract_sampling import (  # noqa: E402
     selection_sql,
     stratum_of,
     stratum_sql,
+    CONTRACT_NAME,
+    EXAMPLE_SAMPLED,
+    ROW_SAMPLED,
+    background_key,
+    background_key_sql,
+    contract_mismatches,
+    load_contract_version,
+    partition_targets,
+    serialization_name,
+    stratum_targets,
+    version_kind,
 )
 
 
@@ -190,3 +201,91 @@ def test_order_variant_sql_and_python_agree():
 
 def test_the_no_peptide_sentinel_cannot_be_a_peptide():
     assert not NO_PEPTIDE.isalpha()
+
+
+# ---------- the contract file ----------
+
+def _contract():
+    stratum = {"target_examples": 3, "target_rows": 3, "rule": {"cap_per_peptide": 2},
+               "examples_available": 9, "examples_available_under_cap": 4}
+    bg = {"target_rows": 5, "expected_supply_rows": 50, "rule": {"fill": "x"}}
+    split = {"by_stratum": {"s7_tcr_peptide_no_mhc": stratum, "background_single_beta_chain": bg}}
+    return {
+        "contract": CONTRACT_NAME,
+        "policies": {
+            "eligibility": {"policy": "reference-aware-v1", "hla_reference_sha256": "aa", "partial_chain_fraction": 0.97},
+            "benchmark_exclusion": {"policy": "heldout-peptides-v2", "min_edit_distance": 2, "list_sha256": "bb"},
+            "split_routing": {"policy": "receptor-hash-v2", "seed": 42},
+            "serialization": "cdr3 x full"},
+        "versions": {"rows": {"target_rows_by_partition": {"trb|trb": 7, "tra_trb|trb_tra": 2}},
+                     "examples": {"splits": {s: split for s in ("train", "val", "test")}}},
+    }
+
+
+BUILD = dict(eligibility_policy="reference-aware-v1", reference_sha256="aa", partial_chain_fraction=0.97,
+             exclusion_policy="heldout-peptides-v2", exclusion_list_sha256="bb", min_edit_distance=2,
+             routing_policy="receptor-hash-v2", seed=42, serialization="cdr3 x full")
+
+
+def test_a_build_under_the_contracts_own_settings_has_no_mismatch():
+    assert contract_mismatches(_contract(), **BUILD) == []
+    assert serialization_name("cdr3", "full") == "cdr3 x full"
+
+
+@pytest.mark.parametrize("key, other", [
+    ("eligibility_policy", "legacy-320-v0"), ("reference_sha256", "cc"), ("partial_chain_fraction", 0.95),
+    ("exclusion_policy", "none"), ("exclusion_list_sha256", None), ("min_edit_distance", 1),
+    ("routing_policy", "receptor-hash-v1"), ("seed", 7), ("serialization", "full x full")])
+def test_every_setting_that_differs_from_the_contract_is_reported(key, other):
+    got = contract_mismatches(_contract(), **{**BUILD, key: other})
+    assert len(got) == 1 and got[0].startswith(key)
+
+
+def test_a_setting_the_caller_forgot_is_a_mismatch_not_a_pass():
+    build = {k: v for k, v in BUILD.items() if k != "exclusion_list_sha256"}
+    assert len(contract_mismatches(_contract(), **build)) == 1
+    with pytest.raises(TypeError):
+        contract_mismatches(_contract(), **BUILD, colour="blue")
+
+
+def test_loading_refuses_other_files_and_unknown_versions(tmp_path):
+    import json
+    good = tmp_path / "c.json"
+    good.write_text(json.dumps(_contract()))
+    contract, version, sha = load_contract_version(good, "rows")
+    assert version_kind(version) == ROW_SAMPLED and len(sha) == 64
+    assert version_kind(load_contract_version(good, "examples")[1]) == EXAMPLE_SAMPLED
+    assert partition_targets(version) == {("trb", "trb"): 7, ("tra_trb", "trb_tra"): 2}
+    with pytest.raises(ValueError):
+        load_contract_version(good, "missing")
+    bad = tmp_path / "other.json"
+    bad.write_text(json.dumps({"contract": "something-else", "versions": {"rows": {}}}))
+    with pytest.raises(ValueError):
+        load_contract_version(bad, "rows")
+    with pytest.raises(ValueError):
+        version_kind({})
+
+
+def test_stratum_targets_cover_every_split_and_refuse_unknown_strata():
+    targets = stratum_targets(_contract()["versions"]["examples"])
+    assert [(t["split"], t["stratum"]) for t in targets] == [
+        (s, n) for s in ("train", "val", "test") for n in ("background_single_beta_chain", "s7_tcr_peptide_no_mhc")]
+    bg, st = targets[0], targets[1]
+    assert bg["background"] == "trb" and bg["target_rows"] == 5
+    assert (st["cap"], st["target_examples"], st["examples_available_under_cap"]) == (2, 3, 4)
+    broken = _contract()["versions"]["examples"]
+    broken["splits"]["val"] = {"by_stratum": {"s10_invented": {}}}
+    with pytest.raises(ValueError):
+        stratum_targets(broken)
+
+
+def test_background_key_sql_and_python_agree_and_differ_from_the_routing_vote():
+    con = _con()
+    cdr3s = [f"CASS{i}F" for i in range(200)]
+    con.execute("CREATE TABLE b (cdr3 VARCHAR)")
+    con.executemany("INSERT INTO b VALUES (?)", [(c,) for c in cdr3s])
+    got = dict(con.execute(f"SELECT cdr3, {background_key_sql(42, 'trb_cdr3', 'cdr3')} FROM b").fetchall())
+    assert got == {c: background_key(42, "trb_cdr3", c) for c in cdr3s}
+    assert background_key(42, "trb_cdr3", "CASSF") != background_key(42, "tra_cdr3", "CASSF")
+    assert background_key(42, "trb_cdr3", "CASSF") != background_key(43, "trb_cdr3", "CASSF")
+

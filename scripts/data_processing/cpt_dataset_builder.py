@@ -47,12 +47,30 @@ from quest.data.benchmark_exclusion import (  # noqa: E402
     normalize_peptide_sql,
 )
 from quest.data.split_routing import (  # noqa: E402
+    RECEPTOR_AXES,
     ROUTING_POLICIES,
     axis_vote_sql,
+    receptor_split_sql,
+)
+from quest.data.contract_sampling import (  # noqa: E402
+    EXAMPLE_SAMPLED,
+    background_key_sql,
+    contract_mismatches,
+    example_hash_sql,
+    load_contract_version,
+    order_variant_key_sql,
+    partition_targets,
+    peptide_rank_sql,
+    selection_sql,
+    serialization_name,
+    stratum_sql,
+    stratum_targets,
+    version_kind,
 )
 from quest.data.mhc_eligibility import (  # noqa: E402
     MHC_ONE_ROLES,
     MHC_TWO_ROLES,
+    PARTIAL_FRACTION,
     UNRESOLVED_ISOTYPE,
     accepted_pairs_table,
     build_index_from_fasta,
@@ -534,13 +552,153 @@ def compute_targets(partition_counts: dict, mode: str, scale: int) -> dict:
     raise ValueError(f'unknown mode: {mode}')
 
 
+# ---------- example-level sampling to a contract ----------
+
+SINGLE_RECEPTOR_SUBSETS = ('tra', 'trb')
+CONTRACT_DISTRIBUTION = 'contract'
+
+
+class ContractNotMet(RuntimeError):
+    """The source cannot supply what the sampling contract fixes. Never worked around."""
+
+
+def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: str,
+                               peptide_lookup: str, version: dict, routing: str, seed: int,
+                               tcr_variant: str, mhc_variant: str, src_cols: list,
+                               log=lambda msg: None) -> dict:
+    """Insert into `staging_raw` exactly the rows an example-sampled contract version fixes.
+
+    The definitions (stratum, example hash, cap-then-count, order variant, background key) are
+    `quest.data.contract_sampling`'s, shared with the scripts that sized the contract. Order of
+    operations: eligibility and isolation (`where`), routing, then selection, because the
+    contract's targets are per split. Raises ContractNotMet rather than insert a different
+    count: when the supply differs from what the contract was sized on, when a target cannot be
+    met, or when an example hash is not unique.
+
+    `src` is the source table expression, `where` the builder's filter clause, `peptide_lookup`
+    a table expression with (mol, cluster_id, split). One row per selected example, one order
+    variant; background rows are single-receptor rows, the lowest seeded keys per split.
+    """
+    assert where.strip().startswith('WHERE'), where[:40]
+    cols = ', '.join(src_cols)
+    vote = axis_vote_sql(routing, seed)
+    text = build_input_text_sql(tcr_variant, mhc_variant)
+    row_key = "md5(concat_ws('|', " + ', '.join(f"coalesce({c}, '')" for c in src_cols) + '))'
+    none = '(SELECT NULL::VARCHAR AS mol, NULL::BIGINT AS cluster_id, NULL::VARCHAR AS split WHERE false)'
+    typed = "* REPLACE (CAST(subset_key AS VARCHAR) AS subset_key, CAST(order_key AS VARCHAR) AS order_key)"
+    singles = ', '.join(f"'{s}'" for s in SINGLE_RECEPTOR_SUBSETS)
+
+    # Every eligible, isolated, routable row that is not a single receptor, with its stratum,
+    # split and example hash. Rows with no text under this serialization are not examples.
+    tagged = f"""
+      SELECT * FROM (
+        SELECT {cols}, subset_key, order_key, pep_n,
+          CASE WHEN s_trb='test' OR s_tra='test' OR s_pep='test' OR s_m1='test' OR s_m2='test' THEN 'test'
+               WHEN s_trb='val' OR s_tra='val' OR s_pep='val' OR s_m1='val' OR s_m2='val' THEN 'val'
+               ELSE 'train' END AS split,
+          {stratum_sql(mhc_class='e_class', classical='e_classical', peptide='pep_n',
+                       tra='tra_cdr3', trb='trb_cdr3', mhc_two='mhc_two')} AS stratum,
+          {example_hash_sql(peptide='pep_n')} AS ex_hash, input_text
+        FROM (
+          SELECT {', '.join('k.' + c for c in src_cols)}, k.subset_key, k.order_key,
+            NULLIF(k.peptide, '') AS pep_n, c.mhc_class AS e_class, c.classical AS e_classical,
+            {vote['s_trb']} AS s_trb, {vote['s_tra']} AS s_tra, {vote['s_pep']} AS s_pep,
+            {vote['s_m1']} AS s_m1, {vote['s_m2']} AS s_m2,
+            {text} AS input_text
+          FROM (SELECT {typed} FROM {src} {where}
+                  AND CAST(subset_key AS VARCHAR) NOT IN ({singles})) k
+          LEFT JOIN {none} jtrb ON false LEFT JOIN {none} jtra ON false
+          LEFT JOIN {peptide_lookup} jpep ON k.peptide = jpep.mol
+          LEFT JOIN {none} jm1 ON false LEFT JOIN {none} jm2 ON false
+          LEFT JOIN {eligibility_table} c ON c.seq_norm = {normalize_sequence_sql('k.mhc_one')}
+                 AND c.allele_norm = coalesce({normalize_sequence_sql('k.mhc_one_allele')}, '')))
+      WHERE coalesce(input_text, '') <> ''"""
+
+    con.execute(f"""CREATE OR REPLACE TEMP TABLE contract_ex AS
+        SELECT stratum, split, pep_n AS peptide, ex_hash, COUNT(*) AS order_variants,
+               arg_min(order_key, {order_variant_key_sql(seed)}) AS chosen_order
+        FROM ({tagged}) GROUP BY stratum, split, pep_n, ex_hash""")
+    n_ex, n_hash = con.execute('SELECT COUNT(*), COUNT(DISTINCT ex_hash) FROM contract_ex').fetchone()
+    if n_ex != n_hash:
+        raise ContractNotMet(f'example hash is not unique: {n_ex:,} examples, {n_hash:,} hashes '
+                             '(one example in two strata or splits)')
+    log(f'  contract: {n_ex:,} distinct examples in the eligible universe')
+    con.execute(f'CREATE OR REPLACE TEMP TABLE contract_ranked AS '
+                f'SELECT *, {peptide_rank_sql()} AS rn_pep FROM contract_ex')
+    con.execute('CREATE OR REPLACE TEMP TABLE contract_selected '
+                '(ex_hash VARCHAR, chosen_order VARCHAR, stratum VARCHAR, split VARCHAR)')
+
+    targets = stratum_targets(version)
+    achieved = {}
+    for t in (t for t in targets if t['background'] is None):
+        key = [t['stratum'], t['split']]
+        total = con.execute('SELECT COUNT(*) FROM contract_ranked WHERE stratum = ? AND split = ?', key).fetchone()[0]
+        under_cap = con.execute(f"SELECT COUNT(*) FROM ({selection_sql('contract_ranked', t['cap'], None)})",
+                                key).fetchone()[0]
+        if (total, under_cap) != (t['examples_available'], t['examples_available_under_cap']):
+            raise ContractNotMet(
+                f"{t['stratum']}/{t['split']}: the source holds {total:,} examples ({under_cap:,} under the "
+                f"cap); the contract was sized on {t['examples_available']:,} ({t['examples_available_under_cap']:,})")
+        con.execute(f"""INSERT INTO contract_selected SELECT ex_hash, chosen_order, stratum, split
+                        FROM ({selection_sql('contract_ranked', t['cap'], t['target_examples'])})""", key)
+        got = con.execute('SELECT COUNT(*) FROM contract_selected WHERE stratum = ? AND split = ?', key).fetchone()[0]
+        if got != t['target_examples']:
+            raise ContractNotMet(f"{t['stratum']}/{t['split']}: selected {got:,}, target {t['target_examples']:,}")
+        achieved[f"{t['split']}/{t['stratum']}"] = got
+
+    # One source row per selected example: its chosen order variant, and the lowest content key
+    # if the source holds that variant more than once.
+    con.execute(f"""INSERT INTO staging_raw
+        SELECT {cols}, subset_key, order_key FROM (
+          SELECT r.*, row_number() OVER (PARTITION BY r.ex_hash ORDER BY {row_key}) AS rk
+          FROM ({tagged}) r JOIN contract_selected s
+            ON s.ex_hash = r.ex_hash AND s.chosen_order = r.order_key)
+        WHERE rk = 1""")
+    n_rows = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0]
+    if n_rows != sum(achieved.values()):
+        raise ContractNotMet(f'{n_rows:,} rows inserted for {sum(achieved.values()):,} selected examples')
+    log(f'  contract: {n_rows:,} example rows selected')
+
+    duplicate_receptors = {}
+    for t in (t for t in targets if t['background'] is not None):
+        sk = t['background']
+        axis = next(a for a in RECEPTOR_AXES if a.startswith(sk))
+        before = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0]
+        con.execute(f"""INSERT INTO staging_raw
+            SELECT {cols}, subset_key, order_key FROM (
+              SELECT {cols}, subset_key, order_key, {text} AS input_text,
+                {receptor_split_sql('k.' + axis, axis, seed)} AS split,
+                {background_key_sql(seed, axis, 'k.' + axis)} AS bk, {row_key} AS rk
+              FROM (SELECT {typed} FROM {src} {where} AND CAST(subset_key AS VARCHAR) = '{sk}') k)
+            WHERE split = '{t['split']}' AND coalesce(input_text, '') <> ''
+            ORDER BY bk, rk LIMIT {t['target_rows']}""")
+        got = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0] - before
+        if got != t['target_rows']:
+            raise ContractNotMet(f"{t['stratum']}/{t['split']}: the source supplies {got:,} single-receptor "
+                                 f"rows, target {t['target_rows']:,}")
+        achieved[f"{t['split']}/{t['stratum']}"] = got
+        log(f"  contract: {t['stratum']}/{t['split']} {got:,} rows")
+    for sk in SINGLE_RECEPTOR_SUBSETS:
+        axis = next(a for a in RECEPTOR_AXES if a.startswith(sk))
+        n, d = con.execute(f"SELECT COUNT(*), COUNT(DISTINCT {axis}) FROM staging_raw WHERE subset_key = '{sk}'").fetchone()
+        duplicate_receptors[sk] = n - d
+    return {'achieved': achieved, 'distinct_examples_in_universe': n_ex,
+            'background_rows_sharing_a_receptor': duplicate_receptors}
+
+
 # ---------- main builder ----------
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--tcr-variant', choices=['cdr3', 'cdr123', 'full'], required=True)
     ap.add_argument('--mhc-variant', choices=['pocket', 'pocket_contact', 'full'], required=True)
-    ap.add_argument('--distribution', choices=['proportional', 'balanced'], required=True)
+    ap.add_argument('--distribution', choices=['proportional', 'balanced', CONTRACT_DISTRIBUTION], required=True,
+                    help='contract samples biological examples per stratum to an example-sampled '
+                         '--sampling-contract version; proportional and balanced sample rows per partition')
+    ap.add_argument('--sampling-contract', type=Path, default=None,
+                    help='cpt-sampling-contract-v1 file. Required for --distribution contract. With '
+                         'proportional it is checked: the computed targets must equal the contract\'s')
+    ap.add_argument('--contract-version', default=None, help='which version of --sampling-contract to build')
     ap.add_argument('--scale', type=int, required=True)
     ap.add_argument('--output-dir', type=Path, required=True)
     ap.add_argument('--eligibility-policy', choices=list(POLICIES), required=True,
@@ -601,6 +759,7 @@ def main():
         src = f"read_parquet('{source_root}/**/*.parquet', hive_partitioning=1)"
 
         # ---------- Step 0a: benchmark isolation ----------
+        excl_sha, excl_info, ref_sha = None, {}, None
         excl_table = None
         exclusion_manifest = 'NOT_APPLIED'
         log(f'benchmark exclusion: {args.benchmark_exclusion}', run_id=run_id)
@@ -716,6 +875,36 @@ def main():
                 raise SystemExit('no MHC chain passed eligibility; refusing to build a corpus '
                                  'with zero validated MHC exposure')
 
+        # ---------- Step 0b: sampling contract ----------
+        contract_version = contract_manifest = None
+        if args.sampling_contract:
+            contract, contract_version, contract_sha = load_contract_version(
+                args.sampling_contract, args.contract_version)
+            by_example = version_kind(contract_version) == EXAMPLE_SAMPLED
+            if by_example != (args.distribution == CONTRACT_DISTRIBUTION):
+                raise SystemExit(f'contract version {args.contract_version!r} fixes '
+                                 f'{version_kind(contract_version)}; --distribution {args.distribution} '
+                                 'cannot build it')
+            if not by_example and args.distribution != 'proportional':
+                raise SystemExit('a row-sampled contract version is built with --distribution proportional')
+            mismatches = contract_mismatches(
+                contract, eligibility_policy=policy, reference_sha256=ref_sha,
+                partial_chain_fraction=PARTIAL_FRACTION if policy == REFERENCE_AWARE_POLICY else None,
+                exclusion_policy=args.benchmark_exclusion, exclusion_list_sha256=excl_sha,
+                min_edit_distance=excl_info.get('min_edit_distance'),
+                routing_policy=args.split_routing, seed=args.seed,
+                serialization=serialization_name(args.tcr_variant, args.mhc_variant))
+            if mismatches:
+                raise SystemExit('refusing to build: this build is not the one the contract was sized '
+                                 'for.\n  ' + '\n  '.join(mismatches))
+            contract_manifest = {'file': str(args.sampling_contract), 'sha256': contract_sha,
+                                 'contract': contract['contract'], 'version': args.contract_version,
+                                 'kind': version_kind(contract_version)}
+            log(f'sampling contract: {args.contract_version} ({contract_sha[:12]})', run_id=run_id)
+        elif args.distribution == CONTRACT_DISTRIBUTION:
+            raise SystemExit('--sampling-contract and --contract-version are required for '
+                             f'--distribution {CONTRACT_DISTRIBUTION}')
+
         # ---------- Step 1: filter counts (F1-F6) ----------
         if policy == LEGACY_POLICY:
             log('STEP 1: filter counts', run_id=run_id)
@@ -770,7 +959,21 @@ def main():
 
         # ---------- Step 3: compute partition targets ----------
         log('STEP 3: compute partition targets', run_id=run_id)
-        targets = compute_targets(partition_counts, args.distribution, args.scale)
+        if args.distribution == CONTRACT_DISTRIBUTION:
+            # Targets are per stratum and split, not per partition. The per-partition table is
+            # filled in afterwards with what the selection realized.
+            targets = {k: 0 for k in partition_counts}
+            contract_total = sum(t.get('target_examples', t.get('target_rows'))
+                                 for t in stratum_targets(contract_version))
+            if args.scale != contract_total:
+                raise SystemExit(f'--scale must be the contract total, {contract_total}')
+        else:
+            targets = compute_targets(partition_counts, args.distribution, args.scale)
+            if contract_version is not None and targets != partition_targets(contract_version):
+                want = partition_targets(contract_version)
+                diff = sorted(k for k in set(targets) | set(want) if targets.get(k) != want.get(k))
+                raise SystemExit(f'refusing to build: {len(diff)} partition target(s) differ from the '
+                                 f'contract, e.g. {[(k, targets.get(k), want.get(k)) for k in diff[:3]]}')
         target_sum = sum(targets.values())
         log(f'  target sum: {target_sum:,} (expected {args.scale:,})', run_id=run_id)
 
@@ -784,12 +987,14 @@ def main():
         if capped_partitions:
             log(f'  capped {len(capped_partitions)} partitions at availability', run_id=run_id)
 
-        # write partition_targets.csv
-        with open(art_dir / 'partition_targets.csv', 'w', newline='') as f:
-            w = csv.writer(f)
-            w.writerow(['subset_key', 'order_key', 'n_post_filter', 'target_n'])
-            for (sk, ok), n in sorted(partition_counts.items()):
-                w.writerow([sk, ok, n, targets[(sk, ok)]])
+        def write_partition_targets():
+            with open(art_dir / 'partition_targets.csv', 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['subset_key', 'order_key', 'n_post_filter', 'target_n'])
+                for (sk, ok), n in sorted(partition_counts.items()):
+                    w.writerow([sk, ok, n, targets[(sk, ok)]])
+
+        write_partition_targets()
 
         # ---------- Step 4: per-partition deterministic sampling ----------
         # Strategy:
@@ -926,8 +1131,29 @@ def main():
         log(f'  step 4 done: {n_sampled_partitions} partitions sampled in '
             f'{time.time()-t_sample_total:.1f}s', run_id=run_id)
 
+        contract_stats = None
+        if args.distribution == CONTRACT_DISTRIBUTION:
+            log('STEP 4 (contract): example-level selection', run_id=run_id)
+            t_c = time.time()
+            contract_stats = fill_staging_from_contract(
+                con, src=src, where=partition_where, eligibility_table=elig_table,
+                peptide_lookup=(f"(SELECT c.peptide AS mol, c.cluster_id, s.split "
+                                f"FROM read_parquet('{clusters_dir / 'peptide_clusters.parquet'}') c "
+                                f"JOIN read_parquet('{split_dir / 'peptide_split_assignment.parquet'}') s "
+                                f"USING (cluster_id))"),
+                version=contract_version, routing=args.split_routing, seed=seed,
+                tcr_variant=args.tcr_variant, mhc_variant=args.mhc_variant, src_cols=src_cols,
+                log=lambda m: log(m, run_id=run_id))
+            for sk, ok, n in con.execute(
+                    'SELECT subset_key, order_key, COUNT(*) FROM staging_raw GROUP BY 1, 2').fetchall():
+                targets[(sk, ok)] = n
+            write_partition_targets()
+            log(f'  contract selection done in {time.time()-t_c:.1f}s', run_id=run_id)
+
         n_raw = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0]
         log(f'  staging_raw: {n_raw:,} rows', run_id=run_id)
+        if contract_stats is not None and n_raw != args.scale:
+            raise ContractNotMet(f'staging_raw has {n_raw:,} rows, the contract fixes {args.scale:,}')
         # Tolerance: 0.3 % of scale (min 100). Bernoulli sampling variance on
         # the trb partition (~6.7 M target out of 1.38 B for Balanced runs)
         # contributes ~sqrt(N*p*(1-p)) ≈ 2.6 K of variance; small partitions
@@ -1079,6 +1305,8 @@ def main():
         # ---------- Step 6: drop empty input_text + collect summary stats ----------
         n_empty = con.execute("SELECT COUNT(*) FROM staging WHERE input_text IS NULL OR input_text = ''").fetchone()[0]
         log(f'  empty input_text rows to drop: {n_empty}', run_id=run_id)
+        if n_empty > 0 and contract_stats is not None:
+            raise ContractNotMet(f'{n_empty} selected rows have no text; a contract build drops nothing')
         if n_empty > 0:
             con.execute("DELETE FROM staging WHERE input_text IS NULL OR input_text = ''")
 
@@ -1203,6 +1431,12 @@ def main():
         log(f'  reloaded: train={len(reloaded["train"]):,} '
             f'val={len(reloaded["validation"]):,} test={len(reloaded["test"]):,} '
             f'total={total_loaded:,}', run_id=run_id)
+        if contract_stats is not None:
+            for name, ds_name in (('train', 'train'), ('val', 'validation'), ('test', 'test')):
+                want = contract_version['splits'][name]['target_rows_total']
+                if len(reloaded[ds_name]) != want:
+                    raise ContractNotMet(f'{ds_name} has {len(reloaded[ds_name]):,} rows, the contract '
+                                         f'fixes {want:,}')
         tolerance = max(100, args.scale // 200)
         if abs(total_loaded - args.scale) > tolerance:
             raise RuntimeError(
@@ -1259,6 +1493,9 @@ def main():
             },
             'eligibility_policy': policy,
             'split_routing': args.split_routing,
+            # None when the build was not checked against, or sampled to, a contract.
+            'sampling_contract': (None if contract_manifest is None
+                                  else {**contract_manifest, **(contract_stats or {})}),
             # F1-F6 exist only under the legacy policy; reference-aware reports per-pair decisions.
             'filter_counts': {
                 'F1': int(filter_row['F1']),
