@@ -5,6 +5,13 @@ Opened 2026-11-10. Not a stage. The contract is frozen in ACS
 the step text and its amendments are in `corpus-repair-plan.md` beside it. Lightweight plan; no
 box until step 6 below.
 
+## Status 2026-11-10
+
+Steps 1-5 done; step 6 done on the laptop, box half open; step 7 done (independent verifier and
+Codex review, eight gaps found and fixed). Results: ACS `repair-status.md`, "Step 10, laptop
+half". The first build exposed an error in the contract's residue budget; the contract is now
+revision 2. Remaining: the box build against the real single-receptor partitions.
+
 ## Goal
 
 A builder that produces either contract version from the same inputs and refuses when it cannot

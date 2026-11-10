@@ -439,3 +439,33 @@ held-out splits by counts with no residue budget. Written to ACS
 No code in this repo changed. Open: the builder cannot sample by example, `mhc_class` is still
 name-based, the background row rule is unfixed, and the counts for strata 3-9 are a proposal.
 
+## 2026-11-10 — step 10, laptop half: the builder samples to the contract; contract revision 2
+
+Plan `plans/step10-contract-build.md`. Commits `779b059`..`483a429`.
+
+- `quest/data/contract_sampling.py`: one definition of strata, example hash, cap-then-count
+  selection, order variant and background key, SQL with Python twins; the ACS sizing scripts
+  import it (output byte-identical).
+- Builder: `--distribution contract`, contract check under `proportional`, path arguments,
+  `mhc_class` from the eligibility decision. Verifier: V7 under the new policy, V11 recounts
+  every built row against the contract.
+- Laptop test builds (41.9M real rows + run05's 9.4M beta / 267k alpha receptors standing in for
+  the single-receptor partitions, about six minutes each): three builds row-identical, every
+  stratum target exact, V1-V11 pass.
+- **The first build's V11 failure was a contract error, not a builder one.** Single-receptor rows
+  had been costed at the paired-row mean CDR3 length (13.16 / 12.33); on run05's sample they
+  average 15.29 / 14.49. Contract revision 2 re-sizes both sides: budget 153,815,755, training
+  6,057,298 rows, class I 31.4% of residue tokens. The census's "class I is 17.2% of residue
+  tokens" is 15.35%.
+- Independent verification and a Codex review found eight gaps, all fixed: a refused build
+  (SystemExit) left no FAIL marker and could leave an old PASS; background supply was unchecked;
+  held-out rules contradicted their targets; selection assumed the routing policy; empty-string
+  components; capped targets after the contract comparison; two V11 blind spots.
+
+Lessons: an estimate standing in for an unmeasured quantity must be named as such where it is
+used and tested by the first thing that can test it — this one sat on both sides of a budget and
+cancelled out of every check until a build counted real rows. And `raise SystemExit` inside
+`try/except Exception` skips the failure marker.
+
+283 focused tests pass with `~/.venvs/quest-cpt`. No box, no push of these commits yet.
+
