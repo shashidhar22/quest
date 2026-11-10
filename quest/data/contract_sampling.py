@@ -204,12 +204,32 @@ def contract_mismatches(contract: dict, **build) -> list[str]:
         "min_edit_distance": p["benchmark_exclusion"]["min_edit_distance"],
         "routing_policy": p["split_routing"]["policy"],
         "seed": p["split_routing"]["seed"],
+        # A peptide's split is a hash of its cluster id, so the split counts hold only for the
+        # cluster files the contract was sized on. Two cluster sets exist under similar names.
+        "peptide_cluster_files": p["split_routing"]["peptide_cluster_files"],
         "serialization": p["serialization"],
     }
     extra = set(build) - set(want)
     if extra:
         raise TypeError(f"unknown build settings: {sorted(extra)}")
     return [f"{k}: contract {v!r}, build {build.get(k)!r}" for k, v in want.items() if build.get(k) != v]
+
+
+PEPTIDE_CLUSTER_FILES = ("clusters/peptide_clusters.parquet", "split_assignments/peptide_split_assignment.parquet")
+
+
+def peptide_cluster_file_hashes(clusters_dir, split_dir) -> dict:
+    """sha256 of the two files that decide a peptide's cluster id, keyed as the contract keys them."""
+    paths = {PEPTIDE_CLUSTER_FILES[0]: Path(clusters_dir) / "peptide_clusters.parquet",
+             PEPTIDE_CLUSTER_FILES[1]: Path(split_dir) / "peptide_split_assignment.parquet"}
+    out = {}
+    for key, path in paths.items():
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for block in iter(lambda: fh.read(1 << 22), b""):
+                h.update(block)
+        out[key] = h.hexdigest()
+    return out
 
 
 def serialization_name(tcr_variant: str, mhc_variant: str) -> str:

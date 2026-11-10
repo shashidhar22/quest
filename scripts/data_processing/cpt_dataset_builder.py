@@ -61,6 +61,7 @@ from quest.data.contract_sampling import (  # noqa: E402
     load_contract_version,
     order_variant_key_sql,
     partition_targets,
+    peptide_cluster_file_hashes,
     peptide_rank_sql,
     selection_sql,
     serialization_name,
@@ -922,6 +923,7 @@ def main():
                 exclusion_policy=args.benchmark_exclusion, exclusion_list_sha256=excl_sha,
                 min_edit_distance=excl_info.get('min_edit_distance'),
                 routing_policy=args.split_routing, seed=args.seed,
+                peptide_cluster_files=peptide_cluster_file_hashes(clusters_dir, split_dir),
                 serialization=serialization_name(args.tcr_variant, args.mhc_variant))
             if mismatches:
                 raise SystemExit('refusing to build: this build is not the one the contract was sized '

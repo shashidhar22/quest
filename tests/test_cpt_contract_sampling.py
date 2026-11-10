@@ -218,7 +218,7 @@ def _contract():
         "policies": {
             "eligibility": {"policy": "reference-aware-v1", "hla_reference_sha256": "aa", "partial_chain_fraction": 0.97},
             "benchmark_exclusion": {"policy": "heldout-peptides-v2", "min_edit_distance": 2, "list_sha256": "bb"},
-            "split_routing": {"policy": "receptor-hash-v2", "seed": 42},
+            "split_routing": {"policy": "receptor-hash-v2", "seed": 42, "peptide_cluster_files": {"c": "dd", "s": "ee"}},
             "serialization": "cdr3 x full"},
         "versions": {"rows": {"target_rows_by_partition": {"trb|trb": 7, "tra_trb|trb_tra": 2}},
                      "examples": {"splits": {s: split for s in ("train", "val", "test")}}},
@@ -227,7 +227,8 @@ def _contract():
 
 BUILD = dict(eligibility_policy="reference-aware-v1", reference_sha256="aa", partial_chain_fraction=0.97,
              exclusion_policy="heldout-peptides-v2", exclusion_list_sha256="bb", min_edit_distance=2,
-             routing_policy="receptor-hash-v2", seed=42, serialization="cdr3 x full")
+             routing_policy="receptor-hash-v2", seed=42, serialization="cdr3 x full",
+             peptide_cluster_files={"c": "dd", "s": "ee"})
 
 
 def test_a_build_under_the_contracts_own_settings_has_no_mismatch():
@@ -238,7 +239,8 @@ def test_a_build_under_the_contracts_own_settings_has_no_mismatch():
 @pytest.mark.parametrize("key, other", [
     ("eligibility_policy", "legacy-320-v0"), ("reference_sha256", "cc"), ("partial_chain_fraction", 0.95),
     ("exclusion_policy", "none"), ("exclusion_list_sha256", None), ("min_edit_distance", 1),
-    ("routing_policy", "receptor-hash-v1"), ("seed", 7), ("serialization", "full x full")])
+    ("routing_policy", "receptor-hash-v1"), ("seed", 7), ("serialization", "full x full"),
+    ("peptide_cluster_files", {"c": "dd", "s": "another-cluster-set"})])
 def test_every_setting_that_differs_from_the_contract_is_reported(key, other):
     got = contract_mismatches(_contract(), **{**BUILD, key: other})
     assert len(got) == 1 and got[0].startswith(key)
@@ -418,4 +420,15 @@ def test_a_rule_that_contradicts_its_target_is_refused(rule, target, ok):
     else:
         with pytest.raises(ValueError, match="implies"):
             stratum_targets(version)
+
+
+def test_peptide_cluster_files_are_identified_by_content(tmp_path):
+    from quest.data.contract_sampling import PEPTIDE_CLUSTER_FILES, peptide_cluster_file_hashes
+    (tmp_path / "c").mkdir(); (tmp_path / "s").mkdir()
+    (tmp_path / "c" / "peptide_clusters.parquet").write_bytes(b"clusters")
+    (tmp_path / "s" / "peptide_split_assignment.parquet").write_bytes(b"splits")
+    got = peptide_cluster_file_hashes(tmp_path / "c", tmp_path / "s")
+    assert set(got) == set(PEPTIDE_CLUSTER_FILES) and all(len(v) == 64 for v in got.values())
+    (tmp_path / "c" / "peptide_clusters.parquet").write_bytes(b"another cluster set")
+    assert peptide_cluster_file_hashes(tmp_path / "c", tmp_path / "s") != got
 
