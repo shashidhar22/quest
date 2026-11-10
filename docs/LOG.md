@@ -423,3 +423,19 @@ identity only); the class lookup join would duplicate rows if two spellings of o
 normalized alike (none today: 9,444 raw pairs, 9,444 normalized); verifier V2 accepts a manifest
 with no reference hash.
 
+## 2026-11-10 — step 9: sampling contract frozen
+
+Decided (Yuexin): per-peptide cap 1,000 on the three TCR + peptide strata; two corpus versions;
+held-out splits by counts with no residue budget. Written to ACS
+`quest-cpt/audits/2026-11-09/repair/contract/sampling-contract.json` by `write-contract.py`.
+
+- `repaired_proportional_10M`: the builder's `compute_targets` over all 325 partitions, summing
+  to exactly 10,000,000. Expected 62,414 classical class-I training rows.
+- `task_enriched_cap1000`: 5,489,741 training rows, 137,219,643 residue tokens against a budget
+  of 137,219,659; class I 35.2% of residue tokens. Paired TCR + peptide + class I keeps 12,284 of
+  21,282 examples, effective peptide count 5.3 -> 34.7, largest peptide 42% -> 8.1%.
+- The writer refuses a target one above supply and a modified exclusion list (both tried).
+
+No code in this repo changed. Open: the builder cannot sample by example, `mhc_class` is still
+name-based, the background row rule is unfixed, and the counts for strata 3-9 are a proposal.
+
