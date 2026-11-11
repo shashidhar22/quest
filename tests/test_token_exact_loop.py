@@ -349,3 +349,33 @@ def test_a_step_cap_stops_there_on_its_own_schedule_and_counts_its_targets(world
                               resume_from=str(out / f"checkpoint_step_{SAVE_EVERY}")))
     with pytest.raises(ValueError, match="outside 0"):
         L.CPTTrainer(make_cfg(world, world["root"] / "capped3", max_steps=STEPS + 1))
+
+
+def test_a_resume_under_a_cap_keeps_the_epoch_it_was_in_and_never_passes_the_cap(world, monkeypatch):
+    seen, orig = [], L.DataCollatorForMLMDynamic.__call__
+
+    def rec(self, examples):
+        seen.append([tuple(ex["input_ids"]) for ex in examples])
+        return orig(self, examples)
+
+    monkeypatch.setattr(L.DataCollatorForMLMDynamic, "__call__", rec)
+    # Two epochs of STEPS, capped at 16: step 10 is inside epoch 0, past half the cap.
+    kw = dict(num_epochs=2, max_steps=STEPS + 1)
+    full = L.CPTTrainer(make_cfg(world, world["root"] / "cap2", **kw))
+    plan = full.train_sampler.step_plan()
+    full.train()
+    rest_of_epoch = seen[sum(plan[:10]):sum(plan)]
+    seen.clear()
+    resumed = L.CPTTrainer(make_cfg(world, world["root"] / "cap2r", **kw,
+                                    resume_from=str(world["root"] / "cap2" / "checkpoint_step_10")))
+    assert (resumed._start_epoch, resumed._skip_steps) == (0, 10)
+    resumed.train()
+    assert seen[:len(rest_of_epoch)] == rest_of_epoch
+    assert resumed.global_step == full.global_step == STEPS + 1
+    # A checkpoint written at the cap has nothing left to train.
+    done = L.CPTTrainer(make_cfg(world, world["root"] / "cap1", max_steps=SAVE_EVERY))
+    done.train()
+    again = L.CPTTrainer(make_cfg(world, world["root"] / "cap1r", max_steps=SAVE_EVERY,
+                                  resume_from=str(world["root"] / "cap1" / f"checkpoint_step_{SAVE_EVERY}")))
+    again.train()
+    assert again.global_step == SAVE_EVERY

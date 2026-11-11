@@ -113,6 +113,13 @@ def check_resume_config(saved: dict, current: dict, *, token_mode: bool,
     # such field and ran whole epochs, which is what 0 means.
     if (saved.get("max_steps") or 0) != (current.get("max_steps") or 0):
         bad.append("max_steps")
+    # Which published corpus the run trains on: `dataset_path` alone cannot tell a corpus from
+    # one republished at the same place. Recorded on one side only is a mismatch; on neither
+    # (no preflight, or a checkpoint from before it existed) there is nothing to compare.
+    which = lambda d: (d.get("corpus_identity") or None) and {  # noqa: E731
+        k: d["corpus_identity"].get(k) for k in ("run_id", "contract_sha256", "marker_sha256")}
+    if which(saved) != which(current):
+        bad.append("corpus_identity")
     if bad:
         detail = ", ".join(f"{k}: checkpoint={saved.get(k)!r} now={current.get(k)!r}" for k in bad)
         raise ValueError(f"resume config mismatch on {len(bad)} field(s) — {detail}")

@@ -241,3 +241,23 @@ def test_the_lazy_export_table_and_all_agree():
         "quest.training.__all__ and _EXPORTS disagree: "
         f"{sorted(set(mod.__all__) ^ set(mod._EXPORTS))}"
     )
+
+
+IDENTITY = {"run_id": "r1", "contract_sha256": "c" * 64, "contract_version": 4,
+            "marker_sha256": "m" * 64, "benchmark_checked": False}
+
+
+def test_a_resume_on_another_corpus_at_the_same_path_is_refused():
+    """`dataset_path` matching says nothing when a corpus was republished there in between."""
+    saved = cfg(corpus_identity=dict(IDENTITY))
+    check_resume_config(saved, cfg(corpus_identity=dict(IDENTITY)), token_mode=True)
+    # Whether the benchmark hashes were also checked is about the audit, not which corpus it is.
+    check_resume_config(saved, cfg(corpus_identity={**IDENTITY, "benchmark_checked": True}), token_mode=True)
+    for change in ({"run_id": "r2"}, {"marker_sha256": "n" * 64}, {"contract_sha256": "d" * 64}):
+        with pytest.raises(ValueError, match="corpus_identity"):
+            check_resume_config(saved, cfg(corpus_identity={**IDENTITY, **change}), token_mode=True)
+    # Recorded on one side only is not agreement, in either direction.
+    with pytest.raises(ValueError, match="corpus_identity"):
+        check_resume_config(saved, cfg(), token_mode=True)
+    with pytest.raises(ValueError, match="corpus_identity"):
+        check_resume_config(cfg(), cfg(corpus_identity=dict(IDENTITY)), token_mode=True)

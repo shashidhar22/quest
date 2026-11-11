@@ -1725,7 +1725,7 @@ class CPTTrainer:
                 f"resume: scheduler at {self.scheduler.last_epoch} but global_step={self.global_step}"
             )
         self._start_epoch, self._skip_steps = int(st["epoch"]), int(st["step_in_epoch"])
-        steps_per_epoch = self.total_steps // max(1, self.cfg.num_epochs)
+        steps_per_epoch = self._steps_per_epoch  # not total_steps // num_epochs: a cap shortens that
         if self._skip_steps >= steps_per_epoch:  # checkpoint fell on an epoch boundary
             self._start_epoch, self._skip_steps = self._start_epoch + 1, 0
         self._log(
@@ -1966,6 +1966,7 @@ class CPTTrainer:
         if max_steps < 0 or max_steps > total_steps:
             raise ValueError(f"max_steps {max_steps} is outside 0..{total_steps} (the run's {self.cfg.num_epochs} epoch(s))")
         total_steps = max_steps or total_steps
+        self._steps_per_epoch = steps_per_epoch
         warmup_steps = int(total_steps * self.cfg.warmup_ratio)
         self.total_steps = total_steps
 
@@ -1991,9 +1992,12 @@ class CPTTrainer:
         for epoch in range(self._start_epoch, cfg.num_epochs):
             if (self.is_distributed or getattr(self, "_token_mode", False)) and hasattr(self.train_sampler, "set_epoch"):
                 self.train_sampler.set_epoch(epoch)
+            if self.global_step >= self.total_steps:   # resumed from a checkpoint at the step cap
+                break
             self._train_one_epoch(epoch, skip_steps=self._skip_steps if epoch == self._start_epoch else 0)
             if self.should_stop:
-                self._log(f"Stopping after epoch {epoch+1} due to early-stop trigger")
+                why = "the step cap" if cfg.max_steps and self.global_step >= self.total_steps else "early-stop trigger"
+                self._log(f"Stopping after epoch {epoch+1} due to {why}")
                 break
         # Final eval + save.
         self._run_canonical_eval(final=True)
