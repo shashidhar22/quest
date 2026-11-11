@@ -13,6 +13,9 @@
 #   CONTRACT=… CONTRACT_SHA256=…  EXCLUSION_LIST=… EXCLUSION_SHA256=…  HLA_REF=… HLA_SHA256=…
 #   VERSION=task_enriched_cap1000 SCALE=7571616 THREADS=30 MEMORY_GB=200
 #   SOURCE_ROOT=… CLUSTERS_DIR=… SPLIT_DIR=…   bash run_contract_build.sh
+#
+# DISTRIBUTION (default contract) is `proportional` for a row-sampled contract version, which is
+# then built with the md5 partition sampler and checked against the contract's partition targets.
 set -euo pipefail
 
 for v in QUEST PY RUN_DIR CONTRACT CONTRACT_SHA256 EXCLUSION_LIST EXCLUSION_SHA256 HLA_REF HLA_SHA256 \
@@ -39,7 +42,13 @@ free_gb=$(df -BG --output=avail "$RUN_DIR" | tail -1 | tr -dc 0-9)
 [ "$free_gb" -ge 150 ] || { echo "REFUSE: only ${free_gb} GB free under $RUN_DIR; DuckDB spills while sorting"; exit 2; }
 say "preflight ok: $(git -C "$QUEST" rev-parse HEAD) free=${free_gb}GB threads=$THREADS memory=${MEMORY_GB}GB"
 
-COMMON=(--tcr-variant cdr3 --mhc-variant full --distribution contract --scale "$SCALE"
+DISTRIBUTION=${DISTRIBUTION:-contract}
+case "$DISTRIBUTION" in
+  contract) BUILD_ONLY=() ;;
+  proportional) BUILD_ONLY=(--partition-sampler md5) ;;
+  *) echo "REFUSE: DISTRIBUTION=$DISTRIBUTION"; exit 2 ;;
+esac
+COMMON=(--tcr-variant cdr3 --mhc-variant full --distribution "$DISTRIBUTION" --scale "$SCALE"
         --eligibility-policy reference-aware-v1 --hla-reference "$HLA_REF"
         --split-routing receptor-hash-v2 --benchmark-exclusion heldout-peptides-v2
         --exclusion-list "$EXCLUSION_LIST" --sampling-contract "$CONTRACT" --contract-version "$VERSION"
@@ -48,7 +57,7 @@ COMMON=(--tcr-variant cdr3 --mhc-variant full --distribution contract --scale "$
 cd "$QUEST"
 
 t0=$(date +%s); builder_rc=0
-"$PY" scripts/data_processing/cpt_dataset_builder.py "${COMMON[@]}" --threads "$THREADS" \
+"$PY" scripts/data_processing/cpt_dataset_builder.py "${COMMON[@]}" "${BUILD_ONLY[@]}" --threads "$THREADS" \
   --memory-gb "$MEMORY_GB" --duckdb-tmp "$RUN_DIR/duckdb_tmp" > "$RUN_DIR/build.log" 2>&1 || builder_rc=$?
 t1=$(date +%s); say "builder rc=$builder_rc in $(( (t1 - t0) / 60 )) min"
 
