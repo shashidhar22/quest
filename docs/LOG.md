@@ -469,3 +469,29 @@ cancelled out of every check until a build counted real rows. And `raise SystemE
 
 283 focused tests pass with `~/.venvs/quest-cpt`. No box, no push of these commits yet.
 
+## 2026-11-10/11 — step 10, box half: the task-enriched corpus builds on the real source
+
+Box visit CR1, four runs on r6i.8xlarge (CPU), ≈ USD 5.3. Commits `416efb5`..`af74da9`.
+
+- Run 4: 7,445,573 rows (5,956,465 / 744,550 / 744,558), every stratum on target, V1-V11 PASS
+  without the test-build flag, 20 minutes. Unpublished, on the box volume.
+- Run 1 refused: the box's `data/molecule_clusters/` is the `neurips_two` cluster set. The
+  contract (revision 3) now names its peptide cluster files by sha256; the builder checks them
+  in the first minute.
+- Run 2 refused: the single-alpha partition holds about 1.36 rows per receptor; the background
+  selection now counts receptors and has no fixed margin.
+- Run 3 built but carried 2.4-2.6% more background residue tokens than estimated: a selected
+  receptor averages 15.66 / 14.87 residues, the mean over rows is 15.29 / 14.49 (measured on the
+  box over both partitions: 15.2907, 14.4896). Contract revision 4 re-sizes the background.
+- Speed: rows with no MHC chain and no peptide skip the filter (row count 37 min → 44 s);
+  background is one streaming pass under a key threshold.
+
+Lessons. (1) Three estimates in two days were each measured on something adjacent to the thing
+needed — paired rows for single rows, beta for alpha, rows for receptors — and each was wrong;
+a check that counted the real thing caught every one. (2) Two cluster sets live under similar
+names; identity by hash, not by path. (3) My time estimate for run 2 (3-3.5 h) extrapolated one
+slow stage to the others and was wrong by 10x; measure a stage before extrapolating it.
+
+New script: `scripts/data_processing/contract_build_box/run_contract_build.sh`. 300+ focused
+tests pass with `~/.venvs/quest-cpt`.
+
