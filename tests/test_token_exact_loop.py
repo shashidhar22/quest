@@ -305,3 +305,19 @@ def test_the_tokenized_cache_is_named_by_the_vocabulary_too(world):
     keys = {base, L.token_cache_key("fp", Swapped(), 160, "fixb", True), L.token_cache_key("fq", tok, 160, "fixb", True),
             L.token_cache_key("fp", tok, 128, "fixb", True), L.token_cache_key("fp", tok, 160, "raw", True)}
     assert len(keys) == 5
+
+
+def test_the_smoke_runs_the_real_loop_for_a_bounded_number_of_steps(world, tmp_path):
+    import token_exact_smoke
+    out = tmp_path / "smoke.json"
+    rc = token_exact_smoke.main([
+        "--dataset_path", world["ds"], "--output_dir", str(tmp_path / "run"), "--canonical_eval_path",
+        world["canon"], "--out", str(out), "--steps", "4", "--base_model", world["model"], "--batch_size", "4",
+        "--gradient_accumulation_steps", "4", "--token_budget", "512", "--max_length", "160",
+        "--eos_strategy", "fixb", "--bucket_boundaries", "32", "64", "128", "--region_eval", "0",
+        "--num_workers", "0"])
+    report = json.loads(out.read_text())
+    assert rc == 0 and report["status"] == "PASS" and report["steps_run"] == 4
+    assert all(r["rows"] == ROWS_PER_STEP and r["targets"] > 0 for r in report["per_step"])
+    assert report["steps_per_epoch"] == STEPS and report["corpus"]["run_id"] == "r1"
+    assert L.exact_step_batches is exact_step_batches                # the patches were undone
