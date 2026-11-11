@@ -105,9 +105,11 @@ def audit(rows, benchmark: dict, heldout_parts, class_of_chain) -> tuple[dict, l
     included. Returns (leakage report, coverage lines).
     """
     heldout = {part: {normalize(p) for _a, _b, p in benchmark[part]} - {""} for part in heldout_parts}
-    pairs = {part: {(b, normalize(p)) for _a, b, p in benchmark[part] if b and normalize(p)} for part in heldout_parts}
-    triples = {part: {(a, b, normalize(p)) for a, b, p in benchmark[part] if a and b and normalize(p)}
-               for part in heldout_parts}
+    pairs = {part: {(normalize(b), normalize(p)) for _a, b, p in benchmark[part] if normalize(b) and normalize(p)}
+             for part in heldout_parts}
+    triples = {part: {(normalize(a), normalize(b), normalize(p)) for a, b, p in benchmark[part]
+                      if normalize(a) and normalize(b) and normalize(p)} for part in heldout_parts}
+    empty_parts = [part for part in heldout_parts if not heldout[part]]
     all_heldout = set().union(*heldout.values())
     hits = {part: {"rows_with_a_heldout_peptide": 0, "rows_with_a_heldout_trb_peptide_association": 0,
                    "rows_with_a_heldout_tra_trb_peptide_association": 0} for part in heldout_parts}
@@ -143,9 +145,9 @@ def audit(rows, benchmark: dict, heldout_parts, class_of_chain) -> tuple[dict, l
             for part in heldout_parts:
                 if p in heldout[part]:
                     hits[part]["rows_with_a_heldout_peptide"] += 1
-                if trb is not None and (trb, p) in pairs[part]:
+                if trb is not None and (normalize(trb), p) in pairs[part]:
                     hits[part]["rows_with_a_heldout_trb_peptide_association"] += 1
-                if tra is not None and trb is not None and (tra, trb, p) in triples[part]:
+                if tra is not None and trb is not None and (normalize(tra), normalize(trb), p) in triples[part]:
                     hits[part]["rows_with_a_heldout_tra_trb_peptide_association"] += 1
     near = near_heldout(built_peptides, all_heldout)
     exact = sorted(p for p in near if p in all_heldout)
@@ -155,6 +157,7 @@ def audit(rows, benchmark: dict, heldout_parts, class_of_chain) -> tuple[dict, l
         "rows_checked": n_rows, "peptide_bearing_rows": sum(built_peptides.values()),
         "distinct_built_peptides": len(built_peptides), "heldout_parts": list(heldout_parts),
         "distinct_heldout_peptides": len(all_heldout),
+        "heldout_parts_without_a_peptide": empty_parts,
         "per_heldout_part": hits,
         "built_peptides_equal_to_a_heldout_one": len(exact),
         "built_peptides_one_edit_from_a_heldout_one": len(one_edit),
@@ -166,7 +169,9 @@ def audit(rows, benchmark: dict, heldout_parts, class_of_chain) -> tuple[dict, l
         "not_covered": ("receptor-only recurrence, which is permitted; benchmark parts not named above; "
                         "peptide clusters (no crosswalk)"),
     }
-    report["status"] = "PASS" if (n_rows > 0 and report["peptide_bearing_rows"] > 0 and not near and all(
+    # Nothing to compare against is not a pass: every named part must contribute a peptide.
+    report["status"] = "PASS" if (n_rows > 0 and report["peptide_bearing_rows"] > 0 and heldout_parts
+                                  and not empty_parts and not near and all(
         v == 0 for part in hits.values() for v in part.values())) else "FAIL"
     lines = [{"split": split, "stratum": stratum, "rows": s["rows"], "distinct_examples": len(s["examples"]),
               "distinct_peptides": len(s["peptides"]), "distinct_trb_cdr3": len(s["trb"]),
@@ -181,9 +186,13 @@ def load_benchmark(splits_dir, task: str, parts) -> tuple[dict, dict]:
     out, shas = {}, {}
     for part in parts:
         path = Path(splits_dir) / f"{task}_{part}.parquet"
-        frame = pd.read_parquet(path, columns=["row_id", "tra_cdr3", "trb_cdr3", "peptide"]).drop_duplicates("row_id")
+        # Every row counts: molecules are compared as sets, so repeated rows cost nothing and
+        # dropping by row_id could discard a peptide if two rows ever shared an id.
+        frame = pd.read_parquet(path, columns=["tra_cdr3", "trb_cdr3", "peptide"])
         text = lambda v: v if isinstance(v, str) else None
-        out[part] = [(text(a), text(b), text(p)) for a, b, p in zip(frame.tra_cdr3, frame.trb_cdr3, frame.peptide)]
+        out[part] = sorted({(text(a), text(b), text(p))
+                            for a, b, p in zip(frame.tra_cdr3, frame.trb_cdr3, frame.peptide)},
+                           key=lambda m: tuple(x or "" for x in m))
         shas[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
     return out, shas
 
@@ -218,7 +227,9 @@ def main() -> int:
 
     benchmark, split_shas = load_benchmark(a.splits_dir, a.task, ["train", *a.heldout_parts])
     report, lines = audit(built_rows(a.dataset), benchmark, a.heldout_parts, class_of_chain)
-    report = {"dataset": str(a.dataset), "run_id": manifest.get("run_id"), "task": a.task,
+    if not manifest.get("run_id"):
+        ap.error("the build manifest has no run_id: the audit could not be tied to its build")
+    report = {"dataset": str(a.dataset), "run_id": manifest["run_id"], "task": a.task,
               "benchmark_split_sha256": split_shas, "hla_reference_sha256": ref_sha, **report}
     a.out_dir.mkdir(parents=True, exist_ok=True)
     with (a.out_dir / "coverage-by-split.csv").open("x", newline="") as fh:

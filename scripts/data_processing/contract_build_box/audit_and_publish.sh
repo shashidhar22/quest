@@ -7,9 +7,9 @@
 # the audit and a dry-run of the publication.
 #
 #   QUEST=… PY=… RUN_DIR=<run dir holding dataset/> VERSION_DIR=<new dir> CONTRACT=… CONTRACT_SHA256=…
-#   SPLITS_DIR=<benchmark splits> HLA_REF=… DEST=s3://…/<version>/ PUBLISH=0|1  bash audit_and_publish.sh
+#   SPLITS_DIR=<benchmark splits> BENCH_SHA256=<json {file: sha256}> HLA_REF=… DEST=s3://…/<version>/ PUBLISH=0|1  bash audit_and_publish.sh
 set -euo pipefail
-for v in QUEST PY RUN_DIR VERSION_DIR CONTRACT CONTRACT_SHA256 SPLITS_DIR HLA_REF DEST PUBLISH; do
+for v in QUEST PY RUN_DIR VERSION_DIR CONTRACT CONTRACT_SHA256 SPLITS_DIR BENCH_SHA256 HLA_REF DEST PUBLISH; do
   [ -n "${!v:-}" ] || { echo "REFUSE: $v is not set"; exit 2; }
 done
 say(){ echo "[$(date -u '+%F %T')] $*"; }
@@ -27,7 +27,7 @@ say "audit of $(basename "$VERSION_DIR")"
   --out-dir "$VERSION_DIR" > "$VERSION_DIR.audit.log" 2>&1 || { say "AUDIT FAILED"; tail -5 "$VERSION_DIR.audit.log"; exit 1; }
 say "audit PASS: $(grep -o '"distinct_built_peptides": [0-9]*' "$VERSION_DIR.audit.log")"
 if [ "$PUBLISH" = 1 ]; then
-  "$PY" scripts/data_processing/contract_build_box/publish_corpus.py --version-dir "$VERSION_DIR" --dest "$DEST"
+  "$PY" scripts/data_processing/contract_build_box/publish_corpus.py --version-dir "$VERSION_DIR" --dest "$DEST" --benchmark-sha256 "$BENCH_SHA256"
 else
-  "$PY" scripts/data_processing/contract_build_box/publish_corpus.py --version-dir "$VERSION_DIR" --dest "$DEST" --dry-run
+  "$PY" scripts/data_processing/contract_build_box/publish_corpus.py --version-dir "$VERSION_DIR" --dest "$DEST" --benchmark-sha256 "$BENCH_SHA256" --dry-run
 fi

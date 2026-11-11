@@ -12,26 +12,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from quest.data.corpus_preflight import MARKER, corpus_files, corpus_problems  # noqa: E402
 
 
+BENCH = {"as_paired_i_val.parquet": "cd"}
+
+
 def make(root: Path, publish: bool = True) -> Path:
     art = root / "dataset" / "_build_artifacts"
     art.mkdir(parents=True)
-    (root / "dataset" / "train").mkdir()
-    (root / "dataset" / "train" / "data-00000-of-00001.arrow").write_bytes(b"rows")
+    (root / "dataset" / "dataset_dict.json").write_text('{"splits": ["train", "validation", "test"]}')
+    for split in ("train", "validation", "test"):
+        (root / "dataset" / split).mkdir()
+        (root / "dataset" / split / "data-00000-of-00001.arrow").write_bytes(b"rows")
     (root / "sampling-contract.json").write_text('{"contract": "cpt-sampling-contract-v1"}')
     sha = hashlib.sha256((root / "sampling-contract.json").read_bytes()).hexdigest()
     (art / "_implementer_done").write_text("STATUS=PASS\n")
     (art / "_verifier_done").write_text("STATUS=PASS\n")
     (art / "build_manifest.json").write_text(json.dumps({
-        "run_id": "r1", "antigenic_specificity_exclusion": {"policy": "heldout-peptides-v2"},
-        "sampling_contract": {"sha256": sha, "kind": "examples per stratum", "background_universe": "contract"}}))
+        "run_id": "r1", "antigenic_specificity_exclusion": {
+            "policy": "heldout-peptides-v2", "list_sha256": "ab", "n_peptides": 3},
+        "sampling_contract": {"sha256": sha, "version": "enriched", "kind": "examples per stratum", "background_universe": "contract"}}))
     for i in range(1, 12):
         body = {"status": "PASS"}
         if i == 11:
-            body.update(contract="cpt-sampling-contract-v1", sha256=sha)
+            body.update(contract="cpt-sampling-contract-v1", sha256=sha, version="enriched")
         (art / f"v{i}_check.json").write_text(json.dumps(body))
     (root / "leakage-audit.json").write_text(json.dumps({
         "status": "PASS", "minimum_edit_distance_to_a_heldout_peptide": "at least 2", "run_id": "r1",
-        "peptide_bearing_rows": 10}))
+        "peptide_bearing_rows": 10, "task": "as_paired_i", "heldout_parts": ["val"],
+        "distinct_heldout_peptides": 4, "heldout_parts_without_a_peptide": [], "benchmark_split_sha256": BENCH}))
     (root / "coverage-by-split.csv").write_text(
         "split,stratum,rows\ntrain,s1_paired_tcr_peptide_classI,5\ntrain,s8_peptide_only,9\nval,s1_paired_tcr_peptide_classI,1\n")
     if publish:
@@ -82,7 +89,26 @@ BREAKS = {
     "no class I in training": lambda r: (r / "coverage-by-split.csv").write_text(
         "split,stratum,rows\ntrain,s8_peptide_only,9\nval,s1_paired_tcr_peptide_classI,1\n"),
     "coverage missing": lambda r: (r / "coverage-by-split.csv").unlink(),
+    # Review of 2026-11-11: absence or a foreign record passing as agreement.
+    "isolation block empty": lambda r: edit_json(r / ART / "build_manifest.json", antigenic_specificity_exclusion={}),
+    "no run id anywhere": lambda r: (edit_json(r / ART / "build_manifest.json", run_id=None),
+                                     edit_json(r / "leakage-audit.json", run_id=None)),
+    "V11 of another version": lambda r: edit_json(r / ART / "v11_check.json", version="proportional"),
+    "V11 names no version": lambda r: edit_json(r / ART / "v11_check.json", version=None),
+    "audit against no held-out peptide": lambda r: edit_json(r / "leakage-audit.json", distinct_heldout_peptides=0),
+    "audit with an empty part": lambda r: edit_json(r / "leakage-audit.json", heldout_parts_without_a_peptide=["val"]),
+    "audit names no benchmark files": lambda r: edit_json(r / "leakage-audit.json", benchmark_split_sha256=None),
+    "a split has no data": lambda r: (r / "dataset/test/data-00000-of-00001.arrow").unlink(),
+    "a data file is empty": lambda r: (r / "dataset/validation/data-00000-of-00001.arrow").write_bytes(b""),
+    "dataset_dict missing": lambda r: (r / "dataset/dataset_dict.json").unlink(),
+    "a symbolic link": lambda r: (r / "dataset/train/linked.arrow").symlink_to(r / "coverage-by-split.csv"),
 }
+
+
+def test_the_audit_must_have_read_the_expected_benchmark_files(tmp_path):
+    root = make(tmp_path, publish=False)
+    assert corpus_problems(root, require_marker=False, benchmark_split_sha256=BENCH) == []
+    assert corpus_problems(root, require_marker=False, benchmark_split_sha256={"as_paired_i_val.parquet": "ee"})
 
 
 @pytest.mark.parametrize("name", sorted(BREAKS))

@@ -107,3 +107,27 @@ def test_an_audit_that_checked_nothing_does_not_pass():
 
 def test_normalization_is_letters_only_and_upper_case():
     assert normalize("gil gfv ftl") == "GILGFVFTL" and normalize(None) == ""
+
+
+def test_an_audit_against_no_heldout_peptide_does_not_pass():
+    empty = {**BENCH, "test_novel_pep": [("CAVH", "CASSH", None)]}
+    report, _ = audit(CLEAN, empty, PARTS, classify)
+    assert report["status"] == "FAIL" and report["heldout_parts_without_a_peptide"] == ["test_novel_pep"]
+    assert audit(CLEAN, BENCH, [], classify)[0]["status"] == "FAIL"
+
+
+def test_receptor_case_does_not_hide_an_association():
+    bench = {**BENCH, "test_novel_pep": [("cavh", "cassh", "HELDOUTPEP")]}
+    report, _ = audit(CLEAN + [("train", "CAVH<eos>CASSH<eos>HELDOUTPEP", "tra_trb_peptide")], bench, PARTS, classify)
+    hit = report["per_heldout_part"]["test_novel_pep"]
+    assert hit["rows_with_a_heldout_trb_peptide_association"] == 1
+    assert hit["rows_with_a_heldout_tra_trb_peptide_association"] == 1
+
+
+def test_benchmark_rows_sharing_an_id_all_count(tmp_path):
+    import pandas as pd
+    from scripts.data_processing.cpt_built_audit import load_benchmark
+    pd.DataFrame({"row_id": [1, 1], "tra_cdr3": ["CAVA", "CAVA"], "trb_cdr3": ["CASSA", "CASSA"],
+                  "peptide": ["FIRSTPEP", "SECONDPEP"]}).to_parquet(tmp_path / "t_val.parquet")
+    molecules, _ = load_benchmark(tmp_path, "t", ["val"])
+    assert {p for _a, _b, p in molecules["val"]} == {"FIRSTPEP", "SECONDPEP"}

@@ -39,13 +39,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version-dir", type=Path, required=True)
     ap.add_argument("--dest", required=True)
+    ap.add_argument("--benchmark-sha256", type=Path, required=True,
+                    help="JSON {split file name: sha256} the leakage audit must have read")
     ap.add_argument("--dry-run", action="store_true", help="check and write nothing, locally or remotely")
     a = ap.parse_args()
     if not (a.dest.startswith("s3://") and a.dest.endswith("/") and a.dest.count("/") >= 4):
         ap.error("--dest must be s3://bucket/prefix/.../ and end with a slash")
     if (a.version_dir / MARKER).exists():
         ap.error(f"{a.version_dir / MARKER} exists: this directory was already published")
-    problems = corpus_problems(a.version_dir, require_marker=False)
+    problems = corpus_problems(a.version_dir, require_marker=False,
+                               benchmark_split_sha256=json.loads(a.benchmark_sha256.read_text()))
     if problems:
         print("REFUSED: the corpus does not pass preflight:\n  " + "\n  ".join(problems))
         return 1
@@ -64,9 +67,8 @@ def main() -> int:
     if a.dry_run:
         print("dry run: nothing written")
         return 0
-    with (a.version_dir / MARKER).open("x") as fh:
-        json.dump(marker, fh, indent=2)
-        fh.write("\n")
+    # The marker exists nowhere until every other object is up and listed: a failed upload
+    # leaves neither a local nor a remote claim of completeness.
     subprocess.run(["aws", "s3", "cp", "--recursive", "--only-show-errors", "--exclude", MARKER,
                     "--exclude", "*.DS_Store", str(a.version_dir), a.dest], check=True)
     partial = s3_listing(a.dest)
@@ -75,11 +77,14 @@ def main() -> int:
         diff = sorted(k for k in set(partial) | set(want) if partial.get(k) != want.get(k))
         print(f"REFUSED to write the marker: {len(diff)} objects differ after upload, e.g. {diff[:3]}")
         return 1
-    subprocess.run(["aws", "s3", "cp", "--only-show-errors", str(a.version_dir / MARKER), a.dest + MARKER], check=True)
+    text = json.dumps(marker, indent=2) + "\n"
+    subprocess.run(["aws", "s3", "cp", "--only-show-errors", "-", a.dest + MARKER], input=text.encode(), check=True)
     final = s3_listing(a.dest)
-    if set(final) != set(want) | {MARKER}:
+    if final != {**want, MARKER: len(text.encode())}:
         print("FAILED: the final listing is not the uploaded set plus the marker")
         return 1
+    with (a.version_dir / MARKER).open("x") as fh:
+        fh.write(text)
     print(f"PUBLISHED {len(final)} objects to {a.dest}; marker written last")
     return 0
 
