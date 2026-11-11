@@ -592,10 +592,11 @@ def filtered_rows_sql(select: str, src: str, where: str, split, extra: str = '')
 
 SINGLE_RECEPTOR_SUBSETS = ('tra', 'trb')
 CONTRACT_DISTRIBUTION = 'contract'
-# Background selection reads this many rows past the target before keeping one per receptor ...
+# When background selection knows how many rows a subset holds, it first keeps only rows whose key
+# falls under a threshold set to pass about OVERSAMPLE times the rows it needs (plus MARGIN_MIN,
+# so that a small target is not starved by sampling noise). Rows are not receptors: several rows
+# can share one, which is why this is a starting point that the selection widens if it must.
 BACKGROUND_MARGIN_MIN = 1000
-# ... and, when it knows how many rows a subset holds, first keeps only rows whose key falls
-# under a threshold set to pass about this many times the rows it needs.
 BACKGROUND_OVERSAMPLE = 3
 
 
@@ -726,47 +727,56 @@ def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: 
             continue
         axis = next(a for a in RECEPTOR_AXES if a.startswith(sk))
         # One row per receptor: under a CDR3 serialization two rows of one receptor are the same
-        # text. Rows sharing a CDR3 are adjacent in (bk, rk) order, so reading a margin past the
-        # target and keeping each receptor's first row gives the N lowest distinct receptors.
-        margin = {t['split']: t['target_rows'] + t['target_rows'] // 10 + BACKGROUND_MARGIN_MIN for t in wanted}
-        # One pass over the subset instead of a sorted pass per split. A key is a uniform md5, so
-        # "key below a threshold" keeps a known share of the rows; every row below the threshold
-        # is kept, hence as long as a split's candidates outnumber its margin, its lowest
-        # `margin` candidates are the lowest `margin` rows of the whole subset. Checked below.
+        # text. The selection is the N receptors with the lowest keys, each by its lowest-content
+        # row. How many rows share a receptor is a property of the source and is not assumed:
+        # the single-alpha partition holds about 1.4 rows per receptor, the beta one about 1.01.
+        #
+        # One pass over the subset instead of a sorted pass per split. A key is a uniform md5 of
+        # the receptor, so "key below a threshold" keeps whole receptors, a known share of them.
+        # Every receptor below the threshold is kept, so if a split's candidates hold at least N
+        # receptors, its N lowest are the N lowest of the whole subset. If they do not, the
+        # threshold was too tight and the pass is repeated wider, last of all with no threshold.
+        need = {t['split']: t['target_rows'] for t in wanted}
         n_rows = (single_receptor_rows or {}).get(sk)
-        cut = {}
-        for split, m in margin.items():
-            share = 1.0 if not n_rows else BACKGROUND_OVERSAMPLE * m / (n_rows * fraction[split])
-            cut[split] = None if share >= 1 else format(int(share * 16 ** 8), '08x')
-        below = ' OR '.join(f"(split = '{s}'" + ('' if c is None else f" AND bk < '{c}'") + ')' for s, c in cut.items())
         rows = filtered_rows_sql(typed, src, where, where_split, f"AND CAST(subset_key AS VARCHAR) = '{sk}'")
-        con.execute(f"""CREATE OR REPLACE TEMP TABLE contract_bg AS
-            SELECT {cols}, subset_key, order_key, split, bk, {row_key} AS rk FROM (
-              SELECT *, {text} AS input_text FROM (
-                SELECT k.*, {receptor_split_sql('k.' + axis, axis, seed)} AS split,
-                       {background_key_sql(seed, axis, 'k.' + axis)} AS bk
-                FROM ({rows}) k)
-              WHERE {below})
-            WHERE coalesce(input_text, '') <> ''""")
+        for oversample in (BACKGROUND_OVERSAMPLE, 10 * BACKGROUND_OVERSAMPLE, None):
+            cut = {}
+            for split, n in need.items():
+                share = 1.0 if not (n_rows and oversample) else oversample * (n + BACKGROUND_MARGIN_MIN) / (n_rows * fraction[split])
+                cut[split] = None if share >= 1 else format(int(share * 16 ** 8), '08x')
+            below = ' OR '.join(f"(split = '{s}'" + ('' if c is None else f" AND bk < '{c}'") + ')' for s, c in cut.items())
+            con.execute(f"""CREATE OR REPLACE TEMP TABLE contract_bg AS
+                SELECT {cols}, subset_key, order_key, split, bk, {row_key} AS rk FROM (
+                  SELECT *, {text} AS input_text FROM (
+                    SELECT k.*, {receptor_split_sql('k.' + axis, axis, seed)} AS split,
+                           {background_key_sql(seed, axis, 'k.' + axis)} AS bk
+                    FROM ({rows}) k)
+                  WHERE {below})
+                WHERE coalesce(input_text, '') <> ''""")
+            held = {s: (n, d) for s, n, d in con.execute(
+                f'SELECT split, COUNT(*), COUNT(DISTINCT {axis}) FROM contract_bg GROUP BY 1').fetchall()}
+            short = [s for s in need if held.get(s, (0, 0))[1] < need[s]]
+            if not any(cut[s] is not None for s in short):
+                break
+            log(f'  contract: {sk} key threshold too tight for {short} at {oversample}x; reading wider')
         for t in wanted:
             split = t['split']
-            n_cand = con.execute('SELECT COUNT(*) FROM contract_bg WHERE split = ?', [split]).fetchone()[0]
-            if cut[split] is not None and n_cand < margin[split]:
-                raise ContractNotMet(f"{t['stratum']}/{split}: only {n_cand:,} rows fall under the key threshold, "
-                                     f"{margin[split]:,} are needed; the subset holds fewer rows than stated")
+            n_cand, n_distinct = held.get(split, (0, 0))
+            if n_distinct < t['target_rows']:
+                raise ContractNotMet(f"{t['stratum']}/{split}: the source holds {n_distinct:,} distinct "
+                                     f"single-receptor rows ({n_cand:,} rows), target {t['target_rows']:,}")
             before = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0]
             con.execute(f"""INSERT INTO staging_raw
                 SELECT {cols}, subset_key, order_key FROM (
-                  SELECT *, row_number() OVER (PARTITION BY {axis} ORDER BY rk) AS dup FROM (
-                    SELECT * FROM contract_bg WHERE split = '{split}' ORDER BY bk, rk LIMIT {margin[split]}))
+                  SELECT *, row_number() OVER (PARTITION BY {axis} ORDER BY rk) AS dup
+                  FROM contract_bg WHERE split = '{split}')
                 WHERE dup = 1 ORDER BY bk LIMIT {t['target_rows']}""")
             got = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0] - before
             if got != t['target_rows']:
-                raise ContractNotMet(f"{t['stratum']}/{split}: {got:,} distinct single-receptor rows among "
-                                     f"the {margin[split]:,} lowest keys, target {t['target_rows']:,} (too few in "
-                                     "the source, or more rows per receptor than the margin allows)")
+                raise ContractNotMet(f"{t['stratum']}/{split}: selected {got:,}, target {t['target_rows']:,}")
             achieved[f"{split}/{t['stratum']}"] = got
-            log(f"  contract: {t['stratum']}/{split} {got:,} rows (from {n_cand:,} candidates)")
+            log(f"  contract: {t['stratum']}/{split} {got:,} rows (from {n_cand:,} candidate rows, "
+                f"{n_distinct:,} receptors)")
         con.execute('DROP TABLE contract_bg')
     for sk in SINGLE_RECEPTOR_SUBSETS:
         axis = next(a for a in RECEPTOR_AXES if a.startswith(sk))

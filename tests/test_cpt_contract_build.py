@@ -323,21 +323,42 @@ def test_the_threshold_pass_selects_the_same_background_as_the_full_pass(monkeyp
         single_receptor_rows={"trb": n_trb, "tra": sum(r["subset_key"] == "tra" for r in rows)})
     assert staged(con) == want
     # The threshold really cut: the beta candidates read were fewer than the beta rows.
-    cands = [int(m.split("from ")[1].split(" candidates")[0].replace(",", "")) for m in logged
+    cands = [int(m.split("from ")[1].split(" candidate rows")[0].replace(",", "")) for m in logged
              if "background_single_beta_chain" in m]
     assert len(cands) == 3 and sum(cands) < n_trb
 
 
-def test_a_threshold_set_from_an_overstated_row_count_is_refused_not_trusted(monkeypatch):
+def test_a_threshold_set_from_an_overstated_row_count_is_widened_not_trusted(monkeypatch):
     rows, n_trb = big_background()
     monkeypatch.setitem(BACKGROUND, "background_single_beta_chain", ("trb", "trb_cdr3", 0.05))
-    version, _ = expected(rows)
+    version, want = expected(rows)
     monkeypatch.setattr(builder, "BACKGROUND_MARGIN_MIN", 0)
     where = filter_where_sql(REFERENCE_AWARE_POLICY, eligibility_table="elig")
-    with pytest.raises(ContractNotMet, match="threshold"):
-        fill_staging_from_contract(
-            connect(rows), src="source", where=where, eligibility_table="elig", peptide_lookup="pep_lkp",
-            version=version, routing=ROUTING, seed=SEED, tcr_variant="cdr3", mhc_variant="full",
-            src_cols=SRC_COLS, where_split=split_filter(REFERENCE_AWARE_POLICY, where),
-            single_receptor_rows={"trb": n_trb * 50, "tra": 150})
+    con, logged = connect(rows), []
+    fill_staging_from_contract(
+        con, src="source", where=where, eligibility_table="elig", peptide_lookup="pep_lkp",
+        version=version, routing=ROUTING, seed=SEED, tcr_variant="cdr3", mhc_variant="full",
+        src_cols=SRC_COLS, where_split=split_filter(REFERENCE_AWARE_POLICY, where), log=logged.append,
+        single_receptor_rows={"trb": n_trb * 500, "tra": 150})          # a 500x overstatement
+    assert staged(con) == want
+    assert any("too tight" in m for m in logged)
 
+
+def test_many_rows_per_receptor_do_not_starve_the_selection(monkeypatch):
+    """The single-alpha partition holds about 1.4 rows per receptor; a fixed margin over the
+    target was too small there and refused a source that held enough receptors."""
+    rows, n_trb = big_background()
+    monkeypatch.setitem(BACKGROUND, "background_single_beta_chain", ("trb", "trb_cdr3", 0.05))
+    version, want = expected(rows)
+    monkeypatch.setattr(builder, "BACKGROUND_MARGIN_MIN", 0)
+    again = [dict(r, trb_full=f"MCOPY{k}" + r["trb_cdr3"]) for r in rows if r["subset_key"] == "trb" for k in range(4)]
+    where = filter_where_sql(REFERENCE_AWARE_POLICY, eligibility_table="elig")
+    con = connect(rows + again)                                          # five rows per beta receptor
+    fill_staging_from_contract(
+        con, src="source", where=where, eligibility_table="elig", peptide_lookup="pep_lkp",
+        version=version, routing=ROUTING, seed=SEED, tcr_variant="cdr3", mhc_variant="full",
+        src_cols=SRC_COLS, where_split=split_filter(REFERENCE_AWARE_POLICY, where),
+        single_receptor_rows={"trb": 5 * n_trb, "tra": 150})
+    assert staged(con) == want
+    n, d = con.execute("SELECT COUNT(*), COUNT(DISTINCT trb_cdr3) FROM staging_raw WHERE subset_key = 'trb'").fetchone()
+    assert n == d
