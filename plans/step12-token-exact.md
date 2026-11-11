@@ -11,8 +11,9 @@ verifier: nine mutations all caught, real 2-process DDP (gloo) with uneven and z
 ranks matches a single-process reference to 1e-17, the historical `token`, `row` and
 fixed-batch paths are bit-identical to the commit before. Codex: three findings fixed (cache
 key now carries the vocabulary; the preflight is bound to `<version>/dataset`; the logged loss
-is the global mean). Not done: a real-GPU smoke (NCCL, bf16, flash attention), pricing from
-measured throughput.
+is the global mean). GPU smoke done (visit S12): both corpora pass 50 steps on one L4 at token
+budget 8192; the enriched one is out of memory at 16384. Results and prices: ACS
+`repair-status.md`, "Step 12, engineering half". Not done: several GPUs (NCCL), a full epoch.
 
 ## Goal
 

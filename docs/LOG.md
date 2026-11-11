@@ -513,3 +513,17 @@ Lessons. (1) "Zero hits" needs a non-empty thing to hit: every gate now also req
 evidence it compared against. (2) A command passed through two layers of quoting lost its
 variables; put it in a script file. (3) The first Codex run sat an hour waiting on standard
 input; `codex exec` needs `< /dev/null` when it is not on a terminal.
+
+## 2026-11-11 — step 12, engineering half: token_exact in the loop
+
+- `loss_normalization.exact_step_batches` buffers each optimizer step; the loop takes the summed
+  float32 loss times `world_size / N_global`. `token_exact` needs `token_budget > 0` and
+  `corpus_preflight=required`. Tokenized caches of a published corpus go under `output_dir`.
+- Verified on CPU against a recomputed reference, by an independent verifier (real 2-process
+  DDP, nine mutations) and by Codex (three findings fixed). `scripts/training/token_exact_smoke.py`
+  on one L4: both corpora pass at token budget 8192, about 5 h per epoch each.
+
+Lessons. (1) Running the real trainer in a test found what unit tests could not: tokenizing
+wrote cache files into the published corpus, which would have failed the next preflight.
+(2) Token budget 16384 was never a real 16k-token micro-batch on the old corpus; a corpus with
+more long rows was the first to fill one, and it did not fit.
