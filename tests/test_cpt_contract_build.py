@@ -24,11 +24,15 @@ from quest.data.contract_sampling import (  # noqa: E402
     stratum_of,
 )
 from quest.data.split_routing import combine, peptide_split, receptor_split  # noqa: E402
+import scripts.data_processing.cpt_dataset_builder as builder  # noqa: E402
 from scripts.data_processing.cpt_dataset_builder import (  # noqa: E402
+    LEGACY_POLICY,
     REFERENCE_AWARE_POLICY,
     ContractNotMet,
     fill_staging_from_contract,
     filter_where_sql,
+    filtered_rows_sql,
+    split_filter,
 )
 
 SEED, ROUTING = 42, "receptor-hash-v2"
@@ -275,4 +279,65 @@ def test_refuses_an_empty_string_where_a_component_is_absent(column):
     rows = rows + [_row("trb_peptide", "trb_peptide", trb_cdr3="CASSWWWEQYF", peptide=PEPTIDES[3], **{column: ""})]
     with pytest.raises(ContractNotMet, match="empty-string"):
         run(connect(rows), version)
+
+
+# ---------- the cheap full-source passes select the same rows ----------
+
+def test_the_split_filter_keeps_exactly_the_rows_the_filter_keeps():
+    rows = source_rows()
+    # Rows the filter must reject: an unknown MHC chain, with and without a peptide.
+    rows += [_row("trb_mhc_one", "trb_mhc_one", trb_cdr3="CASSNOPEEQYF", mhc_one="GSHSUNKNOWNCHAIN"),
+             _row("peptide_mhc_one", "peptide_mhc_one", peptide=PEPTIDES[2], mhc_one="GSHSUNKNOWNCHAIN")]
+    con = connect(rows)
+    where = filter_where_sql(REFERENCE_AWARE_POLICY, eligibility_table="elig")
+    split = split_filter(REFERENCE_AWARE_POLICY, where)
+    whole = con.execute(f"SELECT sequence, subset_key, order_key FROM source {where} ORDER BY ALL").fetchall()
+    parts = con.execute(f"SELECT * FROM ({filtered_rows_sql('sequence, subset_key, order_key', 'source', where, split)}) ORDER BY ALL").fetchall()
+    assert parts == whole and 0 < len(whole) < len(rows)
+    untouched = con.execute(f"SELECT COUNT(*) FROM source {split[0]}").fetchone()[0]
+    assert untouched == sum(r["subset_key"] in ("tra", "trb", "tra_trb") for r in rows)
+    assert split_filter(LEGACY_POLICY, "WHERE TRUE") is None        # allele names can sit beside a NULL chain
+
+
+def big_background(n=30000):
+    rows = source_rows()
+    aa = "ADEFGHIKLMNPQRSTVWY"
+    extra = [_row("trb", "trb", trb_cdr3="CASR" + "".join(aa[(i // 19 ** k) % 19] for k in range(4)) + "EQFF")
+             for i in range(n)]
+    return rows + extra, sum(r["subset_key"] == "trb" for r in rows) + n
+
+
+def test_the_threshold_pass_selects_the_same_background_as_the_full_pass(monkeypatch):
+    rows, n_trb = big_background()
+    # A small share of the pool, as in a real build, or three times the need is the whole pool.
+    monkeypatch.setitem(BACKGROUND, "background_single_beta_chain", ("trb", "trb_cdr3", 0.05))
+    version, want = expected(rows)
+    monkeypatch.setattr(builder, "BACKGROUND_MARGIN_MIN", 0)      # so that the threshold is below 1 here
+    con = connect(rows)
+    logged = []
+    fill_staging_from_contract(
+        con, src="source", where=filter_where_sql(REFERENCE_AWARE_POLICY, eligibility_table="elig"),
+        eligibility_table="elig", peptide_lookup="pep_lkp", version=version, routing=ROUTING, seed=SEED,
+        tcr_variant="cdr3", mhc_variant="full", src_cols=SRC_COLS, log=logged.append,
+        where_split=split_filter(REFERENCE_AWARE_POLICY, filter_where_sql(REFERENCE_AWARE_POLICY, eligibility_table="elig")),
+        single_receptor_rows={"trb": n_trb, "tra": sum(r["subset_key"] == "tra" for r in rows)})
+    assert staged(con) == want
+    # The threshold really cut: the beta candidates read were fewer than the beta rows.
+    cands = [int(m.split("from ")[1].split(" candidates")[0].replace(",", "")) for m in logged
+             if "background_single_beta_chain" in m]
+    assert len(cands) == 3 and sum(cands) < n_trb
+
+
+def test_a_threshold_set_from_an_overstated_row_count_is_refused_not_trusted(monkeypatch):
+    rows, n_trb = big_background()
+    monkeypatch.setitem(BACKGROUND, "background_single_beta_chain", ("trb", "trb_cdr3", 0.05))
+    version, _ = expected(rows)
+    monkeypatch.setattr(builder, "BACKGROUND_MARGIN_MIN", 0)
+    where = filter_where_sql(REFERENCE_AWARE_POLICY, eligibility_table="elig")
+    with pytest.raises(ContractNotMet, match="threshold"):
+        fill_staging_from_contract(
+            connect(rows), src="source", where=where, eligibility_table="elig", peptide_lookup="pep_lkp",
+            version=version, routing=ROUTING, seed=SEED, tcr_variant="cdr3", mhc_variant="full",
+            src_cols=SRC_COLS, where_split=split_filter(REFERENCE_AWARE_POLICY, where),
+            single_receptor_rows={"trb": n_trb * 50, "tra": 150})
 

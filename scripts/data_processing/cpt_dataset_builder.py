@@ -50,6 +50,8 @@ from quest.data.split_routing import (  # noqa: E402
     RECEPTOR_AXES,
     RECEPTOR_HASH_V2_ROUTING,
     ROUTING_POLICIES,
+    TRAIN_FRACTION,
+    VAL_FRACTION,
     axis_vote_sql,
     receptor_split_sql,
 )
@@ -554,10 +556,47 @@ def compute_targets(partition_counts: dict, mode: str, scale: int) -> dict:
     raise ValueError(f'unknown mode: {mode}')
 
 
+# ---------- full-source passes ----------
+#
+# The source is 1.46B rows, 97% of them single receptors with no MHC chain and no peptide. The
+# filter's subqueries become joins over every row DuckDB is given, so a pass that hands it the
+# whole source spends its time (37 minutes and 115 GB of spill, measured on the box) deciding
+# rows the filter has nothing to say about.
+
+NO_MHC_NO_PEPTIDE = 'mhc_one IS NULL AND mhc_two IS NULL AND peptide IS NULL'
+
+
+def split_filter(policy: str, where: str):
+    """Two WHERE clauses that together keep exactly the rows `where` keeps, or None.
+
+    Under `reference-aware-v1` every clause of the filter is of the form "this component is NULL,
+    or ...", so a row with no MHC chain and no peptide passes without any lookup. The first
+    clause selects those rows, untouched; the second applies the filter to the rest. The legacy
+    policy reads allele NAMES, which can be populated beside a NULL chain, so it is never split.
+    """
+    if policy != REFERENCE_AWARE_POLICY:
+        return None
+    return f'WHERE {NO_MHC_NO_PEPTIDE}', f'{where} AND NOT ({NO_MHC_NO_PEPTIDE})'
+
+
+def filtered_rows_sql(select: str, src: str, where: str, split, extra: str = '') -> str:
+    """`SELECT {select} FROM {src}` restricted by the filter (and `extra`), split when possible."""
+    if split is None:
+        return f'SELECT {select} FROM {src} {where} {extra}'
+    untouched, judged = split
+    return (f'SELECT {select} FROM {src} {untouched} {extra} UNION ALL '
+            f'SELECT {select} FROM {src} {judged} {extra}')
+
+
 # ---------- example-level sampling to a contract ----------
 
 SINGLE_RECEPTOR_SUBSETS = ('tra', 'trb')
 CONTRACT_DISTRIBUTION = 'contract'
+# Background selection reads this many rows past the target before keeping one per receptor ...
+BACKGROUND_MARGIN_MIN = 1000
+# ... and, when it knows how many rows a subset holds, first keeps only rows whose key falls
+# under a threshold set to pass about this many times the rows it needs.
+BACKGROUND_OVERSAMPLE = 3
 
 
 class ContractNotMet(RuntimeError):
@@ -567,7 +606,8 @@ class ContractNotMet(RuntimeError):
 def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: str,
                                peptide_lookup: str, version: dict, routing: str, seed: int,
                                tcr_variant: str, mhc_variant: str, src_cols: list,
-                               log=lambda msg: None) -> dict:
+                               log=lambda msg: None, where_split=None,
+                               single_receptor_rows: dict | None = None) -> dict:
     """Insert into `staging_raw` exactly the rows an example-sampled contract version fixes.
 
     The definitions (stratum, example hash, cap-then-count, order variant, background key) are
@@ -581,6 +621,9 @@ def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: 
     a table expression with (mol, cluster_id, split). One row per selected example, one order
     variant; background rows are single-receptor rows, one per receptor, the lowest seeded keys
     per split.
+
+    `where_split` (`split_filter`) and `single_receptor_rows` ({subset_key: rows}) only make the
+    background pass cheaper; the rows selected are the same with or without them.
     """
     assert where.strip().startswith('WHERE'), where[:40]
     if routing != RECEPTOR_HASH_V2_ROUTING:
@@ -676,32 +719,55 @@ def fill_staging_from_contract(con, *, src: str, where: str, eligibility_table: 
     log(f'  contract: {n_rows:,} example rows selected')
 
     duplicate_receptors = {}
-    for t in (t for t in targets if t['background'] is not None):
-        sk = t['background']
+    fraction = {'train': TRAIN_FRACTION, 'val': VAL_FRACTION, 'test': 1 - TRAIN_FRACTION - VAL_FRACTION}
+    for sk in SINGLE_RECEPTOR_SUBSETS:
+        wanted = [t for t in targets if t['background'] == sk]
+        if not wanted:
+            continue
         axis = next(a for a in RECEPTOR_AXES if a.startswith(sk))
-        before = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0]
         # One row per receptor: under a CDR3 serialization two rows of one receptor are the same
         # text. Rows sharing a CDR3 are adjacent in (bk, rk) order, so reading a margin past the
         # target and keeping each receptor's first row gives the N lowest distinct receptors.
-        margin = t['target_rows'] + t['target_rows'] // 10 + 1000
-        con.execute(f"""INSERT INTO staging_raw
-            SELECT {cols}, subset_key, order_key FROM (
-              SELECT *, row_number() OVER (PARTITION BY {axis} ORDER BY rk) AS dup FROM (
-                SELECT {cols}, subset_key, order_key, bk, rk FROM (
-                  SELECT {cols}, subset_key, order_key, {text} AS input_text,
-                    {receptor_split_sql('k.' + axis, axis, seed)} AS split,
-                    {background_key_sql(seed, axis, 'k.' + axis)} AS bk, {row_key} AS rk
-                  FROM (SELECT {typed} FROM {src} {where} AND CAST(subset_key AS VARCHAR) = '{sk}') k)
-                WHERE split = '{t['split']}' AND coalesce(input_text, '') <> ''
-                ORDER BY bk, rk LIMIT {margin}))
-            WHERE dup = 1 ORDER BY bk LIMIT {t['target_rows']}""")
-        got = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0] - before
-        if got != t['target_rows']:
-            raise ContractNotMet(f"{t['stratum']}/{t['split']}: {got:,} distinct single-receptor rows among "
-                                 f"the {margin:,} lowest keys, target {t['target_rows']:,} (too few in the "
-                                 "source, or more rows per receptor than the margin allows)")
-        achieved[f"{t['split']}/{t['stratum']}"] = got
-        log(f"  contract: {t['stratum']}/{t['split']} {got:,} rows")
+        margin = {t['split']: t['target_rows'] + t['target_rows'] // 10 + BACKGROUND_MARGIN_MIN for t in wanted}
+        # One pass over the subset instead of a sorted pass per split. A key is a uniform md5, so
+        # "key below a threshold" keeps a known share of the rows; every row below the threshold
+        # is kept, hence as long as a split's candidates outnumber its margin, its lowest
+        # `margin` candidates are the lowest `margin` rows of the whole subset. Checked below.
+        n_rows = (single_receptor_rows or {}).get(sk)
+        cut = {}
+        for split, m in margin.items():
+            share = 1.0 if not n_rows else BACKGROUND_OVERSAMPLE * m / (n_rows * fraction[split])
+            cut[split] = None if share >= 1 else format(int(share * 16 ** 8), '08x')
+        below = ' OR '.join(f"(split = '{s}'" + ('' if c is None else f" AND bk < '{c}'") + ')' for s, c in cut.items())
+        rows = filtered_rows_sql(typed, src, where, where_split, f"AND CAST(subset_key AS VARCHAR) = '{sk}'")
+        con.execute(f"""CREATE OR REPLACE TEMP TABLE contract_bg AS
+            SELECT {cols}, subset_key, order_key, split, bk, {row_key} AS rk FROM (
+              SELECT *, {text} AS input_text FROM (
+                SELECT k.*, {receptor_split_sql('k.' + axis, axis, seed)} AS split,
+                       {background_key_sql(seed, axis, 'k.' + axis)} AS bk
+                FROM ({rows}) k)
+              WHERE {below})
+            WHERE coalesce(input_text, '') <> ''""")
+        for t in wanted:
+            split = t['split']
+            n_cand = con.execute('SELECT COUNT(*) FROM contract_bg WHERE split = ?', [split]).fetchone()[0]
+            if cut[split] is not None and n_cand < margin[split]:
+                raise ContractNotMet(f"{t['stratum']}/{split}: only {n_cand:,} rows fall under the key threshold, "
+                                     f"{margin[split]:,} are needed; the subset holds fewer rows than stated")
+            before = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0]
+            con.execute(f"""INSERT INTO staging_raw
+                SELECT {cols}, subset_key, order_key FROM (
+                  SELECT *, row_number() OVER (PARTITION BY {axis} ORDER BY rk) AS dup FROM (
+                    SELECT * FROM contract_bg WHERE split = '{split}' ORDER BY bk, rk LIMIT {margin[split]}))
+                WHERE dup = 1 ORDER BY bk LIMIT {t['target_rows']}""")
+            got = con.execute('SELECT COUNT(*) FROM staging_raw').fetchone()[0] - before
+            if got != t['target_rows']:
+                raise ContractNotMet(f"{t['stratum']}/{split}: {got:,} distinct single-receptor rows among "
+                                     f"the {margin[split]:,} lowest keys, target {t['target_rows']:,} (too few in "
+                                     "the source, or more rows per receptor than the margin allows)")
+            achieved[f"{split}/{t['stratum']}"] = got
+            log(f"  contract: {t['stratum']}/{split} {got:,} rows (from {n_cand:,} candidates)")
+        con.execute('DROP TABLE contract_bg')
     for sk in SINGLE_RECEPTOR_SUBSETS:
         axis = next(a for a in RECEPTOR_AXES if a.startswith(sk))
         n, d = con.execute(f"SELECT COUNT(*), COUNT(DISTINCT {axis}) FROM staging_raw WHERE subset_key = '{sk}'").fetchone()
@@ -976,10 +1042,10 @@ def main():
         t0 = time.time()
         where = filter_where_sql(policy, eligibility_table=elig_table,
                                  excluded_peptides_table=excl_table)
+        where_split = split_filter(policy, where)
         part_df = con.execute(f"""
             SELECT subset_key, order_key, COUNT(*) AS n
-            FROM {src}
-            {where}
+            FROM ({filtered_rows_sql('subset_key, order_key', src, where, where_split)})
             GROUP BY subset_key, order_key
             ORDER BY subset_key, order_key
         """).df()
@@ -1191,7 +1257,8 @@ def main():
                                 f"USING (cluster_id))"),
                 version=contract_version, routing=args.split_routing, seed=seed,
                 tcr_variant=args.tcr_variant, mhc_variant=args.mhc_variant, src_cols=src_cols,
-                log=lambda m: log(m, run_id=run_id))
+                log=lambda m: log(m, run_id=run_id), where_split=where_split,
+                single_receptor_rows={sk: partition_counts.get((sk, sk), 0) for sk in SINGLE_RECEPTOR_SUBSETS})
             for sk, ok, n in con.execute(
                     'SELECT subset_key, order_key, COUNT(*) FROM staging_raw GROUP BY 1, 2').fetchall():
                 targets[(sk, ok)] = n
