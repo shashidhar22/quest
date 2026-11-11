@@ -274,3 +274,34 @@ def test_a_corpus_that_fails_the_preflight_is_not_trained_on(world, tmp_path):
     bench.write_text(json.dumps({"as_paired_i_val.parquet": "ee"}))        # not what the audit read
     with pytest.raises(RuntimeError, match="other benchmark files"):
         L.CPTTrainer(make_cfg(world, tmp_path / "out2", corpus_benchmark_sha256=str(bench)))
+
+
+def test_the_preflight_is_bound_to_the_dataset_that_is_loaded(world, tmp_path):
+    import shutil
+    v = tmp_path / "v"
+    shutil.copytree(world["version"], v)
+    shutil.copytree(v / "dataset", v / "legacy")                    # present, but not what was audited
+    with pytest.raises(RuntimeError, match="audits .*/dataset"):
+        L.check_corpus_and_objective(make_cfg(world, tmp_path / "o", dataset_path=str(v / "legacy")))
+    with pytest.raises(RuntimeError, match="inside the corpus"):
+        L.check_corpus_and_objective(make_cfg(world, world["version"] / "runs" / "a"))
+    assert L.check_corpus_and_objective(make_cfg(world, tmp_path / "o", dataset_path=world["ds"] + "/"))
+
+
+def test_the_tokenized_cache_is_named_by_the_vocabulary_too(world):
+    tok = EsmTokenizer.from_pretrained(world["model"])
+    base = L.token_cache_key("fp", tok, 160, "fixb", True)
+    assert base == L.token_cache_key("fp", EsmTokenizer.from_pretrained(world["model"]), 160, "fixb", True)
+
+    class Swapped:                                                  # same size, two letters exchanged
+        all_special_tokens = tok.all_special_tokens
+
+        def get_vocab(self):
+            v = dict(tok.get_vocab())
+            v["L"], v["A"] = v["A"], v["L"]
+            return v
+
+    Swapped.__name__ = type(tok).__name__
+    keys = {base, L.token_cache_key("fp", Swapped(), 160, "fixb", True), L.token_cache_key("fq", tok, 160, "fixb", True),
+            L.token_cache_key("fp", tok, 128, "fixb", True), L.token_cache_key("fp", tok, 160, "raw", True)}
+    assert len(keys) == 5

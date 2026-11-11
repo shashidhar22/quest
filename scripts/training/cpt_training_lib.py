@@ -400,6 +400,23 @@ def annotate_token_regions(
 # ---------------------------------------------------------------------------
 
 
+# Bump when _preprocess_for_eos_strategy or the tokenization call below changes what a row
+# becomes: an explicitly named cache is loaded by existence, not by the transform's fingerprint.
+TOKEN_CACHE_REVISION = 1
+
+
+def token_cache_key(data_fingerprint: str, tokenizer, max_length: int, eos_strategy: str,
+                    add_length_col: bool) -> str:
+    """Names a tokenized cache by everything it depends on, the tokenizer's vocabulary included
+    (a same-size vocabulary at the same path is a different tokenizer)."""
+    vocab = sorted(tokenizer.get_vocab().items())
+    return hashlib.sha256(json.dumps([
+        TOKEN_CACHE_REVISION, data_fingerprint, max_length, eos_strategy, add_length_col,
+        type(tokenizer).__name__, vocab,
+        sorted(str(t) for t in getattr(tokenizer, "all_special_tokens", [])),
+    ]).encode()).hexdigest()[:16]
+
+
 def load_cpt_dataset(
     path: str,
     tokenizer,
@@ -470,10 +487,7 @@ def load_cpt_dataset(
 
     cache_file = None
     if cache_dir is not None:
-        key = hashlib.sha256(json.dumps([
-            ds._fingerprint, max_length, eos_strategy, add_length_col, type(tokenizer).__name__,
-            getattr(tokenizer, "name_or_path", None), getattr(tokenizer, "vocab_size", None),
-        ]).encode()).hexdigest()[:16]
+        key = token_cache_key(ds._fingerprint, tokenizer, max_length, eos_strategy, add_length_col)
         os.makedirs(cache_dir, exist_ok=True)
         cache_file = os.path.join(cache_dir, f"{os.path.basename(os.path.normpath(target))}-{key}.arrow")
     ds = ds.map(
@@ -1538,7 +1552,14 @@ def check_corpus_and_objective(cfg) -> dict | None:
     if preflight != "required":
         return None
     from quest.data.corpus_preflight import MARKER, corpus_problems, sha256_file
-    version_dir = os.path.dirname(os.path.normpath(cfg.dataset_path))
+    dataset_dir = os.path.normpath(cfg.dataset_path)
+    version_dir = os.path.dirname(dataset_dir)
+    if os.path.basename(dataset_dir) != "dataset":
+        # The preflight audits <version>/dataset and nothing else in that directory.
+        raise RuntimeError(f"corpus_preflight audits {version_dir}/dataset, but dataset_path is {cfg.dataset_path}")
+    inside = os.path.realpath(version_dir) + os.sep
+    if (os.path.realpath(cfg.output_dir) + os.sep).startswith(inside):
+        raise RuntimeError(f"output_dir {cfg.output_dir} is inside the corpus {version_dir}: a run never writes there")
     expected = None
     if getattr(cfg, "corpus_benchmark_sha256", None):
         with open(cfg.corpus_benchmark_sha256) as fh:
@@ -2051,7 +2072,6 @@ class CPTTrainer:
                     raw_loss, logits = out.loss, out.logits
                 if exact:
                     # Summed in float32: a bf16 sum over thousands of targets loses digits.
-                    # accum_loss then estimates the step's global mean from this rank's share.
                     loss = summed_masked_loss(logits.float(), labels) * exact_scale
                 elif plan is None:
                     loss = raw_loss / n_acc            # Stage 4.1 path, bit-identical to before
@@ -2066,6 +2086,12 @@ class CPTTrainer:
             micro_i += 1
 
             if closes_step:
+                if exact and self.is_distributed:
+                    # A rank's accum_loss is world_size x its own share; the mean over ranks is
+                    # the step's global mean, which is what gets logged.
+                    t = torch.tensor([accum_loss], dtype=torch.float64, device=self.device)
+                    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                    accum_loss = float(t.item()) / self.world_size
                 step_i, micro_i = step_i + 1, 0
                 self._epoch_steps_done = step_i
                 grad_norm = torch.nn.utils.clip_grad_norm_(

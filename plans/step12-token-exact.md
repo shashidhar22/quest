@@ -4,6 +4,16 @@ Opened 2026-11-11. Not a stage. Step text: ACS `quest-cpt/audits/2026-11-09/corp
 step 12 and its amendment; gates: ACS `quest-cpt/audits/2026-11-10/new-cpt-plan.md` gates 5-6.
 Lightweight plan.
 
+## Status 2026-11-11
+
+Steps 1-5 done on the laptop, commits `fcfc2ed` and the review fixes after it. Independent
+verifier: nine mutations all caught, real 2-process DDP (gloo) with uneven and zero-target
+ranks matches a single-process reference to 1e-17, the historical `token`, `row` and
+fixed-batch paths are bit-identical to the commit before. Codex: three findings fixed (cache
+key now carries the vocabulary; the preflight is bound to `<version>/dataset`; the logged loss
+is the global mean). Not done: a real-GPU smoke (NCCL, bf16, flash attention), pricing from
+measured throughput.
+
 ## Goal
 
 A trainer that can run the approved objective (`token_exact` = `global-masked-target-mean/v2`)
