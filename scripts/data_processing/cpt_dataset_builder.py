@@ -823,6 +823,14 @@ def main():
                     help='source rows, laid out subset_key=*/order_key=*/*.parquet')
     ap.add_argument('--clusters-dir', type=Path, default=CLUSTERS_DIR)
     ap.add_argument('--split-dir', type=Path, default=SPLIT_DIR)
+    ap.add_argument('--partition-sampler', choices=['duckdb-hash', 'md5'], default='duckdb-hash',
+                    help='key that orders and thresholds rows when sampling per partition. duckdb-hash is '
+                         'what past builds used; its values are not uniform on DuckDB 1.5 or 2.0 (a 2%% '
+                         'threshold kept 15.7%% of a beta partition), so a build checked against a sampling '
+                         'contract must use md5')
+    ap.add_argument('--large-partition-rows', type=int, default=50_000_000,
+                    help='partitions above this many rows are sampled by hash threshold in one pass; '
+                         'lower it only to exercise that path on a small source')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--run-id', type=str, default='runXX')
     ap.add_argument('--threads', type=int, default=DEFAULT_THREADS)
@@ -993,6 +1001,9 @@ def main():
                                  'cannot build it')
             if not by_example and args.distribution != 'proportional':
                 raise SystemExit('a row-sampled contract version is built with --distribution proportional')
+            if not by_example and args.partition_sampler != 'md5':
+                raise SystemExit('a build checked against a sampling contract must use --partition-sampler md5: '
+                                 'duckdb-hash is neither uniform nor stable across DuckDB versions')
             mismatches = contract_mismatches(
                 contract, eligibility_policy=policy, reference_sha256=ref_sha,
                 partial_chain_fraction=PARTIAL_FRACTION if policy == REFERENCE_AWARE_POLICY else None,
@@ -1135,7 +1146,8 @@ def main():
         # byte-identical samples.
         log('STEP 4: hybrid sampling (batched small + isolated large)', run_id=run_id)
         seed = args.seed
-        LARGE_PARTITION_THRESHOLD = 50_000_000  # post-filter row count
+        row_key_fn = 'md5' if args.partition_sampler == 'md5' else 'hash'
+        LARGE_PARTITION_THRESHOLD = args.large_partition_rows  # post-filter row count
 
         src_cols = [
             'tra_full', 'trb_full', 'tra_cdr1', 'tra_cdr2', 'tra_cdr3',
@@ -1191,13 +1203,13 @@ def main():
             con.execute(f"""
                 INSERT INTO staging_raw
                 WITH src AS (
-                  SELECT {sel_inner}, subset_key, order_key
-                  FROM read_parquet({globs!r}, hive_partitioning=1)
-                  {partition_where}
+                  {filtered_rows_sql(sel_inner + ', subset_key, order_key',
+                                     f'read_parquet({globs!r}, hive_partitioning=1)',
+                                     partition_where, where_split)}
                 ),
                 tagged AS (
                   SELECT s.*, t.tgt,
-                    hash(concat_ws('|', '{seed}', subset_key, order_key, sequence)) AS h
+                    {row_key_fn}(concat_ws('|', '{seed}', subset_key, order_key, sequence)) AS h
                   FROM src s
                   JOIN targets_small t ON s.subset_key = t.sk AND s.order_key = t.ok
                 ),
@@ -1238,12 +1250,16 @@ def main():
             t_p = time.time()
             modulus = 10_000_000
             threshold = max(1, int(round(tgt * modulus / n_pf)))
+            # The filter is applied only to rows it can affect (`split_filter`): handed the whole
+            # 1.38B-row partition, its lookups became a 37-minute join that changed no row.
+            keep = f"AND (hash(concat_ws('|', '{seed}', '{sk}', '{ok}', sequence)) % {modulus}) < {threshold}"
+            if args.partition_sampler == 'md5':
+                # An md5 is uniform, so "below this prefix" keeps the share the target needs.
+                cut = format(min(16 ** 8 - 1, int(round(tgt / n_pf * 16 ** 8))), '08x')
+                keep = f"AND md5(concat_ws('|', '{seed}', '{sk}', '{ok}', sequence)) < '{cut}'"
             con.execute(f"""
                 INSERT INTO staging_raw
-                SELECT {sel}
-                FROM read_parquet('{glob}')
-                {partition_where}
-                  AND (hash(concat_ws('|', '{seed}', '{sk}', '{ok}', sequence)) % {modulus}) < {threshold}
+                {filtered_rows_sql(sel, f"read_parquet('{glob}')", partition_where, where_split, keep)}
             """)
             n_inserted = con.execute(
                 f"SELECT COUNT(*) FROM staging_raw WHERE subset_key = '{sk}' AND order_key = '{ok}'"
@@ -1609,6 +1625,7 @@ def main():
                 'distribution': args.distribution,
                 'scale': args.scale,
                 'seed': args.seed,
+                'partition_sampler': args.partition_sampler,
             },
             'paths': {
                 'input': str(source_root),
