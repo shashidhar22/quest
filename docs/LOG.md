@@ -495,3 +495,21 @@ slow stage to the others and was wrong by 10x; measure a stage before extrapolat
 New script: `scripts/data_processing/contract_build_box/run_contract_build.sh`. 300+ focused
 tests pass with `~/.venvs/quest-cpt`.
 
+## 2026-11-11 — step 11: both corpus versions audited from their built files and published
+
+- New: `scripts/data_processing/cpt_built_audit.py` (leakage and coverage from the built rows),
+  `quest/data/corpus_preflight.py` (`corpus_problems`), `contract_build_box/publish_corpus.py`
+  and `audit_and_publish.sh`; builder `--partition-sampler md5` (DuckDB `hash()` is not uniform:
+  a 2.0% threshold kept 15.7%) and the split-filter shortcut on the proportional path.
+- Box visit CR2: proportional version built in 31 min, V1-V11 PASS; both versions pass the audit
+  (0 of 672 held-out peptides, none within one edit) and are published under
+  `s3://fh-pi-warren-h-eco/quest/cpt/repair-20261109T-eligibility/`. Re-checked from the laptop
+  on downloaded bytes.
+- Codex review before the visit: the audit passed against an empty benchmark; the preflight
+  accepted a missing run id, a V11 for the other version, an empty isolation block and missing
+  data files; the publisher left a local marker after a failed upload. All fixed, with tests.
+
+Lessons. (1) "Zero hits" needs a non-empty thing to hit: every gate now also requires the
+evidence it compared against. (2) A command passed through two layers of quoting lost its
+variables; put it in a script file. (3) The first Codex run sat an hour waiting on standard
+input; `codex exec` needs `< /dev/null` when it is not on a terminal.

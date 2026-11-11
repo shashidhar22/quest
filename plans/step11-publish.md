@@ -4,6 +4,12 @@ Opened 2026-11-11. Not a stage. Step text and amendments: ACS
 `quest-cpt/audits/2026-11-09/corpus-repair-plan.md`. Contract: `sampling-contract.json`,
 revision 4. Lightweight plan.
 
+## Status 2026-11-11
+
+Done. Both versions published and re-checked from the laptop (visit CR2). Results: ACS
+`repair-status.md`, "Step 11". The preflight is `quest/data/corpus_preflight.py`; wiring it
+into a launcher is step 12.
+
 ## Goal
 
 Both corpus versions the contract fixes, published to one new S3 prefix with everything needed
