@@ -321,3 +321,31 @@ def test_the_smoke_runs_the_real_loop_for_a_bounded_number_of_steps(world, tmp_p
     assert all(r["rows"] == ROWS_PER_STEP and r["targets"] > 0 for r in report["per_step"])
     assert report["steps_per_epoch"] == STEPS and report["corpus"]["run_id"] == "r1"
     assert L.exact_step_batches is exact_step_batches                # the patches were undone
+
+
+def test_a_step_cap_stops_there_on_its_own_schedule_and_counts_its_targets(world, monkeypatch):
+    seen, orig = [], L.DataCollatorForMLMDynamic.__call__
+
+    def rec(self, examples):
+        batch = orig(self, examples)
+        seen.append(masked_target_count(batch["labels"]))
+        return batch
+
+    monkeypatch.setattr(L.DataCollatorForMLMDynamic, "__call__", rec)
+    out = world["root"] / "capped"
+    tr = L.CPTTrainer(make_cfg(world, out, max_steps=6))
+    plan = tr.train_sampler.step_plan()
+    assert tr.total_steps == 6
+    tr.train()
+    assert tr.global_step == 6
+    assert tr.scheduler.get_last_lr()[0] == pytest.approx(0.0, abs=1e-9)        # the cosine reached its end
+    assert tr.masked_targets_seen == sum(seen[:sum(plan[:6])]) > 0
+    final = json.loads((out / "final" / "trainer_state.json").read_text())
+    assert final["global_step"] == 6 and final["masked_targets_seen"] == tr.masked_targets_seen
+    assert final["loss_weighting_semantics"] == "global-masked-target-mean/v2"
+    assert final["corpus_identity"]["run_id"] == "r1"
+    with pytest.raises(ValueError, match="max_steps"):                          # a resume under another cap
+        L.CPTTrainer(make_cfg(world, world["root"] / "capped2", max_steps=9,
+                              resume_from=str(out / f"checkpoint_step_{SAVE_EVERY}")))
+    with pytest.raises(ValueError, match="outside 0"):
+        L.CPTTrainer(make_cfg(world, world["root"] / "capped3", max_steps=STEPS + 1))

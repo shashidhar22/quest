@@ -109,6 +109,10 @@ def check_resume_config(saved: dict, current: dict, *, token_mode: bool,
     keys = RESUME_MATCH_KEYS + ("rows_per_step",) + (() if token_mode else RESUME_MATCH_KEYS_LEGACY)
     norm = lambda v: json.dumps(v, sort_keys=True, default=str)  # noqa: E731
     bad = [k for k in keys if norm(saved.get(k)) != norm(current.get(k))]
+    # A step cap sets the schedule's length. Checkpoints written before it existed have no
+    # such field and ran whole epochs, which is what 0 means.
+    if (saved.get("max_steps") or 0) != (current.get("max_steps") or 0):
+        bad.append("max_steps")
     if bad:
         detail = ", ".join(f"{k}: checkpoint={saved.get(k)!r} now={current.get(k)!r}" for k in bad)
         raise ValueError(f"resume config mismatch on {len(bad)} field(s) — {detail}")

@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--token_budget", type=int, default=0,
                     help="Stage 4.3: tokens per micro-batch for step-synchronised batching; "
                          "0 = off (fixed batch_size, the Stage 4.1 path)")
+    ap.add_argument("--max_steps", type=int, default=0,
+                    help="stop after this many optimizer steps, with warmup and decay sized to it; 0 = whole epochs")
     ap.add_argument("--corpus_preflight", choices=("off", "required"), default="off",
                     help="'required': refuse unless the parent of --dataset is a published corpus "
                          "passing quest.data.corpus_preflight (needed by --loss_weighting token_exact)")
@@ -169,6 +171,7 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
         token_budget=args.token_budget,
         loss_weighting=args.loss_weighting,
+        max_steps=args.max_steps,
         corpus_preflight=args.corpus_preflight,
         corpus_benchmark_sha256=args.corpus_benchmark_sha256,
         resume_from=args.resume_from,

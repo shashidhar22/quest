@@ -1454,6 +1454,9 @@ class CPTConfig:
 
     # Schedule
     num_epochs: int = 1
+    # > 0: stop after this many optimizer steps and size warmup and cosine decay to it, so a
+    # short run follows its own schedule rather than the head of a longer one. 0 = whole epochs.
+    max_steps: int = 0
     batch_size: int = 256
     gradient_accumulation_steps: int = 2
     eval_every_n_steps: int = 500
@@ -1672,6 +1675,7 @@ class CPTTrainer:
             patience=cfg.early_stopping_patience, min_delta=1e-4, mode="min"
         )
         self.global_step = 0
+        self.masked_targets_seen = 0   # token_exact only: supervised targets over all ranks
         self.best_eval_loss = float("inf")
         self.should_stop = False
         self.last_eval_result: dict | None = None
@@ -1711,6 +1715,7 @@ class CPTTrainer:
         self.optimizer.load_state_dict(st["optimizer"])
         self.scheduler.load_state_dict(st["scheduler"])
         self.global_step = int(st["global_step"])
+        self.masked_targets_seen = int(st.get("masked_targets_seen", 0))
         self.best_eval_loss = float(st["best_eval_loss"])
         if self.cdr3_plateau is not None and st.get("cdr3_plateau"):
             self.cdr3_plateau.best = float(st["cdr3_plateau"]["best"])
@@ -1957,6 +1962,10 @@ class CPTTrainer:
         else:
             steps_per_epoch = max(1, len(self.train_loader) // self.cfg.gradient_accumulation_steps)
         total_steps = steps_per_epoch * self.cfg.num_epochs
+        max_steps = getattr(self.cfg, "max_steps", 0)
+        if max_steps < 0 or max_steps > total_steps:
+            raise ValueError(f"max_steps {max_steps} is outside 0..{total_steps} (the run's {self.cfg.num_epochs} epoch(s))")
+        total_steps = max_steps or total_steps
         warmup_steps = int(total_steps * self.cfg.warmup_ratio)
         self.total_steps = total_steps
 
@@ -2092,6 +2101,8 @@ class CPTTrainer:
                     t = torch.tensor([accum_loss], dtype=torch.float64, device=self.device)
                     dist.all_reduce(t, op=dist.ReduceOp.SUM)
                     accum_loss = float(t.item()) / self.world_size
+                if exact:
+                    self.masked_targets_seen += round(self.world_size / exact_scale)
                 step_i, micro_i = step_i + 1, 0
                 self._epoch_steps_done = step_i
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -2137,6 +2148,15 @@ class CPTTrainer:
 
                 if self.global_step % cfg.save_every_n_steps == 0:
                     self._save_checkpoint(epoch, tag=f"step_{self.global_step}")
+
+                if self.global_step >= self.total_steps:
+                    # The step cap (or the last planned step). Without a cap this coincides
+                    # with the end of the loader, so earlier runs take the same path as before.
+                    self.should_stop = bool(getattr(cfg, "max_steps", 0))
+                    if self.should_stop:
+                        self._log(f"  Reached max_steps={cfg.max_steps}")
+                        pbar.close()
+                        return
 
         pbar.close()
 
@@ -2300,6 +2320,7 @@ class CPTTrainer:
             state = {
                 "format": 1,
                 "global_step": self.global_step,
+                "masked_targets_seen": self.masked_targets_seen,
                 "epoch": epoch,
                 "step_in_epoch": self._epoch_steps_done,
                 "best_eval_loss": self.best_eval_loss,
@@ -2338,6 +2359,9 @@ class CPTTrainer:
             json.dump(
                 {
                     "global_step": self.global_step,
+                    "masked_targets_seen": self.masked_targets_seen,
+                    "corpus_identity": self._corpus_identity,
+                    "loss_weighting_semantics": LOSS_WEIGHTING_SEMANTICS.get(self.cfg.loss_weighting),
                     "best_eval_loss": self.best_eval_loss,
                     "lora_info": self.lora_info,
                     "config": {k: v for k, v in self.cfg.__dict__.items() if not callable(v)},
