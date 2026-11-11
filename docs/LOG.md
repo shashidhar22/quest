@@ -527,3 +527,30 @@ Lessons. (1) Running the real trainer in a test found what unit tests could not:
 wrote cache files into the published corpus, which would have failed the next preflight.
 (2) Token budget 16384 was never a real 16k-token micro-batch on the old corpus; a corpus with
 more long rows was the first to fill one, and it did not fit.
+
+## 2026-11-11 — step 12, spending half prepared: diagnostic and pilot launchers
+
+- Review of the day's code first: a capped multi-epoch resume restarted in the wrong epoch;
+  `pilot_compare.py` accepted true peptides recorded on neither cell; a resume did not compare
+  the corpus identity. Fixed with tests (`48cda90`).
+- Built, laptop only: `diagnostic_analyze.py` and `pilot12_box/run_diagnostic.sh` (gate 4);
+  `pilot12_box/experiment_lock.py`, `experiment-lock.json` and `run_pilot.sh` (gates 6-7); the
+  trainer records a hash of its initial LoRA state. Frozen values and what is not established:
+  `plans/step12-diagnostic-and-pilot.md`.
+- Independent verifier on both drivers: four defects fixed (stale `pilot.json` reused, lock
+  re-read instead of held, `status.json` stale or missing, launch outside the wrapper).
+- Codex (Astra): nine findings fixed. The largest: the lock pinned 12 hand-listed files and
+  not the samplers, collators or negative sampler; it now pins the computed import closure
+  (57 files). 42 protections removed one at a time, each caught by a test.
+
+Lessons. (1) A lock verified once and re-read afterwards is not held: the driver now keeps the
+verified bytes and re-verifies before each GPU step. (2) A test that looks for a word in a
+message passed with the protection removed, because the temporary directory is named after
+the test and its path was in the message; assert the exact phrase. (3) The launch wrapper
+assigns `LOCK`, `STATUS` and `PID` in its own shell, which overwrites an exported variable of
+the same name; a driver's inputs need names of their own (`EXPERIMENT_LOCK`). The watchdog reads
+`POLL` from the same environment, in integer arithmetic. (4) Two overlapping checks hid each
+other from the tests: removing either left the test passing. One check, one test. (5) A test
+stub that left out a field the real judge writes (`smoke`) failed every cell; the real files
+on disk were the fastest way to tell a stub fault from a checker fault.
+

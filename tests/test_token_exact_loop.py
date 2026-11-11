@@ -379,3 +379,18 @@ def test_a_resume_under_a_cap_keeps_the_epoch_it_was_in_and_never_passes_the_cap
                                   resume_from=str(world["root"] / "cap1" / f"checkpoint_step_{SAVE_EVERY}")))
     again.train()
     assert again.global_step == SAVE_EVERY
+
+
+def test_the_initial_lora_state_is_hashed_and_survives_to_the_final_state_and_a_resume(world):
+    a = L.CPTTrainer(make_cfg(world, world["root"] / "init_a", max_steps=SAVE_EVERY))
+    b = L.CPTTrainer(make_cfg(world, world["root"] / "init_b", max_steps=SAVE_EVERY))
+    c = L.CPTTrainer(make_cfg(world, world["root"] / "init_c", max_steps=SAVE_EVERY, seed=8))
+    assert len(a.initial_lora_sha256) == 64
+    assert a.initial_lora_sha256 == b.initial_lora_sha256 != c.initial_lora_sha256
+    a.train()
+    final = json.loads((world["root"] / "init_a" / "final" / "trainer_state.json").read_text())
+    assert final["initial_lora_sha256"] == a.initial_lora_sha256
+    assert L.trainable_sha256(a.model) != a.initial_lora_sha256          # training moved the weights
+    again = L.CPTTrainer(make_cfg(world, world["root"] / "init_r", max_steps=SAVE_EVERY,
+                                  resume_from=str(world["root"] / "init_a" / f"checkpoint_step_{SAVE_EVERY}")))
+    assert again.initial_lora_sha256 == a.initial_lora_sha256           # the run's start, not the checkpoint

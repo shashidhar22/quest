@@ -151,3 +151,10 @@ def test_a_cell_outside_every_contrast_is_still_held_to_the_closed_test_parts():
     cells["P"]["conditions"]["test_novel_pep"] = {"ranks": {}, "true_peptides": {}}
     with pytest.raises(P.PC.ComparisonError, match="test parts closed"):
         P.compare(cells, units(), ["E-B"], n_boot=50)
+
+
+def test_no_positional_verdict_label_is_saved():
+    """`compare_condition` says "B > A" by position; for the contrast E-B its "B" is cell E."""
+    out = P.compare(three_cells(), units(), ["E-B"], n_boot=50)
+    for r in out["contrasts"]["E-B"].values():
+        assert "verdict" not in r and "point" in r

@@ -1,0 +1,192 @@
+{
+ "schema": "experiment-lock/v1",
+ "created_utc": "2026-11-11T23:17:10Z",
+ "stage": "pilot-10pct",
+ "question": "does CPT on a validated repaired corpus improve downstream class-I peptide retrieval over a fresh, equally capable SFT-only base, and does the enriched sampling package improve over repaired proportional sampling?",
+ "primary_contrast": "E-B",
+ "secondary_contrasts": [
+  "P-B",
+  "E-P"
+ ],
+ "replication": "one CPT seed, one SFT seed: exploratory, cannot establish superiority",
+ "code_files": {
+  "quest/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "quest/data/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "quest/data/corpus_preflight.py": "b4c2fbd48955eb856781c68777d97f05b264af2cbf8bb807b83596af928a0113",
+  "quest/metrics/__init__.py": "50fdd8886bb38fd50e39dfb00fbb759577700765aa736cf61450e724bed23764",
+  "quest/metrics/biophysical.py": "2cb65a5149ad64d654bc01b67e7d7e90f28d40c45a817e39dddf911aea27f5ae",
+  "quest/metrics/cdr_analysis.py": "02029ffe0bc448f1c3456dd4fa15ce822aea40830850792811dae658b7cb2c8a",
+  "quest/metrics/position_wise.py": "3bd00870d0d3bcb267d59579b1a5d8c199d6c3a929797308157a3dee0a169954",
+  "quest/metrics/retrieval_metrics.py": "fbcfae4e79d3a4d5feb6d93ce8c46b9e9bd834d0d296ba695ab3c9280a5be1fa",
+  "quest/metrics/sequence_metrics.py": "b6c97093ce3d4769de3284731214f16e213803038b77ea2bfbfe08bc3ff3b973",
+  "quest/models/__init__.py": "c42731011a97d7a4983d951d60f5c5b2975be93a88a50b564d48cfe60a76665e",
+  "quest/models/attention_pooling.py": "5f0cb2b79fd9f8eec6fab656545a3531f8d8fbbbd846589bd1e4246fcda785f8",
+  "quest/models/contrastive_loss.py": "d7252273dffc8943e1c119b2e0c8b1f735848d3d93fb204aae46b3cd5e5d2f5a",
+  "quest/models/cross_encoder.py": "6a8f55732f2d6709332768b5f66735da964cc7d13629d44fc2bb2af3f9226c95",
+  "quest/models/dual_encoder.py": "e0d4c336005746c417a0dac843373d7afe047a1dcf732b3399572c7605b9ec24",
+  "quest/models/lora_utils.py": "2532c9ae8c42904fa18fab205a23b0886e121a884f6e52a34ee55a543366c80e",
+  "quest/models/pmhc_seq2seq_model.py": "f8cf8ed499adf350641c13be7296f66d2ce1252f6751af30090708868ec1255b",
+  "quest/models/positional_encoding.py": "7c6ea0ac04f81c2ddb8c863c9a33abcf745018e896d33ccc4ec0e519f25b7e39",
+  "quest/models/seq2seq_decoder.py": "ac4728d4a427b488445ade9538985dab307e2fe8831180c0ab84772ef99d67f5",
+  "quest/models/seq2seq_model.py": "267a1dbe36e778e754e514eb39b18a00b233873102a532e2d1ea5336a841f2bd",
+  "quest/models/tensor_parallel.py": "1dfe55187c74bc58dfe0a307b4e153c07efc380b316b2825ff189d6e3d851245",
+  "quest/parsers/__init__.py": "3e22b85ac151920c1b114e3ed925d72267233f62521668c0c89e9e9c597367f2",
+  "quest/parsers/cdr_region_identifier.py": "7c2fddd3a89ca35791dfa8faf097225d7893f19d9a148b53524bc5ae51f921d4",
+  "quest/parsers/utils.py": "d5f3cd3a78cd2ce7461dce25def0071ba95670873fb50a695aa6961bcc0391d0",
+  "quest/training/__init__.py": "2add48d8b187d98809b9c31dab5de5f41c94c676227b6b34d3a559132d320c68",
+  "quest/training/backends/__init__.py": "cd05f51d00b85f6373c0a14c6f9be5a28a5f3bdc14824acb0b03b5857c3f7a74",
+  "quest/training/backends/base.py": "dfbc761ea5cf2b667974ab1e643704e28e879404ad4a2890f10bcfc90f12dadd",
+  "quest/training/backends/cuda_backend.py": "f844a88b246615e81d9838ce302aa696e92b5a0a73f6040221f9ee5dc2c96bb1",
+  "quest/training/backends/neuron_backend.py": "345a64097291f408062213cacf008c0ff79fb71b0c3a236b46761f996ee7aa47",
+  "quest/training/base_trainer.py": "4f534badd2dce2b7bf0a8d812e311b35d9dbbb7bb5079942a0daa6dc0b7b1db1",
+  "quest/training/callbacks.py": "50e1216be9d2d1fbe47d49e7ef38bc92f4426d4c365ceaa54637e4e9dc9eebdf",
+  "quest/training/collators.py": "f1d39cdcf8aa3b5a13b0317ffefd3f8db1fd1414e36fff1152c50bf8d34b2ad3",
+  "quest/training/loss_normalization.py": "a103ad336ffc7456f8c244549de8336506d597f79490ede5b01967e6806af2aa",
+  "quest/training/resume_compat.py": "692e12a1aae734b2536f71013ca995ed2c1344e34753347e1bd0a9bd3b72e20e",
+  "quest/training/samplers.py": "0b1f489b17674886efd84aa9bcfa8e30ac498b983deb6e46582630f23b0401a8",
+  "scripts/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "scripts/training/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "scripts/training/cpt_training_lib.py": "66af62e6263a5df305c8a101b8a05198bb8417bae674eb990b56f241a26317d4",
+  "scripts/training/pilot12_box/experiment_lock.py": "051ce860f1599ba9be0936ff146fb0fdc78e6d9ad7204cc1fe1bdc12ce9cbb66",
+  "scripts/training/pilot12_box/pilot_compare.py": "6443afd4fb084be652b53080778c633ea47f0b60b882fd8fed7f1c28652b34d9",
+  "scripts/training/pilot12_box/run_pilot.sh": "87675ed161eb2f433882e13bd0e37ed2daa847c3db339009be2cba1301030a55",
+  "scripts/training/stage42_box/paired_compare.py": "f9b1268bab3c62674fde0f655e3e7755b9f2f800b44391347426e6c2205b139a",
+  "scripts/training/stage42_box/readability.py": "f5af14fd87b751aa6f366285c8e528fd11705d274bd2021b830622439121dab5",
+  "scripts/training/tcr_robust_contrastive_trainer.py": "df73343f849866c5e91746bb2efc640221f968952869a1f77c3b0ec49c4d35d4",
+  "scripts/training/train_cpt_stage2_single.py": "fc8aa4549f61425b340135eea928543289291cbd34e21dd391e039b001d19968",
+  "scripts/training/v04_box/provenance.py": "77168ee433216e80ade8f9c5013d55950f4361a4ae0b46702e7c65f79adf3482",
+  "track_a/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "track_a/esm_sft/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "track_a/esm_sft/encoders.py": "38095ff3a2fb92aaa467a7e17af22677ba2ec8ff8f73ade303c77e265b3fc45d",
+  "track_a/esm_sft/judge.py": "172c4c80ced030296ae9842cb910dbb80597de17139ca9790690c5e5fcd14ea6",
+  "track_a/esm_sft/model.py": "c3f820d5d82e8fd3bed2fbae7ea7e3b34e90e3d22b37f2dfcbc0c735c741f498",
+  "track_a/esm_sft/scoring.py": "6d065e2c05572236f7685c05a8b607403470d92cc19c91f40bd0ad9f55e213bd",
+  "track_a/esm_sft_cubes/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "track_a/esm_sft_cubes/cpt_loader.py": "f3c6869a2d61c847c5fce77f728b45d92b514de7edec642794ad9ae0db241f05",
+  "track_a/shared/__init__.py": "1c1c9a984c1f6c4e9c8fc542ad711be84a556481a207463a1ddd314870a04851",
+  "track_a/shared/artifacts.py": "a38e7a35239cae9502d2c3d789a2d11b5c61e5b4721ca9e72a8c2ce7a5886a3e",
+  "track_a/shared/load_splits.py": "8682a28b89e40b70a8cce148a67b22e2ec74db2acae87da1606c2f272a3ffd25",
+  "track_a/shared/negative_sampling.py": "8d1bf62c30548a8d38fd05e8298593273c763f39cf1fe8c248a68d0fc3b24631"
+ },
+ "corpora": {
+  "P": {
+   "version": "repaired_proportional_10M",
+   "run_id": "cr2-20261111T035019Z",
+   "contract_sha256": "b7ed784704379d4738c7632d7ea4f1072de81016dd3ea361f2b8f2a58406feb8",
+   "marker_sha256": "53fc8cf62af81413be87903c6b6cad9e39dfca2ca98ca2d913b2a94a96c740db"
+  },
+  "E": {
+   "version": "task_enriched_cap1000",
+   "run_id": "cr1-20261111T013453Z",
+   "contract_sha256": "b7ed784704379d4738c7632d7ea4f1072de81016dd3ea361f2b8f2a58406feb8",
+   "marker_sha256": "b7fa340e86679f638ae065850df49c386b348f7d44a23632319356a28b722248"
+  }
+ },
+ "benchmark_split_sha256": {
+  "as_paired_i_train.parquet": "022592e18c276fa86a7fa56b004c995206272245527085c2b4eea3af091268cb",
+  "as_paired_i_val.parquet": "2a09b5abec1c9c9315b27d33edc00da9f2faa584dcef8d90576b429e504bcd28",
+  "as_paired_i_test_iid.parquet": "776dbd0b8ff260f98ca93e19166739355c064beb4ab804e6493f429bade6dbcf",
+  "as_paired_i_test_novel_pep.parquet": "774a994be975739b80211edf4de65fb6fb7eea7aa3120d3b1ece2d912be84602",
+  "as_paired_i_test_level4.parquet": "deed959c09ec5892d95c72d73ab30ef7ba9f941bf38f721a7c66609de88ccc8f"
+ },
+ "model": {
+  "base_model": "esmc_300m",
+  "lora_r": 32,
+  "lora_alpha": 64,
+  "lora_dropout": 0.05
+ },
+ "cpt": {
+  "loss_weighting": "token_exact",
+  "loss_weighting_semantics": "global-masked-target-mean/v2",
+  "token_budget": 8192,
+  "batch_size": 16,
+  "gradient_accumulation_steps": {
+   "P": 64,
+   "E": 47
+  },
+  "max_steps": 780,
+  "num_epochs": 1,
+  "lr": 0.0002,
+  "warmup_ratio": 0.05,
+  "weight_decay": 0.01,
+  "gradient_clip": 1.0,
+  "mlm_probability": 0.15,
+  "max_length": 1024,
+  "bucket_boundaries": [
+   64,
+   128,
+   256,
+   512,
+   1024
+  ],
+  "eos_strategy": "raw",
+  "tcr_variant": "cdr3",
+  "mhc_variant": "full",
+  "seed": 42,
+  "early_stop_n_patience": 0,
+  "checkpoint": "final",
+  "full_target_budget": 23000000,
+  "pilot_target_budget": 2300000,
+  "arm_target_tolerance": 0.02,
+  "basis": "Measured on visit S12 at 1,024 rows per step: P 2,951 and E 4,002 masked targets per step; E's accumulation of 47 gives 752 rows per step, so both arms take about 2,950 targets per step for the same 780 updates."
+ },
+ "sft": {
+  "task": "as_paired_i",
+  "seed": 42,
+  "selector": "best.pt by validation AUROC",
+  "recipe": {
+   "max_train_pos": 50000,
+   "max_val_pos": 5000,
+   "epochs": 2,
+   "patience": 1,
+   "batch_size": 16,
+   "lr": 0.0001,
+   "seed": 42,
+   "num_workers": 4,
+   "max_len": 1024
+  }
+ },
+ "evaluation": {
+  "conditions": [
+   "val"
+  ],
+  "distractor_draw": "length_matched",
+  "max_queries": 5000,
+  "min_peptides": 100,
+  "comparator": {
+   "script": "scripts/training/pilot12_box/pilot_compare.py",
+   "metrics": [
+    "norm_rank",
+    "recall_at_10",
+    "mrr"
+   ],
+   "units": [
+    "peptide",
+    "pep_cluster"
+   ],
+   "n_boot": 4000,
+   "seed": 42
+  },
+  "gate3": "not done: validation only with the current evaluator; every test part stays closed",
+  "split_digests": {
+   "train": "022592e18c276fa8",
+   "val": "2a09b5abec1c9c93"
+  },
+  "pool_digest": "9a8b6bb50f9b72d6"
+ },
+ "spending": {
+  "usd_per_hour": 1.069,
+  "cpt_stage_max_hours": 2,
+  "visit_max_hours": 24,
+  "visit_cap_usd": 26
+ },
+ "limitations": [
+  "masking has no dedicated RNG stream",
+  "SFT hours taken from V04a, not re-measured",
+  "validation evaluation never timed",
+  "native precision",
+  "base model weights and tokenizer are not pinned by digest; third-party packages are not pinned",
+  "the canonical evaluation set's contents are not pinned (it selects nothing: early stop is off)",
+  "an SFT checkpoint is bound to its adapter at evaluation time, not at training time"
+ ]
+}

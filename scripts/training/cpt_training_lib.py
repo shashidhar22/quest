@@ -589,6 +589,19 @@ def load_base_model(
         raise
 
 
+def trainable_sha256(model) -> str:
+    """sha256 over every trainable tensor, by name: the identity of a LoRA state.
+
+    Recorded at construction so two arms that claim one starting point can be held to it; a
+    shared seed number is not that evidence.
+    """
+    h = hashlib.sha256()
+    for name, param in sorted((n, p) for n, p in model.named_parameters() if p.requires_grad):
+        h.update(name.encode())
+        h.update(param.detach().to(torch.float32).cpu().numpy().tobytes())
+    return h.hexdigest()
+
+
 def setup_lora_model(
     model_name: str,
     *,
@@ -1759,6 +1772,11 @@ class CPTTrainer:
             f"trainable={info['trainable_params']:,}/{info['total_params']:,} "
             f"({info['trainable_pct']:.2f}%)  ESM-C={self.is_esmc}"
         )
+        # The state the RUN started from: hashed before a resume overwrites it, and carried
+        # through a resume from the checkpoint (None for checkpoints older than the field).
+        self.initial_lora_sha256 = (trainable_sha256(model) if self._resume_state is None
+                                    else self._resume_state.get("initial_lora_sha256"))
+        self._log(f"Initial LoRA state sha256: {self.initial_lora_sha256}")
         if self._resume_dir is not None:
             # Load the checkpoint's adapter into the freshly built LoRA (before DDP / compile).
             from peft import set_peft_model_state_dict
@@ -2325,6 +2343,7 @@ class CPTTrainer:
                 "format": 1,
                 "global_step": self.global_step,
                 "masked_targets_seen": self.masked_targets_seen,
+                "initial_lora_sha256": self.initial_lora_sha256,
                 "epoch": epoch,
                 "step_in_epoch": self._epoch_steps_done,
                 "best_eval_loss": self.best_eval_loss,
@@ -2364,6 +2383,7 @@ class CPTTrainer:
                 {
                     "global_step": self.global_step,
                     "masked_targets_seen": self.masked_targets_seen,
+                    "initial_lora_sha256": self.initial_lora_sha256,
                     "corpus_identity": self._corpus_identity,
                     "loss_weighting_semantics": LOSS_WEIGHTING_SEMANTICS.get(self.cfg.loss_weighting),
                     "best_eval_loss": self.best_eval_loss,

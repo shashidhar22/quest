@@ -83,11 +83,16 @@ def compare(cells: dict, units: dict, contrasts, n_boot=PC.N_BOOT, seed=PC.SEED)
             raise PC.ComparisonError("; ".join(bad))
         ranks_a = a["conditions"][CONDITION]["ranks"]
         ranks_b = b["conditions"][CONDITION]["ranks"]
-        out["contrasts"][contrast] = {
+        results = {
             f"{metric}/{unit}": PC.compare_condition(
                 CONDITION, ranks_a, ranks_b, units, a["pool_size"], metric=metric, unit=unit,
                 n_boot=n_boot, seed=seed)
             for metric in METRICS for unit in ("peptide", "pep_cluster")}
+        for r in results.values():
+            # "B > A" by position: for the contrast E-B its "B" is cell E. A triage read-out
+            # saves the numbers and no label.
+            r.pop("verdict", None)
+        out["contrasts"][contrast] = results
     return out
 
 
