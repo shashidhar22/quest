@@ -87,7 +87,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--token_budget", type=int, default=0,
                     help="Stage 4.3: tokens per micro-batch for step-synchronised batching; "
                          "0 = off (fixed batch_size, the Stage 4.1 path)")
-    ap.add_argument("--loss_weighting", choices=("row", "token"), default="row",
+    ap.add_argument("--corpus_preflight", choices=("off", "required"), default="off",
+                    help="'required': refuse unless the parent of --dataset is a published corpus "
+                         "passing quest.data.corpus_preflight (needed by --loss_weighting token_exact)")
+    ap.add_argument("--corpus_benchmark_sha256", default=None,
+                    help="JSON {benchmark split file: sha256} the corpus's leakage audit must have read")
+    ap.add_argument("--loss_weighting", choices=("row", "token", "token_exact"), default="row",
                     help="Stage 4.3: how a micro-batch's mean loss is weighted inside its step "
                          "when --token_budget > 0. 'row' = row share (the shipped v2 behaviour; "
                          "gives MHC-bearing tokens ~0.43x the gradient weight the Stage 4.1 path "
@@ -164,6 +169,8 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
         token_budget=args.token_budget,
         loss_weighting=args.loss_weighting,
+        corpus_preflight=args.corpus_preflight,
+        corpus_benchmark_sha256=args.corpus_benchmark_sha256,
         resume_from=args.resume_from,
         resume_assume_objective=args.resume_assume_objective,
         region_eval=True,

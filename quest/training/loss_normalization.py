@@ -34,13 +34,12 @@ step, then clip the resulting gradient once, then step the optimizer. Clipping p
 would make the result depend on the partition again, which is the property this objective exists
 to remove.
 
-WHAT THE LOOP STILL HAS TO DO, and why this module cannot do it alone: the scale needs the step's
-GLOBAL target count before the step's FIRST backward. The current loop pulls one micro-batch at a
-time from the DataLoader, so it cannot know that count yet. Landing this objective therefore means
-buffering the step's micro-batches, counting their targets, one all-reduce of the count, and then
-forward/backward over the buffer. Until that lands, `micro_batch_loss_scale` refuses the name, so
-no run can be started under an objective the loop does not implement. See
-`plans/v04-audit-repair.md` step 5.
+HOW THE LOOP GETS THE COUNT (landed 2026-11-11, `plans/step12-token-exact.md`). The scale needs
+the step's GLOBAL target count before the step's FIRST backward, and a loop that pulls one
+micro-batch at a time cannot know it. `exact_step_batches` buffers one optimizer step's
+micro-batches, counts their targets, does one all-reduce, and hands each micro-batch back with
+the step's scale. `micro_batch_loss_scale` still refuses the name: that function returns a factor
+for a micro-batch MEAN, and this objective has no such factor.
 
 Imports torch and nothing else from this repo, so the contract is testable on a CPU with no peft
 or esm present (`tests/test_loss_normalization.py`).
@@ -134,6 +133,35 @@ def global_target_count(local_counts, group=None) -> int:
     return total
 
 
+def exact_step_batches(batches, plan, world_size: int = 1, count_global=global_target_count):
+    """Yield ``(batch, scale)`` for every micro-batch, one optimizer step at a time.
+
+    ``plan[i]`` is the number of micro-batches in step ``i`` (the sampler's step plan, from the
+    first step still to run). Each step is read whole, its supervised targets counted and
+    all-reduced once, and every one of its micro-batches is yielded with the same
+    ``world_size / N_global``. The caller multiplies the micro-batch's SUMMED loss by it.
+
+    Refuses when the batches and the plan disagree in either direction: a short or long stream
+    would otherwise close steps at the wrong places without a word.
+    """
+    it = iter(batches)
+    for step_i, n_acc in enumerate(plan):
+        step = []
+        for _ in range(n_acc):
+            try:
+                step.append(next(it))
+            except StopIteration:
+                raise RuntimeError(
+                    f"the loader ended inside optimizer step {step_i} of {len(plan)}: "
+                    f"{len(step)} of {n_acc} micro-batches") from None
+        scale = exact_microbatch_scale(
+            count_global([masked_target_count(b["labels"]) for b in step]), world_size)
+        for batch in step:
+            yield batch, scale
+    if next(it, None) is not None:
+        raise RuntimeError(f"the loader holds micro-batches beyond the {len(plan)} planned steps")
+
+
 def micro_batch_loss_scale(n_rows: int, rows_per_rank: int, n_acc: int, token_mode: bool,
                            weighting: str = "row", mb_tokens: int = 0,
                            step_tokens: int = 0) -> float:
@@ -171,15 +199,13 @@ def micro_batch_loss_scale(n_rows: int, rows_per_rank: int, n_acc: int, token_mo
     # the branch the CLI happens to take is not a guard.
     if weighting == "token_exact":
         # The objective approved 2026-11-04: summed target loss over the step's GLOBAL target
-        # count. It cannot be expressed as a per-micro-batch factor, because the denominator is
-        # not known until the step's micro-batches have been counted and all-reduced. Kept inline
-        # and self-contained so this function refuses correctly even when extracted on its own.
+        # count. It cannot be expressed as a factor on a micro-batch MEAN, so this function
+        # refuses it on every path; the loop uses exact_step_batches().
         raise ValueError(
-            "loss_weighting 'token_exact' (global-masked-target-mean/v2) is not implemented in "
-            "the training loop yet. Its contract and gradient tests live in "
-            "quest/training/loss_normalization.py; the loop must buffer each optimizer step and "
-            "all-reduce its supervised-target count first. See plans/v04-audit-repair.md step 5. "
-            "Use 'token' only to reproduce the historical input-length-share objective."
+            "loss_weighting 'token_exact' (global-masked-target-mean/v2) has no per-micro-batch "
+            "factor: its denominator is the optimizer step's global supervised-target count. "
+            "The loop must take exact_step_batches() and a summed loss instead; reaching this "
+            "function under that name means a path that would train another objective."
         )
     if weighting not in ("row", "token"):
         raise ValueError(

@@ -28,6 +28,7 @@ What is genuinely new here:
 from __future__ import annotations
 
 import glob
+import hashlib
 import itertools
 import json
 import math
@@ -59,6 +60,7 @@ from quest.training.resume_compat import (
 )
 from quest.training.loss_normalization import (
     exact_microbatch_scale,
+    exact_step_batches,
     global_target_count,
     masked_target_count,
     sum_from_mean,
@@ -407,6 +409,7 @@ def load_cpt_dataset(
     num_proc: int = 8,
     add_length_col: bool = True,
     eos_strategy: str = "fixb",
+    cache_dir: str | None = None,
 ) -> Dataset:
     """Load an HF dataset (or a specific split subdir), tokenize.
 
@@ -418,6 +421,11 @@ def load_cpt_dataset(
     Returns a Dataset with at minimum ``input_ids`` and ``attention_mask``
     columns. Stratification metadata (``mhc_class``, ``n_segments``, etc.) is
     preserved when present so bucketed_eval can group on it.
+
+    ``cache_dir``: where the tokenized copy is cached. By default ``datasets`` writes
+    ``cache-*.arrow`` INTO the dataset directory, which changes a published corpus under its
+    completion marker; a run on one passes a directory of its own. The file name carries
+    everything the tokenized copy depends on, so a changed setting never reuses an old cache.
     """
     target = os.path.join(path, split) if split else path
     ds = load_from_disk(target)
@@ -460,6 +468,14 @@ def load_cpt_dataset(
     ]
     drop_cols = [c for c in ds.column_names if c not in keep_cols]
 
+    cache_file = None
+    if cache_dir is not None:
+        key = hashlib.sha256(json.dumps([
+            ds._fingerprint, max_length, eos_strategy, add_length_col, type(tokenizer).__name__,
+            getattr(tokenizer, "name_or_path", None), getattr(tokenizer, "vocab_size", None),
+        ]).encode()).hexdigest()[:16]
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"{os.path.basename(os.path.normpath(target))}-{key}.arrow")
     ds = ds.map(
         _prep_and_tok,
         batched=True,
@@ -467,6 +483,7 @@ def load_cpt_dataset(
         num_proc=num_proc,
         remove_columns=drop_cols,
         desc=f"tokenize ({os.path.basename(target)})",
+        cache_file_name=cache_file,
     )
     return ds
 
@@ -1446,7 +1463,15 @@ class CPTConfig:
     # "row" is the shipped v2 behaviour and the default so earlier runs stay reproducible; it
     # down-weights MHC-bearing tokens ~2.3x relative to the Stage 4.1 path. "token" keeps
     # per-token weight uniform. See micro_batch_loss_scale and quest-cpt/findings.md 9.5.
+    # "token_exact" is the objective approved 2026-11-04 (global-masked-target-mean/v2): the
+    # summed loss over every supervised target of the optimizer step, divided by their count
+    # across ranks. It needs token_budget > 0 and corpus_preflight == "required".
     loss_weighting: str = "row"
+    # "required": refuse to train unless the parent of dataset_path is a published corpus that
+    # passes quest.data.corpus_preflight.corpus_problems. "off" reproduces earlier runs.
+    corpus_preflight: str = "off"
+    # Optional JSON file {benchmark split file: sha256}: the leakage audit must have read these.
+    corpus_benchmark_sha256: str | None = None
     bucket_boundaries: list[int] = field(default_factory=lambda: [32, 48, 64, 96, 128])
     dataloader_num_workers: int = 4
     eval_batch_size: int = 64
@@ -1488,6 +1513,45 @@ class CPTConfig:
     # it was trained under as "<weighting>:<semantics>". It is verified against whatever the
     # checkpoint does record, and it can never license an actual change of objective.
     resume_assume_objective: str | None = None
+
+
+def check_corpus_and_objective(cfg) -> dict | None:
+    """Refuse a run whose objective or corpus is not what it says; return the corpus identity.
+
+    Runs before any model or data loads, on every rank. `token_exact` is the objective of the
+    repaired corpora only, so it needs the token-budget sampler (its step plan is the step
+    boundary) and a corpus that passes the preflight. With the preflight off this returns None.
+    """
+    weighting = getattr(cfg, "loss_weighting", "row")
+    preflight = getattr(cfg, "corpus_preflight", "off")
+    if weighting not in LOSS_WEIGHTING_SEMANTICS:
+        raise ValueError(f"unknown loss_weighting {weighting!r}; expected one of {sorted(LOSS_WEIGHTING_SEMANTICS)}")
+    if preflight not in ("off", "required"):
+        raise ValueError(f"corpus_preflight must be 'off' or 'required', not {preflight!r}")
+    if weighting == "token_exact":
+        if cfg.token_budget <= 0:
+            raise ValueError("loss_weighting 'token_exact' needs token_budget > 0: the optimizer step "
+                             "is the token-budget sampler's step, and fixed batches have no such plan")
+        if preflight != "required":
+            raise ValueError("loss_weighting 'token_exact' needs corpus_preflight 'required': it is the "
+                             "objective of the repaired corpora, which are trained on only after they pass")
+    if preflight != "required":
+        return None
+    from quest.data.corpus_preflight import MARKER, corpus_problems, sha256_file
+    version_dir = os.path.dirname(os.path.normpath(cfg.dataset_path))
+    expected = None
+    if getattr(cfg, "corpus_benchmark_sha256", None):
+        with open(cfg.corpus_benchmark_sha256) as fh:
+            expected = json.load(fh)
+    problems = corpus_problems(version_dir, benchmark_split_sha256=expected)
+    if problems:
+        raise RuntimeError(f"{version_dir} does not pass the corpus preflight:\n  " + "\n  ".join(problems))
+    with open(os.path.join(version_dir, MARKER)) as fh:
+        marker = json.load(fh)
+    return {"run_id": marker.get("run_id"), "contract_sha256": (marker.get("contract") or {}).get("sha256"),
+            "contract_version": (marker.get("contract") or {}).get("version"),
+            "marker_sha256": sha256_file(os.path.join(version_dir, MARKER)),
+            "benchmark_checked": expected is not None}
 
 
 class CPTTrainer:
@@ -1566,6 +1630,7 @@ class CPTTrainer:
         # checkpoint or a config mismatch fails in seconds, on every rank alike.
         self._token_mode = cfg.token_budget > 0
         self._loss_weighting = getattr(cfg, "loss_weighting", "row")
+        self._corpus_identity = check_corpus_and_objective(cfg)
         self._resume_dir = resolve_resume_dir(cfg.resume_from, cfg.output_dir)
         self._resume_state: dict | None = None
         if self._resume_dir is not None:
@@ -1616,6 +1681,7 @@ class CPTTrainer:
         # What `loss_weighting` MEANS in this revision, recorded so that redefining the word
         # later cannot slip past a resume check. See quest/training/resume_compat.py.
         d["loss_weighting_semantics"] = LOSS_WEIGHTING_SEMANTICS.get(self.cfg.loss_weighting)
+        d["corpus_identity"] = getattr(self, "_corpus_identity", None)
         return d
 
     def _apply_resume_state(self) -> None:
@@ -1709,6 +1775,10 @@ class CPTTrainer:
         # molecular columns; region_restricted_eval handles its own
         # tokenization/projection per row). For legacy bucketed_eval mode the
         # canonical eval is pre-tokenized like train/val.
+        # A published corpus is never written into: its tokenized copy goes under output_dir.
+        token_cache = (os.path.join(self.cfg.output_dir, "tokenized_cache")
+                       if self._corpus_identity is not None else None)
+
         def _load_train_val(num_proc):
             ds = load_cpt_dataset(
                 train_path,
@@ -1716,6 +1786,7 @@ class CPTTrainer:
                 max_length=self.cfg.max_length,
                 num_proc=num_proc,
                 eos_strategy=self.cfg.eos_strategy,
+                cache_dir=token_cache,
             )
             vds = load_cpt_dataset(
                 val_path,
@@ -1723,6 +1794,7 @@ class CPTTrainer:
                 max_length=self.cfg.max_length,
                 num_proc=num_proc,
                 eos_strategy=self.cfg.eos_strategy,
+                cache_dir=token_cache,
             )
             return ds, vds
 
@@ -1929,8 +2001,13 @@ class CPTTrainer:
             self._skip.skip = skip_batches if token_mode else skip_batches * cfg.batch_size
         if skip_steps:
             self._log(f"  epoch {epoch+1}: skipping {skip_steps} done steps = {skip_batches} loader batches")
+        # token_exact: the step's global target count must be known before its first backward,
+        # so each step's micro-batches are read ahead and come back with the step's scale.
+        exact = weighting == "token_exact"
+        source = (exact_step_batches(self.train_loader, plan[skip_steps:], self.world_size)
+                  if exact else self.train_loader)
         pbar = tqdm(
-            enumerate(self.train_loader),
+            enumerate(source),
             total=len(self.train_loader),
             desc=f"epoch {epoch+1}",
             disable=not self._is_main(),
@@ -1942,6 +2019,8 @@ class CPTTrainer:
         thr_rows, thr_tokens, thr_t0 = 0, 0, time.perf_counter()
 
         for step, batch in pbar:
+            if exact:
+                batch, exact_scale = batch
             input_ids = batch["input_ids"].to(self.device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
             labels = batch["labels"].to(self.device, non_blocking=True)
@@ -1958,7 +2037,7 @@ class CPTTrainer:
               with autocast(device_type="cuda", dtype=torch.bfloat16):
                 if self.is_esmc:
                     logits = _model_forward_logits(self.model, input_ids, attention_mask)
-                    raw_loss = torch.nn.functional.cross_entropy(
+                    raw_loss = None if exact else torch.nn.functional.cross_entropy(
                         logits.view(-1, logits.size(-1)),
                         labels.view(-1),
                         ignore_index=-100,
@@ -1969,8 +2048,12 @@ class CPTTrainer:
                         attention_mask=attention_mask,
                         labels=labels,
                     )
-                    raw_loss = out.loss
-                if plan is None:
+                    raw_loss, logits = out.loss, out.logits
+                if exact:
+                    # Summed in float32: a bf16 sum over thousands of targets loses digits.
+                    # accum_loss then estimates the step's global mean from this rank's share.
+                    loss = summed_masked_loss(logits.float(), labels) * exact_scale
+                elif plan is None:
                     loss = raw_loss / n_acc            # Stage 4.1 path, bit-identical to before
                 else:
                     loss = raw_loss * micro_batch_loss_scale(

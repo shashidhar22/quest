@@ -245,16 +245,16 @@ def test_the_semantics_table_names_all_three_objectives():
     assert S["token_exact"] == "global-masked-target-mean/v2"
 
 
-def test_the_trainer_refuses_the_new_objective_until_its_loop_lands():
-    """Fail closed: a name the training loop does not implement must not start a run.
+def test_the_per_micro_batch_scale_refuses_the_exact_objective():
+    """The exact mean has no factor for a micro-batch MEAN, so this function refuses the name.
 
-    The exact mean needs the step's global target count before its first backward, which the
-    current loop cannot supply. Until that lands, asking for it has to stop the run rather than
-    silently train the old objective under the new name.
+    The loop landed 2026-11-11 and takes `exact_step_batches` with a summed loss instead
+    (`tests/test_token_exact_loop.py`). Reaching this function under `token_exact` would mean a
+    path that trains another objective under the new name.
     """
     from quest.training.loss_normalization import micro_batch_loss_scale
 
-    with pytest.raises(ValueError, match="not implemented in the training loop"):
+    with pytest.raises(ValueError, match="no per-micro-batch factor"):
         micro_batch_loss_scale(4, 16, 4, token_mode=True, weighting="token_exact",
                                mb_tokens=10, step_tokens=40)
 
@@ -285,7 +285,7 @@ def test_the_fixed_batch_path_cannot_smuggle_in_an_unimplemented_objective():
     """
     from quest.training.loss_normalization import micro_batch_loss_scale as f
 
-    with pytest.raises(ValueError, match="not implemented in the training loop"):
+    with pytest.raises(ValueError, match="no per-micro-batch factor"):
         f(16, 256, 16, token_mode=False, weighting="token_exact")
     with pytest.raises(ValueError, match="unknown weighting"):
         f(16, 256, 16, token_mode=False, weighting="nonsense")

@@ -50,8 +50,8 @@ LOSS_WEIGHTING_SEMANTICS = {
     # The objective approved on 2026-11-04: summed loss over every supervised target in the
     # optimizer step, divided by their count across all ranks. A DIFFERENT name rather than a
     # new version of `token`, so that a name never describes behaviour the loop does not have.
-    # Implemented and gradient-tested in quest/training/loss_normalization.py; the training loop
-    # must buffer a step before it can be selected, so micro_batch_loss_scale refuses it for now.
+    # Implemented in quest/training/loss_normalization.py (exact_step_batches); the loop
+    # buffers each optimizer step to learn its global target count (landed 2026-11-11).
     "token_exact": "global-masked-target-mean/v2",
 }
 UNVERSIONED = "UNVERSIONED"
