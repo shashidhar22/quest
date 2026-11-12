@@ -554,3 +554,19 @@ other from the tests: removing either left the test passing. One check, one test
 stub that left out a field the real judge writes (`smoke`) failed every cell; the real files
 on disk were the fastest way to tell a stub fault from a checker fault.
 
+
+## 2026-11-11 — visit DG1: the judge is at the base rate
+
+- Launch path proven on the box (bundle, digests, watchdog, truthful status, publish, stop).
+- Stage A on both V04a checkpoints: rankings repeat exactly, and every logit is within 1e-04
+  of −1.669. V04a's probe log and arm D's training loss (0.451 against 0.4506) agree.
+  ACS `quest-cpt/findings.md` 9.13. Stage B stopped; PL1 on hold; judge repair is next.
+- `diagnostic_analyze.py` now reports score level and spread.
+
+Lessons. (1) The run-time estimate (0.7 s per scoring) came from a summary that divided by the
+query cap; the evaluation file beside it held the real count and gives 2.3 s. A launch
+estimate is recomputed from the artifact, with its n. (2) Reading the first stage's timing
+before the long one started saved the stage that could not finish. (3) A probe that asks only
+"do the scores differ" passed a judge whose scores differ in the fifth decimal; a gate needs
+a size, not an inequality. (4) Recording a minimum (`score_spread_min`) hid that the typical
+value was the same as the minimum.

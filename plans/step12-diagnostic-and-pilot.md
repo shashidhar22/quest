@@ -4,7 +4,16 @@ Opened 2026-11-11. Lightweight plan, nodded 2026-11-11. Gates: ACS
 `quest-cpt/audits/2026-11-10/new-cpt-plan.md` gates 4, 6, 7. Preparation only: nothing here
 starts EC2. Each visit is a separate go-ahead.
 
-## Status 2026-11-11
+## Status 2026-11-11, after visit DG1
+
+DG1's stage A ran (≈ USD 0.3); stage B was stopped and PL1 is on hold. Both V04a judges score
+every candidate within 1e-04 of one logit, the training base rate; the SFT recipe this plan
+freezes for the pilot is the one that produced them. Judge repair comes first (ACS
+`quest-cpt/findings.md` 9.13). Also wrong in this plan: the diagnostic's price. It scores at
+2.4 s per 100 candidates, not 0.7, so stage B needs about 63 minutes per checkpoint and a
+ceiling near 3 h.
+
+## Status 2026-11-11, before any box visit
 
 Steps 1-8 done on the laptop; nothing has run on the box. Built: `diagnostic_analyze.py`,
 `pilot12_box/run_diagnostic.sh`, `pilot12_box/experiment_lock.py` with `experiment-lock.json`

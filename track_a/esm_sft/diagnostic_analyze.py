@@ -101,6 +101,17 @@ def stability(rows, seconds):
                      'queries_midrank_changed': sum(r[name]['midrank'] != r['original']['midrank'] for r in rows)}
     out['ties'] = {'queries_with_true_ties': sum(r['original']['true_ties'] > 1 for r in rows),
                    'queries_all_tied': sum(r['original']['true_ties'] == POOL for r in rows)}
+    # How far apart the scores are at all. A ranking can repeat exactly and still rest on
+    # differences at the numerical floor: both V04a judges put every candidate of every query
+    # within 1e-4 of one logit (DG1, 2026-11-11), which ties alone did not show.
+    logits = [np.asarray(r['original']['logits'], dtype=np.float64) for r in rows]
+    spread = [float(a.max() - a.min()) for a in logits]
+    level = [float(np.median(a)) for a in logits]
+    distinct = [int(np.unique(a).size) for a in logits]
+    three = lambda v: {'min': float(np.min(v)), 'median': float(np.median(v)), 'max': float(np.max(v))}
+    out['scores'] = {'spread_across_candidates': three(spread), 'distinct_per_query': three(distinct),
+                     'median_level': float(np.median(level)),
+                     'level_range_across_queries': float(np.max(level) - np.min(level))}
     n = 3 * len(rows) + sum(d['result'] is not None for r in rows for d in r['donors'])
     out['seconds_per_scoring'] = seconds / n
     return out
@@ -177,6 +188,11 @@ def main(argv=None):
         print(f"{name}: n={st['n_queries']} repeat_max={st['repeat']['max_abs_logit_diff']:.3g} "
               f"reverse_max={st['reverse']['max_abs_logit_diff']:.3g} ties>1={st['ties']['queries_with_true_ties']} "
               f"s/scoring={st['seconds_per_scoring']:.3g}")
+        sc = st['scores']
+        print(f"  {name} scores: level {sc['median_level']:+.5f} (range across queries {sc['level_range_across_queries']:.1e}); "
+              f"spread across candidates min/median/max {sc['spread_across_candidates']['min']:.1e}/"
+              f"{sc['spread_across_candidates']['median']:.1e}/{sc['spread_across_candidates']['max']:.1e}; "
+              f"distinct of {POOL}: median {sc['distinct_per_query']['median']:.0f}")
         for cond, sets in res['receptor_dependence'].items():
             for donor_set, c in sets.items():
                 point = 'NA' if c['point'] is None else f"{c['point']:+.4f}"

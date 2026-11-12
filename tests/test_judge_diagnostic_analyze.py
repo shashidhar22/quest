@@ -253,3 +253,20 @@ def test_cluster_labels_and_donors_are_the_manifests_not_the_results_files(tmp_p
     mp, rp = write(tmp_path, m, dependent, name='dup', mutate=duplicate)
     with pytest.raises(ValueError, match='donors'):
         run(tmp_path, mp, [('dup', rp)], out='r2.json')
+
+
+def test_the_read_out_says_how_far_apart_the_scores_are(tmp_path):
+    """DG1, 2026-11-11: both V04a judges scored every candidate of every query within 1e-4 of
+    one logit, and the read-out showed ties but not that. A ranking can repeat exactly and
+    still rest on nothing."""
+    def flat(rows):                                     # one level for everything, residue 1e-5
+        return [-1.669 + 1e-5 * (i % 7) for i, _ in enumerate(rows)]
+    m = manifest([query(1), query(2), query(3)])
+    mp, rp = write(tmp_path, m, flat, name='flat')
+    s = run(tmp_path, mp, [('flat', rp)])['results']['flat']['stability']['scores']
+    assert s['spread_across_candidates']['median'] == pytest.approx(6e-5, rel=1e-6)
+    assert s['level_range_across_queries'] == pytest.approx(0.0, abs=1e-12)
+    assert s['distinct_per_query']['median'] == 7 and s['median_level'] == pytest.approx(-1.66897, abs=1e-5)
+    mp, rp = write(tmp_path, m, dependent, name='wide')
+    w = run(tmp_path, mp, [('wide', rp)], out='w.json')['results']['wide']['stability']['scores']
+    assert w['spread_across_candidates']['min'] == pytest.approx(10.0)
