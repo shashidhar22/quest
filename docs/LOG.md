@@ -570,3 +570,20 @@ before the long one started saved the stage that could not finish. (3) A probe t
 "do the scores differ" passed a judge whose scores differ in the fifth decimal; a gate needs
 a size, not an inequality. (4) Recording a minimum (`score_spread_min`) hid that the typical
 value was the same as the minimum.
+
+## 2026-11-12 — DG1 repair integration
+
+- Completed the existing uncommitted dual-pool/BatchNorm repair: peptide masks reach training,
+  validation, probe and diagnostic scoring; peptide-pool tensors and normalization buffers persist.
+- Preserved the original Track A architecture by making the repaired architecture explicit in
+  judge.build_model. Fixed the fixture generator's stale serialization API. Reject batch size
+  one and configurations where drop_last would save an untrained checkpoint after zero updates.
+- Cached peptide-feature check at the actual two-epoch budget, four seeds: normalized AUROC
+  0.687–0.725, BCE 0.409–0.427, within-molecule pairwise accuracy 0.705–0.740; unnormalized
+  BCE 0.461–0.466, versus prior 0.450561. Molecule-bootstrap upper BCE bounds all below prior.
+  This is frozen projected-feature evidence, not a retrained ESM-C judge or receptor-dependence result.
+- Verification: 63 focused checks passed; earlier judge/launcher selection 72 passed. Full tests/
+  collection stopped at tests/integration/test_stitchr_direct.py: missing stitchr. Independent
+  review found the zero-batch defect, reproduced by tests and fixed. No EC2 launch.
+- Open: full repaired checkpoint validation, receptor controls, stale experiment lock and DG1
+  stage-B budget. PL1 remains on hold. ACS findings 9.14 holds measured evidence and reproduction.

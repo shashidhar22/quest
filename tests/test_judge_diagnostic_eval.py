@@ -71,9 +71,9 @@ def test_main_publish_and_failures(tmp_path, monkeypatch):
         def numpy(self): return np.array(self.value)
     class Model:
         def eval(self): pass
-        def __call__(self, ids, mask): return Tensor([1.] * len(ids.value))
+        def __call__(self, ids, mask, pep): return Tensor([1.] * len(ids.value))
     torch = types.SimpleNamespace(device=lambda x: x, cuda=types.SimpleNamespace(is_available=lambda: True), tensor=lambda x, dtype: Tensor(x), long='long', no_grad=contextlib.nullcontext, __version__='fake')
-    judge = types.SimpleNamespace(select_device=lambda *a, **kw: 'cuda', build_model=lambda *a: (Model(), types.SimpleNamespace(pad_token_id=0)), load_checkpoint=lambda *a, **kw: {'args': {'seed': 7}, 'data_digests': {'train': 'digest'}}, serialize=lambda *a: [1, 2], _clean=lambda r: r, pad=lambda seqs, pid: (Tensor(seqs), Tensor(seqs)))
+    judge = types.SimpleNamespace(select_device=lambda *a, **kw: 'cuda', build_model=lambda *a: (Model(), types.SimpleNamespace(pad_token_id=0)), load_checkpoint=lambda *a, **kw: {'args': {'seed': 7}, 'data_digests': {'train': 'digest'}}, serialized_or_refuse=lambda *a: ([1, 2], [0, 1]), _clean=lambda r: r, pad=lambda rows, pid: (Tensor(rows), Tensor(rows), Tensor(rows)))
     monkeypatch.setitem(sys.modules, 'torch', torch)
     import track_a.esm_sft
     monkeypatch.setattr(track_a.esm_sft, 'judge', judge, raising=False)
@@ -82,11 +82,11 @@ def test_main_publish_and_failures(tmp_path, monkeypatch):
     assert result['checkpoint_args']['seed'] == 7 and len(result['rows'][0]['original']['logits']) == 100
     with pytest.raises(FileExistsError): diagnostic_eval.main(args)
     out.unlink()
-    judge.serialize = lambda *a: [1] * 1025
+    judge.serialized_or_refuse = lambda *a: ([1] * 1025, [0] * 1024 + [1])
     with pytest.raises(ValueError, match='truncated'): diagnostic_eval.main(args)
     assert not out.exists()
-    judge.serialize = lambda *a: [1]
-    monkeypatch.setattr(Model, '__call__', lambda self, ids, mask: Tensor([float('nan')] * len(ids.value)))
+    judge.serialized_or_refuse = lambda *a: ([1], [1])
+    monkeypatch.setattr(Model, '__call__', lambda self, ids, mask, pep: Tensor([float('nan')] * len(ids.value)))
     with pytest.raises(ValueError, match='non-finite'): diagnostic_eval.main(args)
     assert not out.exists()
 

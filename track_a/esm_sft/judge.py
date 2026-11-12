@@ -45,6 +45,7 @@ QUEST = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(QUEST / "scripts" / "training"))
 from cpt_training_lib import (  # noqa: E402  (the CPT trainer's own serializer + tokenizer)
     _preprocess_for_eos_strategy,
+    annotate_token_regions,
     get_tokenizer,
     project_canonical_row_to_run_input,
 )
@@ -69,7 +70,10 @@ from track_a.shared.negative_sampling import attach_labels, sample_negatives  # 
 
 EOS_STRATEGY = "raw"           # what every Stage 4.1 arm trained with
 POOL_SIZE = 100                # true peptide + 99 distractors (Track A's normalized-recall pool)
-TRAINABLE_KEYS = ("pool.", "head.", "lora_")
+# `pool_peptide.` is listed separately: "pool." does not match "pool_peptide.score.weight", so
+# without it the peptide pool would be dropped from every checkpoint and silently reloaded at its
+# random initialisation — the defect audit finding 2 (2026-11-06) closed for the other tensors.
+TRAINABLE_KEYS = ("pool.", "pool_peptide.", "head.", "lora_")
 
 
 # ---------------------------------------------------------------- serialization
@@ -78,13 +82,45 @@ def _clean(row: dict) -> dict:
     return {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in row.items()}
 
 
-def serialize(row: dict, tcr: str, mhc: str, tok, max_len: int) -> list[int] | None:
-    text, _ = project_canonical_row_to_run_input(row, tcr, mhc)
+def _special_ids(tok) -> set:
+    return {int(i) for i in (tok.cls_token_id, tok.eos_token_id, tok.pad_token_id) if i is not None}
+
+
+def serialize(row: dict, tcr: str, mhc: str, tok, max_len: int):
+    """``(token ids, peptide mask)`` for one row, or None when it serializes to nothing.
+
+    The peptide mask is what `ESMScorer` pools the peptide block over, and it is derived from
+    the SAME text and segment kinds the ids came from, so truncation is accounted for: a
+    peptide pushed past ``max_len`` leaves an all-zero mask and the model refuses the row
+    rather than scoring a molecule whose peptide never reached it.
+    """
+    text, kinds = project_canonical_row_to_run_input(row, tcr, mhc)
     if not text:
         return None
     enc = tok(_preprocess_for_eos_strategy(text, EOS_STRATEGY), add_special_tokens=True,
               truncation=True, max_length=max_len)
-    return [int(x) for x in enc["input_ids"]]
+    ids = [int(x) for x in enc["input_ids"]]
+    regions = annotate_token_regions(text, row, kinds, ids,
+                                     separator_token_id=int(tok.eos_token_id),
+                                     special_token_ids=_special_ids(tok))
+    return ids, [1 if r == "peptide" else 0 for r in regions]
+
+
+def serialized_or_refuse(row: dict, tcr: str, mhc: str, tok, max_len: int, where: str):
+    """`serialize`, with the silent `or [cls]` fallback removed.
+
+    That fallback turned a row the serializer could make nothing of into a one-token molecule
+    and scored it anyway. A judge that cannot see the peptide is the instrument finding 9.14
+    describes, so this refuses and names the row instead.
+    """
+    out = serialize(row, tcr, mhc, tok, max_len)
+    if out is None or not any(out[1]):
+        raise ScoreError(
+            f"{where}: row_id={row.get('row_id')!r} serialized to "
+            f"{'nothing' if out is None else 'no peptide token'} under tcr={tcr} mhc={mhc} "
+            f"max_len={max_len} (order_key={row.get('order_key')!r}). Scoring it would feed the "
+            f"model a molecule with no peptide in it; fix the row or the serialization.")
+    return out
 
 
 class RowsDS(Dataset):
@@ -97,24 +133,28 @@ class RowsDS(Dataset):
         return len(self.rows)
 
     def __getitem__(self, i):
-        ids = serialize(self.rows[i], self.tcr, self.mhc, self.tok, self.max_len) or [self.tok.cls_token_id]
-        return torch.tensor(ids, dtype=torch.long), torch.tensor(self.labels[i])
+        ids, pep = serialized_or_refuse(self.rows[i], self.tcr, self.mhc, self.tok,
+                                        self.max_len, "training row")
+        return ids, pep, torch.tensor(self.labels[i])
 
 
-def pad(seqs: list[torch.Tensor], pad_id: int):
-    n, L = len(seqs), max(len(s) for s in seqs)
+def pad(rows, pad_id: int):
+    """``[(ids, peptide mask), ...]`` -> ``(ids, attention mask, peptide mask)``."""
+    n, L = len(rows), max(len(r[0]) for r in rows)
     ids = torch.full((n, L), pad_id, dtype=torch.long)
     am = torch.zeros((n, L), dtype=torch.long)
-    for i, s in enumerate(seqs):
-        ids[i, : len(s)] = s
+    pep = torch.zeros((n, L), dtype=torch.long)
+    for i, (s, p) in enumerate(rows):
+        ids[i, : len(s)] = torch.as_tensor(s, dtype=torch.long)
         am[i, : len(s)] = 1
-    return ids, am
+        pep[i, : len(p)] = torch.as_tensor(p, dtype=torch.long)
+    return ids, am, pep
 
 
 def collate(pad_id):
     def f(batch):
-        ids, am = pad([b[0] for b in batch], pad_id)
-        return ids, am, torch.stack([b[1] for b in batch])
+        ids, am, pep = pad([(b[0], b[1]) for b in batch], pad_id)
+        return ids, am, pep, torch.stack([b[2] for b in batch])
     return f
 
 
@@ -122,7 +162,7 @@ def collate(pad_id):
 def build_model(adapter: str, device) -> tuple[ESMScorer, object]:
     """adapter = 'none' -> fresh LoRA of the CPT shape (fair base arm); else a local adapter dir."""
     loaded = load_esmc_from_local_lora(None if adapter in ("none", "base") else adapter)
-    model = ESMScorer(loaded, head_dim=256, dropout=0.1, freeze_base=True).to(device)
+    model = ESMScorer(loaded, head_dim=256, dropout=0.1, freeze_base=True, peptide_pool=True).to(device)
     return model, get_tokenizer("esmc_300m")
 
 
@@ -183,6 +223,8 @@ def with_negatives(pos: pd.DataFrame, seed: int) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- train
 def cmd_train(a):
+    if a.batch_size < 2:
+        raise ScoreError("batch_size must be at least 2 for the normalized judge head")
     random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
     dev = torch.device(select_device(torch.cuda.is_available(),
                                     allow_cpu=getattr(a, "allow_cpu", False)))
@@ -192,10 +234,19 @@ def cmd_train(a):
     tr = tr.sample(n=min(max_pos, len(tr)), random_state=a.seed) if len(tr) > max_pos else tr
     va = va.sample(n=min(max_val, len(va)), random_state=a.seed) if len(va) > max_val else va
     tr, va = with_negatives(tr.reset_index(drop=True), 43), with_negatives(va.reset_index(drop=True), 44)
+    if len(tr) < a.batch_size:
+        raise ScoreError(
+            f"training has {len(tr)} rows, fewer than batch_size={a.batch_size}; "
+            "drop_last would train zero batches. Reduce batch_size or supply more molecules.")
     model, tok = build_model(a.adapter, dev)
     pid = int(tok.pad_token_id)
+    # drop_last on the TRAINING loader only: `build_head` starts with BatchNorm1d, which raises
+    # on a batch of one in train mode ("Expected more than 1 value per channel"), and a trailing
+    # singleton is whatever len(rows) % batch_size happens to be. Evaluation runs in eval() on
+    # running statistics, so its last batch is kept and every row is scored.
     mk = lambda df, sh, bs: DataLoader(RowsDS(df, a.tcr_variant, a.mhc_variant, tok, a.max_len), batch_size=bs,
-                                       shuffle=sh, num_workers=a.num_workers, collate_fn=collate(pid))
+                                       shuffle=sh, num_workers=a.num_workers, collate_fn=collate(pid),
+                                       drop_last=sh)
     tl, vl = mk(tr, True, a.batch_size), mk(va, False, a.batch_size * 2)
     print(f"[judge] train rows {len(tr):,} (molecules x 1+5 negatives) val rows {len(va):,} "
           f"trainable params {n_trainable(model):,}", flush=True)
@@ -204,9 +255,9 @@ def cmd_train(a):
     best, bad, hist = -1.0, 0, []
     for ep in range(1, (1 if a.smoke else a.epochs) + 1):
         model.train(); t0 = time.time(); s = n = 0
-        for i, (ids, am, y) in enumerate(tl):
-            ids, am, y = ids.to(dev), am.to(dev), y.to(dev)
-            loss = bce(model(ids, am), y)
+        for i, (ids, am, pep, y) in enumerate(tl):
+            ids, am, pep, y = ids.to(dev), am.to(dev), pep.to(dev), y.to(dev)
+            loss = bce(model(ids, am, pep), y)
             opt.zero_grad(); loss.backward(); opt.step()
             s += loss.item() * len(y); n += len(y)
             if i % 500 == 0:
@@ -215,8 +266,9 @@ def cmd_train(a):
                       f"{n / el:.1f} rows/s)", flush=True)
         model.eval(); P, Y = [], []
         with torch.no_grad():
-            for ids, am, y in vl:
-                P += torch.sigmoid(model(ids.to(dev), am.to(dev))).float().cpu().tolist(); Y += y.tolist()
+            for ids, am, pep, y in vl:
+                P += torch.sigmoid(model(ids.to(dev), am.to(dev), pep.to(dev))).float().cpu().tolist()
+                Y += y.tolist()
         from sklearn.metrics import roc_auc_score
         auc = float(roc_auc_score(Y, P)) if len(set(Y)) > 1 else 0.5
         hist.append({"epoch": ep, "train_loss": s / max(n, 1), "val_auc": auc, "secs": round(time.time() - t0, 1)})
@@ -382,12 +434,13 @@ def cmd_eval(a):
             seqs = []
             for p in [true] + others:
                 row["peptide"] = p
-                ids = serialize(row, a.tcr_variant, a.mhc_variant, tok, a.max_len) or [tok.cls_token_id]
-                trunc += len(ids) >= a.max_len
-                seqs.append(torch.tensor(ids, dtype=torch.long))
-            ids, am = pad(seqs, pid)
+                one = serialized_or_refuse(row, a.tcr_variant, a.mhc_variant, tok, a.max_len,
+                                           f"{cond} candidate {p!r}")
+                trunc += len(one[0]) >= a.max_len
+                seqs.append(one)
+            ids, am, pep = pad(seqs, pid)
             with torch.no_grad():
-                sc = model(ids.to(dev), am.to(dev)).float().cpu().numpy()
+                sc = model(ids.to(dev), am.to(dev), pep.to(dev)).float().cpu().numpy()
             # rank_of refuses a non-finite score instead of turning it into rank 1. The raise
             # propagates: an eval that cannot score every query writes NO output file, so a
             # numerical failure can never reach the gate or the comparator as a result.
@@ -492,16 +545,24 @@ def cmd_probe(a):
         seqs = []
         for p in cands:
             row["peptide"] = p
-            seqs.append(torch.tensor(serialize(row, a.tcr_variant, a.mhc_variant, tok, a.max_len) or [tok.cls_token_id]))
-        ids, am = pad(seqs, pid)
+            seqs.append(serialized_or_refuse(row, a.tcr_variant, a.mhc_variant, tok, a.max_len,
+                                             f"probe candidate {p!r}"))
+        ids, am, pep = pad(seqs, pid)
         with torch.no_grad():
             emb = encoder_forward(model.loaded, ids.to(dev), am.to(dev)).float()
-            pooled = model.pool(emb, am.to(dev).bool())
-            sc = model(ids.to(dev), am.to(dev)).float().cpu().numpy()
+            valid = am.to(dev).bool()
+            pooled_all = model.pool(emb, valid)
+            pooled_pep = model.pool_peptide(emb, pep.to(dev).bool() & valid)
+            sc = model(ids.to(dev), am.to(dev), pep.to(dev)).float().cpu().numpy()
         n_distinct = len(set(np.round(sc, 6).tolist()))
-        pooled_spread = float((pooled - pooled.mean(0, keepdim=True)).abs().max())
+        # Both blocks are reported: the whole-molecule pool barely moves when the peptide is
+        # swapped (1.3-1.9 % of its length, finding 9.14) while the peptide pool moves 7-16 %,
+        # so one spread figure over the concatenation would hide which block is alive.
+        spread = lambda v: float((v - v.mean(0, keepdim=True)).abs().max())
+        pooled_spread = spread(torch.cat([pooled_all, pooled_pep], dim=-1))
         lens = [int(x.sum()) for x in am]
         print(f"[probe] row_id={row['row_id']} lens={lens} pooled_spread={pooled_spread:.3e} "
+              f"(molecule {spread(pooled_all):.3e}, peptide {spread(pooled_pep):.3e}) "
               f"logits={np.array2string(sc, precision=6)} distinct={n_distinct}/{len(sc)}", flush=True)
         try:
             rank_of(sc)

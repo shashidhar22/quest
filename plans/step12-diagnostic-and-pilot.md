@@ -4,6 +4,15 @@ Opened 2026-11-11. Lightweight plan, nodded 2026-11-11. Gates: ACS
 `quest-cpt/audits/2026-11-10/new-cpt-plan.md` gates 4, 6, 7. Preparation only: nothing here
 starts EC2. Each visit is a separate go-ahead.
 
+## Status 2026-11-12 — local judge repair
+
+Dual pooling and feature normalization are integrated and tested; cached-feature learning beats
+the prior within two epochs (ACS findings 9.14). This does not validate a full retrained judge.
+PL1 remains on hold for fresh-base training and receptor-swap controls. The experiment lock
+below is intentionally stale after the repair: regenerate it only after the revised recipe is
+validated. V04a checkpoints need the old architecture; new diagnostic runs need fresh checkpoints
+and a revised stage-B ceiling. No EC2 launch during the repair.
+
 ## Status 2026-11-11, after visit DG1
 
 DG1's stage A ran (≈ USD 0.3); stage B was stopped and PL1 is on hold. Both V04a judges score

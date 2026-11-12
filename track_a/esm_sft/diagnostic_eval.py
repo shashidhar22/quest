@@ -132,11 +132,16 @@ def main(argv=None):
     def scorer(rows):
         seqs = []
         for row in rows:
-            ids = judge.serialize(judge._clean(row), a.tcr_variant, a.mhc_variant, tok, a.max_len + 1)
-            if not ids or len(ids) > a.max_len: raise ValueError('empty or truncated serialization')
-            seqs.append(torch.tensor(ids, dtype=torch.long))
-        ids, mask = judge.pad(seqs, int(tok.pad_token_id))
-        with torch.no_grad(): return model(ids.to(dev), mask.to(dev)).float().cpu().numpy()
+            # serialized_or_refuse already refuses a row that serializes to nothing or whose
+            # peptide survived no token; max_len + 1 is requested so a row AT the limit is
+            # visible here as over it rather than silently truncated.
+            ids, pep = judge.serialized_or_refuse(judge._clean(row), a.tcr_variant, a.mhc_variant,
+                                                  tok, a.max_len + 1, "diagnostic row")
+            if len(ids) > a.max_len: raise ValueError('empty or truncated serialization')
+            seqs.append((ids, pep))
+        ids, mask, pep = judge.pad(seqs, int(tok.pad_token_id))
+        with torch.no_grad():
+            return model(ids.to(dev), mask.to(dev), pep.to(dev)).float().cpu().numpy()
     results = evaluate_manifest(manifest, scorer, a.batch_size, a.max_seconds, a.draw, start)
     from track_a.shared import artifacts as A
     output = {'protocol': 'judge-diagnostic-results-v1', 'manifest_sha256': manifest_digest, 'checkpoint_sha256': checkpoint_digest, 'code_revision': A.code_commit(), 'diagnostic_code_sha256': _digest(__file__), 'checkpoint_args': ck.get('args'), 'checkpoint_data_digests': ck.get('data_digests'), 'cpt_lineage': A.cpt_lineage(a.adapter), 'settings': vars(a), 'runtime': {'device': str(dev), 'python': platform.python_version(), 'numpy': np.__version__, 'torch': torch.__version__, 'seconds': time.monotonic()-start}, 'rows': results}
