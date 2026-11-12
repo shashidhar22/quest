@@ -47,6 +47,8 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if os.path.exists(a.out):
         ap.error(f"{a.out} exists")
+    if a.steps < 1:
+        ap.error("--steps must be at least 1: a smoke that runs nothing would still report PASS")
 
     cfg = L.CPTConfig(
         base_model=a.base_model, dataset_path=a.dataset_path, canonical_eval_path=a.canonical_eval_path,
@@ -113,6 +115,8 @@ def main(argv=None) -> int:
     warm = done[5:] or done                            # the first steps carry start-up cost
     tot = lambda k, rows=warm: sum(r[k] for r in rows)
     problems = []
+    if not done:
+        problems.append("no step ran (an empty step plan)")
     if len(done) != steps or tr.global_step != steps:
         problems.append(f"{len(done)} steps recorded, global_step {tr.global_step}, wanted {steps}")
     if not all(math.isfinite(r["loss"]) and math.isfinite(r["grad_norm"]) for r in done):

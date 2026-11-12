@@ -251,6 +251,20 @@ def test_each_step_is_wrapped_in_timeout_when_present(dbox, tmp_path):
                                             "-k 30 3120", "-k 30 3120", "-k 30 600"]
 
 
+def test_a_step_ended_by_its_own_time_limit_is_not_reported_as_the_ceiling(dbox, tmp_path):
+    """coreutils `timeout` exits 124, the status run_step also returns at MAX_HOURS. The record
+    must say which of the two stopped the step."""
+    bin_ = tmp_path / "tbin"
+    bin_.mkdir()
+    (bin_ / "timeout").write_text("#!/bin/bash\nexit 124\n")
+    (bin_ / "timeout").chmod(0o755)
+    r = dbox.run(PATH=f"{bin_}:{os.environ['PATH']}")
+    assert r.returncode == 1, dbox.log()
+    s = dbox.status()
+    assert s["outcome"] == "failed" and s["stage"] == "A"
+    assert "720 s time limit" in s["detail"] and "ceiling" not in s["detail"], s["detail"]
+
+
 def test_a_ceiling_above_the_frozen_two_hours_refuses(dbox):
     """The wrapper defaults MAX_HOURS to 8; this visit's ceiling is frozen at 2 in the plan."""
     r = dbox.run(MAX_HOURS="8")

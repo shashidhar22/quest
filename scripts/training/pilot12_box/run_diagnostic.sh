@@ -138,11 +138,15 @@ run_step(){
 }
 
 # step_or_die <label> <log> <timeout seconds> <command...>: run_step, with a stop at the ceiling
-# told apart from a failure in status.json.
+# told apart from a failure in status.json. 124 is also what coreutils `timeout` exits with, so
+# the ceiling is named only when it has in fact passed.
 step_or_die(){
   local rc=0
   run_step "$@" || rc=$?
-  [ "$rc" -ne 124 ] || die "$1: stopped at the ceiling while it was running"
+  if [ "$rc" -eq 124 ]; then
+    expired && die "$1: stopped at the ceiling while it was running"
+    die "$1: ended by its own $3 s time limit (its log is $2)"
+  fi
   [ "$rc" -eq 0 ] || die "$1 failed (rc=$rc; its log is $2)"
 }
 
