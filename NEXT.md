@@ -23,5 +23,8 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    `test_novel_tcr`, `test_novel_allele`, `test_mixed` (their peptides overlap train).
 6. EC2 last verified stopped (2026-11-11 23:55 UTC). Preserve colleague edits in `/home/ubuntu/quest`; deploy by bundle
    + worktree (recent visits used `/home/ubuntu/quest-cr`).
-7. Repair commits in QUEST and ACS are local only: automatic approval review blocked the
-   GitHub push as an unverified export. User approval of the existing remote destinations is pending.
+7. Repair commits pushed after explicit approval. EC2 validation now running (2026-11-12):
+   i-0030c1a9c845b3714, run 20261112T160549Z-1857, /home/ubuntu/dg1-repair-out/latest.
+   Fresh base, 1000 train/300 val molecules, two epochs plus matched receptor swaps;
+   90-minute job limit, 2-hour watchdog, 3-hour boot shutdown backstop. Retrieve validation.json
+   from S3 quest/tcrbench2/pilot12/dg1-repair/20261112T160549Z-1857 and verify stopped state.
