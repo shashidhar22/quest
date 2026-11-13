@@ -24,11 +24,12 @@ def sample_negatives(
     mhc_col: str = "mhc_one_allele",
     n_per_pos: int = NEG_RATIO,
     seed: int = NEG_SEED,
+    known_positives: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Return a DataFrame of negatives matching the positives schema.
 
     Algorithm:
-      1. Build positive-set: set of (tcr, pep, mhc) tuples.
+      1. Build positive-set from positives plus optional full-split known_positives.
       2. For each positive row, draw n_per_pos random peptides from the train
          peptide pool. Pair (tcr_i, mhc_i) with each random peptide.
       3. Reject draws whose (tcr, pep, mhc) is in the positive-set; resample
@@ -46,7 +47,10 @@ def sample_negatives(
       random training peptides".
     """
     rng = np.random.default_rng(seed)
-    pos_set = set(zip(positives[tcr_col], positives[pep_col], positives[mhc_col]))
+    # Keep the sampled peptide distribution, but reject positives known anywhere
+    # in the same split. Union the panel so an incomplete reference stays safe.
+    reference = positives if known_positives is None else pd.concat([positives, known_positives])
+    pos_set = set(zip(reference[tcr_col], reference[pep_col], reference[mhc_col]))
     pep_pool = positives[pep_col].dropna().to_numpy()
 
     if len(pep_pool) == 0:

@@ -628,3 +628,7 @@ value was the same as the minimum.
   calibration fit and sample disjointness. All experiments published.
 - DG1 is not scientifically cleared. Next is the fixed-feature/train-only-standardized baseline
   suggested in the earlier review, with corrected controls; PL1 stays on hold.
+
+## 2026-11-13 — Full-split negative reference repair
+
+The fixed-feature diagnostic review found subsampled negatives matching known positives outside the sample: 72 exact paired-receptor training negatives and one validation negative. The shared sampler now accepts an optional full-split reference, retaining the sampled peptide distribution and default caller behavior. DG1 training supplies each full split before subsampling; training never consults validation/test labels. Regression tests cover reference exclusion, seeded compatibility and training-entrypoint wiring. Fixed-feature experiment prepared in ACS; S3 approved, AWS SSO renewal pending. PL1 remains blocked.

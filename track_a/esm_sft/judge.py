@@ -214,10 +214,11 @@ def load_split(task: str, split: str) -> pd.DataFrame:
     return df.drop_duplicates(subset="row_id", keep="first").reset_index(drop=True)
 
 
-def with_negatives(pos: pd.DataFrame, seed: int) -> pd.DataFrame:
+def with_negatives(pos: pd.DataFrame, seed: int, known_positives: pd.DataFrame | None = None) -> pd.DataFrame:
     # Track A / Track B parity: 5x peptide-swap negatives; (tcr, mhc) kept, so the negative
     # inherits the positive's MHC sequence columns.
-    negs = sample_negatives(pos, tcr_col="trb_cdr3", pep_col="peptide", mhc_col="mhc_one_allele", seed=seed)
+    negs = sample_negatives(pos, tcr_col="trb_cdr3", pep_col="peptide", mhc_col="mhc_one_allele", seed=seed,
+                            known_positives=known_positives)
     return attach_labels(pos, negs).sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
 
@@ -230,10 +231,12 @@ def cmd_train(a):
                                     allow_cpu=getattr(a, "allow_cpu", False)))
     out = Path(a.out_dir); out.mkdir(parents=True, exist_ok=True)
     max_pos, max_val = (200, 50) if a.smoke else (a.max_train_pos, a.max_val_pos)
-    tr = load_split(a.task, "train"); va = load_split(a.task, "val")
+    tr_ref = load_split(a.task, "train"); va_ref = load_split(a.task, "val")
+    tr, va = tr_ref, va_ref
     tr = tr.sample(n=min(max_pos, len(tr)), random_state=a.seed) if len(tr) > max_pos else tr
     va = va.sample(n=min(max_val, len(va)), random_state=a.seed) if len(va) > max_val else va
-    tr, va = with_negatives(tr.reset_index(drop=True), 43), with_negatives(va.reset_index(drop=True), 44)
+    tr = with_negatives(tr.reset_index(drop=True), 43, known_positives=tr_ref)
+    va = with_negatives(va.reset_index(drop=True), 44, known_positives=va_ref)
     if len(tr) < a.batch_size:
         raise ScoreError(
             f"training has {len(tr)} rows, fewer than batch_size={a.batch_size}; "

@@ -143,3 +143,19 @@ def test_train_entrypoint_saves_reloadable_repaired_judge(tmp_path, monkeypatch)
     assert epoch['val_loss'] == pytest.approx(expected_loss, abs=1e-6)
     assert epoch['val_prior_loss'] == pytest.approx(0.45056120886630463)
     assert epoch['val_loss_beats_prior'] == (epoch['val_loss'] < epoch['val_prior_loss'])
+
+
+def test_training_passes_full_split_reference_before_subsampling(tmp_path, monkeypatch):
+    training_inputs(monkeypatch)
+    original = J.with_negatives
+    seen = []
+    def checked(panel, seed, known_positives=None):
+        assert len(panel) == 2
+        assert len(known_positives) == 4
+        seen.append(seed)
+        return original(panel, seed, known_positives=known_positives)
+    monkeypatch.setattr(J, 'with_negatives', checked)
+    args = train_args(tmp_path, 2)
+    args.max_train_pos = args.max_val_pos = 2
+    J.cmd_train(args)
+    assert seen == [43, 44]
