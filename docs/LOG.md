@@ -604,3 +604,27 @@ value was the same as the minimum.
 - Frozen-encoder comparison running as 20261113T024720Z-2701 (Nov 12 local), same data/seed/recipe,
   497,795 trainable parameters; limits and retrieval path in NEXT.md. First watchdog stopped the
   box; two capacity refusals preceded the successful restart. No pilot/CPT training.
+
+### DG1 frozen outcome and corrected control
+
+- Frozen run completed/published in 476 seconds. Selected epoch 1: BCE 0.453102, AUROC 0.666402;
+  final epoch 2: BCE 0.518780, AUROC 0.5131. Neither beats the 0.450561 prior point estimate.
+- Found a flaw in this session's swap control: 248/288 donors already bound the original peptide.
+  Withdraw the receptor-independence interpretation of that aggregate. Donor selection now excludes
+  known positives from all validation rows (three regression tests). Corrected coverage is 255
+  molecules / 23 clusters. Reanalysis of 40 valid saved frozen swaps: delta 0.010,
+  peptide-cluster interval [-0.0095,0.0389]; specificity remains unestablished.
+- PL1 remains blocked. Next: corrected evaluation of existing checkpoints, then a fixed-feature,
+  train-only-standardized head baseline if needed; no blind training sweep or new default recipe.
+
+### Corrected full readout complete
+
+- Evaluation-only run 20261113T030649Z-1684 completed in 185 seconds. Corrected controls cover
+  255 molecules / 26 peptides / 23 clusters. True-minus-donor pairwise delta: trainable −0.03686
+  [-0.04145,+0.01053], frozen −0.09412 [-0.11447,+0.01818]. No reliable true-receptor advantage.
+- Two-parameter calibration fit only on 200 unused training molecules preserves ranking but
+  yields held-out BCE 0.49901/0.45221, still above prior 0.45056. It remains a diagnostic,
+  not a production recipe. Saved-score verification independently reproduces ranks, BCE,
+  calibration fit and sample disjointness. All experiments published.
+- DG1 is not scientifically cleared. Next is the fixed-feature/train-only-standardized baseline
+  suggested in the earlier review, with corrected controls; PL1 stays on hold.

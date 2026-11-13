@@ -9,7 +9,8 @@ A binding judge produced almost constant logits despite apparently informative v
 3. Measure held-out BCE against the class prior and positive-versus-negative ranking within each molecule; global AUROC alone cannot exclude query offsets.
 4. Follow the repair through serialization, batch collation, training, checkpoint save/load and diagnostic scoring with a real tokenizer and a tiny encoder.
 5. Validate the full model: learning on cached features did not guarantee held-out BCE below the prior. Compare a receptor-free baseline and receptor substitutions before accepting global AUROC.
-6. Review shared callers and batch boundaries. This exposed broken legacy compatibility, an obsolete fixture-generator API and zero-update checkpoints from drop_last.
+6. Audit perturbation controls before interpreting invariance: swapping in a receptor already known to bind the target is not a negative control. Exclude those pairs using the full reference, and report the reduced independent coverage.
+7. Review shared callers and batch boundaries. This exposed broken legacy compatibility, an obsolete fixture-generator API and zero-update checkpoints from drop_last.
 
 ## Judgment calls
 Keep BCE and learning-rate defaults so the repair does not confound objective changes with representation changes. Preserve old Track A callers explicitly. Treat cached-feature success as evidence for head conditioning, not proof of receptor specificity or successful full-model training. Keep the paid pilot blocked until that separate experiment is complete.
