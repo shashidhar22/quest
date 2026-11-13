@@ -9,7 +9,8 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    still above prior 0.4506. Corrected receptor swaps show no reliable true-receptor advantage.
 2. Fixed-feature/train-only-standardized diagnostic is implemented locally (ACS ops/dg1-repair/fixed_features.py); five checks pass.
    Five EC2 starts across three sizes refused capacity; original g6.2xlarge restored and stopped verified.
-   Local MPS experiment running, output /private/tmp/dg1-fixed-20261113, one-hour timeout. Preliminary cached-fixture BCE 0.702, AUROC 0.752.
+   Local MPS extraction PID 25357 running; output /private/tmp/dg1-fixed-20261113, one-hour timeout.
+   Completion watcher PID 26012 runs independent replay then approved S3 publication; inspect completion.json. Preliminary cached-fixture BCE 0.702, AUROC 0.752.
    Negative sampling now rejects known positives from the full split before fitting.
    First move: collect and independently replay the 1000/300 fixed-feature results. Numerical collapse
    and control bugs are repaired; neither current neural recipe is promoted. PL1 stays on hold.
