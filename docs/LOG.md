@@ -587,3 +587,20 @@ value was the same as the minimum.
   review found the zero-batch defect, reproduced by tests and fixed. No EC2 launch.
 - Open: full repaired checkpoint validation, receptor controls, stale experiment lock and DG1
   stage-B budget. PL1 remains on hold. ACS findings 9.14 holds measured evidence and reproduction.
+
+## 2026-11-12 — full-model DG1 validation and receptor-free control
+
+- Published the approved repair commits; installed stitchr 1.3.1. Full-suite run: 1,053 passed,
+  26 failed, 5 errors, 2 skipped. All 25 training/resume tests passed outside the sandbox;
+  remaining unrelated missing-data/dependency/normalization failures are named in ACS verification logs.
+- EC2 run 20261112T160549Z-1857 completed in 780 seconds of training/readout. Fresh base,
+  1,000 train / 300 val molecules, two epochs: train loss 0.3094 → 0.2450, val AUROC 0.7301,
+  BCE 0.5453 (prior 0.4506), pairwise 0.7933. Scores no longer constant. Receptor substitutions
+  barely change matched ranking (0.8014 → 0.7972), so PL1 remains blocked.
+- A train-only peptide-composition/length logistic baseline scores BCE 0.4250 / AUROC 0.7513;
+  split hashes match EC2. This illustrates why global AUROC alone cannot validate receptor recognition.
+- Added row-weighted held-out BCE and prior-baseline reporting to summaries/checkpoints; kept
+  AUROC selection unchanged. Regression test covers uneven validation batches. Focused 63 tests pass.
+- Frozen-encoder comparison running as 20261113T024720Z-2701 (Nov 12 local), same data/seed/recipe,
+  497,795 trainable parameters; limits and retrieval path in NEXT.md. First watchdog stopped the
+  box; two capacity refusals preceded the successful restart. No pilot/CPT training.

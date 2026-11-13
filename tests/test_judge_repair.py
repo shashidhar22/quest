@@ -122,7 +122,24 @@ def test_invalid_batch_cannot_publish_untrained_checkpoint(tmp_path, monkeypatch
 
 def test_train_entrypoint_saves_reloadable_repaired_judge(tmp_path, monkeypatch):
     training_inputs(monkeypatch)
-    J.cmd_train(train_args(tmp_path, 4))
+    trained, tok = model(), EsmSequenceTokenizer()
+    monkeypatch.setattr(J, 'build_model', lambda *a: (trained, tok))
+    # 24 validation rows yield batches of 10, 10, 4: loss must be row-weighted.
+    J.cmd_train(train_args(tmp_path, 5))
     checkpoint = J.load_checkpoint(model(), tmp_path / 'best.pt', 'cpu')
     assert checkpoint['trainable_state_dict']['head.0.num_batches_tracked'].item() > 0
     assert 'pool_peptide.score.weight' in checkpoint['trainable_state_dict']
+    assert np.isfinite(checkpoint['val_loss'])
+    import json
+    summary = json.loads((tmp_path / 'train_summary.json').read_text())
+    epoch = summary['history'][0]
+    assert epoch['val_loss'] == checkpoint['val_loss']
+    rows = J.with_negatives(J.load_split('as_paired_i', 'val'), 44)
+    dataset = J.RowsDS(rows, 'cdr3', 'full', tok, 1024)
+    ids, am, pep, labels = J.collate(tok.pad_token_id)([dataset[i] for i in range(len(dataset))])
+    trained.eval()
+    with torch.no_grad():
+        expected_loss = torch.nn.functional.binary_cross_entropy_with_logits(trained(ids, am, pep), labels).item()
+    assert epoch['val_loss'] == pytest.approx(expected_loss, abs=1e-6)
+    assert epoch['val_prior_loss'] == pytest.approx(0.45056120886630463)
+    assert epoch['val_loss_beats_prior'] == (epoch['val_loss'] < epoch['val_prior_loss'])

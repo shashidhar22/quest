@@ -265,14 +265,28 @@ def cmd_train(a):
                 print(f"[judge]  ep{ep} step {i}/{len(tl)} loss {s / max(n, 1):.4f} ({el:.0f}s, "
                       f"{n / el:.1f} rows/s)", flush=True)
         model.eval(); P, Y = [], []
+        val_loss_sum = 0.0
         with torch.no_grad():
             for ids, am, pep, y in vl:
-                P += torch.sigmoid(model(ids.to(dev), am.to(dev), pep.to(dev))).float().cpu().tolist()
+                logits = model(ids.to(dev), am.to(dev), pep.to(dev))
+                val_loss_sum += bce(logits, y.to(dev)).item() * len(y)
+                P += torch.sigmoid(logits).float().cpu().tolist()
                 Y += y.tolist()
         from sklearn.metrics import roc_auc_score
+        if not Y:
+            raise ScoreError("validation has no rows; refusing to publish an unvalidated checkpoint")
         auc = float(roc_auc_score(Y, P)) if len(set(Y)) > 1 else 0.5
-        hist.append({"epoch": ep, "train_loss": s / max(n, 1), "val_auc": auc, "secs": round(time.time() - t0, 1)})
-        print(f"[judge] epoch {ep} train_loss {s / max(n, 1):.4f} val_auc {auc:.4f}", flush=True)
+        val_loss = val_loss_sum / len(Y)
+        positive_fraction = sum(Y) / len(Y)
+        prior_loss = (-positive_fraction * math.log(positive_fraction)
+                      - (1 - positive_fraction) * math.log(1 - positive_fraction)
+                      if 0 < positive_fraction < 1 else 0.0)
+        quality = {"val_loss": val_loss, "val_prior_loss": prior_loss,
+                   "val_loss_beats_prior": val_loss < prior_loss}
+        hist.append({"epoch": ep, "train_loss": s / max(n, 1), "val_auc": auc,
+                     **quality, "secs": round(time.time() - t0, 1)})
+        print(f"[judge] epoch {ep} train_loss {s / max(n, 1):.4f} val_auc {auc:.4f} "
+              f"val_loss {val_loss:.4f} prior_loss {prior_loss:.4f}", flush=True)
         sd = {k: v for k, v in model.state_dict().items() if any(t in k for t in TRAINABLE_KEYS)}
         # Keep the latest epoch too: on 2026-10-07 a below-chance val AUC made selection keep the
         # untrained epoch 1, and the epoch-2 weights were lost with nothing to re-evaluate.
@@ -280,7 +294,7 @@ def cmd_train(a):
         # which data produced the weights it is reading rather than which data is there now.
         meta = {"args": vars(a), "data_digests": A.split_digests(a.task, ("train", "val")),
                 "sft_objective": SFT_OBJECTIVE, "cotenants": cotenants(),
-                "code_commit": A.code_commit()}
+                "code_commit": A.code_commit(), **quality}
         torch.save({**meta, "epoch": ep, "val_auc": auc, "trainable_state_dict": sd}, out / "last.pt")
         if auc > best + 1e-4:
             best, bad = auc, 0
