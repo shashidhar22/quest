@@ -10,8 +10,7 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
 2. First move: test a fixed-feature/train-only-standardized head baseline (the earlier review's
    minimal proposal), using the corrected known-positive-excluding controls. Numerical collapse
    and control bugs are repaired; neither current neural recipe is promoted. PL1 stays on hold.
-   All three EC2 jobs completed/published; EC2 is stopping (verified 2026-11-13 03:19 UTC).
-   Confirm stopped before any restart; no computation remains active.
+   All three EC2 jobs completed/published; EC2 stopped confirmed 2026-11-13 03:21 UTC.
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
    `audit_and_publish.sh` (CPU box, r6i.8xlarge; enriched 20 min, proportional 31 min and
    243 GB peak). Contract revision 4. The box's own `data/molecule_clusters/` is the WRONG
