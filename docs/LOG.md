@@ -649,3 +649,15 @@ All local jobs completed; EC2 restored to original g6.2xlarge and stopped.
 Resumed after approval-service usage interruption. S3 feature-cache SHA-256 matches the local
 manifest after download; independent result checks pass. EC2 verified stopped with original
 g6.2xlarge type. Scientific gate and PL1 remain blocked; no additional training launched.
+
+## 2026-11-17 — Regularization CV does not hold out peptides
+
+Code review of the November 13 follow-up. Folds group molecules by true peptide cluster, but
+negatives are other panel molecules' peptides, so each held-out cluster's peptides remain in
+the fit folds as negatives only (1298/1508/1518 fit rows, 35–38%). Saved out-of-fold logits
+rank positives below negatives at every C (AUROC 0.060–0.120), so the 0.6644 loss and "CV
+prefers the prior" reflect the fold design, not the head. Removing those rows: C=0.0001 loss
+0.5216 vs matching prior 0.4768, ranking still below chance (AUROC 0.270–0.446); remaining
+cause not established. Validation metrics, receptor-swap results and the PL1 block are
+unaffected; published files unchanged. Check and output in ACS judge-head
+(`cv-leak-check.py`, `local-fixed/regularized/cv-leak.json`).

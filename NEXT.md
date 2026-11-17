@@ -8,11 +8,13 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    GPU BCE: trainable 0.5453, frozen 0.4531; independent train-only calibration gives 0.4990/0.4522,
    still above prior 0.4506. Corrected receptor swaps show no reliable true-receptor advantage.
 2. Fixed-feature MPS run completed; independent replay passes. C=1: validation BCE 0.7378.
-   Training-cluster CV prefers the constant prior (0.4506 vs best logistic 0.6644).
+   Training-cluster CV (best logistic 0.6644 vs prior 0.4506) is NOT a valid selection: held-out
+   peptides stay in the fit folds as negatives, OOF AUROC 0.06-0.12 (ACS cv-leak-check.py, Nov 17).
    Best logistic C=0.0001 gives held-out BCE 0.4290 but receptor delta +0.0016,
    CI [-0.0185,+0.0216]; exploratory, no recipe promoted. PL1 stays on hold.
    First move: revise receptor-sensitive validation before further paid training; retain the
-   receptor-free comparator. Cached features permit CPU reuse; no jobs remain active.
+   receptor-free comparator; draw negatives within each fold for any training-only selection.
+   Cached features permit CPU reuse; no jobs remain active.
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
    `audit_and_publish.sh` (CPU box, r6i.8xlarge; enriched 20 min, proportional 31 min and
    243 GB peak). Contract revision 4. The box's own `data/molecule_clusters/` is the WRONG
