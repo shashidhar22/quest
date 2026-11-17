@@ -671,3 +671,15 @@ including prior, and full-panel final refit policy. Dominant-cluster companion p
 624/188/188 molecules; low AUROC alone is not a split-validity test. Local MPS job in
 /private/tmp/dg1-foldwise-20261117 is bounded to one hour for extraction and ten minutes for
 selection; published evidence hashes are checked unchanged. Results pending; PL1 stays blocked.
+
+
+## 2026-11-17 — Fold-local CV rerun verified
+
+6000 new rows completed locally on MPS in 1527 seconds; all 1000 positive-feature anchors agree
+(max absolute difference 1.10e-6). Zero input-cluster crossings; 17 tests pass. Independent replay
+refits all 15 CV estimators, final full-panel logistic and paired readouts; published artifacts
+unchanged. Prior BCE 0.45056 beats best logistic 0.45323 at C=0.001 (OOF AUROC 0.58059).
+Exploratory validation BCE 0.40305, receptor delta +0.01725 with 95% CI [-0.06512,+0.02695].
+PL1 remains blocked. All local jobs complete; no EC2 started. Evidence in ACS
+judge-head/local-foldwise; full cache S3 pilot12/dg1-repair-fixed/local-20261117-foldwise-v1/.
+Next: specify a receptor-sensitive validation hypothesis before additional paid training.
