@@ -12,8 +12,10 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    best logistic 0.45323 (C=0.001, OOF AUROC 0.58059). Original contaminated CV is superseded.
    Exploratory full-panel refit: validation BCE 0.40305; receptor delta +0.01725,
    CI [-0.06512,+0.02695]. No recipe promoted; PL1 stays blocked.
-   First move: define a receptor-sensitive validation hypothesis and success criterion before
-   paid training. Keep receptor-free comparator. All local jobs complete.
+   Paired 100-candidate test complete: frozen judge 194/255 Recall@10 with either receptor.
+   Paired interaction readout improves mean rank by 28.19, but Recall@10 gain CI crosses zero.
+   Confirm on an independent panel with broader donor and peptide coverage before PL1.
+   Evidence: ACS judge-head/paired-100. All local jobs complete.
    Evidence: ACS judge-head/local-foldwise; full cache S3 prefix
    pilot12/dg1-repair-fixed/local-20261117-foldwise-v1/ (see feature-cache.json).
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
