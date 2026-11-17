@@ -661,3 +661,13 @@ prefers the prior" reflect the fold design, not the head. Removing those rows: C
 cause not established. Validation metrics, receptor-swap results and the PL1 block are
 unaffected; published files unchanged. Check and output in ACS judge-head
 (`cv-leak-check.py`, `local-fixed/regularized/cv-leak.json`).
+
+
+## 2026-11-17 — Fold-local CV repair rerun started
+
+Confirmed Claude's proposed fold-local negatives remove input-peptide leakage. Added input-cluster
+lookup checks, mutation regressions, positive feature equivalence assertion, train-only selection
+including prior, and full-panel final refit policy. Dominant-cluster companion policy yields
+624/188/188 molecules; low AUROC alone is not a split-validity test. Local MPS job in
+/private/tmp/dg1-foldwise-20261117 is bounded to one hour for extraction and ten minutes for
+selection; published evidence hashes are checked unchanged. Results pending; PL1 stays blocked.

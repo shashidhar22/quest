@@ -14,7 +14,9 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    CI [-0.0185,+0.0216]; exploratory, no recipe promoted. PL1 stays on hold.
    First move: revise receptor-sensitive validation before further paid training; retain the
    receptor-free comparator; draw negatives within each fold for any training-only selection.
-   Cached features permit CPU reuse; no jobs remain active.
+   Fold-local CV rerun ACTIVE (Nov 17): local MPS, 6000 rows, folds624/188/188;
+   /private/tmp/dg1-foldwise-20261117/stage-0.log and job-status.json.
+   Bounded wrapper runs selection automatically after embedding; review results before promotion.
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
    `audit_and_publish.sh` (CPU box, r6i.8xlarge; enriched 20 min, proportional 31 min and
    243 GB peak). Contract revision 4. The box's own `data/molecule_clusters/` is the WRONG
@@ -28,6 +30,6 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
 7. Saved runs: trainable 20261112T160549Z-1857, frozen 20261113T024720Z-2701, corrected readout
    20261113T030649Z-1684 (Nov 12 local). S3 quest/tcrbench2/pilot12/ prefixes dg1-repair,
    dg1-repair-frozen, dg1-repair-readout respectively. ACS preserves reports/raw evaluation scores;
-   model checkpoints remain on S3 and the EC2 volume. No jobs are left intentionally running.
+   model checkpoints remain on S3 and the EC2 volume. Only the bounded local foldwise rerun above is active.
    Fixed-feature cache: pilot12/dg1-repair-fixed/local-20261113T1422Z/ (S3 SHA-256 verified Nov 17).
    The experiment lock and checkpoint paths still need revision before any pilot.
