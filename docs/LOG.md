@@ -632,3 +632,20 @@ value was the same as the minimum.
 ## 2026-11-13 — Full-split negative reference repair
 
 The fixed-feature diagnostic review found subsampled negatives matching known positives outside the sample: 72 exact paired-receptor training negatives and one validation negative. The shared sampler now accepts an optional full-split reference, retaining the sampled peptide distribution and default caller behavior. DG1 training supplies each full split before subsampling; training never consults validation/test labels. Regression tests cover reference exclusion, seeded compatibility and training-entrypoint wiring. Fixed-feature experiment prepared in ACS; S3 approved, AWS SSO renewal pending. PL1 remains blocked.
+
+## 2026-11-13 — Fixed-feature experiment and regularization follow-up complete
+
+The MPS extraction finished in 2255 seconds. C=1 train/val BCE 0.2492/0.7378; true-minus-donor
+ranking −0.0094, CI [−0.0353,+0.0378]. Independent replay passes exactly after correcting the
+verifier's float32 rank rounding (new regression, no relaxed tolerance). CPU training-cluster
+CV prefers the constant prior: best logistic OOF BCE 0.6644 vs 0.4506. Best logistic C=0.0001
+has held-out BCE 0.4290 but receptor delta +0.0016, CI [−0.0185,+0.0216]. Improved calibration
+alone is insufficient; no recipe promoted and PL1 stays blocked. Features retained for CPU
+reuse; future work needs a revised receptor-sensitive validation hypothesis, not blind scaling.
+All local jobs completed; EC2 restored to original g6.2xlarge and stopped.
+
+## 2026-11-17 — DG1 evidence publication finalized
+
+Resumed after approval-service usage interruption. S3 feature-cache SHA-256 matches the local
+manifest after download; independent result checks pass. EC2 verified stopped with original
+g6.2xlarge type. Scientific gate and PL1 remain blocked; no additional training launched.

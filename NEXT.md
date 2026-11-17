@@ -1,4 +1,4 @@
-# NEXT — quest (updated 2026-11-12) · history: `docs/LOG.md`
+# NEXT — quest (updated 2026-11-17) · history: `docs/LOG.md`
 
 Judge-first's −0.023 for legacy arm D is correctly computed, but both of its SFT judges sit at
 the training base rate (DG1, 2026-11-11), so it compares what is left over, not two working judges. Corpus
@@ -7,14 +7,12 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
 1. DG1 code repairs are done; scientific gate remains uncleared (ACS findings 9.15).
    GPU BCE: trainable 0.5453, frozen 0.4531; independent train-only calibration gives 0.4990/0.4522,
    still above prior 0.4506. Corrected receptor swaps show no reliable true-receptor advantage.
-2. Fixed-feature/train-only-standardized diagnostic is implemented locally (ACS ops/dg1-repair/fixed_features.py); five checks pass.
-   Five EC2 starts across three sizes refused capacity; original g6.2xlarge restored and stopped verified.
-   Local MPS extraction PID 25357 running; output /private/tmp/dg1-fixed-20261113, one-hour timeout.
-   Completion watcher PID 26012 runs independent replay then approved S3 publication; inspect completion.json. Preliminary cached-fixture BCE 0.702, AUROC 0.752.
-   Negative sampling now rejects known positives from the full split before fitting.
-   First move: collect and independently replay the 1000/300 fixed-feature results. Numerical collapse
-   and control bugs are repaired; neither current neural recipe is promoted. PL1 stays on hold.
-   All three EC2 jobs completed/published; EC2 stopped confirmed 2026-11-13 03:21 UTC.
+2. Fixed-feature MPS run completed; independent replay passes. C=1: validation BCE 0.7378.
+   Training-cluster CV prefers the constant prior (0.4506 vs best logistic 0.6644).
+   Best logistic C=0.0001 gives held-out BCE 0.4290 but receptor delta +0.0016,
+   CI [-0.0185,+0.0216]; exploratory, no recipe promoted. PL1 stays on hold.
+   First move: revise receptor-sensitive validation before further paid training; retain the
+   receptor-free comparator. Cached features permit CPU reuse; no jobs remain active.
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
    `audit_and_publish.sh` (CPU box, r6i.8xlarge; enriched 20 min, proportional 31 min and
    243 GB peak). Contract revision 4. The box's own `data/molecule_clusters/` is the WRONG
@@ -23,10 +21,11 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
 4. The contract's counts for strata 3-9 are a proposal, not derived.
 5. Not isolated from CPT and not safe to score against a CPT model: benchmark parts
    `test_novel_tcr`, `test_novel_allele`, `test_mixed` (their peptides overlap train).
-6. EC2 shutdown requested after completed readout (state above). Preserve colleague edits in `/home/ubuntu/quest`; deploy by bundle
+6. EC2 restored to g6.2xlarge and stopped after capacity refusals. Preserve colleague edits in `/home/ubuntu/quest`; deploy by bundle
    + worktree (recent visits used `/home/ubuntu/quest-cr`).
 7. Saved runs: trainable 20261112T160549Z-1857, frozen 20261113T024720Z-2701, corrected readout
    20261113T030649Z-1684 (Nov 12 local). S3 quest/tcrbench2/pilot12/ prefixes dg1-repair,
    dg1-repair-frozen, dg1-repair-readout respectively. ACS preserves reports/raw evaluation scores;
    model checkpoints remain on S3 and the EC2 volume. No jobs are left intentionally running.
+   Fixed-feature cache: pilot12/dg1-repair-fixed/local-20261113T1422Z/ (S3 SHA-256 verified Nov 17).
    The experiment lock and checkpoint paths still need revision before any pilot.
