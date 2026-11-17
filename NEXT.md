@@ -17,6 +17,8 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    Independent 43-cluster/43-donor test complete: 10 true vs 8 donor hits, peptide-only 9.
    Rank gain +5.21 (95% interval −8.30 to +18.14). PL1 stays on hold. See revised step-12 plan.
    Evidence: ACS judge-head/paired-100. All local jobs complete.
+   CPU baseline-plus-correction and joint training completed: both selected zero receptor
+   weight on training folds. No PL1 promotion. Results: ACS judge-head/joint-readout.
    Evidence: ACS judge-head/local-foldwise; full cache S3 prefix
    pilot12/dg1-repair-fixed/local-20261117-foldwise-v1/ (see feature-cache.json).
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
