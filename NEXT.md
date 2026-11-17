@@ -14,7 +14,8 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    CI [-0.06512,+0.02695]. No recipe promoted; PL1 stays blocked.
    Paired 100-candidate test complete: frozen judge 194/255 Recall@10 with either receptor.
    Paired interaction readout improves mean rank by 28.19, but Recall@10 gain CI crosses zero.
-   Confirm on an independent panel with broader donor and peptide coverage before PL1.
+   Independent 43-cluster/43-donor test complete: 10 true vs 8 donor hits, peptide-only 9.
+   Rank gain +5.21 (95% interval −8.30 to +18.14). PL1 stays on hold. See revised step-12 plan.
    Evidence: ACS judge-head/paired-100. All local jobs complete.
    Evidence: ACS judge-head/local-foldwise; full cache S3 prefix
    pilot12/dg1-repair-fixed/local-20261117-foldwise-v1/ (see feature-cache.json).

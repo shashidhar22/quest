@@ -4,6 +4,50 @@ Opened 2026-11-11. Lightweight plan, nodded 2026-11-11. Gates: ACS
 `quest-cpt/audits/2026-11-10/new-cpt-plan.md` gates 4, 6, 7. Preparation only: nothing here
 starts EC2. Each visit is a separate go-ahead.
 
+## November 17 decision — hold PL1 until the judge qualifies
+
+The budget-matched P/E corpus comparison still answers the intended CPT question. Its
+measurement plan needs revision before a paid run. The executable lock currently selects
+the SFT checkpoint by validation AUROC and scores original receptors only. The repaired
+frozen judge reached 194/255 Recall@10 hits with the true receptor and 194/255 with a donor.
+The swap-trained readout gave 48 versus 2 hits, but the cluster interval for that difference
+included zero. These data come from an inspected panel with 26 donors and 199 queries in one
+cluster. The evaluator's 5,000-query setting is a cap. The entire validation split has 873
+distinct molecules, 53 peptides and 40 peptide clusters. Even scoring every molecule triggers
+the lock's underpowered flag at 100 peptides.
+
+The subsequent fixed-readout test covered 43 held-out peptide clusters with one unique donor
+per cluster. Five pairs from the initial 48 were excluded before outcomes were inspected due
+to overlap with an earlier positive control. The new readout recorded 10 true versus 8 donor
+hits, a +4.65 percentage-point difference (95% interval −11.63 to +20.93). Mean rank improved
+by 5.21 places (interval −8.30 to +18.14). Peptide-only retrieval achieved 9 hits. Both
+receptor-effect intervals cross zero. PL1 remains on hold. These are unused clusters from the
+same benchmark source, so independent-source replication is still open.
+
+1. Qualify one base judge before starting either CPT arm. Use training-only selection,
+   fold-local negative sampling, full-reference known-positive exclusion and a fixed readout.
+   Save the reference model, checkpoint, preprocessing, candidate manifests and scorer hashes.
+2. Freeze the evaluation population and decision margins before scoring a future qualification
+   panel. Use held-out receptor and peptide clusters, one vote per target cluster, unique
+   matched donors where feasible and identical 100 candidates, MHC and serialization order.
+   Report the unmatched denominator and donor reuse. Keep the final benchmark test sets closed.
+3. Require evidence for both useful retrieval and receptor dependence. Compare absolute
+   true-receptor Recall@10 against the peptide-only comparator on the same queries. Report
+   true-minus-donor Recall@10 and donor-minus-true mean rank with paired cluster intervals.
+   Specify the minimum useful effects and tolerable loss of absolute retrieval from the
+   intended pilot decision before seeing new outcomes. An inconclusive interval keeps the hold.
+   A panel already used to redesign a readout becomes development evidence for its successor.
+4. After qualification, replace the SFT selector and evaluation manifest in the lock generator,
+   implement and test the paired scoring path, regenerate the lock, and run a local dry run
+   plus a timed scoring smoke test. The earlier lock documents the historical recipe.
+5. Apply the same qualified recipe and candidate/donor pairs to B, P and E. Retain the 780
+   updates per CPT arm, matched masked-target budgets and the E−B primary contrast. Report
+   absolute retrieval and the between-arm difference in receptor advantage on the same clusters.
+   With one seed per arm, treat the pilot as triage.
+
+Evidence: ACS `quest-cpt/audits/2026-11-09/repair/judge-head/paired-100/` and
+`independent-panel/`.
+
 ## Status 2026-11-12 — local judge repair
 
 Dual pooling and feature normalization are integrated and tested; cached-feature learning beats
