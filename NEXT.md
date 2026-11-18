@@ -9,6 +9,10 @@ versus 9/43, familiar assignment 64.1%, external IMMREP25 macro AUC0.1 0.5017.
 Keep PL1 P/E on hold. Results and comparisons: ACS box-jobs/visits/base-scale.md and
 judge-head/base-scale/. S3 run: pilot12/base-scale-v1/20261118T191744Z-2250/.
 
+Matched-head visit completed using the same split, fixed larger-base encoder and pools,
+2,075 single-use training pairs. True/donor Recall@10 11/43 vs 11/43, external macro
+AUC0.1 0.4962. Keep P/E on hold. See ACS judge-head/matched-base/ for all comparisons.
+
 1. DG1 code repairs are done; scientific gate remains uncleared (ACS findings 9.15).
    GPU BCE: trainable 0.5453, frozen 0.4531; independent train-only calibration gives 0.4990/0.4522,
    still above prior 0.4506. Corrected receptor swaps show no reliable true-receptor advantage.
