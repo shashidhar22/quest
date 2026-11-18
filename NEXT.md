@@ -19,6 +19,8 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    Evidence: ACS judge-head/paired-100. All local jobs complete.
    CPU baseline-plus-correction and joint training completed: both selected zero receptor
    weight on training folds. No PL1 promotion. Results: ACS judge-head/joint-readout.
+   Priority 3 complete: chain pooling won 68/128 vs 69/128 matched peptide-only pooling
+   on familiar peptides with held-out receptor clusters. PL1 remains on hold. See chain-pooling/.
    Evidence: ACS judge-head/local-foldwise; full cache S3 prefix
    pilot12/dg1-repair-fixed/local-20261117-foldwise-v1/ (see feature-cache.json).
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
