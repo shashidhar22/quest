@@ -30,6 +30,10 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    production 0.5081 (95% target interval 0.4991–0.5183), directional 0.4980,
    peptide-only 0.5000. DG1 remains unqualified. Keep PL1 on hold and preserve the
    paired retrieval gate. ACS judge-head/immrep25/ contains scores and overlap audits.
+   Training-size diagnostic: 85 to 2,236 matched groups improves familiar assignment
+   from 66.4% to 82.0%; IMMREP25 0.5009 to 0.5045, unseen true/donor hits 4/43 vs 3/43.
+   Keep PL1 on hold. Next production scaling test is supervised base only, with held-out
+   exclusions fixed. See ACS judge-head/size-curve/.
    Evidence: ACS judge-head/local-foldwise; full cache S3 prefix
    pilot12/dg1-repair-fixed/local-20261117-foldwise-v1/ (see feature-cache.json).
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
