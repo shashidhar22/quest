@@ -4,6 +4,12 @@ Opened 2026-11-11. Lightweight plan, nodded 2026-11-11. Gates: ACS
 `quest-cpt/audits/2026-11-10/new-cpt-plan.md` gates 4, 6, 7. Preparation only: nothing here
 starts EC2. Each visit is a separate go-ahead.
 
+## November 18 base-only visit
+
+Run the reversible supervised base comparison first. The directional head's 26-fold scale increase improved familiar assignment to 82%, with unseen-target macro AUC0.1 of 0.5045. The production checkpoint uses a different representation and has only been tested at 1,000 supervised positives. The base visit tests 14,157 eligible positives against that checkpoint under the existing exclusion policy. Follow the frozen panels, recipe and ceilings in ACS `quest-cpt/box-jobs/visits/base-scale.md`. The outcome determines whether fresh confirmation is warranted; P and E remain gated.
+
+The base-only visit is complete. True/donor Recall@10 was 10/43 versus 9/43 with the larger base and 9/43 versus 8/43 with original DG1. Familiar assignment rose to 64.1%, while external macro AUC0.1 was 0.5017. Both paired receptor-effect intervals cross zero. Keep P and E on hold and retain the evaluated scoring manifests for development.
+
 ## November 17 decision — hold PL1 until the judge qualifies
 
 The budget-matched P/E corpus comparison still answers the intended CPT question. Its

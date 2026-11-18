@@ -4,6 +4,11 @@ Judge-first's −0.023 for legacy arm D is correctly computed, but both of its S
 the training base rate (DG1, 2026-11-11), so it compares what is left over, not two working judges. Corpus
 eligibility repair is through step 11 of 12; the plan and all results are in ACS
 `quest-cpt/audits/2026-11-09/` (`corpus-repair-plan.md`, `repair-status.md`).
+Base-only supervised scaling finished on 14,157 positives. True/donor hits were 10/43
+versus 9/43, familiar assignment 64.1%, external IMMREP25 macro AUC0.1 0.5017.
+Keep PL1 P/E on hold. Results and comparisons: ACS box-jobs/visits/base-scale.md and
+judge-head/base-scale/. S3 run: pilot12/base-scale-v1/20261118T191744Z-2250/.
+
 1. DG1 code repairs are done; scientific gate remains uncleared (ACS findings 9.15).
    GPU BCE: trainable 0.5453, frozen 0.4531; independent train-only calibration gives 0.4990/0.4522,
    still above prior 0.4506. Corrected receptor swaps show no reliable true-receptor advantage.
@@ -32,8 +37,7 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    paired retrieval gate. ACS judge-head/immrep25/ contains scores and overlap audits.
    Training-size diagnostic: 85 to 2,236 matched groups improves familiar assignment
    from 66.4% to 82.0%; IMMREP25 0.5009 to 0.5045, unseen true/donor hits 4/43 vs 3/43.
-   Keep PL1 on hold. Next production scaling test is supervised base only, with held-out
-   exclusions fixed. See ACS judge-head/size-curve/.
+   Keep PL1 on hold. The subsequent production scaling visit is summarized above. See ACS judge-head/size-curve/.
    Evidence: ACS judge-head/local-foldwise; full cache S3 prefix
    pilot12/dg1-repair-fixed/local-20261117-foldwise-v1/ (see feature-cache.json).
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
