@@ -22,8 +22,10 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    Priority 3 complete: chain pooling won 68/128 vs 69/128 matched peptide-only pooling
    on familiar peptides with held-out receptor clusters. PL1 remains on hold. See chain-pooling/.
    Reciprocal assignment diagnostic: chain head 63/128, same receptor wins both peptides
-   in 114/128. Similarity 64.1%. Training roles are strongly imbalanced. Test reciprocal
-   training loss before further pilot spending. Evidence: ACS judge-head/reciprocal-control/.
+   in 114/128. Similarity 64.1%. Training roles are strongly imbalanced. Reciprocal
+   training loss comparison completed: 85 single-use groups, familiar-target assignment
+   70.3% directional / 69.5% reciprocal. Both heads give 4/43 true hits on unseen targets
+   versus 9/43 peptide-only. PL1 remains on hold. See ACS judge-head/reciprocal-training/. Evidence: ACS judge-head/reciprocal-control/.
    Evidence: ACS judge-head/local-foldwise; full cache S3 prefix
    pilot12/dg1-repair-fixed/local-20261117-foldwise-v1/ (see feature-cache.json).
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
