@@ -1,4 +1,4 @@
-# NEXT — quest (updated 2026-11-17) · history: `docs/LOG.md`
+# NEXT — quest (updated 2026-11-18) · history: `docs/LOG.md`
 
 Judge-first's −0.023 for legacy arm D is correctly computed, but both of its SFT judges sit at
 the training base rate (DG1, 2026-11-11), so it compares what is left over, not two working judges. Corpus
@@ -26,6 +26,10 @@ eligibility repair is through step 11 of 12; the plan and all results are in ACS
    training loss comparison completed: 85 single-use groups, familiar-target assignment
    70.3% directional / 69.5% reciprocal. Both heads give 4/43 true hits on unseen targets
    versus 9/43 peptide-only. PL1 remains on hold. See ACS judge-head/reciprocal-training/. Evidence: ACS judge-head/reciprocal-control/.
+   IMMREP25 full public panel complete (10,000 rows, 20 targets). Macro AUC0.1:
+   production 0.5081 (95% target interval 0.4991–0.5183), directional 0.4980,
+   peptide-only 0.5000. DG1 remains unqualified. Keep PL1 on hold and preserve the
+   paired retrieval gate. ACS judge-head/immrep25/ contains scores and overlap audits.
    Evidence: ACS judge-head/local-foldwise; full cache S3 prefix
    pilot12/dg1-repair-fixed/local-20261117-foldwise-v1/ (see feature-cache.json).
 3. Rebuilding: `scripts/data_processing/contract_build_box/run_contract_build.sh` then
