@@ -1,5 +1,9 @@
 # NEXT — quest (updated 2026-11-19) · history: `docs/LOG.md`
 
+Independent human-antigen within-target audit completed in ACS repair/within-target/.
+IEDB/CEDAR yielded zero fresh mixed-label targets. No training or comparable AUC.
+Keep PL1 on hold; obtain a paired receptor-by-single-peptide response matrix.
+
 IMMREP25 masked readout completed. Original 0.5061, larger-base SFT 0.4967,
 learned head 0.5017. The same-readout difference favors original; its advantage over
 the learned judge is unresolved. Prioritize independent within-target supervision.
