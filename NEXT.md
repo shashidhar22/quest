@@ -1,5 +1,11 @@
 # NEXT — quest (updated 2026-11-18) · history: `docs/LOG.md`
 
+PL1 exploratory run 20261118T234214Z-2208 completed. True/donor hits B 10/9, P 12/8,
+E 11/6 out of 43. P improved paired rank gain over B by 6.72 places (95% interval
++0.23 to +13.21). Primary E−B Recall@10 and external AUC remain inconclusive.
+Keep judge qualification open. Fresh replication of proportional rank gain is the first
+follow-up. Results in ACS repair/pl1-large/; both adapters and scores are archived.
+
 Judge-first's −0.023 for legacy arm D is correctly computed, but both of its SFT judges sit at
 the training base rate (DG1, 2026-11-11), so it compares what is left over, not two working judges. Corpus
 eligibility repair is through step 11 of 12; the plan and all results are in ACS
