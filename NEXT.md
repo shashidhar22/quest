@@ -1,10 +1,10 @@
-# NEXT — quest (updated 2026-11-18) · history: `docs/LOG.md`
+# NEXT — quest (updated 2026-11-19) · history: `docs/LOG.md`
 
-PL1 exploratory run 20261118T234214Z-2208 completed. True/donor hits B 10/9, P 12/8,
-E 11/6 out of 43. P improved paired rank gain over B by 6.72 places (95% interval
-+0.23 to +13.21). Primary E−B Recall@10 and external AUC remain inconclusive.
-Keep judge qualification open. Fresh replication of proportional rank gain is the first
-follow-up. Results in ACS repair/pl1-large/; both adapters and scores are archived.
+Fresh VDJdb replication completed. On 97 held-out peptide clusters, proportional minus
+base rank gain was +1.98 (95% interval −1.90 to +5.80) and true Recall@10 fell from
+29/97 to 17/97. Only three units passed the additional receptor-family screen.
+Neither judge qualifies. Keep PL1 on hold. For any new qualification panel, establish
+receptor-family coverage before assigning donors. Evidence in ACS repair/fresh-rank/.
 
 Judge-first's −0.023 for legacy arm D is correctly computed, but both of its SFT judges sit at
 the training base rate (DG1, 2026-11-11), so it compares what is left over, not two working judges. Corpus
