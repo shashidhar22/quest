@@ -1,5 +1,10 @@
 # NEXT — quest (updated 2026-11-19) · history: `docs/LOG.md`
 
+IMMREP25 masked readout completed. Original 0.5061, larger-base SFT 0.4967,
+learned head 0.5017. The same-readout difference favors original; its advantage over
+the learned judge is unresolved. Prioritize independent within-target supervision.
+See ACS repair/masked-immrep/.
+
 Fresh VDJdb replication completed. On 97 held-out peptide clusters, proportional minus
 base rank gain was +1.98 (95% interval −1.90 to +5.80) and true Recall@10 fell from
 29/97 to 17/97. Only three units passed the additional receptor-family screen.
