@@ -3,8 +3,9 @@
 Fresh VDJdb replication completed. On 97 held-out peptide clusters, proportional minus
 base rank gain was +1.98 (95% interval −1.90 to +5.80) and true Recall@10 fell from
 29/97 to 17/97. Only three units passed the additional receptor-family screen.
-Neither judge qualifies. Keep PL1 on hold. For any new qualification panel, establish
-receptor-family coverage before assigning donors. Evidence in ACS repair/fresh-rank/.
+Neither judge qualifies. Keep PL1 on hold. Family-first matching retained 30 training-held-out clusters,
+but just one fresh to both roles of the prior panel. No scoring rerun. New source coverage
+is required for independent confirmation. Evidence in ACS repair/family-first/.
 
 Judge-first's −0.023 for legacy arm D is correctly computed, but both of its SFT judges sit at
 the training base rate (DG1, 2026-11-11), so it compares what is left over, not two working judges. Corpus
